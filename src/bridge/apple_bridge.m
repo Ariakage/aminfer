@@ -2594,6 +2594,113 @@ ami_status ami_compute_encode_dispatch_vision(ami_compute *compute,
     return AMI_OK;
 }
 
+static ami_status vision_frame_from_cg_image(ami_device *device,
+                                             CGImageRef cg_img,
+                                             uint32_t max_dim,
+                                             ami_vision_frame **out_frame) {
+    if (out_frame == NULL) {
+        return AMI_ERR_INVALID_ARGUMENT;
+    }
+    *out_frame = NULL;
+    if (device == NULL || cg_img == NULL || max_dim == 0) {
+        return AMI_ERR_INVALID_ARGUMENT;
+    }
+
+    const size_t width = CGImageGetWidth(cg_img);
+    const size_t height = CGImageGetHeight(cg_img);
+    if (width == 0 || height == 0 || width > max_dim || height > max_dim) {
+        return AMI_ERR_VISION;
+    }
+
+    ami_vision_frame *frame = NULL;
+    ami_status st = ami_vision_frame_create(device, AMI_VISION_FMT_BGRA8,
+                                            (uint32_t)width, (uint32_t)height, &frame);
+    if (st != AMI_OK) {
+        return st;
+    }
+
+    void *base = NULL;
+    size_t bpr = 0;
+    uint32_t locked_h = 0;
+    st = ami_vision_frame_lock_plane(frame, 0, 0, &base, &bpr, &locked_h);
+    if (st != AMI_OK) {
+        ami_vision_frame_destroy(frame);
+        return st;
+    }
+
+    CGColorSpaceRef cs = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
+    if (cs == NULL) {
+        ami_vision_frame_unlock(frame, 0);
+        ami_vision_frame_destroy(frame);
+        return AMI_ERR_VISION;
+    }
+    // Little-endian 32-bit PremultipliedFirst yields [B, G, R, A] bytes matching BGRA8Unorm.
+    const CGBitmapInfo bmp_info =
+        (CGBitmapInfo)kCGBitmapByteOrder32Little | (CGBitmapInfo)kCGImageAlphaPremultipliedFirst;
+    CGContextRef ctx = CGBitmapContextCreate(base, width, height, 8, bpr, cs, bmp_info);
+    CGColorSpaceRelease(cs);
+    if (ctx == NULL) {
+        ami_vision_frame_unlock(frame, 0);
+        ami_vision_frame_destroy(frame);
+        return AMI_ERR_VISION;
+    }
+    CGContextSetBlendMode(ctx, kCGBlendModeCopy);
+    CGContextDrawImage(ctx, CGRectMake(0.0, 0.0, (CGFloat)width, (CGFloat)height), cg_img);
+    CGContextRelease(ctx);
+
+    st = ami_vision_frame_unlock(frame, 0);
+    if (st != AMI_OK) {
+        ami_vision_frame_destroy(frame);
+        return st;
+    }
+    *out_frame = frame;
+    return AMI_OK;
+}
+
+static ami_status cg_image_from_vision_frame(ami_vision_frame *frame,
+                                             bool opaque_alpha,
+                                             CGImageRef *out_img) {
+    if (out_img == NULL) {
+        return AMI_ERR_INVALID_ARGUMENT;
+    }
+    *out_img = NULL;
+    if (frame == NULL || frame->format != AMI_VISION_FMT_BGRA8) {
+        return AMI_ERR_INVALID_ARGUMENT;
+    }
+
+    void *base = NULL;
+    size_t bpr = 0;
+    uint32_t locked_h = 0;
+    ami_status st = ami_vision_frame_lock_plane(frame, 0, 1u, &base, &bpr, &locked_h);
+    if (st != AMI_OK) {
+        return st;
+    }
+
+    CGColorSpaceRef cs = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
+    if (cs == NULL) {
+        ami_vision_frame_unlock(frame, 1u);
+        return AMI_ERR_VISION;
+    }
+    const CGBitmapInfo alpha_info = opaque_alpha
+        ? (CGBitmapInfo)kCGImageAlphaNoneSkipFirst
+        : (CGBitmapInfo)kCGImageAlphaPremultipliedFirst;
+    const CGBitmapInfo bmp_info = (CGBitmapInfo)kCGBitmapByteOrder32Little | alpha_info;
+    CGContextRef ctx = CGBitmapContextCreate(base, frame->width, frame->height, 8, bpr, cs, bmp_info);
+    CGColorSpaceRelease(cs);
+    if (ctx == NULL) {
+        ami_vision_frame_unlock(frame, 1u);
+        return AMI_ERR_VISION;
+    }
+    CGImageRef cg_img = CGBitmapContextCreateImage(ctx);
+    CGContextRelease(ctx);
+    ami_vision_frame_unlock(frame, 1u);
+    if (cg_img == NULL) {
+        return AMI_ERR_VISION;
+    }
+    *out_img = cg_img;
+    return AMI_OK;
+}
+
 ami_status ami_image_load_iosurface(ami_device *device, const char *path,
                                     ami_vision_frame **out_frame) {
     if (out_frame == NULL) {
@@ -2620,62 +2727,10 @@ ami_status ami_image_load_iosurface(ami_device *device, const char *path,
             return AMI_ERR_VISION;
         }
 
-        const size_t width = CGImageGetWidth(cg_img);
-        const size_t height = CGImageGetHeight(cg_img);
-        if (width == 0 || height == 0 || width > AMI_MAX_TEXTURE_DIM || height > AMI_MAX_TEXTURE_DIM) {
-            CGImageRelease(cg_img);
-            return AMI_ERR_VISION;
-        }
-
-        ami_vision_frame *frame = NULL;
-        ami_status st = ami_vision_frame_create(device, AMI_VISION_FMT_BGRA8,
-                                                (uint32_t)width, (uint32_t)height, &frame);
-        if (st != AMI_OK) {
-            CGImageRelease(cg_img);
-            return st;
-        }
-
-        void *base = NULL;
-        size_t bpr = 0;
-        uint32_t locked_h = 0;
-        st = ami_vision_frame_lock_plane(frame, 0, 0, &base, &bpr, &locked_h);
-        if (st != AMI_OK) {
-            ami_vision_frame_destroy(frame);
-            CGImageRelease(cg_img);
-            return st;
-        }
-
-        CGColorSpaceRef cs = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
-        if (cs == NULL) {
-            ami_vision_frame_unlock(frame, 0);
-            ami_vision_frame_destroy(frame);
-            CGImageRelease(cg_img);
-            return AMI_ERR_VISION;
-        }
-        // Little-endian 32-bit PremultipliedFirst yields [B, G, R, A] bytes matching BGRA8Unorm.
-        const CGBitmapInfo bmp_info =
-            (CGBitmapInfo)kCGBitmapByteOrder32Little | (CGBitmapInfo)kCGImageAlphaPremultipliedFirst;
-        CGContextRef ctx = CGBitmapContextCreate(base, width, height, 8, bpr, cs, bmp_info);
-        CGColorSpaceRelease(cs);
-        if (ctx == NULL) {
-            ami_vision_frame_unlock(frame, 0);
-            ami_vision_frame_destroy(frame);
-            CGImageRelease(cg_img);
-            return AMI_ERR_VISION;
-        }
-        CGContextSetBlendMode(ctx, kCGBlendModeCopy);
-        CGContextDrawImage(ctx, CGRectMake(0.0, 0.0, (CGFloat)width, (CGFloat)height), cg_img);
-        CGContextRelease(ctx);
+        ami_status st = vision_frame_from_cg_image(device, cg_img, AMI_MAX_TEXTURE_DIM, out_frame);
         CGImageRelease(cg_img);
-
-        st = ami_vision_frame_unlock(frame, 0);
-        if (st != AMI_OK) {
-            ami_vision_frame_destroy(frame);
-            return st;
-        }
-        *out_frame = frame;
+        return st;
     }
-    return AMI_OK;
 }
 
 ami_status ami_image_write_png(ami_vision_frame *frame, const char *path) {
@@ -2691,32 +2746,10 @@ ami_status ami_image_write_png(ami_vision_frame *frame, const char *path) {
         }
         NSURL *url = [NSURL fileURLWithPath:ns_path];
 
-        void *base = NULL;
-        size_t bpr = 0;
-        uint32_t locked_h = 0;
-        ami_status st = ami_vision_frame_lock_plane(frame, 0, 1u, &base, &bpr, &locked_h);
+        CGImageRef cg_img = NULL;
+        ami_status st = cg_image_from_vision_frame(frame, false, &cg_img);
         if (st != AMI_OK) {
             return st;
-        }
-
-        CGColorSpaceRef cs = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
-        if (cs == NULL) {
-            ami_vision_frame_unlock(frame, 1u);
-            return AMI_ERR_VISION;
-        }
-        const CGBitmapInfo bmp_info =
-            (CGBitmapInfo)kCGBitmapByteOrder32Little | (CGBitmapInfo)kCGImageAlphaPremultipliedFirst;
-        CGContextRef ctx = CGBitmapContextCreate(base, frame->width, frame->height, 8, bpr, cs, bmp_info);
-        CGColorSpaceRelease(cs);
-        if (ctx == NULL) {
-            ami_vision_frame_unlock(frame, 1u);
-            return AMI_ERR_VISION;
-        }
-        CGImageRef cg_img = CGBitmapContextCreateImage(ctx);
-        CGContextRelease(ctx);
-        ami_vision_frame_unlock(frame, 1u);
-        if (cg_img == NULL) {
-            return AMI_ERR_VISION;
         }
 
         CGImageDestinationRef dst = CGImageDestinationCreateWithURL(
@@ -2731,6 +2764,166 @@ ami_status ami_image_write_png(ami_vision_frame *frame, const char *path) {
         CGImageRelease(cg_img);
         return ok ? AMI_OK : AMI_ERR_VISION;
     }
+}
+
+ami_status ami_image_decode_bytes_iosurface(ami_device *device,
+                                            const uint8_t *bytes, size_t len,
+                                            ami_vision_frame **out_frame) {
+    if (out_frame == NULL) {
+        return AMI_ERR_INVALID_ARGUMENT;
+    }
+    *out_frame = NULL;
+    if (device == NULL || bytes == NULL || len == 0) {
+        return AMI_ERR_INVALID_ARGUMENT;
+    }
+
+    @autoreleasepool {
+        NSData *data = [NSData dataWithBytesNoCopy:(void *)(uintptr_t)bytes
+                                            length:(NSUInteger)len
+                                      freeWhenDone:NO];
+        if (data == nil) {
+            return AMI_ERR_OUT_OF_MEMORY;
+        }
+        NSDictionary *src_opts = @{
+            (__bridge id)kCGImageSourceShouldCache: @NO,
+        };
+        CGImageSourceRef src = CGImageSourceCreateWithData(
+            (__bridge CFDataRef)data, (__bridge CFDictionaryRef)src_opts);
+        if (src == NULL) {
+            return AMI_ERR_VISION;
+        }
+        if (CGImageSourceGetCount(src) == 0) {
+            CFRelease(src);
+            return AMI_ERR_VISION;
+        }
+        NSDictionary *img_opts = @{
+            (__bridge id)kCGImageSourceShouldCache: @NO,
+            (__bridge id)kCGImageSourceShouldCacheImmediately: @YES,
+        };
+        CGImageRef cg_img = CGImageSourceCreateImageAtIndex(
+            src, 0, (__bridge CFDictionaryRef)img_opts);
+        CFRelease(src);
+        if (cg_img == NULL) {
+            return AMI_ERR_VISION;
+        }
+
+        ami_status st = vision_frame_from_cg_image(
+            device, cg_img, AMI_VISION_MAX_BYTES_IMAGE_DIM, out_frame);
+        CGImageRelease(cg_img);
+        return st;
+    }
+}
+
+void ami_vision_free_bytes(void *bytes) {
+    free(bytes);
+}
+
+ami_status ami_image_encode_uti_alloc(ami_vision_frame *const *frames,
+                                      uint32_t frame_count, const char *uti,
+                                      uint8_t **out_bytes, size_t *out_len) {
+    if (out_bytes != NULL) {
+        *out_bytes = NULL;
+    }
+    if (out_len != NULL) {
+        *out_len = 0;
+    }
+    if (frames == NULL || frame_count == 0 || frame_count > 128u ||
+        uti == NULL || uti[0] == '\0' || out_bytes == NULL || out_len == NULL) {
+        return AMI_ERR_INVALID_ARGUMENT;
+    }
+    for (uint32_t i = 0; i < frame_count; i++) {
+        if (frames[i] == NULL || frames[i]->format != AMI_VISION_FMT_BGRA8) {
+            return AMI_ERR_INVALID_ARGUMENT;
+        }
+    }
+
+    const bool is_jpeg = (strcmp(uti, "public.jpeg") == 0);
+    const bool is_bmp = (strcmp(uti, "com.microsoft.bmp") == 0);
+    const bool is_gif = (strcmp(uti, "com.compuserve.gif") == 0);
+    const bool opaque_alpha = is_jpeg || is_bmp;
+
+    @autoreleasepool {
+        NSString *ns_uti = [NSString stringWithUTF8String:uti];
+        if (ns_uti == nil) {
+            return AMI_ERR_INVALID_ARGUMENT;
+        }
+        CFMutableDataRef cf_out = CFDataCreateMutable(kCFAllocatorDefault, 0);
+        if (cf_out == NULL) {
+            return AMI_ERR_OUT_OF_MEMORY;
+        }
+        CGImageDestinationRef dst = CGImageDestinationCreateWithData(
+            cf_out, (__bridge CFStringRef)ns_uti, (size_t)frame_count, NULL);
+        if (dst == NULL) {
+            CFRelease(cf_out);
+            return AMI_ERR_VISION;
+        }
+
+        if (is_gif && frame_count > 1u) {
+            NSDictionary *gif_props = @{
+                (__bridge id)kCGImagePropertyGIFDictionary: @{
+                    (__bridge id)kCGImagePropertyGIFLoopCount: @0,
+                },
+            };
+            CGImageDestinationSetProperties(dst, (__bridge CFDictionaryRef)gif_props);
+        }
+
+        NSDictionary *frame_props = (is_gif && frame_count > 1u)
+            ? @{
+                (__bridge id)kCGImagePropertyGIFDictionary: @{
+                    (__bridge id)kCGImagePropertyGIFDelayTime: @(0.05),
+                },
+              }
+            : nil;
+
+        for (uint32_t i = 0; i < frame_count; i++) {
+            CGImageRef cg_img = NULL;
+            ami_status st = cg_image_from_vision_frame(frames[i], opaque_alpha, &cg_img);
+            if (st != AMI_OK) {
+                CFRelease(dst);
+                CFRelease(cf_out);
+                return st;
+            }
+            CGImageDestinationAddImage(dst, cg_img, (__bridge CFDictionaryRef)frame_props);
+            CGImageRelease(cg_img);
+        }
+
+        bool ok = CGImageDestinationFinalize(dst);
+        CFRelease(dst);
+        if (!ok) {
+            CFRelease(cf_out);
+            return AMI_ERR_VISION;
+        }
+
+        const CFIndex cf_len = CFDataGetLength(cf_out);
+        if (cf_len <= 0) {
+            CFRelease(cf_out);
+            return AMI_ERR_VISION;
+        }
+        uint8_t *buf = malloc((size_t)cf_len);
+        if (buf == NULL) {
+            CFRelease(cf_out);
+            return AMI_ERR_OUT_OF_MEMORY;
+        }
+        memcpy(buf, CFDataGetBytePtr(cf_out), (size_t)cf_len);
+        CFRelease(cf_out);
+        *out_bytes = buf;
+        *out_len = (size_t)cf_len;
+        return AMI_OK;
+    }
+}
+
+ami_status ami_image_encode_png_alloc(ami_vision_frame *frame,
+                                      uint8_t **out_bytes, size_t *out_len) {
+    if (frame == NULL) {
+        if (out_bytes != NULL) {
+            *out_bytes = NULL;
+        }
+        if (out_len != NULL) {
+            *out_len = 0;
+        }
+        return AMI_ERR_INVALID_ARGUMENT;
+    }
+    return ami_image_encode_uti_alloc(&frame, 1u, "public.png", out_bytes, out_len);
 }
 
 typedef struct ami_vt_encode_collector {
@@ -3252,6 +3445,1848 @@ ami_status ami_vt_decode_clip_frame(ami_vt_decode_session *session,
         out_frame);
     CVPixelBufferRelease(out.pixel_buffer);
     return st;
+}
+
+// ----------------------------------------------------------------------------
+// M9.6 C29 Item 7: Pure In-Memory ISO-BMFF Muxer/Demuxer, Annex-B, & ImageIO
+// ----------------------------------------------------------------------------
+
+#define AMI_ISO_FOURCC(a, b, c, d) \
+    (((uint32_t)(uint8_t)(a) << 24) | ((uint32_t)(uint8_t)(b) << 16) | \
+     ((uint32_t)(uint8_t)(c) << 8)  | (uint32_t)(uint8_t)(d))
+
+static inline uint16_t ami_read_be16(const uint8_t *p) {
+    return (uint16_t)(((uint16_t)p[0] << 8) | (uint16_t)p[1]);
+}
+
+static inline uint32_t ami_read_be32(const uint8_t *p) {
+    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
+           ((uint32_t)p[2] << 8) | (uint32_t)p[3];
+}
+
+static inline uint64_t ami_read_be64(const uint8_t *p) {
+    return ((uint64_t)ami_read_be32(p) << 32) | (uint64_t)ami_read_be32(p + 4);
+}
+
+static inline void ami_write_be32(uint8_t *p, uint32_t v) {
+    p[0] = (uint8_t)(v >> 24);
+    p[1] = (uint8_t)(v >> 16);
+    p[2] = (uint8_t)(v >> 8);
+    p[3] = (uint8_t)(v & 0xFFu);
+}
+
+typedef struct ami_byte_vec {
+    uint8_t *data;
+    size_t len;
+    size_t cap;
+} ami_byte_vec;
+
+static bool bv_reserve(ami_byte_vec *v, size_t extra) {
+    if (extra > SIZE_MAX - v->len) {
+        return false;
+    }
+    const size_t needed = v->len + extra;
+    if (needed <= v->cap) {
+        return true;
+    }
+    size_t new_cap = (v->cap == 0) ? 4096u : v->cap;
+    while (new_cap < needed) {
+        if (new_cap > SIZE_MAX / 2u) {
+            new_cap = needed;
+            break;
+        }
+        new_cap *= 2u;
+    }
+    uint8_t *grown = realloc(v->data, new_cap);
+    if (grown == NULL) {
+        return false;
+    }
+    v->data = grown;
+    v->cap = new_cap;
+    return true;
+}
+
+static bool bv_append_bytes(ami_byte_vec *v, const void *src, size_t n) {
+    if (n == 0) {
+        return true;
+    }
+    if (!bv_reserve(v, n)) {
+        return false;
+    }
+    memcpy(v->data + v->len, src, n);
+    v->len += n;
+    return true;
+}
+
+static bool bv_append_zeros(ami_byte_vec *v, size_t n) {
+    if (n == 0) {
+        return true;
+    }
+    if (!bv_reserve(v, n)) {
+        return false;
+    }
+    memset(v->data + v->len, 0, n);
+    v->len += n;
+    return true;
+}
+
+static bool bv_append_u8(ami_byte_vec *v, uint8_t b) {
+    return bv_append_bytes(v, &b, 1u);
+}
+
+static bool bv_append_be16(ami_byte_vec *v, uint16_t val) {
+    const uint8_t buf[2] = {
+        (uint8_t)(val >> 8),
+        (uint8_t)(val & 0xFFu),
+    };
+    return bv_append_bytes(v, buf, sizeof(buf));
+}
+
+static bool bv_append_be32(ami_byte_vec *v, uint32_t val) {
+    uint8_t buf[4];
+    ami_write_be32(buf, val);
+    return bv_append_bytes(v, buf, sizeof(buf));
+}
+
+static bool bv_append_fourcc(ami_byte_vec *v, const char tag[4]) {
+    return bv_append_bytes(v, tag, 4u);
+}
+
+static bool bv_begin_box(ami_byte_vec *v, const char tag[4], size_t *out_pos) {
+    *out_pos = v->len;
+    return bv_append_be32(v, 0u) && bv_append_fourcc(v, tag);
+}
+
+static bool bv_begin_fullbox(ami_byte_vec *v, const char tag[4],
+                             uint8_t version, uint32_t flags, size_t *out_pos) {
+    const uint32_t vf = ((uint32_t)version << 24) | (flags & 0x00FFFFFFu);
+    return bv_begin_box(v, tag, out_pos) && bv_append_be32(v, vf);
+}
+
+static bool bv_end_box(ami_byte_vec *v, size_t pos) {
+    const size_t sz = v->len - pos;
+    if (sz > UINT32_MAX) {
+        return false;
+    }
+    ami_write_be32(v->data + pos, (uint32_t)sz);
+    return true;
+}
+
+static bool bv_append_unity_matrix(ami_byte_vec *v) {
+    const uint32_t m[9] = {
+        0x00010000u, 0u, 0u,
+        0u, 0x00010000u, 0u,
+        0u, 0u, 0x40000000u,
+    };
+    for (size_t i = 0; i < 9u; i++) {
+        if (!bv_append_be32(v, m[i])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static ami_status extract_clip_codec_config(const ami_vt_clip *clip, ami_byte_vec *out_cfg) {
+    if (clip == NULL || clip->format_desc == NULL || out_cfg == NULL) {
+        return AMI_ERR_INVALID_ARGUMENT;
+    }
+    @autoreleasepool {
+        CFDictionaryRef exts = CMFormatDescriptionGetExtensions(clip->format_desc);
+        if (exts != NULL) {
+            CFDictionaryRef atoms = (CFDictionaryRef)CFDictionaryGetValue(
+                exts, kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms);
+            if (atoms != NULL) {
+                CFStringRef key = (clip->codec == AMI_VT_CODEC_HEVC) ? CFSTR("hvcC") : CFSTR("avcC");
+                CFDataRef cfg = (CFDataRef)CFDictionaryGetValue(atoms, key);
+                if (cfg != NULL && CFDataGetLength(cfg) > 0) {
+                    if (!bv_append_bytes(out_cfg, CFDataGetBytePtr(cfg),
+                                         (size_t)CFDataGetLength(cfg))) {
+                        return AMI_ERR_OUT_OF_MEMORY;
+                    }
+                    return AMI_OK;
+                }
+            }
+        }
+    }
+
+    // Fallback for H.264 if SampleDescriptionExtensionAtoms did not populate avcC.
+    if (clip->codec == AMI_VT_CODEC_H264) {
+        size_t param_count = 0;
+        int nal_len_hdr = 0;
+        if (CMVideoFormatDescriptionGetH264ParameterSetAtIndex(
+                clip->format_desc, 0, NULL, NULL, &param_count, &nal_len_hdr) == noErr &&
+            param_count >= 2u) {
+            const uint8_t *sps = NULL;
+            size_t sps_sz = 0;
+            const uint8_t *pps = NULL;
+            size_t pps_sz = 0;
+            if (CMVideoFormatDescriptionGetH264ParameterSetAtIndex(
+                    clip->format_desc, 0, &sps, &sps_sz, NULL, NULL) == noErr &&
+                CMVideoFormatDescriptionGetH264ParameterSetAtIndex(
+                    clip->format_desc, 1, &pps, &pps_sz, NULL, NULL) == noErr &&
+                sps != NULL && sps_sz >= 4u && sps_sz <= UINT16_MAX &&
+                pps != NULL && pps_sz >= 1u && pps_sz <= UINT16_MAX) {
+                const uint8_t len_m1 = (nal_len_hdr == 1 || nal_len_hdr == 2 || nal_len_hdr == 4)
+                    ? (uint8_t)(nal_len_hdr - 1) : 3u;
+                bool ok = bv_append_u8(out_cfg, 1u) &&
+                          bv_append_u8(out_cfg, sps[1]) &&
+                          bv_append_u8(out_cfg, sps[2]) &&
+                          bv_append_u8(out_cfg, sps[3]) &&
+                          bv_append_u8(out_cfg, (uint8_t)(0xFCu | len_m1)) &&
+                          bv_append_u8(out_cfg, 0xE1u) &&
+                          bv_append_be16(out_cfg, (uint16_t)sps_sz) &&
+                          bv_append_bytes(out_cfg, sps, sps_sz) &&
+                          bv_append_u8(out_cfg, 1u) &&
+                          bv_append_be16(out_cfg, (uint16_t)pps_sz) &&
+                          bv_append_bytes(out_cfg, pps, pps_sz);
+                return ok ? AMI_OK : AMI_ERR_OUT_OF_MEMORY;
+            }
+        }
+    }
+    return AMI_ERR_VISION;
+}
+
+ami_status ami_vt_clip_export_mp4_bytes(const ami_vt_clip *clip,
+                                        uint8_t **out_bytes, size_t *out_len) {
+    if (out_bytes != NULL) {
+        *out_bytes = NULL;
+    }
+    if (out_len != NULL) {
+        *out_len = 0;
+    }
+    if (clip == NULL || clip->format_desc == NULL || clip->samples == NULL ||
+        clip->frame_count == 0 || clip->fps == 0 ||
+        (clip->codec != AMI_VT_CODEC_H264 && clip->codec != AMI_VT_CODEC_HEVC) ||
+        out_bytes == NULL || out_len == NULL) {
+        return AMI_ERR_INVALID_ARGUMENT;
+    }
+
+    const uint32_t n = clip->frame_count;
+    const uint32_t timescale = clip->fps * 1000u;
+    const uint32_t sample_delta = 1000u;
+    if ((uint64_t)n * (uint64_t)sample_delta > UINT32_MAX) {
+        return AMI_ERR_INVALID_ARGUMENT;
+    }
+    const uint32_t total_duration = n * sample_delta;
+
+    ami_byte_vec codec_cfg = { 0 };
+    ami_status st = extract_clip_codec_config(clip, &codec_cfg);
+    if (st != AMI_OK) {
+        free(codec_cfg.data);
+        return st;
+    }
+
+    uint32_t *sample_sizes = calloc(n, sizeof(uint32_t));
+    uint32_t *sync_indices = calloc(n, sizeof(uint32_t));
+    if (sample_sizes == NULL || sync_indices == NULL) {
+        free(sample_sizes);
+        free(sync_indices);
+        free(codec_cfg.data);
+        return AMI_ERR_OUT_OF_MEMORY;
+    }
+
+    uint32_t sync_count = 0;
+    uint64_t mdat_payload_bytes = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        if (clip->samples[i] == NULL) {
+            free(sample_sizes);
+            free(sync_indices);
+            free(codec_cfg.data);
+            return AMI_ERR_VISION;
+        }
+        CMBlockBufferRef bb = CMSampleBufferGetDataBuffer(clip->samples[i]);
+        if (bb == NULL) {
+            free(sample_sizes);
+            free(sync_indices);
+            free(codec_cfg.data);
+            return AMI_ERR_VISION;
+        }
+        const size_t sz = CMBlockBufferGetDataLength(bb);
+        if (sz == 0 || sz > UINT32_MAX || mdat_payload_bytes > UINT32_MAX - sz) {
+            free(sample_sizes);
+            free(sync_indices);
+            free(codec_cfg.data);
+            return AMI_ERR_VISION;
+        }
+        sample_sizes[i] = (uint32_t)sz;
+        mdat_payload_bytes += sz;
+
+        bool is_sync = true;
+        CFArrayRef atts = CMSampleBufferGetSampleAttachmentsArray(clip->samples[i], false);
+        if (atts != NULL && CFArrayGetCount(atts) > 0) {
+            CFDictionaryRef dict = (CFDictionaryRef)CFArrayGetValueAtIndex(atts, 0);
+            if (dict != NULL) {
+                CFBooleanRef not_sync = NULL;
+                if (CFDictionaryGetValueIfPresent(dict, kCMSampleAttachmentKey_NotSync,
+                                                  (const void **)&not_sync) &&
+                    not_sync != NULL && CFBooleanGetValue(not_sync)) {
+                    is_sync = false;
+                }
+            }
+        }
+        if (is_sync) {
+            sync_indices[sync_count++] = i + 1u;
+        }
+    }
+
+    ami_byte_vec out = { 0 };
+    bool ok = true;
+    size_t ftyp_pos = 0, moov_pos = 0, mvhd_pos = 0, trak_pos = 0, tkhd_pos = 0;
+    size_t mdia_pos = 0, mdhd_pos = 0, hdlr_pos = 0, minf_pos = 0, vmhd_pos = 0;
+    size_t dinf_pos = 0, dref_pos = 0, url_pos = 0, stbl_pos = 0, stsd_pos = 0;
+    size_t entry_pos = 0, cfg_box_pos = 0, stts_pos = 0, stss_pos = 0;
+    size_t stsc_pos = 0, stsz_pos = 0, stco_pos = 0, mdat_pos = 0;
+    size_t stco_offset_pos = 0;
+
+    // 1. ftyp
+    ok = ok && bv_begin_box(&out, "ftyp", &ftyp_pos);
+    ok = ok && bv_append_fourcc(&out, "isom");
+    ok = ok && bv_append_be32(&out, 512u);
+    ok = ok && bv_append_fourcc(&out, "isom");
+    ok = ok && bv_append_fourcc(&out, "iso2");
+    ok = ok && bv_append_fourcc(&out, (clip->codec == AMI_VT_CODEC_HEVC) ? "hvc1" : "avc1");
+    ok = ok && bv_append_fourcc(&out, "mp41");
+    ok = ok && bv_end_box(&out, ftyp_pos);
+
+    // 2. moov
+    ok = ok && bv_begin_box(&out, "moov", &moov_pos);
+
+    // mvhd (v0)
+    ok = ok && bv_begin_fullbox(&out, "mvhd", 0u, 0u, &mvhd_pos);
+    ok = ok && bv_append_be32(&out, 0u) && bv_append_be32(&out, 0u); // creation, mod
+    ok = ok && bv_append_be32(&out, timescale);
+    ok = ok && bv_append_be32(&out, total_duration);
+    ok = ok && bv_append_be32(&out, 0x00010000u); // rate 1.0
+    ok = ok && bv_append_be16(&out, 0x0100u);     // volume 1.0
+    ok = ok && bv_append_zeros(&out, 10u);
+    ok = ok && bv_append_unity_matrix(&out);
+    ok = ok && bv_append_zeros(&out, 24u);        // pre_defined[6]
+    ok = ok && bv_append_be32(&out, 2u);          // next_track_ID
+    ok = ok && bv_end_box(&out, mvhd_pos);
+
+    // trak
+    ok = ok && bv_begin_box(&out, "trak", &trak_pos);
+
+    // tkhd (v0, enabled | in_movie)
+    ok = ok && bv_begin_fullbox(&out, "tkhd", 0u, 0x000003u, &tkhd_pos);
+    ok = ok && bv_append_be32(&out, 0u) && bv_append_be32(&out, 0u);
+    ok = ok && bv_append_be32(&out, 1u); // track_ID
+    ok = ok && bv_append_be32(&out, 0u);
+    ok = ok && bv_append_be32(&out, total_duration);
+    ok = ok && bv_append_zeros(&out, 8u);
+    ok = ok && bv_append_be16(&out, 0u) && bv_append_be16(&out, 0u);
+    ok = ok && bv_append_be16(&out, 0u) && bv_append_be16(&out, 0u);
+    ok = ok && bv_append_unity_matrix(&out);
+    ok = ok && bv_append_be32(&out, clip->width << 16);
+    ok = ok && bv_append_be32(&out, clip->height << 16);
+    ok = ok && bv_end_box(&out, tkhd_pos);
+
+    // mdia
+    ok = ok && bv_begin_box(&out, "mdia", &mdia_pos);
+
+    // mdhd (v0)
+    ok = ok && bv_begin_fullbox(&out, "mdhd", 0u, 0u, &mdhd_pos);
+    ok = ok && bv_append_be32(&out, 0u) && bv_append_be32(&out, 0u);
+    ok = ok && bv_append_be32(&out, timescale);
+    ok = ok && bv_append_be32(&out, total_duration);
+    ok = ok && bv_append_be16(&out, 0x55C4u); // "und"
+    ok = ok && bv_append_be16(&out, 0u);
+    ok = ok && bv_end_box(&out, mdhd_pos);
+
+    // hdlr (vide)
+    ok = ok && bv_begin_fullbox(&out, "hdlr", 0u, 0u, &hdlr_pos);
+    ok = ok && bv_append_be32(&out, 0u);
+    ok = ok && bv_append_fourcc(&out, "vide");
+    ok = ok && bv_append_zeros(&out, 12u);
+    ok = ok && bv_append_bytes(&out, "VideoHandler", 13u);
+    ok = ok && bv_end_box(&out, hdlr_pos);
+
+    // minf
+    ok = ok && bv_begin_box(&out, "minf", &minf_pos);
+
+    // vmhd
+    ok = ok && bv_begin_fullbox(&out, "vmhd", 0u, 1u, &vmhd_pos);
+    ok = ok && bv_append_zeros(&out, 8u);
+    ok = ok && bv_end_box(&out, vmhd_pos);
+
+    // dinf -> dref -> url
+    ok = ok && bv_begin_box(&out, "dinf", &dinf_pos);
+    ok = ok && bv_begin_fullbox(&out, "dref", 0u, 0u, &dref_pos);
+    ok = ok && bv_append_be32(&out, 1u);
+    ok = ok && bv_begin_fullbox(&out, "url ", 0u, 1u, &url_pos);
+    ok = ok && bv_end_box(&out, url_pos);
+    ok = ok && bv_end_box(&out, dref_pos);
+    ok = ok && bv_end_box(&out, dinf_pos);
+
+    // stbl
+    ok = ok && bv_begin_box(&out, "stbl", &stbl_pos);
+
+    // stsd
+    ok = ok && bv_begin_fullbox(&out, "stsd", 0u, 0u, &stsd_pos);
+    ok = ok && bv_append_be32(&out, 1u);
+    ok = ok && bv_begin_box(&out, (clip->codec == AMI_VT_CODEC_HEVC) ? "hvc1" : "avc1", &entry_pos);
+    ok = ok && bv_append_zeros(&out, 6u);
+    ok = ok && bv_append_be16(&out, 1u); // data_reference_index
+    ok = ok && bv_append_zeros(&out, 16u);
+    ok = ok && bv_append_be16(&out, (uint16_t)clip->width);
+    ok = ok && bv_append_be16(&out, (uint16_t)clip->height);
+    ok = ok && bv_append_be32(&out, 0x00480000u); // 72 dpi
+    ok = ok && bv_append_be32(&out, 0x00480000u);
+    ok = ok && bv_append_be32(&out, 0u);
+    ok = ok && bv_append_be16(&out, 1u); // frame_count
+    ok = ok && bv_append_zeros(&out, 32u); // compressorname
+    ok = ok && bv_append_be16(&out, 24u); // depth
+    ok = ok && bv_append_be16(&out, 0xFFFFu); // pre_defined = -1
+    ok = ok && bv_begin_box(&out, (clip->codec == AMI_VT_CODEC_HEVC) ? "hvcC" : "avcC", &cfg_box_pos);
+    ok = ok && bv_append_bytes(&out, codec_cfg.data, codec_cfg.len);
+    ok = ok && bv_end_box(&out, cfg_box_pos);
+    ok = ok && bv_end_box(&out, entry_pos);
+    ok = ok && bv_end_box(&out, stsd_pos);
+
+    // stts
+    ok = ok && bv_begin_fullbox(&out, "stts", 0u, 0u, &stts_pos);
+    ok = ok && bv_append_be32(&out, 1u);
+    ok = ok && bv_append_be32(&out, n);
+    ok = ok && bv_append_be32(&out, sample_delta);
+    ok = ok && bv_end_box(&out, stts_pos);
+
+    // stss (if any sync samples)
+    if (sync_count > 0) {
+        ok = ok && bv_begin_fullbox(&out, "stss", 0u, 0u, &stss_pos);
+        ok = ok && bv_append_be32(&out, sync_count);
+        for (uint32_t i = 0; i < sync_count; i++) {
+            ok = ok && bv_append_be32(&out, sync_indices[i]);
+        }
+        ok = ok && bv_end_box(&out, stss_pos);
+    }
+
+    // stsc (all samples in 1 contiguous chunk)
+    ok = ok && bv_begin_fullbox(&out, "stsc", 0u, 0u, &stsc_pos);
+    ok = ok && bv_append_be32(&out, 1u);
+    ok = ok && bv_append_be32(&out, 1u);
+    ok = ok && bv_append_be32(&out, n);
+    ok = ok && bv_append_be32(&out, 1u);
+    ok = ok && bv_end_box(&out, stsc_pos);
+
+    // stsz
+    ok = ok && bv_begin_fullbox(&out, "stsz", 0u, 0u, &stsz_pos);
+    ok = ok && bv_append_be32(&out, 0u);
+    ok = ok && bv_append_be32(&out, n);
+    for (uint32_t i = 0; i < n; i++) {
+        ok = ok && bv_append_be32(&out, sample_sizes[i]);
+    }
+    ok = ok && bv_end_box(&out, stsz_pos);
+
+    // stco (chunk 1 offset patched right before mdat)
+    ok = ok && bv_begin_fullbox(&out, "stco", 0u, 0u, &stco_pos);
+    ok = ok && bv_append_be32(&out, 1u);
+    stco_offset_pos = out.len;
+    ok = ok && bv_append_be32(&out, 0u);
+    ok = ok && bv_end_box(&out, stco_pos);
+
+    ok = ok && bv_end_box(&out, stbl_pos);
+    ok = ok && bv_end_box(&out, minf_pos);
+    ok = ok && bv_end_box(&out, mdia_pos);
+    ok = ok && bv_end_box(&out, trak_pos);
+    ok = ok && bv_end_box(&out, moov_pos);
+
+    // 3. mdat
+    if (ok) {
+        const size_t chunk_off = out.len + 8u;
+        if (chunk_off > UINT32_MAX || mdat_payload_bytes > UINT32_MAX - 8u) {
+            ok = false;
+        } else {
+            ami_write_be32(out.data + stco_offset_pos, (uint32_t)chunk_off);
+        }
+    }
+    ok = ok && bv_begin_box(&out, "mdat", &mdat_pos);
+    if (ok && mdat_payload_bytes > 0) {
+        if (!bv_reserve(&out, (size_t)mdat_payload_bytes)) {
+            ok = false;
+        } else {
+            for (uint32_t i = 0; i < n; i++) {
+                CMBlockBufferRef bb = CMSampleBufferGetDataBuffer(clip->samples[i]);
+                const uint32_t sz = sample_sizes[i];
+                if (CMBlockBufferCopyDataBytes(bb, 0, sz, out.data + out.len) != kCMBlockBufferNoErr) {
+                    ok = false;
+                    break;
+                }
+                out.len += sz;
+            }
+        }
+    }
+    ok = ok && bv_end_box(&out, mdat_pos);
+
+    free(sample_sizes);
+    free(sync_indices);
+    free(codec_cfg.data);
+
+    if (!ok) {
+        free(out.data);
+        return AMI_ERR_OUT_OF_MEMORY;
+    }
+
+    *out_bytes = out.data;
+    *out_len = out.len;
+    return AMI_OK;
+}
+
+typedef struct ami_vt_compressed_sample {
+    const uint8_t *data;
+    size_t size;
+    int64_t dts;
+    int64_t pts;
+    int64_t duration;
+    bool is_sync;
+} ami_vt_compressed_sample;
+
+typedef struct ami_vt_batch_collector {
+    pthread_mutex_t mu;
+    CVPixelBufferRef *slots;
+    int64_t *pts_vals;
+    int32_t *pts_scales;
+    uint32_t capacity;
+    OSStatus first_error;
+} ami_vt_batch_collector;
+
+static void vt_batch_decompress_callback(void *decompressionOutputRefCon,
+                                         void *sourceFrameRefCon,
+                                         OSStatus status,
+                                         VTDecodeInfoFlags infoFlags,
+                                         CVImageBufferRef imageBuffer,
+                                         CMTime presentationTimeStamp,
+                                         CMTime presentationDuration) {
+    (void)infoFlags;
+    (void)presentationDuration;
+    ami_vt_batch_collector *col = (ami_vt_batch_collector *)decompressionOutputRefCon;
+    if (col == NULL) {
+        return;
+    }
+    pthread_mutex_lock(&col->mu);
+    if (status != noErr) {
+        if (col->first_error == noErr) {
+            col->first_error = status;
+        }
+        pthread_mutex_unlock(&col->mu);
+        return;
+    }
+    const uintptr_t slot_1based = (uintptr_t)sourceFrameRefCon;
+    if (slot_1based >= 1u && slot_1based <= (uintptr_t)col->capacity && imageBuffer != NULL) {
+        const uint32_t slot = (uint32_t)(slot_1based - 1u);
+        if (col->slots[slot] != NULL) {
+            CVPixelBufferRelease(col->slots[slot]);
+        }
+        CVPixelBufferRetain(imageBuffer);
+        col->slots[slot] = imageBuffer;
+        col->pts_vals[slot] = presentationTimeStamp.value;
+        col->pts_scales[slot] = presentationTimeStamp.timescale;
+    }
+    pthread_mutex_unlock(&col->mu);
+}
+
+typedef struct ami_pres_order_entry {
+    int64_t pts;
+    uint32_t decode_idx;
+} ami_pres_order_entry;
+
+static int cmp_pres_order(const void *a, const void *b) {
+    const ami_pres_order_entry *pa = (const ami_pres_order_entry *)a;
+    const ami_pres_order_entry *pb = (const ami_pres_order_entry *)b;
+    if (pa->pts < pb->pts) {
+        return -1;
+    }
+    if (pa->pts > pb->pts) {
+        return 1;
+    }
+    if (pa->decode_idx < pb->decode_idx) {
+        return -1;
+    }
+    if (pa->decode_idx > pb->decode_idx) {
+        return 1;
+    }
+    return 0;
+}
+
+static ami_status decode_compressed_samples_iosurface(
+    ami_device *device,
+    CMVideoFormatDescriptionRef fmt_desc,
+    const ami_vt_compressed_sample *samples,
+    uint32_t sample_count,
+    uint32_t timescale,
+    bool has_reordering,
+    uint32_t max_frames,
+    ami_vision_frame **out_frames,
+    uint32_t *out_frame_count) {
+    if (device == NULL || fmt_desc == NULL || samples == NULL || sample_count == 0 ||
+        timescale == 0 || max_frames == 0 || max_frames > AMI_VISION_MAX_VIDEO_FRAMES ||
+        out_frames == NULL || out_frame_count == NULL) {
+        return AMI_ERR_INVALID_ARGUMENT;
+    }
+    *out_frame_count = 0;
+    for (uint32_t i = 0; i < max_frames; i++) {
+        out_frames[i] = NULL;
+    }
+
+    const CMVideoDimensions dims = CMVideoFormatDescriptionGetDimensions(fmt_desc);
+    if (dims.width <= 0 || dims.height <= 0 ||
+        dims.width > (int32_t)AMI_VISION_MAX_BYTES_IMAGE_DIM ||
+        dims.height > (int32_t)AMI_VISION_MAX_BYTES_IMAGE_DIM) {
+        return AMI_ERR_VISION;
+    }
+
+    const uint32_t k_count = (sample_count < max_frames) ? sample_count : max_frames;
+
+    uint32_t *want_slot = calloc(sample_count, sizeof(uint32_t));
+    bool *need_decode = calloc(sample_count, sizeof(bool));
+    ami_pres_order_entry *pres = calloc(sample_count, sizeof(ami_pres_order_entry));
+    if (want_slot == NULL || need_decode == NULL || pres == NULL) {
+        free(want_slot);
+        free(need_decode);
+        free(pres);
+        return AMI_ERR_OUT_OF_MEMORY;
+    }
+
+    for (uint32_t i = 0; i < sample_count; i++) {
+        pres[i].pts = samples[i].pts;
+        pres[i].decode_idx = i;
+    }
+    if (has_reordering) {
+        qsort(pres, sample_count, sizeof(ami_pres_order_entry), cmp_pres_order);
+    }
+
+    for (uint32_t k = 0; k < k_count; k++) {
+        const uint32_t pres_idx = (k_count == 1u)
+            ? 0u
+            : (uint32_t)(((uint64_t)k * (uint64_t)(sample_count - 1u)) / (uint64_t)(k_count - 1u));
+        const uint32_t d_idx = pres[pres_idx].decode_idx;
+        want_slot[d_idx] = k + 1u;
+
+        uint32_t sync_start = d_idx;
+        while (sync_start > 0 && !samples[sync_start].is_sync) {
+            sync_start--;
+        }
+        uint32_t gop_end = d_idx;
+        if (has_reordering) {
+            while (gop_end + 1u < sample_count && !samples[gop_end + 1u].is_sync) {
+                gop_end++;
+            }
+        }
+        for (uint32_t j = sync_start; j <= gop_end; j++) {
+            need_decode[j] = true;
+        }
+    }
+    free(pres);
+
+    ami_vt_batch_collector col = { 0 };
+    if (pthread_mutex_init(&col.mu, NULL) != 0) {
+        free(want_slot);
+        free(need_decode);
+        return AMI_ERR_VISION;
+    }
+    col.slots = calloc(k_count, sizeof(CVPixelBufferRef));
+    col.pts_vals = calloc(k_count, sizeof(int64_t));
+    col.pts_scales = calloc(k_count, sizeof(int32_t));
+    col.capacity = k_count;
+    if (col.slots == NULL || col.pts_vals == NULL || col.pts_scales == NULL) {
+        free(col.slots);
+        free(col.pts_vals);
+        free(col.pts_scales);
+        pthread_mutex_destroy(&col.mu);
+        free(want_slot);
+        free(need_decode);
+        return AMI_ERR_OUT_OF_MEMORY;
+    }
+
+    ami_status st = AMI_OK;
+    VTDecompressionSessionRef vt_session = NULL;
+
+    @autoreleasepool {
+        NSDictionary *dec_spec = @{
+            (__bridge id)kVTVideoDecoderSpecification_EnableHardwareAcceleratedVideoDecoder: @YES,
+        };
+        NSDictionary *dst_attrs = @{
+            (__bridge id)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_420YpCbCr8BiPlanarFullRange),
+            (__bridge id)kCVPixelBufferIOSurfacePropertiesKey: @{},
+            (__bridge id)kCVPixelBufferMetalCompatibilityKey: @YES,
+            (__bridge id)kCVPixelBufferBytesPerRowAlignmentKey: @64,
+        };
+        VTDecompressionOutputCallbackRecord cb = {
+            .decompressionOutputCallback = vt_batch_decompress_callback,
+            .decompressionOutputRefCon = &col,
+        };
+        OSStatus os_st = VTDecompressionSessionCreate(
+            kCFAllocatorDefault,
+            fmt_desc,
+            (__bridge CFDictionaryRef)dec_spec,
+            (__bridge CFDictionaryRef)dst_attrs,
+            &cb,
+            &vt_session);
+        if (os_st != noErr || vt_session == NULL) {
+            st = AMI_ERR_VISION;
+        }
+    }
+
+    if (st == AMI_OK) {
+        for (uint32_t i = 0; i < sample_count; i++) {
+            if (!need_decode[i]) {
+                continue;
+            }
+            if (i > 0 && !need_decode[i - 1u]) {
+                VTDecompressionSessionFinishDelayedFrames(vt_session);
+                VTDecompressionSessionWaitForAsynchronousFrames(vt_session);
+            }
+
+            const ami_vt_compressed_sample *s = &samples[i];
+            CMBlockBufferRef block_buf = NULL;
+            OSStatus os_st = CMBlockBufferCreateWithMemoryBlock(
+                kCFAllocatorDefault,
+                (void *)(uintptr_t)s->data,
+                s->size,
+                kCFAllocatorNull,
+                NULL,
+                0,
+                s->size,
+                0,
+                &block_buf);
+            if (os_st != kCMBlockBufferNoErr || block_buf == NULL) {
+                st = AMI_ERR_VISION;
+                break;
+            }
+
+            CMSampleTimingInfo timing = {
+                .duration = CMTimeMake(s->duration > 0 ? s->duration : 1, (int32_t)timescale),
+                .presentationTimeStamp = CMTimeMake(s->pts, (int32_t)timescale),
+                .decodeTimeStamp = CMTimeMake(s->dts, (int32_t)timescale),
+            };
+            size_t sample_sz = s->size;
+            CMSampleBufferRef sample_buf = NULL;
+            os_st = CMSampleBufferCreateReady(
+                kCFAllocatorDefault,
+                block_buf,
+                fmt_desc,
+                1,
+                1,
+                &timing,
+                1,
+                &sample_sz,
+                &sample_buf);
+            CFRelease(block_buf);
+            if (os_st != noErr || sample_buf == NULL) {
+                st = AMI_ERR_VISION;
+                break;
+            }
+
+            os_st = VTDecompressionSessionDecodeFrame(
+                vt_session,
+                sample_buf,
+                0,
+                (void *)(uintptr_t)want_slot[i],
+                NULL);
+            CFRelease(sample_buf);
+            if (os_st != noErr) {
+                st = AMI_ERR_VISION;
+                break;
+            }
+        }
+
+        if (st == AMI_OK) {
+            OSStatus finish_st = VTDecompressionSessionFinishDelayedFrames(vt_session);
+            OSStatus wait_st = VTDecompressionSessionWaitForAsynchronousFrames(vt_session);
+            if (finish_st != noErr || wait_st != noErr) {
+                st = AMI_ERR_VISION;
+            }
+        } else {
+            VTDecompressionSessionWaitForAsynchronousFrames(vt_session);
+        }
+    }
+
+    if (vt_session != NULL) {
+        VTDecompressionSessionInvalidate(vt_session);
+        CFRelease(vt_session);
+    }
+
+    free(want_slot);
+    free(need_decode);
+
+    id<MTLDevice> mtl_dev = device_of(device);
+    if (st == AMI_OK) {
+        pthread_mutex_lock(&col.mu);
+        if (col.first_error != noErr) {
+            st = AMI_ERR_VISION;
+        } else {
+            for (uint32_t k = 0; k < k_count; k++) {
+                if (col.slots[k] == NULL) {
+                    st = AMI_ERR_VISION;
+                    break;
+                }
+            }
+        }
+        pthread_mutex_unlock(&col.mu);
+    }
+
+    uint32_t built = 0;
+    if (st == AMI_OK) {
+        for (uint32_t k = 0; k < k_count; k++) {
+            st = vision_frame_init_from_mtl_device(
+                mtl_dev,
+                col.slots[k],
+                0u,
+                1u,
+                col.pts_vals[k],
+                col.pts_scales[k],
+                &out_frames[k]);
+            if (st != AMI_OK) {
+                break;
+            }
+            built++;
+        }
+    }
+
+    if (st != AMI_OK) {
+        for (uint32_t k = 0; k < built; k++) {
+            ami_vision_frame_destroy(out_frames[k]);
+            out_frames[k] = NULL;
+        }
+    } else {
+        *out_frame_count = built;
+    }
+
+    for (uint32_t k = 0; k < k_count; k++) {
+        if (col.slots[k] != NULL) {
+            CVPixelBufferRelease(col.slots[k]);
+        }
+    }
+    free(col.slots);
+    free(col.pts_vals);
+    free(col.pts_scales);
+    pthread_mutex_destroy(&col.mu);
+    return st;
+}
+
+// ----------------------------------------------------------------------------
+// Pure-C Bounds-Checked ISO-BMFF (MP4 / MOV) Demuxer
+// ----------------------------------------------------------------------------
+
+static int iso_next_box(const uint8_t *buf, size_t *cursor, size_t parent_end,
+                        uint32_t *out_type, size_t *out_payload_start,
+                        size_t *out_box_end) {
+    if (*cursor > parent_end) {
+        return -1;
+    }
+    if (*cursor == parent_end) {
+        return 0;
+    }
+    const size_t avail = parent_end - *cursor;
+    if (avail < 8u) {
+        return -1;
+    }
+    const uint32_t size32 = ami_read_be32(buf + *cursor);
+    const uint32_t box_type = ami_read_be32(buf + *cursor + 4u);
+    size_t hdr_len = 8u;
+    uint64_t box_size = (uint64_t)size32;
+    if (size32 == 1u) {
+        if (avail < 16u) {
+            return -1;
+        }
+        box_size = ami_read_be64(buf + *cursor + 8u);
+        hdr_len = 16u;
+    } else if (size32 == 0u) {
+        box_size = (uint64_t)avail;
+    }
+    if (box_size < (uint64_t)hdr_len || box_size > (uint64_t)avail) {
+        return -1;
+    }
+    *out_type = box_type;
+    *out_payload_start = *cursor + hdr_len;
+    *out_box_end = *cursor + (size_t)box_size;
+    *cursor = *out_box_end;
+    return 1;
+}
+
+typedef struct ami_iso_video_track {
+    bool seen_hdlr;
+    uint32_t handler_type;
+    uint32_t timescale;
+    uint32_t codec;
+    bool has_codec_config;
+    const uint8_t *codec_config_ptr;
+    size_t codec_config_len;
+    uint32_t width;
+    uint32_t height;
+    const uint8_t *stsz_ptr;
+    size_t stsz_len;
+    const uint8_t *stsc_ptr;
+    size_t stsc_len;
+    const uint8_t *stco_ptr;
+    size_t stco_len;
+    bool stco_is_64;
+    const uint8_t *stss_ptr;
+    size_t stss_len;
+    const uint8_t *stts_ptr;
+    size_t stts_len;
+    const uint8_t *ctts_ptr;
+    size_t ctts_len;
+} ami_iso_video_track;
+
+static bool iso_parse_stsd(const uint8_t *buf, size_t start, size_t end,
+                           ami_iso_video_track *trk) {
+    if (end - start < 8u) {
+        return false;
+    }
+    const uint32_t entry_count = ami_read_be32(buf + start + 4u);
+    if (entry_count == 0 || entry_count > 64u) {
+        return false;
+    }
+    size_t cur = start + 8u;
+    for (uint32_t e = 0; e < entry_count; e++) {
+        uint32_t etype = 0;
+        size_t estart = 0;
+        size_t eend = 0;
+        const int rc = iso_next_box(buf, &cur, end, &etype, &estart, &eend);
+        if (rc <= 0) {
+            return false;
+        }
+        const bool is_h264 = (etype == AMI_ISO_FOURCC('a', 'v', 'c', '1') ||
+                              etype == AMI_ISO_FOURCC('a', 'v', 'c', '3'));
+        const bool is_hevc = (etype == AMI_ISO_FOURCC('h', 'v', 'c', '1') ||
+                              etype == AMI_ISO_FOURCC('h', 'e', 'v', '1'));
+        if (!is_h264 && !is_hevc) {
+            continue;
+        }
+        if (eend - estart < 78u) {
+            return false;
+        }
+        const uint16_t w = ami_read_be16(buf + estart + 24u);
+        const uint16_t h = ami_read_be16(buf + estart + 26u);
+        size_t sub_cur = estart + 78u;
+        const uint32_t want_cfg = is_hevc
+            ? AMI_ISO_FOURCC('h', 'v', 'c', 'C')
+            : AMI_ISO_FOURCC('a', 'v', 'c', 'C');
+        while (sub_cur < eend) {
+            uint32_t stype = 0;
+            size_t sstart = 0;
+            size_t send = 0;
+            const int src = iso_next_box(buf, &sub_cur, eend, &stype, &sstart, &send);
+            if (src < 0) {
+                return false;
+            }
+            if (src == 0) {
+                break;
+            }
+            if (stype == want_cfg && send > sstart) {
+                trk->codec = is_hevc ? AMI_VT_CODEC_HEVC : AMI_VT_CODEC_H264;
+                trk->has_codec_config = true;
+                trk->codec_config_ptr = buf + sstart;
+                trk->codec_config_len = send - sstart;
+                trk->width = w;
+                trk->height = h;
+                return true;
+            }
+        }
+    }
+    return true;
+}
+
+static bool iso_parse_stbl(const uint8_t *buf, size_t start, size_t end,
+                           ami_iso_video_track *trk) {
+    size_t cur = start;
+    while (cur < end) {
+        uint32_t btype = 0;
+        size_t bstart = 0;
+        size_t bend = 0;
+        const int rc = iso_next_box(buf, &cur, end, &btype, &bstart, &bend);
+        if (rc < 0) {
+            return false;
+        }
+        if (rc == 0) {
+            break;
+        }
+        const size_t blen = bend - bstart;
+        if (btype == AMI_ISO_FOURCC('s', 't', 's', 'd')) {
+            if (!iso_parse_stsd(buf, bstart, bend, trk)) {
+                return false;
+            }
+        } else if (btype == AMI_ISO_FOURCC('s', 't', 's', 'z')) {
+            trk->stsz_ptr = buf + bstart;
+            trk->stsz_len = blen;
+        } else if (btype == AMI_ISO_FOURCC('s', 't', 's', 'c')) {
+            trk->stsc_ptr = buf + bstart;
+            trk->stsc_len = blen;
+        } else if (btype == AMI_ISO_FOURCC('s', 't', 'c', 'o')) {
+            trk->stco_ptr = buf + bstart;
+            trk->stco_len = blen;
+            trk->stco_is_64 = false;
+        } else if (btype == AMI_ISO_FOURCC('c', 'o', '6', '4')) {
+            trk->stco_ptr = buf + bstart;
+            trk->stco_len = blen;
+            trk->stco_is_64 = true;
+        } else if (btype == AMI_ISO_FOURCC('s', 't', 's', 's')) {
+            trk->stss_ptr = buf + bstart;
+            trk->stss_len = blen;
+        } else if (btype == AMI_ISO_FOURCC('s', 't', 't', 's')) {
+            trk->stts_ptr = buf + bstart;
+            trk->stts_len = blen;
+        } else if (btype == AMI_ISO_FOURCC('c', 't', 't', 's')) {
+            trk->ctts_ptr = buf + bstart;
+            trk->ctts_len = blen;
+        }
+    }
+    return true;
+}
+
+static bool iso_parse_minf(const uint8_t *buf, size_t start, size_t end,
+                           ami_iso_video_track *trk) {
+    size_t cur = start;
+    while (cur < end) {
+        uint32_t btype = 0;
+        size_t bstart = 0;
+        size_t bend = 0;
+        const int rc = iso_next_box(buf, &cur, end, &btype, &bstart, &bend);
+        if (rc < 0) {
+            return false;
+        }
+        if (rc == 0) {
+            break;
+        }
+        if (btype == AMI_ISO_FOURCC('s', 't', 'b', 'l')) {
+            if (!iso_parse_stbl(buf, bstart, bend, trk)) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+static bool iso_parse_mdia(const uint8_t *buf, size_t start, size_t end,
+                           ami_iso_video_track *trk) {
+    size_t cur = start;
+    while (cur < end) {
+        uint32_t btype = 0;
+        size_t bstart = 0;
+        size_t bend = 0;
+        const int rc = iso_next_box(buf, &cur, end, &btype, &bstart, &bend);
+        if (rc < 0) {
+            return false;
+        }
+        if (rc == 0) {
+            break;
+        }
+        const size_t blen = bend - bstart;
+        if (btype == AMI_ISO_FOURCC('m', 'd', 'h', 'd')) {
+            if (blen < 4u) {
+                return false;
+            }
+            const uint8_t ver = buf[bstart];
+            if (ver == 0u) {
+                if (blen < 20u) {
+                    return false;
+                }
+                trk->timescale = ami_read_be32(buf + bstart + 12u);
+            } else if (ver == 1u) {
+                if (blen < 28u) {
+                    return false;
+                }
+                trk->timescale = ami_read_be32(buf + bstart + 20u);
+            }
+        } else if (btype == AMI_ISO_FOURCC('h', 'd', 'l', 'r')) {
+            if (blen < 12u) {
+                return false;
+            }
+            trk->seen_hdlr = true;
+            trk->handler_type = ami_read_be32(buf + bstart + 8u);
+        } else if (btype == AMI_ISO_FOURCC('m', 'i', 'n', 'f')) {
+            if (!iso_parse_minf(buf, bstart, bend, trk)) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+static bool iso_parse_trak(const uint8_t *buf, size_t start, size_t end,
+                           ami_iso_video_track *trk) {
+    memset(trk, 0, sizeof(*trk));
+    trk->timescale = 30000u;
+    size_t cur = start;
+    while (cur < end) {
+        uint32_t btype = 0;
+        size_t bstart = 0;
+        size_t bend = 0;
+        const int rc = iso_next_box(buf, &cur, end, &btype, &bstart, &bend);
+        if (rc < 0) {
+            return false;
+        }
+        if (rc == 0) {
+            break;
+        }
+        if (btype == AMI_ISO_FOURCC('m', 'd', 'i', 'a')) {
+            if (!iso_parse_mdia(buf, bstart, bend, trk)) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+static ami_status parse_avcc_format_desc(const uint8_t *cfg, size_t cfg_len,
+                                          CMVideoFormatDescriptionRef *out_fmt) {
+    *out_fmt = NULL;
+    if (cfg == NULL || cfg_len < 7u || cfg[0] != 1u) {
+        return AMI_ERR_VISION;
+    }
+    const int nal_len_size = (int)((cfg[4] & 0x03u) + 1u);
+    if (nal_len_size != 1 && nal_len_size != 2 && nal_len_size != 4) {
+        return AMI_ERR_VISION;
+    }
+    const uint8_t num_sps = cfg[5] & 0x1Fu;
+    size_t p = 6u;
+
+    const uint8_t *ptrs[64];
+    size_t sizes[64];
+    size_t total = 0;
+
+    for (uint8_t i = 0; i < num_sps; i++) {
+        if (p + 2u > cfg_len) {
+            return AMI_ERR_VISION;
+        }
+        const uint16_t sz = ami_read_be16(cfg + p);
+        p += 2u;
+        if (sz == 0 || sz > cfg_len - p || total >= 64u) {
+            return AMI_ERR_VISION;
+        }
+        ptrs[total] = cfg + p;
+        sizes[total] = sz;
+        total++;
+        p += sz;
+    }
+    if (p >= cfg_len) {
+        return AMI_ERR_VISION;
+    }
+    const uint8_t num_pps = cfg[p++];
+    if (num_sps == 0 || num_pps == 0) {
+        return AMI_ERR_VISION;
+    }
+    for (uint8_t i = 0; i < num_pps; i++) {
+        if (p + 2u > cfg_len) {
+            return AMI_ERR_VISION;
+        }
+        const uint16_t sz = ami_read_be16(cfg + p);
+        p += 2u;
+        if (sz == 0 || sz > cfg_len - p || total >= 64u) {
+            return AMI_ERR_VISION;
+        }
+        ptrs[total] = cfg + p;
+        sizes[total] = sz;
+        total++;
+        p += sz;
+    }
+
+    CMFormatDescriptionRef fmt = NULL;
+    OSStatus os_st = CMVideoFormatDescriptionCreateFromH264ParameterSets(
+        kCFAllocatorDefault, total, ptrs, sizes, nal_len_size, &fmt);
+    if (os_st != noErr || fmt == NULL) {
+        return AMI_ERR_VISION;
+    }
+    *out_fmt = (CMVideoFormatDescriptionRef)fmt;
+    return AMI_OK;
+}
+
+static ami_status parse_hvcc_format_desc(const uint8_t *cfg, size_t cfg_len,
+                                          CMVideoFormatDescriptionRef *out_fmt) {
+    *out_fmt = NULL;
+    if (cfg == NULL || cfg_len < 23u || cfg[0] != 1u) {
+        return AMI_ERR_VISION;
+    }
+    const int nal_len_size = (int)((cfg[21] & 0x03u) + 1u);
+    if (nal_len_size != 1 && nal_len_size != 2 && nal_len_size != 4) {
+        return AMI_ERR_VISION;
+    }
+    const uint8_t num_arrays = cfg[22];
+    size_t p = 23u;
+
+    const uint8_t *ptrs[64];
+    size_t sizes[64];
+    size_t total = 0;
+
+    for (uint8_t a = 0; a < num_arrays; a++) {
+        if (p + 3u > cfg_len) {
+            return AMI_ERR_VISION;
+        }
+        const uint16_t num_nalus = ami_read_be16(cfg + p + 1u);
+        p += 3u;
+        for (uint16_t j = 0; j < num_nalus; j++) {
+            if (p + 2u > cfg_len) {
+                return AMI_ERR_VISION;
+            }
+            const uint16_t sz = ami_read_be16(cfg + p);
+            p += 2u;
+            if (sz == 0 || sz > cfg_len - p || total >= 64u) {
+                return AMI_ERR_VISION;
+            }
+            ptrs[total] = cfg + p;
+            sizes[total] = sz;
+            total++;
+            p += sz;
+        }
+    }
+    if (total == 0) {
+        return AMI_ERR_VISION;
+    }
+
+    CMFormatDescriptionRef fmt = NULL;
+    OSStatus os_st = CMVideoFormatDescriptionCreateFromHEVCParameterSets(
+        kCFAllocatorDefault, total, ptrs, sizes, nal_len_size, NULL, &fmt);
+    if (os_st != noErr || fmt == NULL) {
+        return AMI_ERR_VISION;
+    }
+    *out_fmt = (CMVideoFormatDescriptionRef)fmt;
+    return AMI_OK;
+}
+
+static bool is_isobmff_container(const uint8_t *bytes, size_t len) {
+    if (bytes == NULL || len < 8u) {
+        return false;
+    }
+    const uint32_t tag = ami_read_be32(bytes + 4u);
+    if (tag == AMI_ISO_FOURCC('f', 't', 'y', 'p') ||
+        tag == AMI_ISO_FOURCC('m', 'o', 'o', 'v')) {
+        return true;
+    }
+    if (tag == AMI_ISO_FOURCC('w', 'i', 'd', 'e') ||
+        tag == AMI_ISO_FOURCC('f', 'r', 'e', 'e') ||
+        tag == AMI_ISO_FOURCC('s', 'k', 'i', 'p') ||
+        tag == AMI_ISO_FOURCC('m', 'd', 'a', 't')) {
+        size_t cur = 0;
+        uint32_t boxes_seen = 0;
+        while (cur < len && boxes_seen < 32u) {
+            uint32_t btype = 0;
+            size_t bstart = 0;
+            size_t bend = 0;
+            const int rc = iso_next_box(bytes, &cur, len, &btype, &bstart, &bend);
+            if (rc <= 0) {
+                break;
+            }
+            boxes_seen++;
+            if (btype == AMI_ISO_FOURCC('m', 'o', 'o', 'v')) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+static ami_status decode_isobmff_bytes(ami_device *device,
+                                       const uint8_t *bytes, size_t len,
+                                       uint32_t max_frames,
+                                       ami_vision_frame **out_frames,
+                                       uint32_t *out_frame_count) {
+    bool found_moov = false;
+    bool found_video = false;
+    ami_iso_video_track video_trk = { 0 };
+
+    size_t top_cur = 0;
+    while (top_cur < len) {
+        uint32_t btype = 0;
+        size_t bstart = 0;
+        size_t bend = 0;
+        const int rc = iso_next_box(bytes, &top_cur, len, &btype, &bstart, &bend);
+        if (rc < 0) {
+            return AMI_ERR_VISION;
+        }
+        if (rc == 0) {
+            break;
+        }
+        if (btype == AMI_ISO_FOURCC('m', 'o', 'o', 'v')) {
+            found_moov = true;
+            size_t mcur = bstart;
+            while (mcur < bend) {
+                uint32_t mtype = 0;
+                size_t mstart = 0;
+                size_t mend = 0;
+                const int mrc = iso_next_box(bytes, &mcur, bend, &mtype, &mstart, &mend);
+                if (mrc < 0) {
+                    return AMI_ERR_VISION;
+                }
+                if (mrc == 0) {
+                    break;
+                }
+                if (mtype == AMI_ISO_FOURCC('t', 'r', 'a', 'k') && !found_video) {
+                    ami_iso_video_track cand;
+                    if (!iso_parse_trak(bytes, mstart, mend, &cand)) {
+                        return AMI_ERR_VISION;
+                    }
+                    if (cand.seen_hdlr && cand.handler_type != AMI_ISO_FOURCC('v', 'i', 'd', 'e')) {
+                        continue;
+                    }
+                    if (cand.has_codec_config) {
+                        video_trk = cand;
+                        found_video = true;
+                    }
+                }
+            }
+        }
+    }
+
+    if (!found_moov || !found_video ||
+        video_trk.stsz_ptr == NULL || video_trk.stsc_ptr == NULL || video_trk.stco_ptr == NULL ||
+        video_trk.timescale == 0) {
+        return AMI_ERR_VISION;
+    }
+
+    // Parse stsz
+    if (video_trk.stsz_len < 12u) {
+        return AMI_ERR_VISION;
+    }
+    const uint32_t uniform_size = ami_read_be32(video_trk.stsz_ptr + 4u);
+    const uint32_t sample_count = ami_read_be32(video_trk.stsz_ptr + 8u);
+    if (sample_count == 0 || sample_count > 250000u) {
+        return AMI_ERR_VISION;
+    }
+    if (uniform_size == 0) {
+        if (video_trk.stsz_len < 12u + (size_t)sample_count * 4u) {
+            return AMI_ERR_VISION;
+        }
+    } else if ((uint64_t)uniform_size * (uint64_t)sample_count > (uint64_t)len) {
+        return AMI_ERR_VISION;
+    }
+
+    // Parse stco / co64
+    if (video_trk.stco_len < 8u) {
+        return AMI_ERR_VISION;
+    }
+    const uint32_t chunk_count = ami_read_be32(video_trk.stco_ptr + 4u);
+    const size_t chunk_entry_sz = video_trk.stco_is_64 ? 8u : 4u;
+    if (chunk_count == 0 || chunk_count > 250000u ||
+        video_trk.stco_len - 8u < (size_t)chunk_count * chunk_entry_sz) {
+        return AMI_ERR_VISION;
+    }
+
+    // Parse stsc
+    if (video_trk.stsc_len < 8u) {
+        return AMI_ERR_VISION;
+    }
+    const uint32_t stsc_count = ami_read_be32(video_trk.stsc_ptr + 4u);
+    if (stsc_count == 0 || stsc_count > 250000u ||
+        video_trk.stsc_len - 8u < (size_t)stsc_count * 12u) {
+        return AMI_ERR_VISION;
+    }
+    uint32_t prev_fc = 0;
+    for (uint32_t r = 0; r < stsc_count; r++) {
+        const uint8_t *rp = video_trk.stsc_ptr + 8u + (size_t)r * 12u;
+        const uint32_t fc = ami_read_be32(rp);
+        const uint32_t spc = ami_read_be32(rp + 4u);
+        if (fc == 0 || spc == 0 || (r == 0 && fc != 1u) || (r > 0 && fc <= prev_fc)) {
+            return AMI_ERR_VISION;
+        }
+        prev_fc = fc;
+    }
+
+    ami_vt_compressed_sample *samples = calloc(sample_count, sizeof(ami_vt_compressed_sample));
+    if (samples == NULL) {
+        return AMI_ERR_OUT_OF_MEMORY;
+    }
+
+    // Resolve chunk offsets + stsc + stsz -> exact verified sample slices
+    uint32_t stsc_idx = 0;
+    uint32_t s_idx = 0;
+    for (uint32_t c = 0; c < chunk_count && s_idx < sample_count; c++) {
+        const uint32_t chunk_1 = c + 1u;
+        while (stsc_idx + 1u < stsc_count) {
+            const uint32_t next_fc = ami_read_be32(
+                video_trk.stsc_ptr + 8u + (size_t)(stsc_idx + 1u) * 12u);
+            if (chunk_1 >= next_fc) {
+                stsc_idx++;
+            } else {
+                break;
+            }
+        }
+        const uint32_t spc = ami_read_be32(
+            video_trk.stsc_ptr + 8u + (size_t)stsc_idx * 12u + 4u);
+        uint64_t off = video_trk.stco_is_64
+            ? ami_read_be64(video_trk.stco_ptr + 8u + (size_t)c * 8u)
+            : (uint64_t)ami_read_be32(video_trk.stco_ptr + 8u + (size_t)c * 4u);
+        for (uint32_t j = 0; j < spc && s_idx < sample_count; j++) {
+            const uint32_t sz = (uniform_size != 0)
+                ? uniform_size
+                : ami_read_be32(video_trk.stsz_ptr + 12u + (size_t)s_idx * 4u);
+            if (sz == 0 || off > (uint64_t)len || (uint64_t)sz > (uint64_t)len - off) {
+                free(samples);
+                return AMI_ERR_VISION;
+            }
+            samples[s_idx].data = bytes + (size_t)off;
+            samples[s_idx].size = (size_t)sz;
+            samples[s_idx].is_sync = true;
+            off += (uint64_t)sz;
+            s_idx++;
+        }
+    }
+    if (s_idx != sample_count) {
+        free(samples);
+        return AMI_ERR_VISION;
+    }
+
+    // Parse stts (DTS + duration)
+    if (video_trk.stts_ptr != NULL) {
+        if (video_trk.stts_len < 8u) {
+            free(samples);
+            return AMI_ERR_VISION;
+        }
+        const uint32_t stts_count = ami_read_be32(video_trk.stts_ptr + 4u);
+        if (video_trk.stts_len - 8u < (size_t)stts_count * 8u) {
+            free(samples);
+            return AMI_ERR_VISION;
+        }
+        uint32_t ti = 0;
+        int64_t cur_dts = 0;
+        for (uint32_t e = 0; e < stts_count && ti < sample_count; e++) {
+            const uint8_t *ep = video_trk.stts_ptr + 8u + (size_t)e * 8u;
+            const uint32_t sc = ami_read_be32(ep);
+            const uint32_t delta = ami_read_be32(ep + 4u);
+            for (uint32_t k = 0; k < sc && ti < sample_count; k++) {
+                samples[ti].dts = cur_dts;
+                samples[ti].pts = cur_dts;
+                samples[ti].duration = (delta > 0) ? (int64_t)delta : 1;
+                cur_dts += (int64_t)delta;
+                ti++;
+            }
+        }
+        if (ti != sample_count) {
+            free(samples);
+            return AMI_ERR_VISION;
+        }
+    } else {
+        const int64_t def_delta = (int64_t)(video_trk.timescale / 30u > 0 ? video_trk.timescale / 30u : 1u);
+        for (uint32_t i = 0; i < sample_count; i++) {
+            samples[i].dts = (int64_t)i * def_delta;
+            samples[i].pts = samples[i].dts;
+            samples[i].duration = def_delta;
+        }
+    }
+
+    // Parse optional ctts (composition time offset -> B-frame reordering)
+    bool has_reordering = false;
+    if (video_trk.ctts_ptr != NULL) {
+        if (video_trk.ctts_len < 8u) {
+            free(samples);
+            return AMI_ERR_VISION;
+        }
+        const uint8_t ver = video_trk.ctts_ptr[0];
+        const uint32_t ctts_count = ami_read_be32(video_trk.ctts_ptr + 4u);
+        if (video_trk.ctts_len - 8u < (size_t)ctts_count * 8u) {
+            free(samples);
+            return AMI_ERR_VISION;
+        }
+        uint32_t ci = 0;
+        for (uint32_t e = 0; e < ctts_count && ci < sample_count; e++) {
+            const uint8_t *ep = video_trk.ctts_ptr + 8u + (size_t)e * 8u;
+            const uint32_t sc = ami_read_be32(ep);
+            const int64_t off = (ver == 1u)
+                ? (int64_t)(int32_t)ami_read_be32(ep + 4u)
+                : (int64_t)ami_read_be32(ep + 4u);
+            if (off != 0) {
+                has_reordering = true;
+            }
+            for (uint32_t k = 0; k < sc && ci < sample_count; k++) {
+                samples[ci].pts = samples[ci].dts + off;
+                ci++;
+            }
+        }
+    }
+
+    // Parse optional stss (sync sample table)
+    if (video_trk.stss_ptr != NULL) {
+        if (video_trk.stss_len < 8u) {
+            free(samples);
+            return AMI_ERR_VISION;
+        }
+        const uint32_t sync_cnt = ami_read_be32(video_trk.stss_ptr + 4u);
+        if (video_trk.stss_len - 8u < (size_t)sync_cnt * 4u) {
+            free(samples);
+            return AMI_ERR_VISION;
+        }
+        for (uint32_t i = 0; i < sample_count; i++) {
+            samples[i].is_sync = false;
+        }
+        for (uint32_t i = 0; i < sync_cnt; i++) {
+            const uint32_t s1 = ami_read_be32(video_trk.stss_ptr + 8u + (size_t)i * 4u);
+            if (s1 == 0 || s1 > sample_count) {
+                free(samples);
+                return AMI_ERR_VISION;
+            }
+            samples[s1 - 1u].is_sync = true;
+        }
+    }
+
+    CMVideoFormatDescriptionRef fmt_desc = NULL;
+    ami_status st = (video_trk.codec == AMI_VT_CODEC_HEVC)
+        ? parse_hvcc_format_desc(video_trk.codec_config_ptr, video_trk.codec_config_len, &fmt_desc)
+        : parse_avcc_format_desc(video_trk.codec_config_ptr, video_trk.codec_config_len, &fmt_desc);
+    if (st != AMI_OK || fmt_desc == NULL) {
+        free(samples);
+        return AMI_ERR_VISION;
+    }
+
+    st = decode_compressed_samples_iosurface(
+        device, fmt_desc, samples, sample_count, video_trk.timescale,
+        has_reordering, max_frames, out_frames, out_frame_count);
+    CFRelease(fmt_desc);
+    free(samples);
+    return st;
+}
+
+// ----------------------------------------------------------------------------
+// Raw Annex-B H.264 / HEVC Bitstream Demuxer
+// ----------------------------------------------------------------------------
+
+static bool looks_like_annexb(const uint8_t *bytes, size_t len) {
+    if (bytes == NULL || len < 4u) {
+        return false;
+    }
+    if (bytes[0] == 0u && bytes[1] == 0u) {
+        if (bytes[2] == 1u) {
+            return true;
+        }
+        if (len >= 5u && bytes[2] == 0u && bytes[3] == 1u) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static size_t find_annexb_start_code(const uint8_t *buf, size_t pos, size_t len,
+                                     size_t *out_sc_len) {
+    for (size_t i = pos; i + 3u <= len; i++) {
+        if (buf[i] == 0u && buf[i + 1u] == 0u) {
+            if (buf[i + 2u] == 1u) {
+                *out_sc_len = 3u;
+                return i;
+            }
+            if (i + 4u <= len && buf[i + 2u] == 0u && buf[i + 3u] == 1u) {
+                *out_sc_len = 4u;
+                return i;
+            }
+        }
+    }
+    *out_sc_len = 0;
+    return len;
+}
+
+static ami_status decode_annexb_bytes(ami_device *device,
+                                      const uint8_t *bytes, size_t len,
+                                      uint32_t max_frames,
+                                      ami_vision_frame **out_frames,
+                                      uint32_t *out_frame_count) {
+    typedef struct nal_slice {
+        const uint8_t *ptr;
+        size_t len;
+    } nal_slice;
+
+    nal_slice *nals = NULL;
+    size_t nal_cap = 0;
+    size_t nal_count = 0;
+
+    size_t sc_len = 0;
+    size_t pos = find_annexb_start_code(bytes, 0u, len, &sc_len);
+    while (pos < len) {
+        const size_t nal_start = pos + sc_len;
+        size_t next_sc_len = 0;
+        const size_t next_pos = find_annexb_start_code(bytes, nal_start, len, &next_sc_len);
+        size_t nal_end = next_pos;
+        while (nal_end > nal_start && bytes[nal_end - 1u] == 0u) {
+            nal_end--;
+        }
+        if (nal_end > nal_start) {
+            if (nal_count >= nal_cap) {
+                size_t new_cap = (nal_cap == 0) ? 32u : nal_cap * 2u;
+                nal_slice *grown = realloc(nals, new_cap * sizeof(nal_slice));
+                if (grown == NULL) {
+                    free(nals);
+                    return AMI_ERR_OUT_OF_MEMORY;
+                }
+                nals = grown;
+                nal_cap = new_cap;
+            }
+            nals[nal_count++] = (nal_slice){ .ptr = bytes + nal_start, .len = nal_end - nal_start };
+        }
+        pos = next_pos;
+        sc_len = next_sc_len;
+    }
+
+    if (nal_count == 0) {
+        free(nals);
+        return AMI_ERR_VISION;
+    }
+
+    bool saw_h264_sps = false;
+    bool saw_h264_pps = false;
+    bool saw_hevc_vps = false;
+    bool saw_hevc_sps = false;
+    bool saw_hevc_pps = false;
+
+    for (size_t i = 0; i < nal_count; i++) {
+        const uint8_t b0 = nals[i].ptr[0];
+        const uint8_t h264_type = b0 & 0x1Fu;
+        const uint8_t hevc_type = (b0 >> 1u) & 0x3Fu;
+        if (h264_type == 7u && (b0 & 0x80u) == 0) {
+            saw_h264_sps = true;
+        }
+        if (h264_type == 8u && (b0 & 0x80u) == 0) {
+            saw_h264_pps = true;
+        }
+        if (hevc_type == 32u && (b0 & 0x80u) == 0) {
+            saw_hevc_vps = true;
+        }
+        if (hevc_type == 33u && (b0 & 0x80u) == 0) {
+            saw_hevc_sps = true;
+        }
+        if (hevc_type == 34u && (b0 & 0x80u) == 0) {
+            saw_hevc_pps = true;
+        }
+    }
+
+    const bool is_hevc = (saw_hevc_vps && saw_hevc_sps && saw_hevc_pps);
+    const bool is_h264 = (!is_hevc && saw_h264_sps && saw_h264_pps);
+    if (!is_hevc && !is_h264) {
+        free(nals);
+        return AMI_ERR_VISION;
+    }
+
+    const uint8_t *param_ptrs[64];
+    size_t param_sizes[64];
+    size_t param_count = 0;
+
+    ami_byte_vec avcc_buf = { 0 };
+    typedef struct au_range {
+        size_t byte_off;
+        size_t byte_len;
+        bool is_sync;
+    } au_range;
+    au_range *aus = calloc(nal_count, sizeof(au_range));
+    if (aus == NULL) {
+        free(nals);
+        return AMI_ERR_OUT_OF_MEMORY;
+    }
+    uint32_t au_count = 0;
+    bool cur_au_open = false;
+    size_t cur_au_start = 0;
+    bool cur_au_sync = false;
+
+    for (size_t i = 0; i < nal_count; i++) {
+        const uint8_t *np = nals[i].ptr;
+        const size_t nsz = nals[i].len;
+        if (nsz > UINT32_MAX - 4u) {
+            free(aus);
+            free(avcc_buf.data);
+            free(nals);
+            return AMI_ERR_VISION;
+        }
+        bool is_param = false;
+        bool is_aud = false;
+        bool is_vcl = false;
+        bool is_first_slice = false;
+        bool is_idr = false;
+
+        if (is_hevc) {
+            const uint8_t t = (np[0] >> 1u) & 0x3Fu;
+            is_param = (t == 32u || t == 33u || t == 34u);
+            is_aud = (t == 35u);
+            is_vcl = (t <= 21u);
+            is_idr = (t == 19u || t == 20u || t == 21u);
+            is_first_slice = is_vcl && nsz >= 3u && ((np[2] & 0x80u) != 0);
+        } else {
+            const uint8_t t = np[0] & 0x1Fu;
+            is_param = (t == 7u || t == 8u);
+            is_aud = (t == 9u);
+            is_vcl = (t >= 1u && t <= 5u);
+            is_idr = (t == 5u);
+            is_first_slice = is_vcl && nsz >= 2u && ((np[1] & 0x80u) != 0);
+        }
+
+        if (is_param) {
+            if (param_count < 64u) {
+                param_ptrs[param_count] = np;
+                param_sizes[param_count] = nsz;
+                param_count++;
+            }
+            continue;
+        }
+        if (is_aud || (is_first_slice && cur_au_open)) {
+            if (cur_au_open && avcc_buf.len > cur_au_start) {
+                aus[au_count++] = (au_range){
+                    .byte_off = cur_au_start,
+                    .byte_len = avcc_buf.len - cur_au_start,
+                    .is_sync = cur_au_sync,
+                };
+                cur_au_open = false;
+                cur_au_sync = false;
+            }
+            if (is_aud) {
+                continue;
+            }
+        }
+        if (is_vcl) {
+            if (!cur_au_open) {
+                cur_au_open = true;
+                cur_au_start = avcc_buf.len;
+                cur_au_sync = is_idr;
+            } else if (is_idr) {
+                cur_au_sync = true;
+            }
+            if (!bv_append_be32(&avcc_buf, (uint32_t)nsz) ||
+                !bv_append_bytes(&avcc_buf, np, nsz)) {
+                free(aus);
+                free(avcc_buf.data);
+                free(nals);
+                return AMI_ERR_OUT_OF_MEMORY;
+            }
+        }
+    }
+    if (cur_au_open && avcc_buf.len > cur_au_start) {
+        aus[au_count++] = (au_range){
+            .byte_off = cur_au_start,
+            .byte_len = avcc_buf.len - cur_au_start,
+            .is_sync = cur_au_sync,
+        };
+    }
+    free(nals);
+
+    if (au_count == 0 || param_count == 0) {
+        free(aus);
+        free(avcc_buf.data);
+        return AMI_ERR_VISION;
+    }
+
+    CMFormatDescriptionRef fmt_desc = NULL;
+    OSStatus os_st = is_hevc
+        ? CMVideoFormatDescriptionCreateFromHEVCParameterSets(
+              kCFAllocatorDefault, param_count, param_ptrs, param_sizes, 4, NULL, &fmt_desc)
+        : CMVideoFormatDescriptionCreateFromH264ParameterSets(
+              kCFAllocatorDefault, param_count, param_ptrs, param_sizes, 4, &fmt_desc);
+    if (os_st != noErr || fmt_desc == NULL) {
+        free(aus);
+        free(avcc_buf.data);
+        return AMI_ERR_VISION;
+    }
+
+    ami_vt_compressed_sample *samples = calloc(au_count, sizeof(ami_vt_compressed_sample));
+    if (samples == NULL) {
+        CFRelease(fmt_desc);
+        free(aus);
+        free(avcc_buf.data);
+        return AMI_ERR_OUT_OF_MEMORY;
+    }
+    for (uint32_t i = 0; i < au_count; i++) {
+        samples[i].data = avcc_buf.data + aus[i].byte_off;
+        samples[i].size = aus[i].byte_len;
+        samples[i].dts = (int64_t)i * 1000;
+        samples[i].pts = (int64_t)i * 1000;
+        samples[i].duration = 1000;
+        samples[i].is_sync = aus[i].is_sync;
+    }
+    free(aus);
+
+    ami_status st = decode_compressed_samples_iosurface(
+        device, (CMVideoFormatDescriptionRef)fmt_desc, samples, au_count, 30000u,
+        false, max_frames, out_frames, out_frame_count);
+    CFRelease(fmt_desc);
+    free(samples);
+    free(avcc_buf.data);
+    return st;
+}
+
+ami_status ami_video_decode_bytes_iosurface(ami_device *device,
+                                            const uint8_t *bytes, size_t len,
+                                            uint32_t max_frames,
+                                            ami_vision_frame **out_frames,
+                                            uint32_t *out_frame_count) {
+    if (out_frame_count != NULL) {
+        *out_frame_count = 0;
+    }
+    if (out_frames != NULL && max_frames > 0 && max_frames <= AMI_VISION_MAX_VIDEO_FRAMES) {
+        for (uint32_t i = 0; i < max_frames; i++) {
+            out_frames[i] = NULL;
+        }
+    }
+    if (device == NULL || bytes == NULL || len == 0 ||
+        max_frames == 0 || max_frames > AMI_VISION_MAX_VIDEO_FRAMES ||
+        out_frames == NULL || out_frame_count == NULL) {
+        return AMI_ERR_INVALID_ARGUMENT;
+    }
+
+    // 1. ISO-BMFF MP4 / MOV container path (H.264 / HEVC -> hardware VideoToolbox NV12 IOSurface)
+    if (is_isobmff_container(bytes, len)) {
+        return decode_isobmff_bytes(device, bytes, len, max_frames, out_frames, out_frame_count);
+    }
+
+    // 2. Raw Annex-B H.264 / HEVC bitstream path
+    if (looks_like_annexb(bytes, len)) {
+        return decode_annexb_bytes(device, bytes, len, max_frames, out_frames, out_frame_count);
+    }
+
+    // 3. Multi-frame animated ImageIO (GIF / APNG / WebP / multi-page TIFF) or single-image fallback
+    @autoreleasepool {
+        NSData *data = [NSData dataWithBytesNoCopy:(void *)(uintptr_t)bytes
+                                            length:(NSUInteger)len
+                                      freeWhenDone:NO];
+        if (data == nil) {
+            return AMI_ERR_OUT_OF_MEMORY;
+        }
+        NSDictionary *src_opts = @{
+            (__bridge id)kCGImageSourceShouldCache: @NO,
+        };
+        CGImageSourceRef src = CGImageSourceCreateWithData(
+            (__bridge CFDataRef)data, (__bridge CFDictionaryRef)src_opts);
+        if (src == NULL) {
+            return AMI_ERR_VISION;
+        }
+        const size_t total = CGImageSourceGetCount(src);
+        if (total == 0) {
+            CFRelease(src);
+            return AMI_ERR_VISION;
+        }
+
+        const uint32_t k_count = (total < (size_t)max_frames) ? (uint32_t)total : max_frames;
+        NSDictionary *img_opts = @{
+            (__bridge id)kCGImageSourceShouldCache: @NO,
+            (__bridge id)kCGImageSourceShouldCacheImmediately: @YES,
+        };
+
+        uint32_t decoded = 0;
+        ami_status st = AMI_OK;
+        for (uint32_t k = 0; k < k_count; k++) {
+            const size_t idx = (k_count == 1u)
+                ? 0u
+                : (size_t)(((uint64_t)k * (uint64_t)(total - 1u)) / (uint64_t)(k_count - 1u));
+            CGImageRef cg_img = CGImageSourceCreateImageAtIndex(
+                src, idx, (__bridge CFDictionaryRef)img_opts);
+            if (cg_img == NULL) {
+                st = AMI_ERR_VISION;
+                break;
+            }
+            st = vision_frame_from_cg_image(
+                device, cg_img, AMI_VISION_MAX_BYTES_IMAGE_DIM, &out_frames[k]);
+            CGImageRelease(cg_img);
+            if (st != AMI_OK) {
+                break;
+            }
+            if (total > 1u) {
+                out_frames[k]->pts_value = (int64_t)idx;
+                out_frames[k]->pts_timescale = 30;
+            }
+            decoded++;
+        }
+        CFRelease(src);
+
+        if (st != AMI_OK) {
+            for (uint32_t k = 0; k < decoded; k++) {
+                ami_vision_frame_destroy(out_frames[k]);
+                out_frames[k] = NULL;
+            }
+            return st;
+        }
+        *out_frame_count = decoded;
+        return AMI_OK;
+    }
 }
 
 

@@ -635,6 +635,60 @@ ami_status ami_vt_decode_clip_frame(ami_vt_decode_session *session,
                                     const ami_vt_clip *clip, uint32_t frame_index,
                                     ami_vision_frame **out_frame);
 
+#define AMI_VISION_MAX_BYTES_IMAGE_DIM 8192u
+#define AMI_VISION_MAX_VIDEO_FRAMES 64u
+
+/*
+ * Decodes an in-memory image payload (PNG, JPEG, WebP, HEIC, GIF, BMP, TIFF)
+ * via ImageIO CGImageSourceCreateWithData directly into a 16 KiB-aligned BGRA8
+ * IOSurface-backed ami_vision_frame with zero temp files. Enforces width and
+ * height in 1..8192.
+ */
+ami_status ami_image_decode_bytes_iosurface(ami_device *device,
+                                            const uint8_t *bytes, size_t len,
+                                            ami_vision_frame **out_frame);
+
+/*
+ * Encodes a BGRA8 ami_vision_frame into an in-memory PNG buffer (`*out_bytes`,
+ * `*out_len`). Caller must release `*out_bytes` via `ami_vision_free_bytes`.
+ */
+ami_status ami_image_encode_png_alloc(ami_vision_frame *frame,
+                                      uint8_t **out_bytes, size_t *out_len);
+
+/*
+ * Encodes 1 or more BGRA8 ami_vision_frame(s) into an in-memory image payload
+ * for `uti` (e.g. "public.png", "public.jpeg", "com.compuserve.gif"). Caller
+ * must release `*out_bytes` via `ami_vision_free_bytes`.
+ */
+ami_status ami_image_encode_uti_alloc(ami_vision_frame *const *frames,
+                                      uint32_t frame_count, const char *uti,
+                                      uint8_t **out_bytes, size_t *out_len);
+
+/* Releases heap buffers allocated by `ami_image_encode_*_alloc` / `ami_vt_clip_export_mp4_bytes`. */
+void ami_vision_free_bytes(void *bytes);
+
+/*
+ * Muxes a hardware-encoded H.264 or HEVC `ami_vt_clip` into a standard
+ * ISO-BMFF (.mp4) byte buffer in memory (zero temp files). Caller must release
+ * `*out_bytes` via `ami_vision_free_bytes`.
+ */
+ami_status ami_vt_clip_export_mp4_bytes(const ami_vt_clip *clip,
+                                        uint8_t **out_bytes, size_t *out_len);
+
+/*
+ * Decodes up to `max_frames` (1..64, evenly sampled across total frame count
+ * when clip has > max_frames frames) from an in-memory video/animated payload
+ * (ISO-BMFF MP4/MOV H.264/HEVC, raw Annex-B H.264/HEVC, or multi-frame/single
+ * ImageIO GIF/APNG/WebP/PNG/JPEG) directly into 16 KiB-aligned IOSurface
+ * ami_vision_frames (NV12 or BGRA8) with zero temp files and zero AVFoundation.
+ * `out_frames` must hold at least `max_frames` pointers.
+ */
+ami_status ami_video_decode_bytes_iosurface(ami_device *device,
+                                            const uint8_t *bytes, size_t len,
+                                            uint32_t max_frames,
+                                            ami_vision_frame **out_frames,
+                                            uint32_t *out_frame_count);
+
 /* --------------------------------------------------------------------------
  * M7.5 C19: Rootless Apple Silicon Telemetry & Terminal Raw-Mode Helpers
  * -------------------------------------------------------------------------- */
