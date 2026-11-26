@@ -1239,6 +1239,9 @@ class _PlannedEntry:
     outer_scale_divisor_mode: bool = False
     outer_scale_expert_index: int = -1
     scale_tile_shape: tuple[int, int] | None = None
+    src_total_rows: int | None = None
+    row_gather_runs: tuple[tuple[int, int], ...] | None = None
+    mimo_qkv_slice: tuple[Any, int, int] | None = None  # `(MimoQkvSpec, out_start, out_count)`
 
 
 @dataclass(frozen=True)
@@ -1474,14 +1477,22 @@ def _make_entry(
     outer_scale_divisor_mode: bool = False,
     outer_scale_expert_index: int = -1,
     scale_tile_shape: tuple[int, int] | None = None,
+    src_total_rows: int | None = None,
+    row_gather_runs: tuple[tuple[int, int], ...] | None = None,
+    mimo_qkv_slice: tuple[Any, int, int] | None = None,
+    name_already_normalized: bool = False,
 ) -> _PlannedEntry:
-    name = _normalize_name(name)
+    if not name_already_normalized:
+        name = _normalize_name(name)
     if not (1 <= len(shape) <= 4):
         raise ValueError(f"tensor rank must be 1..4 for {name!r}, got {len(shape)}")
     use_sme2 = (
         not is_vision_tensor(name)
         and dtype in (DType.F16, DType.BF16, DType.Q2_AFFINE, DType.Q3_AFFINE, DType.Q4_AFFINE)
         and (dtype not in AFFINE_DTYPES or group_size == SME2_GROUP_K)
+        and row_gather_runs is None
+        and mimo_qkv_slice is None
+        and not (data_convert is not None and data_convert.endswith("_to_bf16"))
         and _should_sme2_pack(
             kind,
             dtype,
@@ -1503,6 +1514,21 @@ def _make_entry(
         param_kind = QuantParamKind.AFFINE_SCALE_BIAS
         if data_convert == "d2t_i64_to_u32":
             data_bytes = (data.length // 8) * 4
+        elif data_convert == "hf_mxfp4_to_gguf_mxfp4":
+            data_bytes = (data.length // 16) * 17
+        elif data_convert is not None and data_convert.startswith("affine") and data_convert.endswith("_to_bf16"):
+            data_bytes = shape[0] * shape[1] * 2
+        elif mimo_qkv_slice is not None:
+            _spec, _out_s, out_cnt = mimo_qkv_slice
+            if dtype == DType.FP8_E4M3_ROW:
+                data_bytes = out_cnt * _spec.k_cols
+            elif dtype == DType.F32:
+                data_bytes = out_cnt * _spec.k_cols * 4
+            else:
+                data_bytes = out_cnt * _spec.k_cols * 2
+        elif row_gather_runs is not None:
+            eff_src_rows = src_total_rows or shape[0]
+            data_bytes = shape[0] * (data.length // eff_src_rows)
         else:
             data_bytes = data.length  # f16<->bf16, i32->u32, packed nibbles and raw copies preserve length
         if params_bytes_override is not None:
@@ -1511,8 +1537,12 @@ def _make_entry(
             content = params_offset + params_bytes if params_bytes > 0 else data_bytes
         elif scales is not None:
             params_offset = _align_up(data_bytes, 64)
-            groups = scales.length // _SAFETENSORS_DTYPE_BYTES[scales.dtype]
-            params_bytes = groups * 4  # half2(scale, bias)
+            if row_gather_runs is not None and src_total_rows:
+                groups = (scales.length // _SAFETENSORS_DTYPE_BYTES[scales.dtype]) // src_total_rows
+                params_bytes = shape[0] * groups * 4
+            else:
+                groups = scales.length // _SAFETENSORS_DTYPE_BYTES[scales.dtype]
+                params_bytes = groups * 4  # half2(scale, bias)
             content = params_offset + params_bytes
         else:
             params_offset = 0
@@ -1545,6 +1575,9 @@ def _make_entry(
         outer_scale_divisor_mode=outer_scale_divisor_mode,
         outer_scale_expert_index=outer_scale_expert_index,
         scale_tile_shape=scale_tile_shape,
+        src_total_rows=src_total_rows,
+        row_gather_runs=row_gather_runs,
+        mimo_qkv_slice=mimo_qkv_slice,
     )
 
 
@@ -1800,6 +1833,11 @@ def plan_amf_entries(
     sme2_pack_loop_adapters: bool = True,
     nvfp4_global_scale_is_divisor: bool = False,
     stats_out: dict[str, int] | None = None,
+    mimo_config: Mapping[str, Any] | None = None,
+    mimo_qkv_tp_degree: int = 1,
+    mimo_mtp_standalone: bool = False,
+    mimo_dflash_mode: bool = False,
+    qwen35_config: Mapping[str, Any] | None = None,
 ) -> list[_PlannedEntry]:
     """Pass 1: plan every output entry from shard headers alone."""
     if group_size not in AFFINE_GROUP_SIZES:
@@ -1817,7 +1855,139 @@ def plan_amf_entries(
             excluded.add(_normalize_lenient(tok))
 
     def is_excluded(raw_name: str) -> bool:
-        return raw_name in excluded or _normalize_lenient(raw_name) in excluded
+        if raw_name in excluded or _normalize_lenient(raw_name) in excluded:
+            return True
+        if mimo_config is not None:
+            from aminfer_tools.mimo_v2 import is_mimo_audio_tensor, is_mimo_mtp_tensor
+
+            if is_mimo_audio_tensor(raw_name):
+                return True
+            if not mimo_mtp_standalone and is_mimo_mtp_tensor(raw_name):
+                return True
+        return False
+
+    def _plan_out_name(raw_name: str) -> str:
+        if mimo_dflash_mode:
+            from aminfer_tools.mimo_v2 import normalize_mimo_dflash_tensor_name
+
+            nm = normalize_mimo_dflash_tensor_name(raw_name)
+        elif mimo_config is not None or mimo_mtp_standalone:
+            from aminfer_tools.mimo_v2 import normalize_mimo_tensor_name
+
+            nm = normalize_mimo_tensor_name(raw_name, mtp_standalone=mimo_mtp_standalone)
+        elif qwen35_config is not None:
+            from aminfer_tools.mimo_v2 import normalize_qwen35_tensor_name
+
+            nm = normalize_qwen35_tensor_name(raw_name)
+        else:
+            return _normalize_name(raw_name)
+        enc = nm.encode("utf-8")
+        if len(enc) == 0 or len(enc) > 47:
+            raise ValueError(f"AMF tensor name must be 1..47 UTF-8 bytes, got {len(enc)}: {nm!r}")
+        return nm
+
+    def _qwen35_split_specs(out_base: str, n_rows: int) -> list[tuple[str, tuple[tuple[int, int], ...]]] | None:
+        if qwen35_config is None or is_vision_tensor(out_base):
+            return None
+        base = out_base[:-7] if out_base.endswith(".weight") else out_base
+        if base.endswith(".linear_attn.in_proj_qkv"):
+            lk_h = int(qwen35_config.get("linear_num_key_heads") or 16)
+            lk_d = int(qwen35_config.get("linear_key_head_dim") or 128)
+            lv_h = int(qwen35_config.get("linear_num_value_heads") or 32)
+            lv_d = int(qwen35_config.get("linear_value_head_dim") or 128)
+            kq = lk_h * lk_d
+            vd = lv_h * lv_d
+            if n_rows != 2 * kq + vd:
+                raise ValueError(f"qwen3_5 {out_base}: rows {n_rows} != 2*{kq}+{vd}")
+            pfx = base[: -len(".in_proj_qkv")]
+            return [
+                (f"{pfx}.q_proj.weight", ((0, kq),)),
+                (f"{pfx}.k_proj.weight", ((kq, kq),)),
+                (f"{pfx}.v_proj.weight", ((2 * kq, vd),)),
+            ]
+        if base.endswith(".self_attn.q_proj") and bool(qwen35_config.get("attn_output_gate", True)):
+            qh = int(qwen35_config.get("num_attention_heads") or 16)
+            hd = int(qwen35_config.get("head_dim") or 256)
+            if n_rows == 2 * qh * hd:
+                pfx = base[: -len(".q_proj")]
+                return [
+                    (f"{pfx}.q_proj.weight", tuple((h_i * 2 * hd, hd) for h_i in range(qh))),
+                    (f"{pfx}.q_gate_proj.weight", tuple((h_i * 2 * hd + hd, hd) for h_i in range(qh))),
+                ]
+        return None
+
+    def _emit_mimo_qkv_entries(
+        raw_name: str,
+        norm_base: str,
+        w_t: _ShardTensor,
+        s_t: _ShardTensor | None,
+    ) -> bool:
+        if mimo_config is None:
+            return False
+        from aminfer_tools.mimo_v2 import resolve_mimo_qkv_spec_for_tensor
+
+        spec = resolve_mimo_qkv_spec_for_tensor(
+            raw_name,
+            w_t.shape[0],
+            w_t.shape[1],
+            s_t.shape[0] if s_t is not None else None,
+            mimo_config,
+            tp_degree=mimo_qkv_tp_degree,
+        )
+        if spec is None:
+            return False
+        out_pfx = norm_base
+        for suf in (".weight",):
+            if out_pfx.endswith(suf):
+                out_pfx = out_pfx[: -len(suf)]
+        out_pfx = out_pfx[: -len(".qkv_proj")] if out_pfx.endswith(".qkv_proj") else out_pfx
+        if s_t is not None:
+            if dtype_mode == "auto":
+                tgt_dt = DType.FP8_E4M3_ROW
+                qb = 8
+            elif dtype_mode == "bf16":
+                tgt_dt = DType.BF16
+                qb = 0
+            elif dtype_mode == "f16":
+                tgt_dt = DType.F16
+                qb = 0
+            else:
+                tgt_dt = DType.F32
+                qb = 0
+            dc = None
+        else:
+            tgt_dt, dc = _unquantized_target(w_t.dtype, dtype_mode, norm_base)
+            qb = 0
+        for comp, off_r, cnt_r in (
+            ("q_proj", 0, spec.q_total),
+            ("k_proj", spec.q_total, spec.k_total),
+            ("v_proj", spec.q_total + spec.k_total, spec.v_total),
+        ):
+            out_nm = f"{out_pfx}.{comp}.weight"
+            knd, lyr, exp = _classify_tensor(out_nm, cold_set, all_experts_cold)
+            p_over = (cnt_r * 4) if tgt_dt == DType.FP8_E4M3_ROW else 0
+            entries.append(
+                _make_entry(
+                    out_nm,
+                    knd,
+                    tgt_dt,
+                    qb,
+                    0,
+                    lyr,
+                    exp,
+                    (cnt_r, spec.k_cols),
+                    _full_range(w_t),
+                    dc,
+                    _full_range(s_t) if s_t is not None else None,
+                    None,
+                    sme2_pack="none",
+                    params_mode="fp8_row" if tgt_dt == DType.FP8_E4M3_ROW else "affine_scale_bias",
+                    params_bytes_override=p_over,
+                    mimo_qkv_slice=(spec, off_r, cnt_r),
+                    name_already_normalized=True,
+                )
+            )
+        return True
 
     eff_vision_mode = resolve_vision_mode(
         tensors.keys(),
@@ -1922,7 +2092,63 @@ def plan_amf_entries(
         n, packed = w.shape
         groups = s.shape[1]
         bits, amf_dtype = _quant_bits_for(prefix, packed, groups, group_size)
-        norm_name = _normalize_name(prefix)
+        is_mimo_or_q35 = (
+            mimo_config is not None
+            or qwen35_config is not None
+            or mimo_dflash_mode
+            or mimo_mtp_standalone
+        )
+        norm_name = _plan_out_name(f"{prefix}.weight") if is_mimo_or_q35 else _normalize_name(prefix)
+        k_full = groups * group_size
+        if qwen35_config is not None and norm_name.endswith((".linear_attn.a_proj.weight", ".linear_attn.b_proj.weight")):
+            kind, layer, expert = _classify_tensor(norm_name, cold_set, all_experts_cold)
+            entries.append(
+                _make_entry(
+                    norm_name,
+                    kind,
+                    DType.BF16,
+                    0,
+                    0,
+                    layer,
+                    expert,
+                    (n, k_full),
+                    _full_range(w),
+                    f"affine{bits}_to_bf16",
+                    _full_range(s),
+                    _full_range(b),
+                    sme2_pack="none",
+                    params_bytes_override=0,
+                    name_already_normalized=True,
+                )
+            )
+            continue
+        q35_splits = _qwen35_split_specs(norm_name, n)
+        if q35_splits is not None:
+            for split_nm, runs in q35_splits:
+                split_rows = sum(rc for _, rc in runs)
+                kind, layer, expert = _classify_tensor(split_nm, cold_set, all_experts_cold)
+                entries.append(
+                    _make_entry(
+                        split_nm,
+                        kind,
+                        amf_dtype,
+                        bits,
+                        group_size,
+                        layer,
+                        expert,
+                        (split_rows, k_full),
+                        _full_range(w),
+                        None,
+                        _full_range(s),
+                        _full_range(b),
+                        sme2_pack=sme2_pack,
+                        sme2_pack_loop_adapters=sme2_pack_loop_adapters,
+                        src_total_rows=n,
+                        row_gather_runs=runs,
+                        name_already_normalized=True,
+                    )
+                )
+            continue
         kind, layer, expert = _classify_tensor(norm_name, cold_set, all_experts_cold)
         entries.append(
             _make_entry(
@@ -1933,13 +2159,14 @@ def plan_amf_entries(
                 group_size,
                 layer,
                 expert,
-                (n, groups * group_size),
+                (n, k_full),
                 _full_range(w),
                 None,
                 _full_range(s),
                 _full_range(b),
                 sme2_pack=sme2_pack,
                 sme2_pack_loop_adapters=sme2_pack_loop_adapters,
+                name_already_normalized=True,
             )
         )
 
@@ -2077,6 +2304,31 @@ def plan_amf_entries(
         if is_excluded(base) or is_excluded(w_name):
             continue
         if skip_lm_head and is_lm_head(base) and (embed_rows is None or w.shape[0] == embed_rows):
+            continue
+
+        if w.dtype == "U8" and s is not None and s.dtype == "U8" and s2 is None and amax_t is None and gscale is None and len(w.shape) == 2 and len(s.shape) == 2 and w.shape[0] == s.shape[0] and w.shape[1] == 16 * s.shape[1]:
+            k_full = w.shape[1] * 2
+            norm_name = _plan_out_name(w_name if w_name.endswith(".weight") else f"{base}.weight")
+            kind, layer, expert = _classify_tensor(norm_name, cold_set, all_experts_cold)
+            entries.append(
+                _make_entry(
+                    norm_name,
+                    kind,
+                    DType.GGUF_MXFP4,
+                    4,
+                    32,
+                    layer,
+                    expert,
+                    (w.shape[0], k_full),
+                    _full_range(w),
+                    "hf_mxfp4_to_gguf_mxfp4",
+                    _full_range(s),
+                    None,
+                    sme2_pack="none",
+                    params_bytes_override=0,
+                    name_already_normalized=True,
+                )
+            )
             continue
 
         if w.dtype in ("U8", "U32", "I32"):
@@ -2222,7 +2474,9 @@ def plan_amf_entries(
 
         if len(w.shape) != 2:
             raise ValueError(f"FP8/MXFP8 weight {w_name} must be 2D or 3D expert stack, got {list(w.shape)}")
-        out_name = _normalize_name(w_name if s is None else (w_name if style == "underscore_weight" else base))
+        out_name = _plan_out_name(w_name if s is None else (w_name if style == "underscore_weight" else base))
+        if _emit_mimo_qkv_entries(w_name, out_name, w, s):
+            continue
         kind, layer, expert = _classify_tensor(out_name, cold_set, all_experts_cold)
         entries.append(
             _plan_fp8_or_mxfp8_slice(
@@ -2309,7 +2563,35 @@ def plan_amf_entries(
                     )
                 )
             continue
-        norm_name = _normalize_name(name)
+        norm_name = _plan_out_name(name)
+        if len(t.shape) == 2 and _emit_mimo_qkv_entries(name, norm_name, t, None):
+            continue
+        if len(t.shape) == 2:
+            q35_splits = _qwen35_split_specs(norm_name, t.shape[0])
+            if q35_splits is not None:
+                for split_nm, runs in q35_splits:
+                    split_rows = sum(rc for _, rc in runs)
+                    kind, layer, expert = _classify_tensor(split_nm, cold_set, all_experts_cold)
+                    entries.append(
+                        _make_entry(
+                            split_nm,
+                            kind,
+                            amf_dtype,
+                            0,
+                            0,
+                            layer,
+                            expert,
+                            (split_rows, t.shape[1]),
+                            _full_range(t),
+                            convert,
+                            sme2_pack=sme2_pack,
+                            sme2_pack_loop_adapters=sme2_pack_loop_adapters,
+                            src_total_rows=t.shape[0],
+                            row_gather_runs=runs,
+                            name_already_normalized=True,
+                        )
+                    )
+                continue
         kind, layer, expert = _classify_tensor(norm_name, cold_set, all_experts_cold)
         # Flatten 5D Conv3d vision `patch_embed` weights `[out_c, 3, t_patch, kh, kw]`
         # into 2D `[out_c, 3 * t_patch * kh * kw]` to fit AMF v0's 4-dim shape slot
@@ -2318,6 +2600,14 @@ def plan_amf_entries(
         if len(eff_shape) == 5 and is_vision_tensor(norm_name) and "patch_embed" in norm_name.lower():
             flat_in = eff_shape[1] * eff_shape[2] * eff_shape[3] * eff_shape[4]
             eff_shape = (eff_shape[0], flat_in)
+        elif (
+            qwen35_config is not None
+            and norm_name.endswith(".linear_attn.conv1d.weight")
+            and len(eff_shape) == 3
+            and (eff_shape[1] == 1 or eff_shape[2] == 1)
+        ):
+            kern = eff_shape[2] if eff_shape[1] == 1 else eff_shape[1]
+            eff_shape = (eff_shape[0], kern)
         entries.append(
             _make_entry(
                 norm_name,
@@ -2332,6 +2622,7 @@ def plan_amf_entries(
                 convert,
                 sme2_pack=sme2_pack,
                 sme2_pack_loop_adapters=sme2_pack_loop_adapters,
+                name_already_normalized=True,
             )
         )
 
@@ -2566,9 +2857,215 @@ def _stream_sme2_entry(entry: _PlannedEntry, readers: _ShardReaders, w: _BlobWri
     w.zeros(entry.blob_bytes - entry.data_bytes)
 
 
+def _stream_mimo_qkv_entry(entry: _PlannedEntry, readers: _ShardReaders, w: _BlobWriter) -> None:
+    """Stream TP-deinterleaved and sliced `mimo_v2` `q_proj`/`k_proj`/`v_proj` rows directly into `.amf`."""
+    from aminfer_tools.mimo_v2 import dequantize_mimo_qkv_row_f32
+
+    assert entry.mimo_qkv_slice is not None
+    spec, out_start, out_count = entry.mimo_qkv_slice
+    src_fh = readers.get(entry.data.path)
+    k = spec.k_cols
+
+    # Decompose `[out_start, out_start + out_count)` across TP ranks into contiguous rank chunks.
+    def _rank_chunks() -> list[tuple[int, int, int]]:
+        chunks: list[tuple[int, int, int]] = []  # (src_row_start, row_count, sc_block_start_row)
+        if out_start == 0 and out_count == spec.q_total:
+            for r in range(spec.tp_degree):
+                chunks.append((r * spec.rank_rows, spec.q_tp, r * spec.sb_per_rank))
+        elif out_start == spec.q_total and out_count == spec.k_total:
+            for r in range(spec.tp_degree):
+                chunks.append((r * spec.rank_rows + spec.q_tp, spec.k_tp, r * spec.sb_per_rank + spec.sb_q_tp))
+        elif out_start == spec.q_total + spec.k_total and out_count == spec.v_total:
+            for r in range(spec.tp_degree):
+                chunks.append(
+                    (
+                        r * spec.rank_rows + spec.q_tp + spec.k_tp,
+                        spec.v_tp,
+                        r * spec.sb_per_rank + spec.sb_q_tp + spec.sb_k_tp,
+                    )
+                )
+        else:
+            raise ValueError(f"unsupported mimo_qkv_slice ({out_start}, {out_count}) for {entry.name!r}")
+        return chunks
+
+    chunks = _rank_chunks()
+    if entry.scales is not None:
+        s_fh = readers.get(entry.scales.path)
+        sc_raw = _read_exact(s_fh, entry.scales.offset, entry.scales.length)
+        if entry.scales.dtype == "F32":
+            scales_f32 = f32_bytes_to_f32_list(sc_raw)
+        elif entry.scales.dtype == "BF16":
+            scales_f32 = bf16_bytes_to_f32_list(sc_raw)
+        elif entry.scales.dtype == "F16":
+            scales_f32 = f16_bytes_to_f32_list(sc_raw)
+        else:
+            raise ValueError(f"unsupported scale_inv dtype {entry.scales.dtype} for {entry.name}")
+        row_scales: list[float] = []
+        for src_r0, cnt, sc_base in chunks:
+            done = 0
+            while done < cnt:
+                take = min(128, cnt - done)
+                raw = memoryview(_read_exact(src_fh, entry.data.offset + (src_r0 + done) * k, take * k))
+                for i in range(take):
+                    vals = dequantize_mimo_qkv_row_f32(
+                        raw[i * k : (i + 1) * k],
+                        sc_base + ((done + i) // 128),
+                        scales_f32,
+                        k,
+                    )
+                    if entry.dtype == DType.FP8_E4M3_ROW:
+                        q_row, r_sc = quantize_row_f32_to_e4m3_row(vals)
+                        w.write(q_row)
+                        row_scales.append(r_sc)
+                    elif entry.dtype == DType.BF16:
+                        w.write(f32_to_bf16_bytes(vals))
+                    elif entry.dtype == DType.F16:
+                        w.write(f32_values_to_f16_bytes(vals))
+                    elif entry.dtype == DType.F32:
+                        w.write(struct.pack(f"<{len(vals)}f", *vals))
+                    else:
+                        raise ValueError(f"unsupported mimo_qkv target dtype {entry.dtype.name}")
+                done += take
+        if entry.dtype == DType.FP8_E4M3_ROW:
+            w.zeros(entry.params_offset - entry.data_bytes)
+            w.write(struct.pack(f"<{len(row_scales)}f", *row_scales))
+            content = entry.params_offset + entry.params_bytes
+        else:
+            content = entry.data_bytes
+        w.zeros(entry.blob_bytes - content)
+        return
+
+    # Unquantized float source `qkv_proj` split cleanly across ranks.
+    elem_b = 4 if entry.data.dtype == "F32" else 2
+    row_b = k * elem_b
+    for src_r0, cnt, _ in chunks:
+        done = 0
+        while done < cnt:
+            take = min(256, cnt - done)
+            raw = _read_exact(src_fh, entry.data.offset + (src_r0 + done) * row_b, take * row_b)
+            if entry.data_convert is None:
+                w.write(raw)
+            elif entry.data_convert == "bf16_to_f16":
+                w.write(bf16_bytes_to_f16_bytes(raw, what=entry.name))
+            elif entry.data_convert == "f16_to_bf16":
+                w.write(f16_bytes_to_bf16_bytes(raw))
+            else:
+                raise ValueError(f"unsupported float qkv conversion {entry.data_convert!r}")
+            done += take
+    w.zeros(entry.blob_bytes - entry.data_bytes)
+
+
+def _stream_hf_mxfp4_entry(entry: _PlannedEntry, readers: _ShardReaders, w: _BlobWriter) -> None:
+    """Repack HF `MXFP4` (`U8 [N, K//2]` + `U8 [N, K//32]` UE8M0) into inline `GGUF_MXFP4` blocks."""
+    from aminfer_tools.mimo_v2 import repack_hf_mxfp4_row_to_gguf
+
+    assert entry.scales is not None
+    n_rows, k = entry.shape
+    w_row_b = k // 2
+    s_row_b = k // 32
+    src_fh = readers.get(entry.data.path)
+    s_fh = readers.get(entry.scales.path)
+    done = 0
+    while done < n_rows:
+        take = min(128, n_rows - done)
+        w_mv = memoryview(_read_exact(src_fh, entry.data.offset + done * w_row_b, take * w_row_b))
+        s_mv = memoryview(_read_exact(s_fh, entry.scales.offset + done * s_row_b, take * s_row_b))
+        for i in range(take):
+            w.write(repack_hf_mxfp4_row_to_gguf(w_mv[i * w_row_b : (i + 1) * w_row_b], s_mv[i * s_row_b : (i + 1) * s_row_b], k))
+        done += take
+    w.zeros(entry.blob_bytes - entry.data_bytes)
+
+
+def _stream_affine_to_bf16_entry(entry: _PlannedEntry, readers: _ShardReaders, w: _BlobWriter) -> None:
+    """Dequantize small MLX affine tensors (e.g. `qwen3_5` `in_proj_a/b`) to `BF16`."""
+    assert entry.scales is not None and entry.biases is not None
+    bits = int(entry.data_convert[len("affine") : -len("_to_bf16")])  # type: ignore[index]
+    aff_dt = _AFFINE_BITS_DTYPE[bits]
+    row_data_fn, deq = _AFFINE_DEQUANT_SPEC[aff_dt]
+    n_rows, k = entry.shape
+    sb_elem = _SAFETENSORS_DTYPE_BYTES[entry.scales.dtype]
+    groups = (entry.scales.length // sb_elem) // n_rows
+    gs = k // groups
+    row_d = row_data_fn(k)
+    row_sb = groups * sb_elem
+    src_fh = readers.get(entry.data.path)
+    s_fh = readers.get(entry.scales.path)
+    b_fh = readers.get(entry.biases.path)
+    for r in range(n_rows):
+        d_raw = _read_exact(src_fh, entry.data.offset + r * row_d, row_d)
+        s_raw = _read_exact(s_fh, entry.scales.offset + r * row_sb, row_sb)
+        b_raw = _read_exact(b_fh, entry.biases.offset + r * row_sb, row_sb)
+        s_f = bf16_bytes_to_f32_list(s_raw) if entry.scales.dtype == "BF16" else (f16_bytes_to_f32_list(s_raw) if entry.scales.dtype == "F16" else f32_bytes_to_f32_list(s_raw))
+        b_f = bf16_bytes_to_f32_list(b_raw) if entry.biases.dtype == "BF16" else (f16_bytes_to_f32_list(b_raw) if entry.biases.dtype == "F16" else f32_bytes_to_f32_list(b_raw))
+        p_buf = bytearray(groups * 4)
+        p_f16 = interleave_scale_bias_f16(
+            f32_values_to_f16_bytes(s_f),
+            f32_values_to_f16_bytes(b_f),
+        )
+        p_buf[:] = p_f16
+        vals = deq(d_raw, p_buf, k, group_size=gs)
+        w.write(f32_to_bf16_bytes(vals))
+    w.zeros(entry.blob_bytes - entry.data_bytes)
+
+
+def _stream_row_gathered_entry(entry: _PlannedEntry, readers: _ShardReaders, w: _BlobWriter) -> None:
+    """Stream contiguous `(row_start, row_count)` row runs cleanly for weights and optional affine scales/biases."""
+    assert entry.row_gather_runs is not None and entry.src_total_rows
+    src_fh = readers.get(entry.data.path)
+    row_d = entry.data.length // entry.src_total_rows
+    for r_start, r_cnt in entry.row_gather_runs:
+        off = entry.data.offset + r_start * row_d
+        tot = r_cnt * row_d
+        done = 0
+        while done < tot:
+            take = min(_COPY_CHUNK_BYTES, tot - done)
+            raw = _read_exact(src_fh, off + done, take)
+            if entry.data_convert is None:
+                w.write(raw)
+            elif entry.data_convert == "bf16_to_f16":
+                w.write(bf16_bytes_to_f16_bytes(raw, what=entry.name))
+            elif entry.data_convert == "f16_to_bf16":
+                w.write(f16_bytes_to_bf16_bytes(raw))
+            else:
+                raise ValueError(f"unknown conversion {entry.data_convert!r}")
+            done += take
+    if entry.params_bytes > 0:
+        assert entry.scales is not None and entry.biases is not None
+        w.zeros(entry.params_offset - entry.data_bytes)
+        elem = _SAFETENSORS_DTYPE_BYTES[entry.scales.dtype]
+        row_sb = (entry.scales.length // entry.src_total_rows)
+        s_fh = readers.get(entry.scales.path)
+        b_fh = readers.get(entry.biases.path)
+        for r_start, r_cnt in entry.row_gather_runs:
+            s_raw = _read_exact(s_fh, entry.scales.offset + r_start * row_sb, r_cnt * row_sb)
+            b_raw = _read_exact(b_fh, entry.biases.offset + r_start * row_sb, r_cnt * row_sb)
+            w.write(
+                interleave_scale_bias_f16(
+                    _to_f16_chunk(s_raw, entry.scales.dtype, f"{entry.name} scales"),
+                    _to_f16_chunk(b_raw, entry.biases.dtype, f"{entry.name} biases"),
+                )
+            )
+        content = entry.params_offset + entry.params_bytes
+    else:
+        content = entry.data_bytes
+    w.zeros(entry.blob_bytes - content)
+
+
 def _stream_entry(entry: _PlannedEntry, readers: _ShardReaders, w: _BlobWriter) -> None:
     if entry.layout == TensorLayout.SME2_PANEL64:
         _stream_sme2_entry(entry, readers, w)
+        return
+    if entry.mimo_qkv_slice is not None:
+        _stream_mimo_qkv_entry(entry, readers, w)
+        return
+    if entry.data_convert == "hf_mxfp4_to_gguf_mxfp4":
+        _stream_hf_mxfp4_entry(entry, readers, w)
+        return
+    if entry.data_convert is not None and entry.data_convert.startswith("affine") and entry.data_convert.endswith("_to_bf16"):
+        _stream_affine_to_bf16_entry(entry, readers, w)
+        return
+    if entry.row_gather_runs is not None:
+        _stream_row_gathered_entry(entry, readers, w)
         return
     src = readers.get(entry.data.path)
     if entry.data_convert is None:
@@ -3009,6 +3506,11 @@ def pack_amf_from_safetensors(
     allow_lowbit_q2_retranscode: bool = True,
     fine_rungs: bool = False,
     stats_out: dict[str, int] | None = None,
+    mimo_config: Mapping[str, Any] | None = None,
+    mimo_qkv_tp_degree: int | None = None,
+    mimo_mtp_standalone: bool = False,
+    mimo_dflash_mode: bool = False,
+    qwen35_config: Mapping[str, Any] | None = None,
 ) -> list[PackedTensorMeta]:
     """Convert a safetensors checkpoint into a 16 KiB-aligned `.amf` v0 file.
 
@@ -3173,6 +3675,26 @@ def pack_amf_from_safetensors(
     eff_sme2_pack = "all-linear" if (lut16_sme2 and eff_sme2_requested == "none") else eff_sme2_requested
     resolved = resolved_probe
     tie = tie_cfg if tie_word_embeddings is None else tie_word_embeddings
+    eff_mimo_cfg = mimo_config
+    eff_mimo_tp = 1 if mimo_qkv_tp_degree is None else mimo_qkv_tp_degree
+    eff_qwen35_cfg = qwen35_config
+    cfg_probe_p = config_path or resolved.config_path
+    if eff_mimo_cfg is None and eff_qwen35_cfg is None and cfg_probe_p is not None and cfg_probe_p.is_file():
+        probe_cfg_obj = json.loads(cfg_probe_p.read_text(encoding="utf-8"))
+        if isinstance(probe_cfg_obj, dict):
+            from aminfer_tools.mimo_v2 import (
+                _effective_mimo_cfg,
+                infer_mimo_qkv_tp_degree,
+                is_mimo_v2_config,
+                is_qwen35_config,
+            )
+
+            if is_mimo_v2_config(probe_cfg_obj) and not mimo_dflash_mode:
+                eff_mimo_cfg = _effective_mimo_cfg(probe_cfg_obj)
+                if mimo_qkv_tp_degree is None:
+                    eff_mimo_tp = infer_mimo_qkv_tp_degree(probe_cfg_obj, probe_tensors)
+            elif is_qwen35_config(probe_cfg_obj):
+                eff_qwen35_cfg = _effective_mimo_cfg(probe_cfg_obj)
     tensors = probe_tensors
     plan = plan_amf_entries(
         tensors,
@@ -3187,6 +3709,11 @@ def pack_amf_from_safetensors(
         sme2_pack_loop_adapters=sme2_pack_loop_adapters,
         nvfp4_global_scale_is_divisor=eff_divisor,
         stats_out=stats_out,
+        mimo_config=eff_mimo_cfg,
+        mimo_qkv_tp_degree=eff_mimo_tp,
+        mimo_mtp_standalone=mimo_mtp_standalone,
+        mimo_dflash_mode=mimo_dflash_mode,
+        qwen35_config=eff_qwen35_cfg,
     )
 
     meta_blobs: list[tuple[str, bytes]] = []
@@ -3198,7 +3725,18 @@ def pack_amf_from_safetensors(
             tokenizer_path=tokenizer_path,
         )
         if cfg_p is not None:
-            meta_blobs.append((META_CONFIG_JSON, cfg_p.read_bytes()))
+            if eff_mimo_cfg is not None:
+                from aminfer_tools.mimo_v2 import build_mimo_v2_config_json
+
+                cfg_b = json.dumps(build_mimo_v2_config_json(eff_mimo_cfg), ensure_ascii=False, indent=2).encode("utf-8") + b"\n"
+                meta_blobs.append((META_CONFIG_JSON, cfg_b))
+            elif eff_qwen35_cfg is not None:
+                from aminfer_tools.mimo_v2 import build_qwen35_config_json
+
+                cfg_b = json.dumps(build_qwen35_config_json(eff_qwen35_cfg), ensure_ascii=False, indent=2).encode("utf-8") + b"\n"
+                meta_blobs.append((META_CONFIG_JSON, cfg_b))
+            else:
+                meta_blobs.append((META_CONFIG_JSON, cfg_p.read_bytes()))
         if tok_p is not None:
             meta_blobs.append((META_TOKENIZER_JSON, tok_p.read_bytes()))
         ct_bytes = _maybe_compile_chat_template_bytes(
@@ -5831,6 +6369,11 @@ def gsq_convert_with_vision(
     allow_lowbit_q2_retranscode: bool = True,
     fine_rungs: bool = False,
     stats_out: dict[str, int] | None = None,
+    mimo_config: Mapping[str, Any] | None = None,
+    mimo_qkv_tp_degree: int | None = None,
+    mimo_mtp_standalone: bool = False,
+    mimo_dflash_mode: bool = False,
+    qwen35_config: Mapping[str, Any] | None = None,
 ) -> list[PackedTensorMeta]:
     """Run W14 GSQ+RCO with W20 vision-tower precision policy.
 

@@ -134,6 +134,7 @@ _DTYPE_BITS_RANK = {
     DType.Q3_AFFINE: 3,
     DType.Q4_AFFINE: 4,
     DType.NVFP4_G16: 4,
+    DType.GGUF_MXFP4: 4,
     DType.Q5_AFFINE: 5,
     DType.Q6_AFFINE: 6,
     DType.Q8_AFFINE: 8,
@@ -1981,7 +1982,15 @@ def _algorithmic_bytes(dtype: DType, shape: tuple[int, ...], group_size: int) ->
 
 def _role_of_tensor(name: str, kind: TensorKind) -> str:
     lower = name.lower()
-    if kind == TensorKind.NORM or "norm" in lower or ".ln_" in lower or lower.endswith(".unified_pre_gamma"):
+    if (
+        kind == TensorKind.NORM
+        or "norm" in lower
+        or ".ln_" in lower
+        or lower.endswith(".unified_pre_gamma")
+        or "sink_bias" in lower
+        or "attn_sinks" in lower
+        or "attn_sink" in lower
+    ):
         return "norm"
     if (
         kind == TensorKind.ROUTER
@@ -2006,10 +2015,12 @@ def _role_of_tensor(name: str, kind: TensorKind) -> str:
         or "controllers" in lower
         or "message_gate" in lower
         or "_mgate" in lower
+        or ".linear_attn.a_proj" in lower
+        or ".linear_attn.b_proj" in lower
         or is_inkling2_controller_tensor(name)
     ):
         return "controller"
-    if "sconv" in lower or "conv1d" in lower or "convolution" in lower:
+    if "sconv" in lower or "conv1d" in lower or "convolution" in lower or "a_log" in lower or "dt_bias" in lower:
         return "sconv"
     if (
         "hc_" in lower
@@ -2023,9 +2034,14 @@ def _role_of_tensor(name: str, kind: TensorKind) -> str:
     ):
         return "ihc"
     if (
-        lower.startswith(("mtp.", "mtp_layers.", "dflare.", "dfly.", "dfly_layers."))
+        lower.startswith(("mtp.", "mtp_layers.", "dflash.", "dflare.", "dfly.", "dfly_layers."))
+        or lower in ("fc.weight", "hidden_norm.weight")
         or ".mtp" in lower
+        or ".eh_proj." in lower
+        or ".enorm." in lower
+        or ".hnorm." in lower
         or "dflare" in lower
+        or "dflash" in lower
         or "dfly" in lower
         or "markov_head" in lower
         or "confidence_head" in lower
@@ -2994,6 +3010,24 @@ class _UnifiedSource:
             resolved = resolve_checkpoint(self.input_path)
             tie = _load_tie_flag(resolved.config_path) if tie_word_embeddings is None else tie_word_embeddings
             raw_tensors = _collect_tensors(resolved.shard_paths)
+            eff_mimo_cfg = None
+            eff_mimo_tp = 1
+            eff_qwen35_cfg = None
+            if resolved.config_path is not None and resolved.config_path.is_file():
+                from aminfer_tools.mimo_v2 import (
+                    _effective_mimo_cfg,
+                    infer_mimo_qkv_tp_degree,
+                    is_mimo_v2_config,
+                    is_qwen35_config,
+                )
+
+                probe_cfg = json.loads(resolved.config_path.read_text(encoding="utf-8"))
+                if isinstance(probe_cfg, dict):
+                    if is_mimo_v2_config(probe_cfg):
+                        eff_mimo_cfg = _effective_mimo_cfg(probe_cfg)
+                        eff_mimo_tp = infer_mimo_qkv_tp_degree(probe_cfg, raw_tensors)
+                    elif is_qwen35_config(probe_cfg):
+                        eff_qwen35_cfg = _effective_mimo_cfg(probe_cfg)
             planned = plan_amf_entries(
                 raw_tensors,
                 group_size=group_size,
@@ -3005,6 +3039,9 @@ class _UnifiedSource:
                 sme2_pack="none",
                 strip_vision=strip_vision,
                 stats_out=stats_out,
+                mimo_config=eff_mimo_cfg,
+                mimo_qkv_tp_degree=eff_mimo_tp,
+                qwen35_config=eff_qwen35_cfg,
             )
             self._sf_readers = _ShardReaders()
             self.model_id = model_id_override or self.input_path.stem
@@ -3063,6 +3100,46 @@ class _UnifiedSource:
         fh = self._sf_readers.get(e.data.path)
         out: list[list[float]] = []
 
+        if e.dtype == DType.GGUF_MXFP4 and e.data_convert == "hf_mxfp4_to_gguf_mxfp4":
+            from aminfer_tools.mimo_v2 import dequantize_hf_mxfp4_row_f32
+
+            assert e.scales is not None
+            row_w_b = k // 2
+            row_s_b = k // 32
+            s_fh = self._sf_readers.get(e.scales.path)
+            for r in row_indices:
+                if r < 0 or r >= n_rows:
+                    raise IndexError(f"row {r} out of bounds for {e.name}")
+                d_raw = _read_exact(fh, e.data.offset + r * row_w_b, row_w_b)
+                s_raw = _read_exact(s_fh, e.scales.offset + r * row_s_b, row_s_b)
+                out.append(dequantize_hf_mxfp4_row_f32(d_raw, s_raw, k))
+            return out
+
+        if e.mimo_qkv_slice is not None and e.scales is not None:
+            from aminfer_tools.mimo_v2 import dequantize_mimo_qkv_row_f32, map_mimo_contiguous_qkv_row
+
+            spec, out_start, _ = e.mimo_qkv_slice
+            s_fh = self._sf_readers.get(e.scales.path)
+            sc_raw = _read_exact(s_fh, e.scales.offset, e.scales.length)
+            sc_f32 = _decode_sf_floats(sc_raw, e.scales.dtype)
+            for r in row_indices:
+                if r < 0 or r >= n_rows:
+                    raise IndexError(f"row {r} out of bounds for {e.name}")
+                src_r, sc_r = map_mimo_contiguous_qkv_row(spec, out_start + r)
+                d_raw = _read_exact(fh, e.data.offset + src_r * k, k)
+                out.append(dequantize_mimo_qkv_row_f32(d_raw, sc_r, sc_f32, k))
+            return out
+
+        def _phys_row(log_r: int) -> int:
+            if e.row_gather_runs is None:
+                return log_r
+            cur = log_r
+            for r_start, r_cnt in e.row_gather_runs:
+                if cur < r_cnt:
+                    return r_start + cur
+                cur -= r_cnt
+            raise IndexError(f"row {log_r} out of bounds for gathered {e.name}")
+
         if e.dtype in _AFFINE_DEQUANT_SPEC:
             assert e.scales is not None and e.biases is not None
             row_data_fn, deq = _AFFINE_DEQUANT_SPEC[e.dtype]
@@ -3076,9 +3153,10 @@ class _UnifiedSource:
             for r in row_indices:
                 if r < 0 or r >= n_rows:
                     raise IndexError(f"row {r} out of bounds for {e.name}")
-                d_raw = _read_exact(fh, e.data.offset + r * row_d, row_d)
-                s_raw = _read_exact(s_fh, e.scales.offset + r * row_sb, row_sb)
-                b_raw = _read_exact(b_fh, e.biases.offset + r * row_sb, row_sb)
+                pr = _phys_row(r)
+                d_raw = _read_exact(fh, e.data.offset + pr * row_d, row_d)
+                s_raw = _read_exact(s_fh, e.scales.offset + pr * row_sb, row_sb)
+                b_raw = _read_exact(b_fh, e.biases.offset + pr * row_sb, row_sb)
                 s_vals = _decode_sf_floats(s_raw, e.scales.dtype)
                 b_vals = _decode_sf_floats(b_raw, e.biases.dtype)
                 p_buf = bytearray(groups * 4)
@@ -3201,15 +3279,27 @@ class _UnifiedSource:
             DType.FP8_E4M3_TENSOR,
             DType.MXFP8_G32,
             DType.NVFP4_G16,
-        ):
+            DType.GGUF_MXFP4,
+        ) or e.mimo_qkv_slice is not None:
             return self._decode_sf_quant_rows(e, row_indices)
+
+        def _phys_row_u(log_r: int) -> int:
+            if e.row_gather_runs is None:
+                return log_r
+            cur = log_r
+            for r_start, r_cnt in e.row_gather_runs:
+                if cur < r_cnt:
+                    return r_start + cur
+                cur -= r_cnt
+            raise IndexError(f"row {log_r} out of bounds for {e.name}")
 
         elem_b = 2 if e.data.dtype in ("F16", "BF16") else 4
         row_b = k * elem_b
         for r in row_indices:
             if r < 0 or r >= n_rows:
                 raise IndexError(f"row {r} out of bounds for {e.name}")
-            raw = _read_exact(fh, e.data.offset + r * row_b, row_b)
+            pr = _phys_row_u(r)
+            raw = _read_exact(fh, e.data.offset + pr * row_b, row_b)
             out.append(_decode_sf_floats(raw, e.data.dtype))
         return out
 
@@ -3269,10 +3359,11 @@ class _UnifiedSource:
             DType.FP8_E4M3_TENSOR,
             DType.MXFP8_G32,
             DType.NVFP4_G16,
-        ):
+            DType.GGUF_MXFP4,
+        ) or e.mimo_qkv_slice is not None or e.row_gather_runs is not None:
             for r0 in range(0, n_rows, batch_rows):
                 cnt = min(batch_rows, n_rows - r0)
-                yield self._decode_sf_quant_rows(e, range(r0, r0 + cnt))
+                yield self.read_rows_f32(t, range(r0, r0 + cnt))
             return
 
         elem_b = 2 if e.data.dtype in ("F16", "BF16") else 4
@@ -3336,6 +3427,9 @@ class _UnifiedSource:
                 e is not None
                 and e.dtype in _NATIVE_FLOAT_DTYPES
                 and e.scales is None
+                and e.mimo_qkv_slice is None
+                and e.row_gather_runs is None
+                and not (e.data_convert is not None and e.data_convert.endswith("_to_bf16"))
                 and e.data.dtype in _SF_FLOAT_DTYPE_CODES
             )
         return False
@@ -4517,6 +4611,13 @@ def gsq_convert(
                             (DType.Q2_AFFINE, 32),
                             (DType.Q3_AFFINE, group_size),
                             (DType.NVFP4_G16, 16),
+                        )
+                    elif all_same_src and src_dt == DType.GGUF_MXFP4:
+                        expert_rungs = (
+                            (DType.Q2_AFFINE, group_size),
+                            (DType.Q2_AFFINE, 32),
+                            (DType.Q3_AFFINE, group_size),
+                            (DType.GGUF_MXFP4, 32),
                         )
                     elif group_size == 64:
                         expert_rungs = (

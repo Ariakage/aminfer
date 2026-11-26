@@ -1,3 +1,50 @@
 """Offline toolchain for aminfer (never imported at inference runtime)."""
 
 APPLE_PAGE_SIZE: int = 16384
+
+from aminfer_tools.mimo_v2 import (
+    MIMO_SYNTH_PRESETS,
+    MIMO_TIER_PROFILES,
+    QWEN35_SYNTH_PRESETS,
+    MimoV2ConvertReport,
+    MimoV2MetadataReport,
+    MimoV2SynthBundle,
+    MimoV2SynthConfig,
+    MimoV2TierProfile,
+    Qwen35ConvertReport,
+    Qwen35MetadataReport,
+    Qwen35SynthBundle,
+    Qwen35SynthConfig,
+    convert_mimo_v2_checkpoint,
+    convert_qwen35_checkpoint,
+    export_mimo_dflash,
+    export_mimo_mtp_from_safetensors,
+    generate_synth_mimo_bundle,
+    generate_synth_qwen35_bundle,
+    validate_mimo_v2_metadata_dir,
+    validate_qwen35_metadata_dir,
+)
+
+__all__ = [
+    "APPLE_PAGE_SIZE",
+    "MIMO_SYNTH_PRESETS",
+    "MIMO_TIER_PROFILES",
+    "QWEN35_SYNTH_PRESETS",
+    "MimoV2ConvertReport",
+    "MimoV2MetadataReport",
+    "MimoV2SynthBundle",
+    "MimoV2SynthConfig",
+    "MimoV2TierProfile",
+    "Qwen35ConvertReport",
+    "Qwen35MetadataReport",
+    "Qwen35SynthBundle",
+    "Qwen35SynthConfig",
+    "convert_mimo_v2_checkpoint",
+    "convert_qwen35_checkpoint",
+    "export_mimo_dflash",
+    "export_mimo_mtp_from_safetensors",
+    "generate_synth_mimo_bundle",
+    "generate_synth_qwen35_bundle",
+    "validate_mimo_v2_metadata_dir",
+    "validate_qwen35_metadata_dir",
+]

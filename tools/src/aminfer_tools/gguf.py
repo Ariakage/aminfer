@@ -1262,8 +1262,43 @@ def normalize_gguf_tensor_name(
     layer_remap: dict[int, int] | None = None,
     inkling2_runtime_names: bool = False,
     attn_res_shifted_by_1: bool = False,
+    arch: str = "",
+    mimo_mtp_mode: bool = False,
 ) -> str:
     """Normalize a GGUF tensor name (`blk.N.*`, `v.blk.N.*`, `mm.*`) to canonical `.amf` naming."""
+    eff_arch = arch.lower()
+    if eff_arch == "dflash":
+        dflash_top = {
+            "fc.weight": "fc.weight",
+            "dflash.fc.weight": "fc.weight",
+            "dflare.fc.weight": "fc.weight",
+            "hidden_norm.weight": "hidden_norm.weight",
+            "enc.output_norm.weight": "hidden_norm.weight",
+            "fc_norm.weight": "hidden_norm.weight",
+            "dflash.hidden_norm.weight": "hidden_norm.weight",
+            "dflare.fc_norm.weight": "hidden_norm.weight",
+            "output_norm.weight": "norm.weight",
+            "norm.weight": "norm.weight",
+            "dflare.norm.weight": "norm.weight",
+            "mask_embed": "mask_embed.weight",
+            "dflash.mask_embed": "mask_embed.weight",
+            "mask_embd.weight": "mask_embed.weight",
+            "mask_embed.weight": "mask_embed.weight",
+        }
+        if raw_name in dflash_top:
+            return _normalize_name(dflash_top[raw_name])
+    if eff_arch in ("mimo2", "mimo_v2") and mimo_mtp_mode:
+        mn = re.match(r"^(?:model\.)?(?:mtp\.)?nextn\.(\d+)\.(.+)$", raw_name)
+        if mn is not None:
+            k_idx = str(int(mn.group(1)))
+            n_rest = mn.group(2)
+            mtp_rest_map = {
+                "pre_mlp_layernorm.weight": "post_attention_layernorm.weight",
+                "self_attn.attention_sink_bias": "self_attn.sink_bias",
+                "output_norm.weight": "final_layernorm.weight",
+            }
+            n_rest = mtp_rest_map.get(n_rest, n_rest)
+            return _normalize_name(f"layers.{k_idx}.{n_rest}")
     if raw_name in _GGUF_TOP_MAP:
         return _normalize_name(_GGUF_TOP_MAP[raw_name])
     mv = _GGUF_VISION_BLK_RE.match(raw_name)
@@ -1281,6 +1316,47 @@ def normalize_gguf_tensor_name(
         phys_blk_idx = layer_remap.get(raw_blk_idx, raw_blk_idx) if layer_remap is not None else raw_blk_idx
         blk_idx = str(phys_blk_idx)
         rest = mb.group(2)
+        if eff_arch in ("dflash", "mimo2", "mimo_v2"):
+            if rest in (
+                "attn_sinks.weight",
+                "attn_sink.weight",
+                "attn_sink_bias",
+                "self_attn.attention_sink_bias",
+                "self_attn.sink_bias",
+            ):
+                return _normalize_name(f"layers.{blk_idx}.self_attn.sink_bias")
+            if eff_arch in ("mimo2", "mimo_v2"):
+                if rest in ("exp_probs_b.bias", "ffn_exp_probs_b.bias", "ffn_gate_inp.bias"):
+                    return _normalize_name(f"layers.{blk_idx}.mlp.gate.bias")
+                if mimo_mtp_mode:
+                    if rest in ("nextn.enorm.weight", "enorm.weight"):
+                        return _normalize_name(f"layers.{blk_idx}.enorm.weight")
+                    if rest in ("nextn.hnorm.weight", "hnorm.weight"):
+                        return _normalize_name(f"layers.{blk_idx}.hnorm.weight")
+                    if rest in ("nextn.eh_proj.weight", "eh_proj.weight"):
+                        return _normalize_name(f"layers.{blk_idx}.eh_proj.weight")
+                    if rest in ("pre_mlp_layernorm.weight", "ffn_norm.weight", "post_attention_norm.weight"):
+                        return _normalize_name(f"layers.{blk_idx}.post_attention_layernorm.weight")
+                    if rest in ("final_layernorm.weight", "nextn.norm.weight", "ffn_post_norm.weight", "output_norm.weight"):
+                        return _normalize_name(f"layers.{blk_idx}.final_layernorm.weight")
+        if eff_arch in ("qwen35", "qwen3_5", "qwen35moe"):
+            qwen35_leaf_map = {
+                "attn_gate.weight": "linear_attn.g_proj.weight",
+                "ssm_out.weight": "linear_attn.o_proj.weight",
+                "ssm_alpha.weight": "linear_attn.a_proj.weight",
+                "ssm_beta.weight": "linear_attn.b_proj.weight",
+                "ssm_conv1d.weight": "linear_attn.conv1d.weight",
+                "ssm_conv1d": "linear_attn.conv1d.weight",
+                "ssm_a": "linear_attn.A_log",
+                "ssm_a.weight": "linear_attn.A_log",
+                "ssm_dt.bias": "linear_attn.dt_bias",
+                "ssm_dt_bias": "linear_attn.dt_bias",
+                "ssm_dt.weight": "linear_attn.dt_bias",
+                "ssm_norm.weight": "linear_attn.norm.weight",
+                "ssm_norm": "linear_attn.norm.weight",
+            }
+            if rest in qwen35_leaf_map:
+                return _normalize_name(f"layers.{blk_idx}.{qwen35_leaf_map[rest]}")
         if rest == "ffn_res_query.weight":
             return _normalize_name(f"attn_res.mlp_queries.{blk_idx}")
         if rest == "attn_res_query.weight":
@@ -1524,18 +1600,76 @@ def _build_synthesized_config_bytes(
         "model_type": arch,
     }
     if arch == "dflash":
+        is_mimo_dflash = (
+            "dflash.target_layers" in kv
+            or "dflash.attention.value_scale" in kv
+            or "tokenizer.ggml.mask_token_id" in kv
+        )
         cfg["architectures"] = ["DFlashForCausalLM"]
         cfg["draft_kind"] = "dflash"
-        cfg["dflare_format"] = "dflare"
+        cfg["dflare_format"] = "dflash" if is_mimo_dflash else "dflare"
         cfg["block_size"] = int(kv.get("dflash.block_size", kv.get("dflare.block_size", 8)) or 8)
-        cfg["markov_rank"] = int(kv.get("dflash.markov_rank", kv.get("dflare.markov_rank", 256)) or 256)
-        cfg["markov_head_type"] = str(kv.get("dflash.markov_head_type", kv.get("dflare.markov_head_type", "rnn_hidden")))
+        default_mrank = 0 if is_mimo_dflash else 256
+        default_mtype = "none" if is_mimo_dflash else "rnn_hidden"
+        cfg["markov_rank"] = int(
+            kv.get("dflash.markov_rank", kv.get("dflare.markov_rank", default_mrank)) or default_mrank
+        )
+        cfg["markov_head_type"] = str(
+            kv.get("dflash.markov_head_type", kv.get("dflare.markov_head_type", default_mtype))
+        )
         tids = kv.get("dflash.target_layer_ids", kv.get("dflare.target_layer_ids"))
         if isinstance(tids, list):
             cfg["target_layer_ids"] = [int(x) for x in tids]
+        else:
+            # llama.cpp `convert_hf_to_gguf.py` emits 1-indexed `dflash.target_layers` (`[1, 12, 24, 36, 48]`).
+            t_layers = kv.get("dflash.target_layers")
+            if isinstance(t_layers, list) and t_layers:
+                vals = [int(x) for x in t_layers]
+                cfg["target_layer_ids"] = [v - 1 for v in vals] if min(vals) >= 1 else vals
         lids = kv.get("dflash.local_layer_ids", kv.get("dflare.local_layer_ids"))
         if isinstance(lids, list):
             cfg["local_layer_ids"] = [int(x) for x in lids]
+        if "dflash.attention.value_scale" in kv:
+            cfg["attention_value_scale"] = float(kv["dflash.attention.value_scale"])
+        if "dflash.attention.causal" in kv:
+            cfg["attention_causal"] = bool(kv["dflash.attention.causal"])
+        if "dflash.rope.dimension_count" in kv:
+            cfg["rope_dim"] = int(kv["dflash.rope.dimension_count"])
+        if "tokenizer.ggml.mask_token_id" in kv:
+            cfg["mask_token_id"] = int(kv["tokenizer.ggml.mask_token_id"])
+        cfg["add_swa_attention_sink_bias"] = True
+    elif arch in ("mimo2", "mimo_v2"):
+        cfg["model_type"] = "mimo_v2"
+        cfg["architectures"] = ["MiMoV2ForCausalLM"]
+        if f"{arch}.attention.value_length" in kv:
+            cfg["v_head_dim"] = int(kv[f"{arch}.attention.value_length"])
+            cfg["swa_v_head_dim"] = cfg["v_head_dim"]
+        if f"{arch}.attention.key_length" in kv:
+            cfg["swa_head_dim"] = int(kv[f"{arch}.attention.key_length"])
+        if f"{arch}.attention.value_scale" in kv:
+            cfg["attention_value_scale"] = float(kv[f"{arch}.attention.value_scale"])
+        if f"{arch}.rope.freq_base_swa" in kv:
+            cfg["swa_rope_theta"] = float(kv[f"{arch}.rope.freq_base_swa"])
+        if f"{arch}.rope.dimension_count" in kv:
+            cfg["rope_dim"] = int(kv[f"{arch}.rope.dimension_count"])
+        h_kv = kv.get(f"{arch}.attention.head_count_kv")
+        swa_pat_m = kv.get(f"{arch}.attention.sliding_window_pattern")
+        if isinstance(swa_pat_m, list) and swa_pat_m:
+            cfg["hybrid_layer_pattern"] = [int(x) for x in swa_pat_m]
+            cfg["layer_types"] = ["full_attention" if int(x) == 0 else "sliding_attention" for x in swa_pat_m]
+            if isinstance(h_kv, list) and len(h_kv) == len(swa_pat_m):
+                glob_kvh = next((int(k_v) for k_v, fl in zip(h_kv, swa_pat_m) if int(fl) == 0), int(h_kv[0]))
+                swa_kvh = next((int(k_v) for k_v, fl in zip(h_kv, swa_pat_m) if int(fl) != 0), int(h_kv[-1]))
+                cfg["num_key_value_heads"] = glob_kvh
+                cfg["swa_num_key_value_heads"] = swa_kvh
+        cfg["add_swa_attention_sink_bias"] = True
+        cfg["scoring_func"] = "sigmoid"
+        cfg["norm_topk_prob"] = True
+    elif arch in ("qwen35", "qwen3_5", "qwen35moe"):
+        cfg["model_type"] = "qwen3_5"
+        cfg["architectures"] = ["Qwen3_5ForCausalLM"]
+        cfg["rmsnorm_unit_offset"] = True
+        cfg["attn_output_gate"] = True
     elif arch == "clip":
         cfg["architectures"] = ["ClipVisionModel"]
     else:
@@ -1754,6 +1888,7 @@ class _PlannedGgufEntry:
     expert_scale: float | None = None
     second_expert_scale: float | None = None
     synthetic_bytes: bytes | None = None
+    row_gather_runs: tuple[tuple[int, int], ...] | None = None
 
 
 def _scale_gguf_blocks_in_place(buf: bytearray, dtype: DType, bb: int, scale_f: float, name: str) -> None:
@@ -1922,6 +2057,7 @@ def pack_amf_from_gguf(
     engram_shards: int = 1,
     meta_config_override: bytes | None = None,
     stats_out: dict[str, int] | None = None,
+    mimo_mtp_mode: bool = False,
 ) -> list[PackedTensorMeta]:
     """Stream-convert a GGUF v2/v3 file (or split shards) into a 16 KiB-aligned `.amf` v0."""
     in_path = pathlib.Path(input_path)
@@ -1959,6 +2095,27 @@ def pack_amf_from_gguf(
             }
         )
         layer_remap = {old_l: new_l for new_l, old_l in enumerate(kept_ids)}
+    if mimo_mtp_mode and arch.lower() in ("mimo2", "mimo_v2"):
+        mtp_blk_ids = sorted(
+            {
+                int(m.group(1))
+                for _, _, t in flat_items
+                if (m := _GGUF_BLK_RE.match(t.name)) is not None
+            }
+        )
+        blk_cnt = int(kv.get(f"{arch}.block_count", 0) or 0)
+        nextn_n = int(kv.get(f"{arch}.nextn_predict_layers", 3) or 3)
+        if blk_cnt > nextn_n > 0 and mtp_blk_ids and max(mtp_blk_ids) >= blk_cnt - nextn_n and min(mtp_blk_ids) < blk_cnt - nextn_n:
+            mtp_start = blk_cnt - nextn_n
+            flat_items = [
+                item
+                for item in flat_items
+                if (m := _GGUF_BLK_RE.match(item[2].name)) is not None and int(m.group(1)) >= mtp_start
+            ]
+            mtp_blk_ids = [idx for idx in mtp_blk_ids if idx >= mtp_start]
+        if mtp_blk_ids:
+            layer_remap = {old_l: new_l for new_l, old_l in enumerate(mtp_blk_ids)}
+            physical_layers = len(mtp_blk_ids)
 
     if stats_out is not None:
         stats_out["physical_layers"] = physical_layers
@@ -2199,6 +2356,8 @@ def pack_amf_from_gguf(
                         layer_remap=layer_remap,
                         inkling2_runtime_names=use_inkling2_runtime_names,
                         attn_res_shifted_by_1=attn_res_shifted_by_1,
+                        arch=arch,
+                        mimo_mtp_mode=mimo_mtp_mode,
                     )
                     extra_pass_items.append((f"{base_out}.pass{p_i}", item))
 
@@ -2278,6 +2437,7 @@ def pack_amf_from_gguf(
                 float | None,
             ]
         ]
+        split_extras: dict[str, tuple[int, int, tuple[tuple[int, int], ...] | None]] = {}
         if ex_m is not None and len(amf_shape_full) == 3:
             raw_layer_i = int(ex_m.group(1))
             layer_i = layer_remap.get(raw_layer_i, raw_layer_i)
@@ -2358,12 +2518,129 @@ def pack_amf_from_gguf(
                     layer_remap=layer_remap,
                     inkling2_runtime_names=use_inkling2_runtime_names,
                     attn_res_shifted_by_1=attn_res_shifted_by_1,
+                    arch=arch,
+                    mimo_mtp_mode=mimo_mtp_mode,
                 )
             )
             if norm_name in excluded:
                 continue
+            eff_shape = amf_shape_full
+            if (
+                arch.lower() in ("qwen35", "qwen3_5", "qwen35moe")
+                and norm_name.endswith(".linear_attn.conv1d.weight")
+                and len(eff_shape) == 3
+                and eff_shape[1] == 1
+            ):
+                eff_shape = (eff_shape[0], eff_shape[2])
             kind, layer_i, exp_i = _classify_tensor(norm_name, cold_set, all_experts_cold)
-            slices = [(norm_name, kind, layer_i, exp_i, amf_shape_full, t.offset, t.expected_bytes, False, None, 0, None, None)]
+            slices = [(norm_name, kind, layer_i, exp_i, eff_shape, t.offset, t.expected_bytes, False, None, 0, None, None)]
+            eff_arch_l = arch.lower()
+            raw_mb = _GGUF_BLK_RE.match(t.name)
+            raw_li = int(raw_mb.group(1)) if raw_mb is not None else layer_i
+            if eff_arch_l in ("mimo2", "mimo_v2") and norm_name.endswith(".self_attn.qkv_proj.weight") and len(eff_shape) == 2:
+                n_r, k_c = eff_shape
+                q_heads = int(kv.get(f"{arch}.attention.head_count", 64) or 64)
+                kv_raw = kv.get(f"{arch}.attention.head_count_kv", 8)
+                if isinstance(kv_raw, Sequence) and not isinstance(kv_raw, (str, bytes)):
+                    kv_heads = int(kv_raw[raw_li] if raw_li < len(kv_raw) else kv_raw[min(layer_i, len(kv_raw) - 1)])
+                else:
+                    kv_heads = int(kv_raw or 8)
+                k_hd = int(kv.get(f"{arch}.attention.key_length", 192) or 192)
+                v_hd = int(kv.get(f"{arch}.attention.value_length", 128) or 128)
+                q_rows, k_rows, v_rows = q_heads * k_hd, kv_heads * k_hd, kv_heads * v_hd
+                if q_rows + k_rows + v_rows == n_r and t.expected_bytes % n_r == 0:
+                    row_b = t.expected_bytes // n_r
+                    pref_qkv = norm_name[: -len("qkv_proj.weight")]
+                    slices = []
+                    cur_r = 0
+                    for sub_proj, sub_rows in (("q_proj.weight", q_rows), ("k_proj.weight", k_rows), ("v_proj.weight", v_rows)):
+                        sub_name = _normalize_name(f"{pref_qkv}{sub_proj}")
+                        if sub_name not in excluded:
+                            sub_kind, sub_li, sub_ei = _classify_tensor(sub_name, cold_set, all_experts_cold)
+                            slices.append(
+                                (
+                                    sub_name,
+                                    sub_kind,
+                                    sub_li,
+                                    sub_ei,
+                                    (sub_rows, k_c),
+                                    t.offset + cur_r * row_b,
+                                    sub_rows * row_b,
+                                    False,
+                                    None,
+                                    0,
+                                    None,
+                                    None,
+                                )
+                            )
+                            split_extras[sub_name] = (cur_r, sub_rows, None)
+                        cur_r += sub_rows
+            elif eff_arch_l in ("qwen35", "qwen3_5", "qwen35moe") and norm_name.endswith(".self_attn.qkv_proj.weight") and len(eff_shape) == 2:
+                n_r, k_c = eff_shape
+                k_heads = int(kv.get(f"{arch}.ssm.group_count", 16) or 16)
+                v_heads = int(kv.get(f"{arch}.ssm.time_step_rank", 32) or 32)
+                state_sz = int(kv.get(f"{arch}.ssm.state_size", 128) or 128)
+                v_total = int(kv.get(f"{arch}.ssm.inner_size", v_heads * state_sz) or (v_heads * state_sz))
+                q_rows = k_heads * state_sz
+                k_rows = k_heads * state_sz
+                if q_rows + k_rows + v_total == n_r and t.expected_bytes % n_r == 0:
+                    row_b = t.expected_bytes // n_r
+                    slices = []
+                    cur_r = 0
+                    for sub_proj, sub_rows in (("q_proj.weight", q_rows), ("k_proj.weight", k_rows), ("v_proj.weight", v_total)):
+                        sub_name = _normalize_name(f"layers.{layer_i}.linear_attn.{sub_proj}")
+                        if sub_name not in excluded:
+                            sub_kind, sub_li, sub_ei = _classify_tensor(sub_name, cold_set, all_experts_cold)
+                            slices.append(
+                                (
+                                    sub_name,
+                                    sub_kind,
+                                    sub_li,
+                                    sub_ei,
+                                    (sub_rows, k_c),
+                                    t.offset + cur_r * row_b,
+                                    sub_rows * row_b,
+                                    False,
+                                    None,
+                                    0,
+                                    None,
+                                    None,
+                                )
+                            )
+                            split_extras[sub_name] = (cur_r, sub_rows, None)
+                        cur_r += sub_rows
+            elif eff_arch_l in ("qwen35", "qwen3_5", "qwen35moe") and norm_name.endswith(".self_attn.q_proj.weight") and len(eff_shape) == 2:
+                n_r, k_c = eff_shape
+                n_heads = int(kv.get(f"{arch}.attention.head_count", 0) or 0)
+                hd = int(kv.get(f"{arch}.attention.key_length", 0) or 0)
+                if n_heads > 0 and hd > 0 and n_r == 2 * n_heads * hd and t.expected_bytes % n_r == 0:
+                    row_b = t.expected_bytes // n_r
+                    half_r = n_heads * hd
+                    q_runs = tuple((h * 2 * hd, hd) for h in range(n_heads))
+                    g_runs = tuple((h * 2 * hd + hd, hd) for h in range(n_heads))
+                    pref_sa = norm_name[: -len("q_proj.weight")]
+                    slices = []
+                    for sub_proj, runs in (("q_proj.weight", q_runs), ("q_gate_proj.weight", g_runs)):
+                        sub_name = _normalize_name(f"{pref_sa}{sub_proj}")
+                        if sub_name not in excluded:
+                            sub_kind, sub_li, sub_ei = _classify_tensor(sub_name, cold_set, all_experts_cold)
+                            slices.append(
+                                (
+                                    sub_name,
+                                    sub_kind,
+                                    sub_li,
+                                    sub_ei,
+                                    (half_r, k_c),
+                                    t.offset,
+                                    half_r * row_b,
+                                    False,
+                                    None,
+                                    0,
+                                    None,
+                                    None,
+                                )
+                            )
+                            split_extras[sub_name] = (0, 0, runs)
 
         for (
             out_name,
@@ -2483,6 +2760,7 @@ def pack_amf_from_gguf(
                     convert = "sme2_f16"
 
             content = (params_offset + params_bytes) if params_bytes > 0 else data_bytes
+            sc_row_off, sc_row_cnt, gather_runs = split_extras.get(out_name, (0, 0, None))
             entry_obj = _PlannedGgufEntry(
                 name=out_name,
                 kind=out_kind,
@@ -2504,12 +2782,15 @@ def pack_amf_from_gguf(
                 params_offset=params_offset,
                 params_bytes=params_bytes,
                 blob_bytes=_align_up(max(content, 1), APPLE_PAGE_SIZE),
+                scale_row_offset=sc_row_off if fp8_mode == "fp8_row" else 0,
+                scale_row_count=sc_row_cnt if fp8_mode == "fp8_row" else 0,
                 layout=out_layout,
                 pair_interleave_rows=pair_interleave,
                 second_shard=second_sh,
                 second_src_offset=second_off,
                 expert_scale=exp_scale,
                 second_expert_scale=second_exp_scale,
+                row_gather_runs=gather_runs,
             )
             if engram_output is not None and out_kind == TensorKind.SPARSE_TABLE:
                 planned_engram.append(entry_obj)
@@ -2533,6 +2814,7 @@ def pack_amf_from_gguf(
         embed_metadata
         or is_clip
         or arch == "dflash"
+        or mimo_mtp_mode
         or config_path is not None
         or tokenizer_path is not None
         or chat_template_path is not None
@@ -2546,12 +2828,23 @@ def pack_amf_from_gguf(
             cfg_bytes = ext_cfg.read_bytes()
         else:
             cfg_bytes = _build_synthesized_config_bytes(kv, physical_layers=physical_layers, dedup_layers=dedup_layers)
+        if meta_config_override is None and mimo_mtp_mode and arch.lower() in ("mimo2", "mimo_v2"):
+            from aminfer_tools.mimo_v2 import build_mimo_mtp_config_dict
+
+            cfg_dict = json.loads(cfg_bytes)
+            mtp_dict = build_mimo_mtp_config_dict(cfg_dict, mtp_layers=max(1, physical_layers))
+            cfg_bytes = json.dumps(mtp_dict, ensure_ascii=False, indent=2).encode("utf-8") + b"\n"
         if draft_config_output is not None:
             dcfg_p = pathlib.Path(draft_config_output)
             dcfg_p.parent.mkdir(parents=True, exist_ok=True)
             dcfg_p.write_bytes(cfg_bytes + (b"" if cfg_bytes.endswith(b"\n") else b"\n"))
         if want_meta and (
-            embed_metadata or is_clip or arch == "dflash" or config_path is not None or meta_config_override is not None
+            embed_metadata
+            or is_clip
+            or arch == "dflash"
+            or mimo_mtp_mode
+            or config_path is not None
+            or meta_config_override is not None
         ):
             meta_blobs.append((META_CONFIG_JSON, cfg_bytes))
 
@@ -2671,8 +2964,35 @@ def pack_amf_from_gguf(
                         or e.second_shard is not None
                         or (e.expert_scale is not None and e.expert_scale != 1.0 and e.data_convert != "gguf_nvfp4")
                     )
+                    def _read_gathered_source_bytes(entry: _PlannedGgufEntry) -> bytes:
+                        assert entry.shard is not None and entry.row_gather_runs is not None
+                        sfh_g = in_fhs[entry.shard.path]
+                        if entry.src_bytes % entry.shape[0] != 0:
+                            raise AssertionError(
+                                f"row_gather src_bytes {entry.src_bytes} not divisible by rows {entry.shape[0]}"
+                            )
+                        row_src_b_g = entry.src_bytes // entry.shape[0]
+                        chunks_g: list[bytes] = []
+                        for r0_g, cnt_g in entry.row_gather_runs:
+                            sfh_g.seek(entry.shard.data_offset + entry.src_offset + r0_g * row_src_b_g)
+                            chunks_g.append(_read_exact(sfh_g, cnt_g * row_src_b_g, entry.name))
+                        return b"".join(chunks_g)
+
                     if e.synthetic_bytes is not None:
                         w.write(e.synthetic_bytes)
+                    elif e.row_gather_runs is not None and e.data_convert is None:
+                        assert e.shard is not None
+                        sfh = in_fhs[e.shard.path]
+                        row_src_b = e.src_bytes // e.shape[0]
+                        if e.src_bytes % e.shape[0] != 0:
+                            raise AssertionError(f"row_gather src_bytes {e.src_bytes} not divisible by rows {e.shape[0]}")
+                        for r0, cnt in e.row_gather_runs:
+                            sfh.seek(e.shard.data_offset + e.src_offset + r0 * row_src_b)
+                            left_g = cnt * row_src_b
+                            while left_g > 0:
+                                take = min(8 * 1024 * 1024, left_g)
+                                w.write(_read_exact(sfh, take, e.name))
+                                left_g -= take
                     elif e.data_convert is None and needs_expert_buf:
                         w.write(_prepare_expert_raw(e, in_fhs))
                     elif e.data_convert is None:
@@ -2686,24 +3006,35 @@ def pack_amf_from_gguf(
                             w.write(chunk)
                             left -= take
                     elif e.data_convert in ("f16_to_bf16", "bf16_to_f16"):
-                        assert e.shard is not None
-                        sfh = in_fhs[e.shard.path]
-                        sfh.seek(e.shard.data_offset + e.src_offset)
-                        left = e.src_bytes
-                        while left > 0:
-                            take = min((1 << 20) * 2, left)
-                            chunk = _read_exact(sfh, take, e.name)
+                        if e.row_gather_runs is not None:
+                            chunk = _read_gathered_source_bytes(e)
                             w.write(
                                 f16_bytes_to_bf16_bytes(chunk)
                                 if e.data_convert == "f16_to_bf16"
                                 else bf16_bytes_to_f16_bytes(chunk, what=e.name)
                             )
-                            left -= take
+                        else:
+                            assert e.shard is not None
+                            sfh = in_fhs[e.shard.path]
+                            sfh.seek(e.shard.data_offset + e.src_offset)
+                            left = e.src_bytes
+                            while left > 0:
+                                take = min((1 << 20) * 2, left)
+                                chunk = _read_exact(sfh, take, e.name)
+                                w.write(
+                                    f16_bytes_to_bf16_bytes(chunk)
+                                    if e.data_convert == "f16_to_bf16"
+                                    else bf16_bytes_to_f16_bytes(chunk, what=e.name)
+                                )
+                                left -= take
                     elif e.data_convert in ("f32_to_bf16", "f32_to_f16"):
-                        assert e.shard is not None
-                        sfh = in_fhs[e.shard.path]
-                        sfh.seek(e.shard.data_offset + e.src_offset)
-                        raw = _read_exact(sfh, e.src_bytes, e.name)
+                        if e.row_gather_runs is not None:
+                            raw = _read_gathered_source_bytes(e)
+                        else:
+                            assert e.shard is not None
+                            sfh = in_fhs[e.shard.path]
+                            sfh.seek(e.shard.data_offset + e.src_offset)
+                            raw = _read_exact(sfh, e.src_bytes, e.name)
                         vals = struct.unpack(f"<{e.src_bytes // 4}f", raw)
                         w.write(f32_to_f16_bytes(vals) if e.data_convert == "f32_to_f16" else f32_to_bf16_bytes(vals))
                     elif e.data_convert in (
@@ -2713,17 +3044,24 @@ def pack_amf_from_gguf(
                         "sme2_f32_to_bf16",
                         "sme2_f32_to_f16",
                     ):
-                        assert e.shard is not None
-                        sfh = in_fhs[e.shard.path]
-                        sfh.seek(e.shard.data_offset + e.src_offset)
                         n_r, k_c = e.shape
                         src_row_bytes = k_c * 4 if e.data_convert in ("sme2_f32_to_bf16", "sme2_f32_to_f16") else k_c * 2
                         dst_row_bytes = k_c * 2
+                        gathered_buf = memoryview(_read_gathered_source_bytes(e)) if e.row_gather_runs is not None else None
+                        sfh = None
+                        if gathered_buf is None:
+                            assert e.shard is not None
+                            sfh = in_fhs[e.shard.path]
+                            sfh.seek(e.shard.data_offset + e.src_offset)
                         panels = (n_r + SME2_PANEL_COLS - 1) // SME2_PANEL_COLS
                         for p in range(panels):
                             r0 = p * SME2_PANEL_COLS
                             cnt = min(SME2_PANEL_COLS, n_r - r0)
-                            raw = _read_exact(sfh, cnt * src_row_bytes, e.name)
+                            if gathered_buf is not None:
+                                raw = bytes(gathered_buf[r0 * src_row_bytes : (r0 + cnt) * src_row_bytes])
+                            else:
+                                assert sfh is not None
+                                raw = _read_exact(sfh, cnt * src_row_bytes, e.name)
                             if e.data_convert == "sme2_f16_to_bf16":
                                 raw = f16_bytes_to_bf16_bytes(raw)
                             elif e.data_convert == "sme2_bf16_to_f16":
@@ -2767,15 +3105,22 @@ def pack_amf_from_gguf(
                         outer_sc = e.expert_scale if e.expert_scale is not None else 1.0
                         w.write(struct.pack("<f", outer_sc))
                     elif e.data_convert == "quant_fp8_row":
-                        assert e.shard is not None
-                        sfh = in_fhs[e.shard.path]
-                        sfh.seek(e.shard.data_offset + e.src_offset)
                         n_r, k_c = e.shape
                         elem_b = 4 if e.src_ggml_type == 0 else 2
                         row_src_b = k_c * elem_b
+                        gathered_qbuf = memoryview(_read_gathered_source_bytes(e)) if e.row_gather_runs is not None else None
+                        sfh = None
+                        if gathered_qbuf is None:
+                            assert e.shard is not None
+                            sfh = in_fhs[e.shard.path]
+                            sfh.seek(e.shard.data_offset + e.src_offset)
                         scales_f32: list[float] = []
-                        for _ in range(n_r):
-                            r_raw = _read_exact(sfh, row_src_b, e.name)
+                        for r_i in range(n_r):
+                            if gathered_qbuf is not None:
+                                r_raw = bytes(gathered_qbuf[r_i * row_src_b : (r_i + 1) * row_src_b])
+                            else:
+                                assert sfh is not None
+                                r_raw = _read_exact(sfh, row_src_b, e.name)
                             if e.src_ggml_type == 0:
                                 vals = list(struct.unpack(f"<{k_c}f", r_raw))
                             elif e.src_ggml_type == 1:
@@ -2792,7 +3137,9 @@ def pack_amf_from_gguf(
                         w.zeros(e.params_offset - e.data_bytes)
                         if e.scale_shard is not None and e.scale_info is not None:
                             sc_bytes = _decode_gguf_float_array(e.scale_shard, e.scale_info)
-                            if e.scale_row_count > 0:
+                            if e.row_gather_runs is not None and e.fp8_mode == "fp8_row":
+                                sc_bytes = b"".join(sc_bytes[r0 * 4 : (r0 + cnt) * 4] for r0, cnt in e.row_gather_runs)
+                            elif e.scale_row_count > 0:
                                 sc_bytes = sc_bytes[e.scale_row_offset * 4 : (e.scale_row_offset + e.scale_row_count) * 4]
                             w.write(sc_bytes)
                         elif e.fp8_mode == "fp8_row_ones":

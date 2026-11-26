@@ -46,6 +46,19 @@ from aminfer_tools.inkling2 import (
     generate_synth_inkling2_bundle,
     validate_hf_metadata_dir as validate_inkling2_metadata_dir,
 )
+from aminfer_tools.mimo_v2 import (
+    generate_synth_mimo_bundle,
+    generate_synth_qwen35_bundle,
+    MIMO_SYNTH_PRESETS,
+    MIMO_TIER_PROFILES,
+    QWEN35_SYNTH_PRESETS,
+    convert_mimo_v2_checkpoint,
+    convert_qwen35_checkpoint,
+    export_mimo_dflash,
+    export_mimo_mtp_from_safetensors,
+    validate_mimo_v2_metadata_dir,
+    validate_qwen35_metadata_dir,
+)
 from aminfer_tools.hy4 import (
     HY4_SYNTH_PRESETS,
     VALID_HY4_ENGRAM_DTYPES,
@@ -987,6 +1000,115 @@ def _build_parser() -> argparse.ArgumentParser:
     phy4.add_argument("--no-embed-metadata", action="store_true")
     phy4.add_argument("--workers", type=int, default=1)
 
+    cmimo = sub.add_parser(
+        "convert-mimo",
+        help="Convert MiMo-V2.6-Flash/Pro (`mimo_v2`) + 3L MTP + DFlash + optional ViT sidecar to .amf (W25/W28)",
+    )
+    cmimo.add_argument("--input", required=True, type=pathlib.Path)
+    cmimo.add_argument("--output", required=True, type=pathlib.Path)
+    cmimo.add_argument("--model-id", default=None)
+    cmimo.add_argument("--dtype", choices=DTYPE_MODES, default="auto")
+    cmimo.add_argument("--group-size", type=int, choices=AFFINE_GROUP_SIZES, default=64)
+    cmimo.add_argument("--quant-profile", choices=QUANT_PROFILES, default="uniform")
+    cmimo.add_argument("--target-bits", type=float, default=None)
+    cmimo.add_argument("--target-wired-gib", type=float, default=None)
+    cmimo.add_argument("--target-tier", choices=sorted(MIMO_TIER_PROFILES.keys()), default=None)
+    cmimo.add_argument("--no-rco", action="store_true")
+    cmimo.add_argument("--manifest", type=pathlib.Path, default=None)
+    cmimo.add_argument("--cold-experts", default=None)
+    cmimo.add_argument("--cold-experts-per-layer", type=int, default=None)
+    cmimo.add_argument("--heat-profile", type=pathlib.Path, default=None)
+    cmimo.add_argument("--all-experts-cold", action="store_true")
+    cmimo.add_argument("--qkv-tp-degree", type=int, default=None)
+    cmimo.add_argument("--include-vision", action="store_true")
+    cmimo.add_argument("--strip-vision", action="store_true")
+    cmimo.add_argument("--no-strip-vision", action="store_true")
+    cmimo.add_argument("--vision-sidecar", type=pathlib.Path, default=None)
+    cmimo.add_argument("--vision-block-dtype", choices=VISION_BLOCK_DTYPES, default="auto")
+    cmimo.add_argument("--mtp-input", type=pathlib.Path, default=None)
+    cmimo.add_argument("--mtp-output", type=pathlib.Path, default=None)
+    cmimo.add_argument("--mtp-config-output", type=pathlib.Path, default=None)
+    cmimo.add_argument("--dflash-input", type=pathlib.Path, default=None)
+    cmimo.add_argument("--dflash-output", type=pathlib.Path, default=None)
+    cmimo.add_argument("--dflash-config-output", type=pathlib.Path, default=None)
+    cmimo.add_argument("--dflash-block-size", type=int, choices=(8, 16), default=None)
+    cmimo.add_argument("--config-output", type=pathlib.Path, default=None)
+    cmimo.add_argument("--config", type=pathlib.Path, default=None)
+    cmimo.add_argument("--tokenizer", type=pathlib.Path, default=None)
+    cmimo.add_argument("--tokenizer-config", type=pathlib.Path, default=None)
+    cmimo.add_argument("--chat-template", type=pathlib.Path, default=None)
+    cmimo.add_argument("--no-strict-vocab", action="store_true")
+    cmimo.add_argument("--imatrix", type=pathlib.Path, default=None)
+    cmimo.add_argument("--allow-unsafe-q2", action="store_true")
+    cmimo.add_argument("--max-q2-share", type=float, default=None)
+    cmimo.add_argument("--no-retranscode-lowbit", dest="allow_retranscode_lowbit", action="store_false")
+    cmimo.add_argument("--fine-rungs", action="store_true")
+    cmimo.add_argument("--no-embed-metadata", action="store_true")
+    cmimo.add_argument("--workers", type=int, default=1)
+
+    cq35 = sub.add_parser(
+        "convert-qwen35",
+        help="Convert MiMo-V2.6-Distill-Qwen-9B (`qwen3_5` GDN + GQA + ViT) to .amf (W25/W28)",
+    )
+    cq35.add_argument("--input", required=True, type=pathlib.Path)
+    cq35.add_argument("--output", required=True, type=pathlib.Path)
+    cq35.add_argument("--model-id", default=None)
+    cq35.add_argument("--dtype", choices=DTYPE_MODES, default="auto")
+    cq35.add_argument("--group-size", type=int, choices=AFFINE_GROUP_SIZES, default=None)
+    cq35.add_argument("--quant-profile", choices=QUANT_PROFILES, default="uniform")
+    cq35.add_argument("--target-bits", type=float, default=None)
+    cq35.add_argument("--target-tier", choices=sorted(MIMO_TIER_PROFILES.keys()), default=None)
+    cq35.add_argument("--no-rco", action="store_true")
+    cq35.add_argument("--manifest", type=pathlib.Path, default=None)
+    cq35.add_argument("--include-vision", action="store_true")
+    cq35.add_argument("--strip-vision", action="store_true")
+    cq35.add_argument("--no-strip-vision", action="store_true")
+    cq35.add_argument("--vision-sidecar", type=pathlib.Path, default=None)
+    cq35.add_argument("--vision-block-dtype", choices=VISION_BLOCK_DTYPES, default="auto")
+    cq35.add_argument("--config-output", type=pathlib.Path, default=None)
+    cq35.add_argument("--config", type=pathlib.Path, default=None)
+    cq35.add_argument("--tokenizer", type=pathlib.Path, default=None)
+    cq35.add_argument("--tokenizer-config", type=pathlib.Path, default=None)
+    cq35.add_argument("--chat-template", type=pathlib.Path, default=None)
+    cq35.add_argument("--no-strict-vocab", action="store_true")
+    cq35.add_argument("--imatrix", type=pathlib.Path, default=None)
+    cq35.add_argument("--no-embed-metadata", action="store_true")
+    cq35.add_argument("--workers", type=int, default=1)
+
+    smimo = sub.add_parser(
+        "synth-mimo",
+        help="Generate deterministic tiny mimo_v2 (`192/128` SWA + sink + MoE) + 3L MTP + DFlash .amf bundle",
+    )
+    smimo.add_argument("--preset", default="tiny-mimo-flash", choices=sorted(MIMO_SYNTH_PRESETS.keys()))
+    smimo.add_argument("--output-dir", required=True, type=pathlib.Path)
+    smimo.add_argument("--num-layers", type=int, default=None)
+    smimo.add_argument("--hidden-size", type=int, default=None)
+    smimo.add_argument("--num-experts", type=int, default=None)
+    smimo.add_argument("--dflash-block-size", type=int, choices=(8, 16), default=None)
+    smimo.add_argument("--expert-dtype", choices=("mxfp4", "bf16", "f16"), default=None)
+    smimo.add_argument("--dtype", choices=("bf16", "f16"), default=None)
+    smimo.add_argument("--cold-experts-per-layer", type=int, default=None)
+    smimo.add_argument("--no-mtp", action="store_true")
+    smimo.add_argument("--no-dflash", action="store_true")
+    smimo.add_argument("--no-embed-metadata", action="store_true")
+    smimo.add_argument("--model-id", default=None)
+    smimo.add_argument("--seed", type=int, default=42)
+
+    sq35 = sub.add_parser(
+        "synth-qwen35",
+        help="Generate deterministic tiny qwen3_5 (`GDN + GQA + ViT sidecar`) .amf bundle",
+    )
+    sq35.add_argument("--preset", default="tiny-qwen35", choices=sorted(QWEN35_SYNTH_PRESETS.keys()))
+    sq35.add_argument("--output-dir", required=True, type=pathlib.Path)
+    sq35.add_argument("--num-layers", type=int, default=None)
+    sq35.add_argument("--hidden-size", type=int, default=None)
+    sq35.add_argument("--vision-layers", type=int, default=None)
+    sq35.add_argument("--vision-mode", choices=("sidecar", "inline", "strip"), default="sidecar")
+    sq35.add_argument("--dtype", choices=("bf16", "f16"), default=None)
+    sq35.add_argument("--no-embed-metadata", action="store_true")
+    sq35.add_argument("--model-id", default=None)
+    sq35.add_argument("--seed", type=int, default=42)
+
     part = sub.add_parser(
         "partition-experts",
         help=(
@@ -1024,7 +1146,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     insp.add_argument(
         "--arch",
-        choices=("auto", "qwen4_exp", "deepseek41", "inkling2", "hy4"),
+        choices=("auto", "qwen4_exp", "deepseek41", "inkling2", "hy4", "mimo_v2", "qwen3_5"),
         default="auto",
         help="Architecture validator to invoke (default: auto-detect from config.json)",
     )
@@ -2417,6 +2539,156 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         return 0
 
+    if args.command == "synth-mimo":
+        from dataclasses import replace as dc_replace
+
+        cfg = MIMO_SYNTH_PRESETS[args.preset]
+        ov = {}
+        if args.num_layers is not None:
+            ov["num_hidden_layers"] = args.num_layers
+        if args.hidden_size is not None:
+            ov["hidden_size"] = args.hidden_size
+        if args.num_experts is not None:
+            ov["n_routed_experts"] = args.num_experts
+        if args.dflash_block_size is not None:
+            ov["dflash_block_size"] = args.dflash_block_size
+        if args.expert_dtype is not None:
+            ov["expert_dtype"] = args.expert_dtype
+        if args.dtype is not None:
+            ov["dtype"] = args.dtype
+        if args.cold_experts_per_layer is not None:
+            ov["cold_experts_per_layer"] = args.cold_experts_per_layer
+        if args.no_mtp:
+            ov["include_mtp"] = False
+        if args.no_dflash:
+            ov["include_dflash"] = False
+        if args.model_id is not None:
+            ov["model_id"] = args.model_id
+        if ov:
+            cfg = dc_replace(cfg, **ov)
+        b = generate_synth_mimo_bundle(args.output_dir, config=cfg, seed=args.seed, embed_metadata=not args.no_embed_metadata)
+        print(
+            f"synthesized mimo_v2 ({len(b.backbone_metas)} backbone tensors, "
+            f"mtp={len(b.mtp_metas)}, dflash={len(b.dflash_metas)}, {b.total_bytes} bytes) into {b.output_dir}"
+        )
+        return 0
+
+    if args.command == "synth-qwen35":
+        from dataclasses import replace as dc_replace
+
+        cfg = QWEN35_SYNTH_PRESETS[args.preset]
+        ov = {}
+        if args.num_layers is not None:
+            ov["num_hidden_layers"] = args.num_layers
+        if args.hidden_size is not None:
+            ov["hidden_size"] = args.hidden_size
+        if args.vision_layers is not None:
+            ov["vision_layers"] = args.vision_layers
+        ov["vision_mode"] = args.vision_mode
+        if args.dtype is not None:
+            ov["dtype"] = args.dtype
+        if args.model_id is not None:
+            ov["model_id"] = args.model_id
+        if ov:
+            cfg = dc_replace(cfg, **ov)
+        b = generate_synth_qwen35_bundle(args.output_dir, config=cfg, seed=args.seed, embed_metadata=not args.no_embed_metadata)
+        print(
+            f"synthesized qwen3_5 ({len(b.backbone_metas)} backbone tensors, "
+            f"vision={len(b.vision_metas)}, {b.total_bytes} bytes) into {b.output_dir}"
+        )
+        return 0
+
+    if args.command == "convert-mimo":
+        cold = _parse_cold_experts(args.cold_experts)
+        inc_vis, strip_vis = _resolve_cli_vision_flags(parser, args)
+        enforce_floor = not args.allow_unsafe_q2
+        eff_max_q2 = (
+            1.0 if args.allow_unsafe_q2 else args.max_q2_share
+        ) if (args.allow_unsafe_q2 or args.max_q2_share is not None) else None
+        eff_fine_rungs = True if args.fine_rungs else None
+        rep = convert_mimo_v2_checkpoint(
+            args.input,
+            args.output,
+            model_id=args.model_id,
+            dtype_mode=args.dtype,
+            group_size=args.group_size,
+            quant_profile=args.quant_profile,
+            target_bits=args.target_bits,
+            target_wired_gib=args.target_wired_gib,
+            target_tier=args.target_tier,
+            use_rco=not args.no_rco,
+            manifest_path=args.manifest,
+            cold_experts=cold,
+            cold_experts_per_layer=args.cold_experts_per_layer,
+            heat_profile=args.heat_profile,
+            all_experts_cold=args.all_experts_cold,
+            qkv_tp_degree=args.qkv_tp_degree,
+            strip_vision=strip_vis,
+            include_vision=inc_vis,
+            vision_sidecar=args.vision_sidecar,
+            vision_block_dtype=args.vision_block_dtype,
+            mtp_input=args.mtp_input,
+            mtp_output=args.mtp_output,
+            mtp_config_output=args.mtp_config_output,
+            dflash_input=args.dflash_input,
+            dflash_output=args.dflash_output,
+            dflash_config_output=args.dflash_config_output,
+            dflash_block_size=args.dflash_block_size,
+            config_output=args.config_output,
+            config_path=args.config,
+            tokenizer_path=args.tokenizer,
+            tokenizer_config_path=args.tokenizer_config,
+            chat_template_path=args.chat_template,
+            strict_vocab_check=not args.no_strict_vocab,
+            imatrix_path=args.imatrix,
+            enforce_backbone_floor=enforce_floor,
+            max_q2_share=eff_max_q2,
+            allow_lowbit_q2_retranscode=bool(args.allow_retranscode_lowbit),
+            fine_rungs=eff_fine_rungs,
+            embed_metadata=not args.no_embed_metadata,
+            workers=args.workers,
+        )
+        print(
+            f"converted mimo_v2 ({len(rep.backbone_metas)} backbone tensors, "
+            f"qkv_tp={rep.qkv_tp_degree}, cold_experts={rep.cold_expert_count}, "
+            f"mtp={len(rep.mtp_metas)}, dflash={len(rep.dflash_metas)}, vision={len(rep.vision_metas)}) "
+            f"into {rep.backbone_amf}"
+        )
+        return 0
+
+    if args.command == "convert-qwen35":
+        inc_vis, strip_vis = _resolve_cli_vision_flags(parser, args)
+        rep = convert_qwen35_checkpoint(
+            args.input,
+            args.output,
+            model_id=args.model_id,
+            dtype_mode=args.dtype,
+            group_size=args.group_size,
+            quant_profile=args.quant_profile,
+            target_bits=args.target_bits,
+            target_tier=args.target_tier,
+            use_rco=not args.no_rco,
+            manifest_path=args.manifest,
+            strip_vision=strip_vis,
+            include_vision=inc_vis,
+            vision_sidecar=args.vision_sidecar,
+            vision_block_dtype=args.vision_block_dtype,
+            config_output=args.config_output,
+            config_path=args.config,
+            tokenizer_path=args.tokenizer,
+            tokenizer_config_path=args.tokenizer_config,
+            chat_template_path=args.chat_template,
+            strict_vocab_check=not args.no_strict_vocab,
+            imatrix_path=args.imatrix,
+            embed_metadata=not args.no_embed_metadata,
+            workers=args.workers,
+        )
+        print(
+            f"converted qwen3_5 ({len(rep.backbone_metas)} backbone tensors, "
+            f"vision={len(rep.vision_metas)}) into {rep.backbone_amf}"
+        )
+        return 0
+
     if args.command == "synth-vit":
         started = time.monotonic()
         vit_cfg = SyntheticVitConfig(
@@ -2472,7 +2744,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             mt = str(raw_cfg.get("model_type", "")).lower()
             tc_mt = str(raw_cfg.get("text_config", {}).get("model_type", "")).lower() if isinstance(raw_cfg.get("text_config"), dict) else ""
             combined_mt = f"{mt} {tc_mt}"
-            if "deepseek" in combined_mt:
+            if "mimo" in combined_mt:
+                arch = "mimo_v2"
+            elif "qwen3_5" in combined_mt or "qwen35" in combined_mt:
+                arch = "qwen3_5"
+            elif "deepseek" in combined_mt:
                 arch = "deepseek41"
             elif "qwen" in combined_mt:
                 arch = "qwen4_exp"
@@ -2484,7 +2760,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                 print(f"error: cannot auto-detect arch from model_type={mt!r}; pass --arch", file=sys.stderr)
                 return 2
         try:
-            if arch == "deepseek41":
+            if arch == "mimo_v2":
+                rep = validate_mimo_v2_metadata_dir(base)
+            elif arch == "qwen3_5":
+                rep = validate_qwen35_metadata_dir(base)
+            elif arch == "deepseek41":
                 rep = validate_deepseek41_metadata_dir(base, host_ram_gib=args.host_ram_gib)
             elif arch == "inkling2":
                 rep = validate_inkling2_metadata_dir(base, host_ram_gib=args.host_ram_gib)
@@ -2498,6 +2778,26 @@ def main(argv: Sequence[str] | None = None) -> int:
         data = rep.to_dict()
         if args.as_json:
             print(json.dumps(data, indent=2))
+        elif arch == "mimo_v2":
+            print(
+                f"mimo_v2 metadata OK ({rep.variant}, {rep.model_type}): "
+                f"layers={rep.num_hidden_layers} (SWA={rep.swa_layers}, global={rep.global_layers}), "
+                f"hidden={rep.hidden_size}, head_dim={rep.head_dim}/{rep.v_head_dim}, "
+                f"experts={rep.n_routed_experts} (top-{rep.num_experts_per_tok}), "
+                f"MTP={rep.mtp_layers}L, DFlash={'yes' if rep.dflash_present else 'no'}(B={rep.dflash_block_size}), "
+                f"global_KV={rep.global_kv_bytes_per_token_fp16} B/tok, "
+                f"SWA_cap={rep.swa_kv_window_cap_bytes_fp16 / (1024**2):.2f} MiB, "
+                f"names>47B={rep.long_backbone_names}"
+            )
+        elif arch == "qwen3_5":
+            print(
+                f"qwen3_5 metadata OK ({rep.model_type}): "
+                f"layers={rep.num_hidden_layers} (GDN={rep.linear_attention_layers}, GQA={rep.full_attention_layers}), "
+                f"hidden={rep.hidden_size}, rmsnorm_unit_offset={rep.rmsnorm_unit_offset}, "
+                f"ViT={rep.vision_layers}L, full_KV={rep.full_kv_bytes_per_token_fp16} B/tok, "
+                f"GDN_state={rep.gdn_state_bytes_fp32_fp16 / (1024**2):.1f} MiB, "
+                f"names>47B={rep.long_backbone_names}"
+            )
         elif arch == "inkling2":
             print(
                 f"inkling2 metadata OK ({rep.model_type}): "
