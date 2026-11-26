@@ -1319,11 +1319,46 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     ngram_mod.add_subparser(sub)
 
+    def _add_lora_common_args(p: argparse.ArgumentParser) -> None:
+        p.add_argument("--output", required=True, type=pathlib.Path, help="Output .amlora path")
+        p.add_argument("--adapter-id", default=None, help="Adapter identifier stored in header (default: output stem)")
+        p.add_argument(
+            "--layout",
+            choices=LORA_LAYOUTS,
+            default="row_major",
+            help="Weight layout: row_major, sme2_panel64, or auto (default: row_major)",
+        )
+        p.add_argument("--dtype", choices=LORA_DTYPES, default="f16", help="Adapter weight precision (default: f16)")
+        p.add_argument("--rank", type=int, default=None, help="LoRA rank r (override or synthetic rank, 1..64)")
+        p.add_argument("--lora-alpha", type=float, default=None, help="LoRA alpha scaling numerator")
+        p.add_argument("--num-layers", type=int, default=2, help="Synthetic layer count (default: 2)")
+        p.add_argument("--hidden-size", type=int, default=64, help="Synthetic hidden_size (default: 64)")
+        p.add_argument("--q-dim", type=int, default=None, help="Synthetic q_proj output dim (default: hidden_size)")
+        p.add_argument("--kv-dim", type=int, default=None, help="Synthetic k/v_proj output dim (default: hidden_size)")
+        p.add_argument("--intermediate-size", type=int, default=128, help="Synthetic MLP intermediate_size (default: 128)")
+        p.add_argument(
+            "--target-modules",
+            default="q_proj,v_proj",
+            help="Comma-separated synthetic target modules (default: q_proj,v_proj)",
+        )
+        p.add_argument(
+            "--extra-modules",
+            default="",
+            help="Comma-separated additional synthetic modules (e.g. gate_attn,wr_du)",
+        )
+        p.add_argument("--seed", type=int, default=42, help="Synthetic PRNG seed (default: 42)")
+        p.add_argument("--zero-init-b", action="store_true", help="Zero-initialize synthetic lora_b matrices")
+        p.add_argument(
+            "--dora",
+            action="store_true",
+            help="Synthesize DoRA F32 magnitude vectors (.dora_mag) and set use_dora=true",
+        )
+
     plora = sub.add_parser(
         "pack-lora",
         help=(
-            "Convert a Hugging Face PEFT LoRA checkpoint or synthesize a test adapter into a "
-            "16 KiB-aligned .amlora (.amf-based) bundle (W19, ADR-0022)"
+            "Convert a Hugging Face PEFT LoRA/DoRA checkpoint or synthesize a test adapter into a "
+            "16 KiB-aligned .amlora (.amf-based) bundle (W19, W30, ADR-0022)"
         ),
     )
     plora.add_argument(
@@ -1332,30 +1367,19 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Input PEFT directory (adapter_config.json + adapter_model.safetensors) or .safetensors file",
     )
-    plora.add_argument("--output", required=True, type=pathlib.Path, help="Output .amlora path")
-    plora.add_argument("--adapter-id", default=None, help="Adapter identifier stored in header (default: output stem)")
     plora.add_argument("--adapter-config", type=pathlib.Path, default=None, help="Explicit adapter_config.json override")
-    plora.add_argument("--layout", choices=LORA_LAYOUTS, default="row_major", help="Weight layout (default: row_major)")
-    plora.add_argument("--dtype", choices=LORA_DTYPES, default="f16", help="Adapter weight precision (default: f16)")
-    plora.add_argument("--rank", type=int, default=None, help="LoRA rank r (override or synthetic rank, 1..64)")
-    plora.add_argument("--lora-alpha", type=float, default=None, help="LoRA alpha scaling numerator")
     plora.add_argument(
         "--synthetic",
         action="store_true",
         help="Generate a deterministic synthetic .amlora test adapter instead of reading --input",
     )
-    plora.add_argument("--num-layers", type=int, default=2, help="Synthetic layer count (default: 2)")
-    plora.add_argument("--hidden-size", type=int, default=64, help="Synthetic hidden_size (default: 64)")
-    plora.add_argument("--q-dim", type=int, default=None, help="Synthetic q_proj output dim (default: hidden_size)")
-    plora.add_argument("--kv-dim", type=int, default=None, help="Synthetic k/v_proj output dim (default: hidden_size)")
-    plora.add_argument("--intermediate-size", type=int, default=128, help="Synthetic MLP intermediate_size (default: 128)")
-    plora.add_argument(
-        "--target-modules",
-        default="q_proj,v_proj",
-        help="Comma-separated synthetic target modules (default: q_proj,v_proj)",
+    _add_lora_common_args(plora)
+
+    slora = sub.add_parser(
+        "synth-lora",
+        help="Synthesize a deterministic 16 KiB-aligned .amlora LoRA/DoRA bundle (alias of pack-lora --synthetic)",
     )
-    plora.add_argument("--seed", type=int, default=42, help="Synthetic PRNG seed (default: 42)")
-    plora.add_argument("--zero-init-b", action="store_true", help="Zero-initialize synthetic lora_b matrices")
+    _add_lora_common_args(slora)
 
     svit = sub.add_parser(
         "synth-vit",
@@ -2536,10 +2560,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                 )
         return 0
 
-    if args.command == "pack-lora":
+    if args.command in ("pack-lora", "synth-lora"):
         started = time.monotonic()
-        if args.synthetic:
+        is_synth = args.command == "synth-lora" or bool(args.synthetic)
+        if is_synth:
             targets = _parse_csv(args.target_modules) or ["q_proj", "v_proj"]
+            extra_targets = _parse_csv(args.extra_modules)
             rank = args.rank if args.rank is not None else 4
             alpha = args.lora_alpha if args.lora_alpha is not None else float(rank * 2)
             rep = generate_synthetic_lora(
@@ -2553,10 +2579,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                 rank=rank,
                 lora_alpha=alpha,
                 target_modules=targets,
+                extra_modules=extra_targets,
                 layout=args.layout,
                 dtype=args.dtype,
                 seed=args.seed,
                 zero_init_b=args.zero_init_b,
+                use_dora=bool(args.dora),
             )
         else:
             if args.input is None:
@@ -2573,9 +2601,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
         elapsed = time.monotonic() - started
         l2_tag = "fits_4MiB_L2" if rep.fits_l2_4mib else "EXCEEDS_4MiB_L2"
+        dora_tag = ", dora=true" if rep.use_dora else ""
         print(
             f"packed LoRA {rep.adapter_id!r} ({rep.num_pairs} pair(s), rank={rep.rank}, "
-            f"alpha={rep.lora_alpha:g}, scale={rep.scale:g}, layout={rep.layout}, dtype={rep.dtype}, "
+            f"alpha={rep.lora_alpha:g}, scale={rep.scale:g}, layout={rep.layout}, dtype={rep.dtype}{dora_tag}, "
             f"wired={rep.total_wired_bytes} B [{l2_tag}], file={rep.total_file_bytes} B) "
             f"-> {rep.output_path} in {elapsed:.2f} s"
         )
