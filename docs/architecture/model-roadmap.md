@@ -33,10 +33,10 @@ matching M1/M2 `.amf` packing).
 
 | Tier | Representative models | Total / active params | 3-bit backbone + table size | Target Apple Silicon hardware |
 | --- | --- | --- | --- | --- |
-| **Tier 1** (M2–M5, M2.5 FP16/BF16, M9.1 `qwen3_5`) | `Qwen3-30B-A3B` (3-bit / BF16), `Qwen3-14B` (4-bit / BF16), `Qwen3-0.6B`–`8B` (BF16 / FP16), **`MiMo-V2.6-Distill-Qwen-9B`** (`9.41B` `qwen3_5` GDN+GQA+ViT); extensible to Llama 3/4, Mistral, Gemma, DeepSeek-V2/V3 | 0.6B–30.5B (3B active MoE; 0.6B–14B dense) | ~12.4 GiB (30B-3bit), ~7.5 GiB (14B-4bit), ~5.5 GiB (`Distill-9B` 4-bit), ~1.2–17.5 GiB (0.6B–9B BF16) | **24 GB M4 baseline** (30B-3bit, 14B-4bit, `Distill-9B` 4-bit/Q8, ≤8B BF16/FP16 fully wired) · **36–128 GB+ Macs** (14B/30B BF16/FP16 fully wired, [ADR-0016](../decisions/0016-native-fp16-bf16-and-multishard-import.md)) |
+| **Tier 1** (M2–M5, M2.5 FP16/BF16, M9.1 `qwen3_5`) | `Qwen3-30B-A3B` (3-bit / BF16), `Qwen3-14B` (4-bit / BF16), `Qwen3-0.6B`–`8B` (BF16 / FP16), **`MiMo-V2.6-Distill-Qwen-9B`** (`9.41B` `qwen3_5` GDN+GQA+ViT); extensible to Llama 3/4, Mistral, Gemma, DeepSeek-V2/V3 | 0.6B–30.5B (3B active MoE; 0.6B–14B dense) | ~12.4 GiB (30B-3bit), ~7.5 GiB (14B-4bit), `4.29 GiB` + `873 MiB` ViT (`Distill-9B` `GSQ-RCO`), ~1.2–17.5 GiB (0.6B–9B BF16) | **24 GB M4 baseline** (30B-3bit, 14B-4bit, `Distill-9B` `4.00 bpw` + `27L` ViT sidecar verified at `0` swap, ≤8B BF16/FP16 fully wired) · **36–128 GB+ Macs** (14B/30B BF16/FP16 fully wired, [ADR-0016](../decisions/0016-native-fp16-bf16-and-multishard-import.md)) |
 | **Tier 2** (M6) | **`Qwen3.8-Flash-Next`** (`qwen4_exp`) | 125B backbone (6B active/tok; `2.36B` routed/tok) + 51B PLE + 4B MTP | ~54.7 GiB `3.5b` / ~36.3 GiB `GSQ-RCO` + NVMe PLE | **128 GB+ Max / Ultra** (full backbone wired) · **24 GB M4** (`~11.2–11.6 GiB` hot experts wired + NVMe cold experts & PLE) |
 | **Tier 2B** (M8.2) | **`Inkling-2-Mini`** (`inkling2_loop`, 24L × 3 core passes = 48 eff. steps, 128E top-8) | ~26.4B params (`~5.7B` eff. active; `NVFP4`/`MXFP8` + `0.59 GiB` ViT + `0.59 GiB` `3L` DFlare) | `18.78 GiB` native (`17.60 GiB` excl. ViT); `10.9 GiB` (`UD-IQ3_XXS`) / `16.4 GiB` (`UD-Q4_K_XL`) | **24 GB M4 baseline** (`W20` ViT sidecar stripped + `~10%` cold-expert `F_NOCACHE` spill or `GSQ-RCO`/`UD-Q4`, `40/48` `1024`-token SWA ring unlocking `128K–256K` context, `SME2` `gate_rank=64` controllers + `3L` `DFlare`) |
-| **Tier 2C** (M8.2 & M9.1–M9.3) | **`MiMo-V2.6-Flash`** (`309B`, `mimo_v2`), **`GLM-5.3-Flash`** (`320B`, `glm5_next`), **`Inkling-2-Small`** (`~597B`, `inkling2`), **`Ling-3.1-flash-1019`** (`572B`, `bailing_hybrid`) | `309B–597B` total (`7.96B–24.51B` always-active; `8.46B–12.23B` routed/tok) | `GSQ-RCO`: `~92–94 GiB` (`MiMo`/`GLM` Flash), `~155–172 GiB` (`Inkling-Small`/`Ling-3.1`); native `155.8–533 GiB` | **`128 GB` Max** (`MiMo`/`GLM` Flash `GSQ-RCO` 100% wired; `Inkling-Small` hybrid) · **`256 GB` Studio** (`MiMo`/`GLM` native 4-bit, `Inkling-Small` & `Ling-3.1` `GSQ-RCO` 100% wired) · **`24 GB` M4 internal/TB NVMe** (`3.4–12.1 GiB` wired hot pool + `Q2`/`IQ1_S` cold NVMe + `DFlash`/`DFlare`/`MTP` + `D7`, [ADR-0025](../decisions/0025-staged-frontier-deep-optimization-inkling2-mimo-glm5-ling3.md)) |
+| **Tier 2C** (M8.2 & M9.1–M9.3) | **`MiMo-V2.6-Flash`** (`309B`, `mimo_v2` `39/48` SWA `192/128`), **`GLM-5.3-Flash`** (`320B`, `glm5_next`), **`Inkling-2-Small`** (`~597B`, `inkling2`), **`Ling-3.1-flash-1019`** (`572B`, `bailing_hybrid`) | `309B–597B` total (`7.96B–24.51B` always-active; `8.46B–12.23B` routed/tok) | `GSQ-RCO`: `~92–94 GiB` (`MiMo`/`GLM` Flash), `~155–172 GiB` (`Inkling-Small`/`Ling-3.1`); native `155.8–533 GiB` | **`128 GB` Max** (`MiMo`/`GLM` Flash `GSQ-RCO` 100% wired; `Inkling-Small` hybrid) · **`256 GB` Studio** (`MiMo`/`GLM` native 4-bit, `Inkling-Small` & `Ling-3.1` `GSQ-RCO` 100% wired) · **`24 GB` M4 internal/TB NVMe** (`3.4–12.1 GiB` wired hot pool + `Q2`/`IQ1_S` cold NVMe + `DFlash`/`DFlare`/`MTP` + `D7`, [ADR-0025](../decisions/0025-staged-frontier-deep-optimization-inkling2-mimo-glm5-ling3.md)) |
 | **Tier 3** (M7 & M9.4 HF alignment) | **`DeepSeek-V4.1-Flash-1017`** (`deepseek41`) | 552B CED MoE (pre-release est. 8B/16B; actual published HF `hidden=5120`, `384E`, `top_k=6`, 20L Enc + 20L Dec -> `4.25B` Decoder routed/tok) + 196B Engram (~748B total) | ~241.5 GiB backbone + ~86 GiB Engram (>330 GiB on disk; actual HF `224.8 GiB` `q3_affine` est.) | **512 GB Ultra** (full backbone wired on 800 GB/s bus) · **Multi-Mac 128–256 GB Thunderbolt 5 RDMA cluster** (`thunderbolt_peer`) · **24 GB M4 internal/TB4 PCIe NVMe (`3.2–3.8 GB/s`)** becomes viable for cold-NVMe Decoder tiering (`~11.7–13.3 GiB` hot cache, `~2.5–3.0 tok/s` FP4 / `~6–9 tok/s` `Q2_K` + spec dedup) once `M9.4` (`W28`) real-HF alignment lands ([ADR-0015](../decisions/0015-tiered-frontier-model-roadmap.md)) |
 | **Tier 3B** (M8.2 & M9.1–M9.2 / HW-gated) | **`Hy4-flash`** (`220B`), **`Hy4` / `Hy4-preview`** (`770B`), **`GLM-5.2` / `GLM-5.3`** (`753B`, `glm_moe_dsa`), **`MiMo-V2.6-Pro`** (`1.02T`, `mimo_v2`) | `220B–1,024B` total (`Hy4-flash` `11.3B` active; `753B–1.02T` flagships `24.0B–28.6B` always-active & `20.8B–49B` active/tok) | `Hy4-flash` `76.3–267 GiB`; `GLM-5.2/5.3` `~280 GiB` `GSQ-RCO` (`432 GiB` `NVFP4`); `MiMo-Pro` `~350 GiB` `GSQ-RCO` (`515.9 GiB` `MXFP4`) | `Hy4-flash` on **`128–256 GB`**; **`GLM-5.2/5.3` (`753B`) & `MiMo-V2.6-Pro` (`1.02T`) `GSQ-RCO` 100% wired on a single `512 GB` Ultra** (native `FP8`/`MXFP4` & `Hy4` `4-bit` on **multi-Mac `TB5 RDMA` cluster**; `hy4-preview-tiny-random` on **24 GB M4**) |
 
@@ -239,32 +239,36 @@ operator axes without sacrificing runtime alignment or conversion fidelity:
 
 ## Staged `M9.1`–`M9.5` frontier deep-optimization, real-HF parity, and universal multi-LoRA roadmap (`ADR-0025`, `ADR-0015`, `ADR-0022`)
 
-Following `M8.2` and the HTTP/SSE serving milestone `M8.3` (`C28`,
-[../process.md](../process.md#milestones)), five sequential milestones
+Following `M8.2`, `M8.3` (`C28`), `M9.5` (`W30`), `M9.6` (`C29`), `M9.7` (`W20`),
+and **`M9.1` (`MiMo-V2.6`, `W25`/`G26`/`D15` — implemented and verified on M4
+for `MiMo-V2.6-Distill-Qwen-9B` + `27L` ViT, `synth-mimo`/`bench-m91`, and
+staged `Flash`/`Pro` metadata)**, stages `M9.2`–`M9.4`
 ([ADR-0025](../decisions/0025-staged-frontier-deep-optimization-inkling2-mimo-glm5-ling3.md),
 [ADR-0015](../decisions/0015-tiered-frontier-model-roadmap.md),
 [ADR-0022](../decisions/0022-native-c-python-sdk-and-full-protocol-parity.md);
 capabilities `W25`–`W28`, `W30`, `G26`–`G28`, `D15`, `C27` in
 [../status.md](../status.md)) extend model-specific co-design across
-`MiMo-V2.6`, `GLM-5`, `Ling-3.1`, and real-HF `Qwen3.8-Flash-Next` /
-`DeepSeek-V4.1-Flash-1017` checkpoints with zero primitive rework, and then
-extend runtime multi-LoRA / DoRA hot-loading across all `GraphModel` and
-`M82Runtime` architectures. Across the four model-family stages (`M9.1`–`M9.4`),
+`GLM-5`, `Ling-3.1`, and real-HF `Qwen3.8-Flash-Next` /
+`DeepSeek-V4.1-Flash-1017` checkpoints with zero primitive rework. Across the
+four model-family stages (`M9.1`–`M9.4`),
 a mandatory safetensors JSON header pre-flight gate (`W28`) validates
 `config.json`, `model.safetensors.index.json`, and HTTP Range safetensors
 headers in `tools/tests/test_hf_metadata_validation.py`
 (`long_backbone_names == 0` plus exact tensor shapes and scale/broadcast ranks)
 before converter implementation:
 
-- **`M9.1` — `MiMo-V2.6` (`Flash` `309B`, `Pro` `1.02T`, `Distill-Qwen-9B` `9.4B`):**
-  Exploits `40/48` (`Flash`) and `60/70` (`Pro`) `128`-token `HybridKvRing` SWA
+- **`M9.1` — `MiMo-V2.6` (`Flash` `309B`, `Pro` `1.02T`, `Distill-Qwen-9B` `9.4B`, Implemented on M4 for `Distill-9B` & `mimo_v2` synth/metadata):**
+  Exploits `39/48` (`Flash`) and `60/70` (`Pro`) `128`-token `HybridKvRing` SWA
   layers with asymmetric head dimensions (`swa_head_dim = 192`, `swa_v_head_dim = 128`,
-  `add_swa_attention_sink_bias`), pairs `Flash`'s ultra-light `7.96B` always-active
-  footprint (`~12.1 GiB` wired hot-expert budget on `24 GB` M4) with chained `3`-layer
-  native `MTP` + `8–16`-token `DFlash` block-diffusion drafting (`D15` + `D7`),
-  compresses `Flash` (`~92 GiB` on `128 GB` Max) and `Pro` (`~350 GiB` on single
-  `512 GB` Ultra) via `GSQ-RCO`, and runs `Distill-Qwen-9B` (`qwen3_5`) fully
-  wired on `24 GB` M4.
+  `add_swa_attention_sink_bias`, un-interleaving `TP=4`/`8` `qkv_proj`), pairs
+  `Flash`'s ultra-light `7.96B` always-active footprint (`~12.1 GiB` wired
+  hot-expert budget on `24 GB` M4) with chained `3`-layer native `MTP` +
+  `8–16`-token `DFlash` (`5L` non-causal within-block + `5`-tap `fc`)
+  block-diffusion drafting (`D15` + `D7`), provides `GSQ-RCO` tier profiles for
+  `Flash` (`128 GB` Max) and `Pro` (`512 GB` Ultra), and runs converted
+  `MiMo-V2.6-Distill-Qwen-9B` (`qwen3_5` `4.00 bpw` `4.29 GiB` + `873 MiB` `27L`
+  ViT sidecar) fully wired on `24 GB` M4 at `0` swap
+  ([../benchmarks/results.md](../benchmarks/results.md#m91-mimo-v26-family-g26-asymmetric-192128-swa-d15-chained-3l-mtpdflash-and-real-distill-qwen-9b-parity)).
 - **`M9.2` — `GLM-5` (`GLM-5.2` & `5.3` `753B` `glm_moe_dsa`, `GLM-5.3-Flash` `320B` `glm5_next`):**
   Reuses `G11` + `G25` `IndexCache` for `GLM-5.2/5.3` (`index_topk_freq = 4`
   skipping `75%` of `DSA` re-indexing + `index_share_for_mtp_iteration = true`

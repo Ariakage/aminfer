@@ -6423,3 +6423,49 @@ Verified end-to-end with `<models>/amf/inkling-2-mini-vision.amf` and opaque inp
 
 
 
+## M9.1: MiMo-V2.6 family, G26 asymmetric 192/128 SWA, D15 chained 3L MTP/DFlash, and real Distill-Qwen-9B parity
+
+Canonical M9.1 implementation spans `W28` + `W25` (`a241d76`), `G26` (`b394202`), `D15` (`6af7a19`), and Wave 3 CLI / `bench-m91` / real `MiMo-V2.6-Distill-Qwen-9B` parity.
+
+### 1. Mandatory `W28` Hugging Face metadata pre-flight gate (`aminfer-tools inspect-metadata`)
+
+| Staged HF Metadata Directory (`--host-ram-gib 24`) | Verified Output & Key Invariants (`names>47B = 0`) |
+| --- | --- |
+| `XiaomiMiMo__MiMo-V2.6-Distill-Qwen-9B` (`qwen3_5`) | `layers=32 (GDN=24, GQA=8), hidden=4096, rmsnorm_unit_offset=True, ViT=27L, full_KV=32768 B/tok, GDN_state=49.1 MiB, names>47B=0` |
+| `XiaomiMiMo__MiMo-V2.6-Flash-RL` (`mimo_v2`) | `layers=48 (SWA=39, global=9), hidden=4096, head_dim=192/128, experts=256 (top-8), MTP=3L, DFlash=yes(B=8), global_KV=23040 B/tok, SWA_cap=24.38 MiB, names>47B=0` |
+| `XiaomiMiMo__MiMo-V2.6-Pro-RL` (`mimo_v2`) | `layers=70 (SWA=60, global=10), hidden=6144, head_dim=192/128, experts=384 (top-8), MTP=3L, DFlash=yes(B=8), global_KV=51200 B/tok, SWA_cap=37.50 MiB, names>47B=0` |
+
+### 2. `ReleaseFast` `aminfer bench-m91` & Metal validation gate
+
+- `MTL_DEBUG_LAYER=1 MTL_SHADER_VALIDATION=1 ./zig-out/bin/aminfer bench-m91`: **`0` Metal validation errors**, `bench.m91.all_passed = true`, `bench.m91.swapouts_delta = 0` (`bench.m91.g26.swa_192_128.prefill_cos_sim = 1.000000`, `decode_cos_sim = 1.000000`, `tree_cos_sim = 1.000000`).
+- `ReleaseFast` `./zig-out/bin/aminfer bench-m91` & `bench-m91 --json`:
+
+| Metric | Text Run | JSON Run | Gate / Notes |
+| --- | --- | --- | --- |
+| `g26.flash_rl` KV (`32K` / `128K`) | `7680.00 -> 744.38 MiB` (**`10.32x`**) / `30720.00 -> 2904.38 MiB` (**`10.58x`**) | `10.3174x` / `10.5771x` | `39/48` `128+sink` SWA (`8` KV) + `9` global (`4` KV) |
+| `g26.pro_rl` KV (`32K` / `128K`) | `11200.00 -> 1637.50 MiB` (**`6.84x`**) / `44800.00 -> 6437.50 MiB` (**`6.96x`**) | `6.8397x` / `6.9592x` | `60/70` `128+sink` SWA (`8` KV) + `10` global (`8` KV) |
+| `g26.swa_192_128` (`prefill`/`decode`/`tree` `cos_sim`) | `1.000000` / `1.000000` / `1.000000` | `1.000000` / `1.000000` / `1.000000` | `max_abs_err = 0.000111`, `decode_mean_us = 581.46` / `202.61`, `malloc_delta = -1` / `0`, `passed = true` |
+| `w25.mimo_v2` (`hot` / `cold` `tok/s`) | `823.36` / `214.24` (`cold_fetches = 177`) | `1143.08` / `246.87` | `100%` greedy parity, `malloc_delta = 0` / `-2`, `commit_malloc_delta = 32`, `parity_passed = true` |
+| `w25.qwen3_5` (`tok/s`, ViT `red_blue_diff`, `unit_offset_diff`) | `1129.09` (`vis_tok = 4`, `2.041504`, `1.606201`) | `984.82` | `malloc_delta = 0`, `commit_malloc_delta = 32`, `parity_passed = true` |
+| `d15.mtp3` (`tok/s`, `tau`, `d7_prune_reduction`) | `245.48`, `1.000`, `0.7816` | `155.65`, `1.000`, `0.7471` | `100%` greedy parity vs `mimo_v2` target, `parity_passed = true` |
+| `d15.dflash_b8` (`tok/s`, `tau`, `d7_prune_reduction`) | `244.07`, `1.000`, `0.8691` (`rounds = 22`) | `154.45`, `1.000`, `0.8624` | `100%` greedy parity vs `mimo_v2` target, `parity_passed = true` |
+| `d15.dflash_b16` (`tok/s`, `tau`, `d7_prune_reduction`) | `232.43`, `1.000`, `0.8534` (`rounds = 22`) | `141.32`, `1.000`, `0.8534` | `100%` greedy parity vs `mimo_v2` target, `parity_passed = true` |
+| `w30.lora_dora` (`mimo_v2` / `qwen3_5` `lora_diff`, `unload_err`) | `2.018066` / `1.101563`, `0.000000` / `0.000000` | `2.018066` / `1.101563`, `0.000000` | Encode `malloc_delta = 0` / `0`, `lora_dora.passed = true` |
+| `bench.m91.all_passed` / `swapouts_delta` / `malloc_blocks_delta` | **`true`** / **`0`** / **`0`** | **`true`** / **`0`** / **`0`** | Full `M9.1` synthetic gate passed |
+
+### 3. End-to-end `synth-mimo` & `synth-qwen35` CLI & HTTP/SSE parity (`ReleaseFast`)
+
+- `aminfer ls` / `verify-amf` / `inspect` (`model.amf`: `114` entries, `7.63 MiB` wired / `884,736 B` cold, `swapouts_delta = 0`), `decode` (**`191.62 tok/s`**, `token_ids = [145, 128, 145, 145, 145, 145]`, `swapouts_delta = 0`), `spec-decode -M mtp` (**`152.27 tok/s`**, `placement = sme2`, identical `token_ids`, `swapouts_delta = 0`), `spec-decode -M dflash` (**`136.07 tok/s`**, `spec.mode = dflare`, identical `token_ids`, `swapouts_delta = 0`), `spec-decode -M dflare` (**`105.16 tok/s`**, identical `token_ids`, `swapouts_delta = 0`), `synth-qwen35` `decode` (**`1199.90 tok/s`**, `swapouts_delta = 0`), `chat` (`191.6 tok/s`), and `serve` (`GET /v1/models` + `GET /v1/models/model` + `POST /v1/chat/completions` `200`, `steady_malloc_blocks = 0`, `swapouts_delta = 0`).
+
+### 4. Live real-checkpoint `MiMo-V2.6-Distill-Qwen-9B` + `27L` ViT sidecar on `24 GB` M4 (`ReleaseFast`)
+
+Converted official BF16 `XiaomiMiMo/MiMo-V2.6-Distill-Qwen-9B` (`18.8 GB` safetensors) via `aminfer-tools convert-qwen35 --quant-profile gsq-rco --target-tier 24gb-m4 --vision-block-dtype bf16 --workers 8` (promoting `BF16` `linear_attn.{A_log,dt_bias,conv1d.weight}` to `F32` and pinning `.linear_attn.{a_proj,b_proj}.weight` in `BF16`) into `<models>/amf/mimo-v2.6-distill-qwen-9b-4bit.amf` (`4,498,210,816 B` / `4289.83 MiB`, `486` entries, `4.00 bpw`, `4558.64 MiB` est. total wired) and `<models>/amf/mimo-v2.6-distill-qwen-9b-vision.amf` (`915,570,688 B` / `873.16 MiB`, `334` entries, `27L` `BF16` ViT):
+
+| Run | Configuration | Measured Result | Memory / Swap Delta |
+| --- | --- | --- | --- |
+| **`verify-amf` & `inspect`** | Backbone `.amf` + vision sidecar `.amf` | `amf.status = ok` on both (`486` / `334` tensors), `min_tier = "M4 16GB"` | `inspect.swapouts_delta = 0` |
+| **`decode -t 0`** | `-n 48 --reasoning-effort no_think -p "Answer in one short sentence: What is the capital of France?"` | `prefill_ms = 284.559`, **`14.85 tok/s`** (`67.332 ms/tok`, `59.27 GB/s`), `"Paris."` | `wired_mib = 4473`, **`swapouts_delta = 0`** |
+| **`bench-decode`** | `seq_len = 512` (`511` prefill + `16` decode) | `prefill_ms = 3,853.488` (**`132.61 tok/s`**), **`14.61 tok/s`** (`68.464 ms/tok`, `58.50 GB/s`, `48.8%` bus) | `wired_mib = 4489`, **`swapouts_delta = 0`**, `pageouts_delta = 0` |
+| **`serve --batch-mode serial --vision-sidecar`** | `--max-seq-len 512`, `GET /v1/models` + `POST /v1/chat/completions` (text math + Base64 `64x64` red PNG) | Text `"What is 17 + 25?"` -> `reasoning: "The user asks a simple arithmetic question..."`, `content: "42"` (`dt = 1.539 s`); PNG -> `reasoning: "The image is a solid red square..."`, `content: "Red"` (`dt = 1.795 s`, `27` prompt tokens) | `wired_mib = 5346`, `steady_malloc_blocks = -24`, **`serve.swapouts_delta = 0`**, exit `0` |
+
+Note on `serve` host headroom: under `~18+ GiB` active IDE/co-tenant pressure (`vm.live_zero_swap_reclaimable_mib = 5,904 MiB`), default 16-slot `--batch-mode auto` continuous batching (`6,582 MiB` wired) triggered startup/`REQ0` `SwapOccurred` (`REQ1` steady `swap_delta = 0`, `content = "42"`), whereas `--batch-mode serial` (`5,346 MiB` wired with ViT attached) ran cleanly at `swapouts_delta = 0`. Full `309B` `MiMo-V2.6-Flash-RL` (`128 GB` Max / cold NVMe) and `1.02T` `MiMo-V2.6-Pro-RL` (`512 GB` Ultra) executions remain gated on local weight storage and `128–512 GB` hardware.
