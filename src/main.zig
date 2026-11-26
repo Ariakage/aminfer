@@ -91,6 +91,10 @@ const usage =
     \\                    [-h] [--skip-real] [--bus-bandwidth-gbs F] [--models-dir <dir>]
     \\  bench-m83         run M8.3 C28 /v1/models/{id} LoRA discovery & native Network.framework TLS 1.2/1.3 HTTPS benchmark
     \\                    [-h] [--json]
+    \\  bench-m95         run M9.5 W30 universal GraphModel/M82Runtime multi-LoRA & DoRA zero-flush benchmark
+    \\                    [-h] [--json]
+    \\  bench-m96         run M9.6 C29 OpenAI/Anthropic parity, FIM completions, CORS/HTTPS & Base64 vision/video benchmark
+    \\                    [-h] [--json]
     \\  peer-worker       start a zero-allocation kqueue expert-parallel peer worker (M7 X1-X3)
     \\                    [-hRV] -l|--listen <ip:port> -m|--amf <path> -c|--config <path> -r|--rank N -w|--world-size N
     \\                    [--partition contiguous|round-robin] [--cluster-transport auto|tcp|rdma]
@@ -153,8 +157,10 @@ const usage =
     \\  serve             start the zero-allocation kqueue HTTP/SSE inference server (C7, C8, C14, C15, C18, C21, C22, C28, W19, W24, R10)
     \\                    [-ABEhMNPSV] -m|--amf <path> [-c|--config <path>] [-k|--tokenizer <path>]
     \\                    [-H|--host 127.0.0.1] [-p|--port 8080] [-u|--unix-socket <path>] [-a|--api-key <secret>]
+    \\                    [--cors-allow-origin <origin|none>] [--max-media-bytes N]
     \\                    [--tls-cert <path>] [--tls-key <path>] [--tls-key-passphrase <secret>] [--tls-passphrase-env <ENV>]
     \\                    [--model-id <id>] [-L|--lora <name>=<path.amlora>] [-D|--disk-prefix-cache <dir>]
+    \\                    [--vision-sidecar <path.amf>]
     \\                    [--max-seq-len N] [--max-conns N] [--max-active-requests N]
     \\                    [--max-response-bytes N] [--http-read-timeout-ms N]
     \\                    [--act-quant <none|emulate|mxfp8_g32|fp8_g128|nvfp4_g16|fouroversix_mae>]
@@ -311,6 +317,18 @@ pub fn main(init: std.process.Init) !void {
             try out.writeAll(usage);
         } else {
             try runBenchM83(arena, args[2..], out);
+        }
+    } else if (args.len >= 2 and std.mem.eql(u8, args[1], "bench-m95")) {
+        if (hasHelpFlag(args[2..])) {
+            try out.writeAll(usage);
+        } else {
+            try runBenchM95(arena, args[2..], out);
+        }
+    } else if (args.len >= 2 and std.mem.eql(u8, args[1], "bench-m96")) {
+        if (hasHelpFlag(args[2..])) {
+            try out.writeAll(usage);
+        } else {
+            try runBenchM96(arena, args[2..], out);
         }
     } else if (args.len >= 2 and std.mem.eql(u8, args[1], "peer-worker")) {
         if (hasHelpFlag(args[2..])) {
@@ -477,6 +495,42 @@ fn parseLoraSpecArg(arg: [:0]const u8) error{InvalidLoraSpec}!LoraSpecArg {
     return .{
         .name = name,
         .path = path,
+    };
+}
+
+fn computeLoraPoolBytes(specs: []const LoraSpecArg) !usize {
+    if (specs.len == 0) return aminfer.lora.DEFAULT_LORA_POOL_BYTES;
+    var aligned_sum: usize = 0;
+    for (specs) |ls| {
+        const fd = std.c.open(ls.path.ptr, .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+        if (fd < 0) return error.OpenFailed;
+        defer _ = std.c.close(fd);
+        var st: std.c.Stat = undefined;
+        if (std.c.fstat(fd, &st) != 0 or st.size <= 0) return error.OpenFailed;
+        const aligned = try aminfer.page.alignUp(@intCast(st.size));
+        aligned_sum = std.math.add(usize, aligned_sum, aligned) catch return error.PoolCapExceeded;
+    }
+    if (aligned_sum > aminfer.lora.MAX_LORA_POOL_BYTES) return error.PoolCapExceeded;
+    const headroom: usize = @max(@as(usize, 2 * 1024 * 1024), aligned_sum / 4);
+    const with_headroom = try aminfer.page.alignUp(@max(aminfer.lora.DEFAULT_LORA_POOL_BYTES, aligned_sum + headroom));
+    return @min(aminfer.lora.MAX_LORA_POOL_BYTES, with_headroom);
+}
+
+fn resolveServeGraphUseContinuous(
+    batch_mode: ServeBatchMode,
+    m82_family: aminfer.m82_runtime.M82Family,
+    has_vision_sidecar: bool,
+    use_spec: bool,
+    max_active_requests: usize,
+) error{InvalidFlagCombination}!bool {
+    const is_m82 = (m82_family != .none);
+    return switch (batch_mode) {
+        .serial => false,
+        .continuous => blk: {
+            if (use_spec or is_m82) return error.InvalidFlagCombination;
+            break :blk true;
+        },
+        .auto => (!use_spec and !is_m82 and !has_vision_sidecar and max_active_requests > 1),
     };
 }
 
@@ -2943,6 +2997,46 @@ fn runBenchM83(allocator: std.mem.Allocator, raw_args: []const [:0]const u8, out
     if (!report.all_passed) return error.BenchmarkGateFailed;
 }
 
+const BenchJsonCliFlags = struct {
+    json: bool = false,
+};
+
+fn parseBenchJsonArgs(raw_args: []const [:0]const u8) !BenchJsonCliFlags {
+    var cli: BenchJsonCliFlags = .{};
+    for (raw_args) |flag| {
+        if (std.mem.eql(u8, flag, "--json")) {
+            cli.json = true;
+        } else {
+            return error.UnknownFlag;
+        }
+    }
+    return cli;
+}
+
+fn runBenchM95(allocator: std.mem.Allocator, raw_args: []const [:0]const u8, out: *Io.Writer) !void {
+    const cli = try parseBenchJsonArgs(raw_args);
+    const report = try aminfer.bench_m95_m96.runM95WithConfig(allocator, .{});
+    if (cli.json) {
+        try report.writeJson(out);
+    } else {
+        try report.write(out);
+    }
+    try out.flush();
+    if (!report.all_passed) return error.BenchmarkGateFailed;
+}
+
+fn runBenchM96(allocator: std.mem.Allocator, raw_args: []const [:0]const u8, out: *Io.Writer) !void {
+    const cli = try parseBenchJsonArgs(raw_args);
+    const report = try aminfer.bench_m95_m96.runM96WithConfig(allocator, .{});
+    if (cli.json) {
+        try report.writeJson(out);
+    } else {
+        try report.write(out);
+    }
+    try out.flush();
+    if (!report.all_passed) return error.BenchmarkGateFailed;
+}
+
 fn parseQualityGateArgs(args: []const [:0]const u8) !aminfer.bench.QualityGateConfig {
     var cfg: aminfer.bench.QualityGateConfig = .{};
     var i: usize = 0;
@@ -4447,6 +4541,8 @@ const ServeCliArgs = struct {
     host: []const u8 = "127.0.0.1",
     port: u16 = 8080,
     api_key: ?[]const u8 = null,
+    cors_allow_origin: ?[]const u8 = "*",
+    max_media_bytes: usize = aminfer.server.DEFAULT_MAX_MEDIA_BYTES,
     unix_socket_path: ?[]const u8 = null,
     tls_cert_path: ?[:0]const u8 = null,
     tls_key_path: ?[:0]const u8 = null,
@@ -4505,6 +4601,8 @@ fn parseServeArgs(args: []const [:0]const u8) !ServeCliArgs {
     var host: []const u8 = "127.0.0.1";
     var port: u16 = 8080;
     var api_key: ?[]const u8 = null;
+    var cors_allow_origin: ?[]const u8 = "*";
+    var max_media_bytes: usize = aminfer.server.DEFAULT_MAX_MEDIA_BYTES;
     var unix_socket_path: ?[]const u8 = null;
     var tls_cert_path: ?[:0]const u8 = null;
     var tls_key_path: ?[:0]const u8 = null;
@@ -4729,6 +4827,17 @@ fn parseServeArgs(args: []const [:0]const u8) !ServeCliArgs {
             if (i >= args.len) return error.MissingFlagValue;
             if (args[i].len == 0 or args[i].len > aminfer.server.MAX_API_KEY_BYTES) return error.InvalidApiKey;
             api_key = args[i];
+        } else if (std.mem.eql(u8, flag, "--cors-allow-origin")) {
+            i += 1;
+            if (i >= args.len) return error.MissingFlagValue;
+            if (args[i].len > aminfer.server.MAX_CORS_ORIGIN_BYTES or std.mem.indexOfAny(u8, args[i], "\r\n") != null) {
+                return error.InvalidFlagValue;
+            }
+            cors_allow_origin = if (args[i].len == 0 or std.mem.eql(u8, args[i], "none")) null else args[i];
+        } else if (std.mem.eql(u8, flag, "--max-media-bytes")) {
+            i += 1;
+            if (i >= args.len) return error.MissingFlagValue;
+            max_media_bytes = try std.fmt.parseInt(usize, args[i], 10);
         } else if (std.mem.eql(u8, flag, "--unix-socket") or std.mem.eql(u8, flag, "-u")) {
             i += 1;
             if (i >= args.len) return error.MissingFlagValue;
@@ -4798,6 +4907,8 @@ fn parseServeArgs(args: []const [:0]const u8) !ServeCliArgs {
         .host = host,
         .port = port,
         .api_key = api_key,
+        .cors_allow_origin = cors_allow_origin,
+        .max_media_bytes = max_media_bytes,
         .unix_socket_path = unix_socket_path,
         .tls_cert_path = tls_cert_path,
         .tls_key_path = tls_key_path,
@@ -4898,7 +5009,10 @@ fn serveTokenBytesForSpec(ctx: ?*const anyopaque, token_id: u32) ?[]const u8 {
 
 /// Zero-allocation inference runner bridging `Qwen3Model` / `GraphModel` / `SpecEngine` +
 /// `Tokenizer` into `server.Server`'s `EngineHandler` (`C7`, `C8`, `C18`, `C22`, `D11`, `W9`, `W19`, `G21`).
+const MAX_SERVE_VISION_FRAMES: usize = 32;
+
 const ServeRunner = struct {
+    allocator: std.mem.Allocator,
     target: ServeTarget,
     spec_engine: ?*aminfer.engine.SpecEngine,
     ngram_registry: ?*aminfer.ngram_nvme.DomainNgramRegistry,
@@ -5021,6 +5135,7 @@ const ServeRunner = struct {
         }
 
         return .{
+            .allocator = allocator,
             .target = target,
             .spec_engine = spec_engine,
             .ngram_registry = ngram_registry,
@@ -5252,6 +5367,283 @@ const ServeRunner = struct {
         self.generate(job, stream);
     }
 
+    fn splitVisionPrompt(
+        prompt: []const u8,
+        tpl: *const aminfer.chat_template.ChatTemplate,
+    ) struct { prefix: []const u8, suffix: []const u8 } {
+        const needles = [_][]const u8{
+            "<|unused_200054|>",
+            "<|image_pad|>",
+            "<|video_pad|>",
+            "<\xef\xbd\x9chy_image\xe2\x96\x81pad:opensource\xef\xbd\x9c>",
+            "<\xef\xbd\x9chy_video\xe2\x96\x81pad:opensource\xef\xbd\x9c>",
+            tpl.multimodal.image_tag.slice(),
+            tpl.multimodal.video_tag.slice(),
+        };
+        for (needles) |needle| {
+            if (needle.len == 0) continue;
+            if (std.mem.indexOf(u8, prompt, needle)) |idx| {
+                var suffix = prompt[idx + needle.len ..];
+                if (std.mem.eql(u8, needle, "<|unused_200054|>") and
+                    std.mem.startsWith(u8, suffix, "<|end_message|><|end_message|>"))
+                {
+                    suffix = suffix["<|end_message|>".len..];
+                }
+                return .{ .prefix = prompt[0..idx], .suffix = suffix };
+            }
+        }
+        return .{ .prefix = prompt, .suffix = &.{} };
+    }
+
+    fn selectLoraAdapter(
+        self: *ServeRunner,
+        lora_adapter: ?[]const u8,
+        stream: *aminfer.server.TokenStream,
+    ) bool {
+        const reg_opt: ?*const aminfer.lora.LoraRegistry = switch (self.target) {
+            .qwen3 => |m| m.lora_registry,
+            .graph => |g| g.lora_registry,
+        };
+        const slot_id: u32 = if (lora_adapter) |adp| blk: {
+            const reg = reg_opt orelse {
+                stream.fail("requested LoRA adapter not loaded");
+                return false;
+            };
+            break :blk reg.findSlotByName(adp) orelse {
+                stream.fail("requested LoRA adapter not found");
+                return false;
+            };
+        } else aminfer.lora.NO_ADAPTER;
+
+        switch (self.target) {
+            .qwen3 => |m| m.setActiveLoraSlot(slot_id),
+            .graph => |g| g.setActiveLoraSlot(slot_id),
+        }
+        return true;
+    }
+
+    fn clearLoraAdapter(self: *ServeRunner) void {
+        switch (self.target) {
+            .qwen3 => |m| m.setActiveLoraSlot(aminfer.lora.NO_ADAPTER),
+            .graph => |g| g.setActiveLoraSlot(aminfer.lora.NO_ADAPTER),
+        }
+    }
+
+    fn runSingleStreamDecodeLoop(
+        self: *ServeRunner,
+        job: *const aminfer.server.InferenceJob,
+        stream: *aminfer.server.TokenStream,
+        prompt_len_u32: u32,
+        max_gen: u32,
+        first_tok: u32,
+        use_constrained: bool,
+        gstate: *aminfer.grammar.GrammarState,
+    ) void {
+        var stop_hb: aminfer.sampling.StopHoldback = .{};
+        const emit_res0 = if (job.stop_config.count > 0)
+            self.emitTokenWithStop(stream, first_tok, job.ignore_eos, job.stop_config, &stop_hb)
+        else
+            self.emitToken(stream, first_tok, job.ignore_eos);
+        switch (emit_res0) {
+            .stop => {
+                stream.finish(.stop, prompt_len_u32);
+                return;
+            },
+            .cancelled => return,
+            .ok => {},
+        }
+
+        var next_tok: u32 = first_tok;
+        var pos: u32 = prompt_len_u32;
+        var emitted: u32 = 1;
+        var thinking_cutoff_injected = false;
+        if (!thinking_cutoff_injected and emitted < max_gen and stream.thinkingBudgetExceeded()) {
+            thinking_cutoff_injected = true;
+            if (!self.injectThinkingCutoffIntoKv(&next_tok, &pos, stream)) return;
+        }
+        while (emitted < max_gen and !stream.isCancelled()) {
+            const greedy_tok = switch (self.target) {
+                .qwen3 => |m| m.stepDecode(next_tok, pos) catch {
+                    stream.fail("decode step failed");
+                    return;
+                },
+                .graph => |g| g.stepDecode(next_tok, pos) catch {
+                    stream.fail("graph decode step failed");
+                    return;
+                },
+            };
+            next_tok = if (use_constrained) blk: {
+                break :blk self.sampleConstrainedStep(job, gstate) orelse {
+                    stream.fail("constrained sampling failed");
+                    return;
+                };
+            } else if (job.temperature > 0.0) blk: {
+                break :blk switch (self.target) {
+                    .qwen3 => |m| m.sampleFromLastLogits(job.temperature, job.rng.random(), self.p_res) catch {
+                        stream.fail("sampling failed");
+                        return;
+                    },
+                    .graph => |g| g.sampleFromLastLogits(job.temperature, job.rng.random(), self.p_res) catch {
+                        stream.fail("sampling failed");
+                        return;
+                    },
+                };
+            } else greedy_tok;
+            self.recordSteadyStep();
+            pos += 1;
+            const emit_res = if (job.stop_config.count > 0)
+                self.emitTokenWithStop(stream, next_tok, job.ignore_eos, job.stop_config, &stop_hb)
+            else
+                self.emitToken(stream, next_tok, job.ignore_eos);
+            switch (emit_res) {
+                .stop => {
+                    stream.finish(.stop, prompt_len_u32);
+                    return;
+                },
+                .cancelled => return,
+                .ok => {},
+            }
+            emitted += 1;
+            if (!thinking_cutoff_injected and emitted < max_gen and stream.thinkingBudgetExceeded()) {
+                thinking_cutoff_injected = true;
+                if (!self.injectThinkingCutoffIntoKv(&next_tok, &pos, stream)) return;
+            }
+        }
+        if (!stream.isCancelled()) {
+            stream.finish(.length, prompt_len_u32);
+        }
+    }
+
+    fn generateMultimodal(
+        self: *ServeRunner,
+        job: *const aminfer.server.InferenceJob,
+        stream: *aminfer.server.TokenStream,
+        use_constrained: bool,
+    ) void {
+        if (self.spec_engine != null) {
+            stream.fail("multimodal media attachments are not supported with speculative decoding");
+            return;
+        }
+        const g = switch (self.target) {
+            .graph => |gm| gm,
+            .qwen3 => {
+                stream.fail("multimodal media attachments require a GraphModel with an active vision tower");
+                return;
+            },
+        };
+        if (!g.hasVisionTower()) {
+            stream.fail("model has no active vision tower (pass --vision-sidecar)");
+            return;
+        }
+
+        var frames_buf: [MAX_SERVE_VISION_FRAMES]aminfer.metal.VisionFrame = undefined;
+        var frame_count: usize = 0;
+        defer for (frames_buf[0..frame_count]) |fr| fr.close();
+
+        for (job.mediaSlice()) |item| {
+            switch (item.kind) {
+                .image => {
+                    if (frame_count >= frames_buf.len) {
+                        stream.fail("too many vision frames");
+                        return;
+                    }
+                    frames_buf[frame_count] = aminfer.vision_bridge.decodeImageBytes(g.device, item.data) catch {
+                        stream.fail("failed to decode image attachment");
+                        return;
+                    };
+                    frame_count += 1;
+                },
+                .video => {
+                    const rem = frames_buf.len - frame_count;
+                    if (rem == 0) {
+                        stream.fail("too many vision frames");
+                        return;
+                    }
+                    const take = @min(rem, @as(usize, 8));
+                    const decoded = aminfer.vision_bridge.decodeVideoBytesInto(
+                        g.device,
+                        item.data,
+                        frames_buf[frame_count .. frame_count + take],
+                    ) catch {
+                        stream.fail("failed to decode video attachment");
+                        return;
+                    };
+                    frame_count += decoded.len;
+                },
+            }
+        }
+        if (frame_count == 0) {
+            stream.fail("no vision frames decoded from attachment");
+            return;
+        }
+
+        const split = splitVisionPrompt(job.prompt, &self.chat_template);
+        var prefix_ids = self.tok.encodeWithScratch(&self.encode_scratch, split.prefix, self.prompt_ids_buf) catch {
+            stream.fail("multimodal prefix exceeds max_seq_len or tokenizer scratch");
+            return;
+        };
+        var suffix_ids = self.tok.encodeWithScratch(
+            &self.encode_scratch,
+            split.suffix,
+            self.prompt_ids_buf[prefix_ids.len..],
+        ) catch {
+            stream.fail("multimodal suffix exceeds max_seq_len or tokenizer scratch");
+            return;
+        };
+        if (prefix_ids.len == 0 and suffix_ids.len == 0) {
+            self.prompt_ids_buf[0] = self.bos_token_id orelse 0;
+            prefix_ids = self.prompt_ids_buf[0..1];
+            suffix_ids = &.{};
+        }
+
+        var gstate: aminfer.grammar.GrammarState = if (job.grammar_program) |gp| gp.initialState() else undefined;
+        self.penalty_tracker.reset();
+        if (job.sampling.hasPenalties()) {
+            self.penalty_tracker.recordSlice(prefix_ids);
+            self.penalty_tracker.recordSlice(suffix_ids);
+        }
+
+        const vis_norm: aminfer.vision.NormParams = if (g.config.m82_family.isInkling2() or self.chat_template.dialect == .inkling2)
+            aminfer.vision.NormParams.SIGLIP_DEFAULT
+        else
+            aminfer.vision.NormParams.QWEN_VL_DEFAULT;
+
+        const mm = g.prefillMultimodal(
+            self.allocator,
+            prefix_ids,
+            suffix_ids,
+            frames_buf[0..frame_count],
+            .{
+                .norm = vis_norm,
+                .compute_logits = true,
+            },
+        ) catch {
+            stream.fail("multimodal vision prefill failed");
+            return;
+        };
+        const prompt_len_u32: u32 = mm.total_prompt_tokens;
+        if (!stream.setPromptTokens(prompt_len_u32)) return;
+        if (prompt_len_u32 + 1 >= self.max_seq_len or job.max_tokens == 0) {
+            stream.finish(.length, prompt_len_u32);
+            return;
+        }
+        const max_gen: u32 = @min(job.max_tokens, self.max_seq_len - prompt_len_u32 - 1);
+
+        const next_tok: u32 = if (use_constrained) blk: {
+            break :blk self.sampleConstrainedStep(job, &gstate) orelse {
+                stream.fail("constrained sampling failed");
+                return;
+            };
+        } else if (job.temperature > 0.0) blk: {
+            break :blk g.sampleFromLastLogits(job.temperature, job.rng.random(), self.p_res) catch {
+                stream.fail("sampling failed");
+                return;
+            };
+        } else mm.first_token;
+
+        self.runSingleStreamDecodeLoop(job, stream, prompt_len_u32, max_gen, next_tok, use_constrained, &gstate);
+    }
+
     fn generate(
         self: *ServeRunner,
         job: *const aminfer.server.InferenceJob,
@@ -5267,29 +5659,37 @@ const ServeRunner = struct {
             }
         };
 
-        // W19 per-request LoRA selection (`active_adapters == 0` or `lora_adapter == null`
+        // W19/W30 per-request LoRA selection (`active_adapters == 0` or `lora_adapter == null`
         // keeps `active_lora_slot = NO_ADAPTER` for the zero-overhead outside-layer-loop bypass).
-        if (self.target == .qwen3) {
-            const m = self.target.qwen3;
-            if (job.lora_adapter) |adp| {
-                const reg = m.lora_registry orelse {
-                    stream.fail("requested LoRA adapter not loaded");
-                    return;
-                };
-                const slot_id = reg.findSlotByName(adp) orelse {
-                    stream.fail("requested LoRA adapter not found");
-                    return;
-                };
-                m.setActiveLoraSlot(slot_id);
-            } else {
-                m.setActiveLoraSlot(aminfer.lora.NO_ADAPTER);
-            }
-        }
-        defer if (self.target == .qwen3) {
-            self.target.qwen3.setActiveLoraSlot(aminfer.lora.NO_ADAPTER);
-        };
+        if (!self.selectLoraAdapter(job.lora_adapter, stream)) return;
+        defer self.clearLoraAdapter();
 
-        var prompt_ids = self.tok.encodeWithScratch(
+        const use_constrained = (job.grammar_program != null) or
+            job.sampling.hasPenalties() or
+            job.sampling.logit_bias.len > 0 or
+            job.sampling.top_p < 1.0 or
+            job.sampling.top_k > 0 or
+            job.sampling.min_p > 0.0;
+
+        if (job.media_count > 0) {
+            self.generateMultimodal(job, stream, use_constrained);
+            return;
+        }
+
+        var prompt_ids: []const u32 = if (job.endpoint == .completions and job.prompt_token_ids != null) blk: {
+            const raw_ids = job.prompt_token_ids.?;
+            if (raw_ids.len > self.prompt_ids_buf.len) {
+                stream.fail("prompt token array exceeds max_seq_len");
+                return;
+            }
+            for (raw_ids) |tid| {
+                if (tid >= self.vocab_size) {
+                    stream.fail("prompt token ID out of vocabulary range");
+                    return;
+                }
+            }
+            break :blk raw_ids;
+        } else self.tok.encodeWithScratch(
             &self.encode_scratch,
             job.prompt,
             self.prompt_ids_buf,
@@ -5313,13 +5713,6 @@ const ServeRunner = struct {
             stream.finish(.length, prompt_len_u32);
             return;
         }
-
-        const use_constrained = (job.grammar_program != null) or
-            job.sampling.hasPenalties() or
-            job.sampling.logit_bias.len > 0 or
-            job.sampling.top_p < 1.0 or
-            job.sampling.top_k > 0 or
-            job.sampling.min_p > 0.0;
 
         if (self.spec_engine != null and !job.sampling.logprobs and job.sampling.top_logprobs == 0) {
             const eng = self.spec_engine.?;
@@ -5448,189 +5841,51 @@ const ServeRunner = struct {
             queryNgramPromptTail(reg, self.tok, job.ngram_domain, prompt_ids, &self.ngram_query_errors);
         }
 
-        // Strict zero-overhead unconstrained fast path when `use_constrained == false` and `stop_config.count == 0`.
-        if (!use_constrained and job.stop_config.count == 0) {
-            var next_tok: u32 = switch (self.target) {
-                .qwen3 => |m| blk: {
-                    m.seq_len = 0;
-                    const t = m.prefillPrompt(prompt_ids, true) catch {
-                        stream.fail("prefill failed");
-                        return;
-                    };
-                    break :blk if (job.temperature > 0.0)
-                        m.sampleFromLastLogits(job.temperature, job.rng.random(), self.p_res) catch {
-                            stream.fail("sampling failed");
-                            return;
-                        }
-                    else
-                        t;
-                },
-                .graph => |g| blk: {
-                    g.resetKvCache();
-                    const t = g.prefillChunk(prompt_ids, 0, true) catch {
-                        stream.fail("graph prefill failed");
-                        return;
-                    };
-                    break :blk if (job.temperature > 0.0)
-                        g.sampleFromLastLogits(job.temperature, job.rng.random(), self.p_res) catch {
-                            stream.fail("sampling failed");
-                            return;
-                        }
-                    else
-                        t;
-                },
-            };
-            if (!stream.setPromptTokens(prompt_len_u32)) return;
-
-            switch (self.emitToken(stream, next_tok, job.ignore_eos)) {
-                .stop => {
-                    stream.finish(.stop, prompt_len_u32);
-                    return;
-                },
-                .cancelled => return,
-                .ok => {},
-            }
-            var pos: u32 = prompt_len_u32;
-            var emitted: u32 = 1;
-            var thinking_cutoff_injected = false;
-            if (!thinking_cutoff_injected and emitted < max_gen and stream.thinkingBudgetExceeded()) {
-                thinking_cutoff_injected = true;
-                if (!self.injectThinkingCutoffIntoKv(&next_tok, &pos, stream)) return;
-            }
-            while (emitted < max_gen and !stream.isCancelled()) {
-                next_tok = switch (self.target) {
-                    .qwen3 => |m| blk: {
-                        const t = m.stepDecode(next_tok, pos) catch {
-                            stream.fail("decode step failed");
-                            return;
-                        };
-                        break :blk if (job.temperature > 0.0)
-                            m.sampleFromLastLogits(job.temperature, job.rng.random(), self.p_res) catch {
-                                stream.fail("sampling failed");
-                                return;
-                            }
-                        else
-                            t;
-                    },
-                    .graph => |g| blk: {
-                        const t = g.stepDecode(next_tok, pos) catch {
-                            stream.fail("graph decode step failed");
-                            return;
-                        };
-                        break :blk if (job.temperature > 0.0)
-                            g.sampleFromLastLogits(job.temperature, job.rng.random(), self.p_res) catch {
-                                stream.fail("sampling failed");
-                                return;
-                            }
-                        else
-                            t;
-                    },
-                };
-                self.recordSteadyStep();
-                pos += 1;
-                switch (self.emitToken(stream, next_tok, job.ignore_eos)) {
-                    .stop => {
-                        stream.finish(.stop, prompt_len_u32);
-                        return;
-                    },
-                    .cancelled => return,
-                    .ok => {},
-                }
-                emitted += 1;
-                if (!thinking_cutoff_injected and emitted < max_gen and stream.thinkingBudgetExceeded()) {
-                    thinking_cutoff_injected = true;
-                    if (!self.injectThinkingCutoffIntoKv(&next_tok, &pos, stream)) return;
-                }
-            }
-            if (!stream.isCancelled()) {
-                stream.finish(.length, prompt_len_u32);
-            }
-            return;
-        }
-
-        // Constrained (`C22` grammar bitmask / `C18` sampling penalties / `StopHoldback`) decode path.
-        var gstate: aminfer.grammar.GrammarState = if (job.grammar_program) |gp| gp.initialState() else undefined;
+        var gstate: aminfer.grammar.GrammarState = if (use_constrained and job.grammar_program != null)
+            job.grammar_program.?.initialState()
+        else
+            undefined;
         self.penalty_tracker.reset();
-        if (job.sampling.hasPenalties()) {
+        if (use_constrained and job.sampling.hasPenalties()) {
             self.penalty_tracker.recordSlice(prompt_ids);
         }
-        var stop_hb: aminfer.sampling.StopHoldback = .{};
 
-        switch (self.target) {
-            .qwen3 => |m| {
+        const greedy_first = switch (self.target) {
+            .qwen3 => |m| blk: {
                 m.seq_len = 0;
-                _ = m.prefillPrompt(prompt_ids, true) catch {
+                break :blk m.prefillPrompt(prompt_ids, true) catch {
                     stream.fail("prefill failed");
                     return;
                 };
             },
-            .graph => |g| {
+            .graph => |g| blk: {
                 g.resetKvCache();
-                _ = g.prefillChunk(prompt_ids, 0, true) catch {
+                break :blk g.prefillChunk(prompt_ids, 0, true) catch {
                     stream.fail("graph prefill failed");
                     return;
                 };
             },
-        }
-        var next_tok = self.sampleConstrainedStep(job, &gstate) orelse {
-            stream.fail("constrained sampling failed");
-            return;
         };
-        if (!stream.setPromptTokens(prompt_len_u32)) return;
-
-        switch (self.emitTokenWithStop(stream, next_tok, job.ignore_eos, job.stop_config, &stop_hb)) {
-            .stop => {
-                stream.finish(.stop, prompt_len_u32);
-                return;
-            },
-            .cancelled => return,
-            .ok => {},
-        }
-        var pos: u32 = prompt_len_u32;
-        var emitted: u32 = 1;
-        var thinking_cutoff_injected = false;
-        if (!thinking_cutoff_injected and emitted < max_gen and stream.thinkingBudgetExceeded()) {
-            thinking_cutoff_injected = true;
-            if (!self.injectThinkingCutoffIntoKv(&next_tok, &pos, stream)) return;
-        }
-        while (emitted < max_gen and !stream.isCancelled()) {
-            switch (self.target) {
-                .qwen3 => |m| {
-                    _ = m.stepDecode(next_tok, pos) catch {
-                        stream.fail("decode step failed");
-                        return;
-                    };
-                },
-                .graph => |g| {
-                    _ = g.stepDecode(next_tok, pos) catch {
-                        stream.fail("graph decode step failed");
-                        return;
-                    };
-                },
-            }
-            next_tok = self.sampleConstrainedStep(job, &gstate) orelse {
+        const next_tok: u32 = if (use_constrained) blk: {
+            break :blk self.sampleConstrainedStep(job, &gstate) orelse {
                 stream.fail("constrained sampling failed");
                 return;
             };
-            self.recordSteadyStep();
-            pos += 1;
-            switch (self.emitTokenWithStop(stream, next_tok, job.ignore_eos, job.stop_config, &stop_hb)) {
-                .stop => {
-                    stream.finish(.stop, prompt_len_u32);
+        } else if (job.temperature > 0.0) blk: {
+            break :blk switch (self.target) {
+                .qwen3 => |m| m.sampleFromLastLogits(job.temperature, job.rng.random(), self.p_res) catch {
+                    stream.fail("sampling failed");
                     return;
                 },
-                .cancelled => return,
-                .ok => {},
-            }
-            emitted += 1;
-            if (!thinking_cutoff_injected and emitted < max_gen and stream.thinkingBudgetExceeded()) {
-                thinking_cutoff_injected = true;
-                if (!self.injectThinkingCutoffIntoKv(&next_tok, &pos, stream)) return;
-            }
-        }
-        if (!stream.isCancelled()) {
-            stream.finish(.length, prompt_len_u32);
-        }
+                .graph => |g| g.sampleFromLastLogits(job.temperature, job.rng.random(), self.p_res) catch {
+                    stream.fail("sampling failed");
+                    return;
+                },
+            };
+        } else greedy_first;
+        if (!stream.setPromptTokens(prompt_len_u32)) return;
+
+        self.runSingleStreamDecodeLoop(job, stream, prompt_len_u32, max_gen, next_tok, use_constrained, &gstate);
     }
 };
 
@@ -5897,6 +6152,8 @@ const BatchServeRunner = struct {
     fn bindMetaToSlot(self: *BatchServeRunner, slot_id: u16, meta: PendingJobMeta) void {
         if (self.qwen3_batch_rt) |brt| {
             brt.setSlotLora(slot_id, meta.lora_slot);
+        } else if (self.graph_batch_rt) |grt| {
+            grt.setSlotLora(slot_id, meta.lora_slot);
         }
         if (slot_id < self.slot_constraints.len) {
             self.slot_constraints[slot_id] = .{
@@ -6004,13 +6261,29 @@ const BatchServeRunner = struct {
         out_tokens: []u32,
     ) aminfer.batch_scheduler.BackendError!aminfer.server.TokenizeResult {
         const self: *BatchServeRunner = @ptrCast(@alignCast(ctx));
+        if (job.media_count > 0) return error.TokenizeFailed;
+
         var lora_slot: u32 = aminfer.lora.NO_ADAPTER;
         if (job.lora_adapter) |adp| {
-            const brt = self.qwen3_batch_rt orelse return error.TokenizeFailed;
-            const reg = brt.lora_registry orelse return error.TokenizeFailed;
-            lora_slot = reg.findSlotByName(adp) orelse return error.TokenizeFailed;
+            const reg: ?*const aminfer.lora.LoraRegistry = if (self.qwen3_batch_rt) |brt|
+                brt.lora_registry
+            else if (self.graph_batch_rt) |grt|
+                grt.model.lora_registry
+            else
+                null;
+            const r = reg orelse return error.TokenizeFailed;
+            lora_slot = r.findSlotByName(adp) orelse return error.TokenizeFailed;
         }
-        var prompt_ids = self.tok.encodeWithScratch(
+        var prompt_ids: []u32 = if (job.endpoint == .completions and job.prompt_token_ids != null) blk: {
+            const raw_ids = job.prompt_token_ids.?;
+            if (raw_ids.len > out_tokens.len) return error.TokenizeFailed;
+            const v_cap = self.tok.vocabSize();
+            for (raw_ids) |tid| {
+                if (tid >= v_cap) return error.TokenizeFailed;
+            }
+            @memcpy(out_tokens[0..raw_ids.len], raw_ids);
+            break :blk out_tokens[0..raw_ids.len];
+        } else self.tok.encodeWithScratch(
             &self.encode_scratch,
             job.prompt,
             out_tokens,
@@ -6332,6 +6605,8 @@ const BatchServeRunner = struct {
         };
         if (self.qwen3_batch_rt) |brt| {
             brt.setSlotLora(slot_id, aminfer.lora.NO_ADAPTER);
+        } else if (self.graph_batch_rt) |grt| {
+            grt.setSlotLora(slot_id, aminfer.lora.NO_ADAPTER);
         }
         if (slot_id < self.slot_constraints.len) {
             self.slot_constraints[slot_id] = .{};
@@ -6652,8 +6927,6 @@ fn runServeGraph(
     tok_bytes: []const u8,
     out: *Io.Writer,
 ) !void {
-    if (cli.lora_spec_count > 0) return error.UnsupportedFeature;
-
     var gcfg = try aminfer.graph.GraphConfig.fromJson(allocator, cfg_bytes);
     defer gcfg.deinit(allocator);
 
@@ -6661,14 +6934,13 @@ fn runServeGraph(
     defer tok.deinit(allocator);
 
     const use_spec = cli.draft_mode != null or cli.draft_amf_path != null or cli.ngram_nvme_path != null;
-    const use_continuous: bool = switch (cli.batch_mode) {
-        .serial => false,
-        .continuous => blk: {
-            if (use_spec) return error.InvalidFlagCombination;
-            break :blk true;
-        },
-        .auto => (!use_spec and cli.max_active_requests > 1),
-    };
+    const use_continuous = try resolveServeGraphUseContinuous(
+        cli.batch_mode,
+        gcfg.m82_family,
+        cli.m6.vision_sidecar_path != null,
+        use_spec,
+        cli.max_active_requests,
+    );
     const max_seq_len: u32 = @min(gcfg.max_position_embeddings, @max(@as(u32, 512), cli.max_seq_len));
     var gcfg_kv_layers: u32 = 0;
     for (gcfg.axes.layer_attention_kinds) |ak| {
@@ -6755,6 +7027,32 @@ fn runServeGraph(
         .continuous_batch_only = use_continuous,
     });
     defer model.deinit(allocator);
+
+    var lora_reg_storage: aminfer.lora.LoraRegistry = undefined;
+    var lora_reg_ptr: ?*aminfer.lora.LoraRegistry = null;
+    defer if (lora_reg_ptr) |lr| {
+        model.attachLoraRegistry(null) catch |err| {
+            std.debug.panic("GraphModel.attachLoraRegistry(null) failed in defer: {}", .{err});
+        };
+        lr.deinit(allocator);
+    };
+    if (cli.lora_spec_count > 0) {
+        const lora_pool_bytes = try computeLoraPoolBytes(cli.lora_specs[0..cli.lora_spec_count]);
+        if (budget_override) |b| {
+            try b.checkPlan(model.totalWiredBytes() + lora_pool_bytes);
+        }
+        lora_reg_storage = try aminfer.lora.LoraRegistry.init(.{
+            .pool_bytes = lora_pool_bytes,
+            .base_shape = model.baseModelShape(),
+            .wired_budget = budget_override,
+        });
+        lora_reg_ptr = &lora_reg_storage;
+        for (cli.lora_specs[0..cli.lora_spec_count]) |ls| {
+            _ = try lora_reg_storage.loadAdapterFromFile(allocator, ls.name, ls.path);
+        }
+        try model.attachLoraRegistry(lora_reg_ptr);
+        try model.calibrateLoraDora(allocator);
+    }
 
     var draft_head_storage: aminfer.draft.DraftHead = undefined;
     var draft_head_ptr: ?*aminfer.draft.DraftHead = null;
@@ -6910,6 +7208,7 @@ fn runServeGraph(
 
     const total_wired_bytes: u64 = (if (spec_eng_ptr) |se| se.totalWiredBytes() else model.totalWiredBytes()) +
         (if (batch_rt_ptr) |br| br.totalWiredBytes() else 0) +
+        (if (lora_reg_ptr) |lr| @as(u64, lr.stats().pool_capacity_bytes) else 0) +
         (if (ngram_tbl_ptr) |nt| nt.totalWiredBytes() else 0) +
         (if (ngram_reg_ptr) |nr| (if (spec_eng_ptr == null) nr.totalWiredBytes() else 0) else 0);
     const total_wired_mib: u64 = total_wired_bytes >> 20;
@@ -6927,10 +7226,10 @@ fn runServeGraph(
             .moe = (gcfg.axes.ffn_kind == .moe_swiglu),
             .embeddings = false,
             .rerank = false,
-            .lora = false,
+            .lora = (lora_reg_ptr != null),
             .speculative_decoding = (spec_eng_ptr != null),
         },
-        null,
+        lora_reg_ptr,
     );
     defer discovery.deinit(allocator);
 
@@ -6951,6 +7250,8 @@ fn runServeGraph(
         .adaptive_prefill_narrow = cli.adaptive_prefill_narrow,
         .ngram_registry = ngram_reg_ptr,
         .api_key = cli.api_key,
+        .cors_allow_origin = cli.cors_allow_origin,
+        .max_media_bytes = cli.max_media_bytes,
         .unix_socket_path = cli.unix_socket_path,
         .tokenizer = &tok,
         .chat_template = serve_chat_tpl,
@@ -7076,6 +7377,7 @@ fn runServeGraph(
         steady_hd.size_in_use,
         aminfer.vmstat.Snapshot.swapoutDelta(vm_before, vm_after),
     });
+    try out.flush();
     try aminfer.vmstat.checkNoSwap(vm_before, vm_after);
 }
 
@@ -7311,8 +7613,12 @@ fn runServe(allocator: std.mem.Allocator, raw_args: []const [:0]const u8, out: *
     var lora_reg_ptr: ?*aminfer.lora.LoraRegistry = null;
     defer if (lora_reg_ptr) |lr| lr.deinit(allocator);
     if (cli.lora_spec_count > 0) {
+        const lora_pool_bytes = try computeLoraPoolBytes(cli.lora_specs[0..cli.lora_spec_count]);
+        if (budget_override) |b| {
+            try b.checkPlan(model.totalWiredBytes() + lora_pool_bytes);
+        }
         lora_reg_storage = try aminfer.lora.LoraRegistry.init(.{
-            .pool_bytes = aminfer.lora.MAX_LORA_POOL_BYTES,
+            .pool_bytes = lora_pool_bytes,
             .base_shape = model.baseLoraShape(),
             .sme_dispatcher = if (model.sme_rt) |srt| &srt.dispatcher else null,
             .wired_budget = budget_override,
@@ -7452,6 +7758,8 @@ fn runServe(allocator: std.mem.Allocator, raw_args: []const [:0]const u8, out: *
         .adaptive_prefill_narrow = cli.adaptive_prefill_narrow,
         .ngram_registry = ngram_reg_ptr,
         .api_key = cli.api_key,
+        .cors_allow_origin = cli.cors_allow_origin,
+        .max_media_bytes = cli.max_media_bytes,
         .unix_socket_path = cli.unix_socket_path,
         .tokenizer = &tok,
         .chat_template = serve_chat_tpl,
@@ -7586,6 +7894,7 @@ fn runServe(allocator: std.mem.Allocator, raw_args: []const [:0]const u8, out: *
         steady_hd.size_in_use,
         aminfer.vmstat.Snapshot.swapoutDelta(vm_before, vm_after),
     });
+    try out.flush();
     try aminfer.vmstat.checkNoSwap(vm_before, vm_after);
 }
 
@@ -7920,11 +8229,76 @@ fn parseChatCliArgs(args: []const [:0]const u8) !ChatCliArgs {
     return out;
 }
 
+fn handleChatLoraCommand(
+    reg_opt: ?*const aminfer.lora.LoraRegistry,
+    active_slot: *u32,
+    arg: []const u8,
+    info_sink: aminfer.chat_repl.ByteSink,
+) aminfer.chat_repl.Error!bool {
+    const reg = reg_opt orelse {
+        try info_sink.writeAll("[no LoRA adapters loaded]\n");
+        return false;
+    };
+    if (reg.activeAdapterCount() == 0) {
+        try info_sink.writeAll("[no LoRA adapters loaded]\n");
+        return false;
+    }
+    if (arg.len == 0) {
+        if (active_slot.* == aminfer.lora.NO_ADAPTER) {
+            try info_sink.writeAll("[LoRA active: off (base model)]\n");
+        } else if (reg.adapterAt(active_slot.*)) |adp| {
+            try info_sink.print("[LoRA active: {s} (rank={d}, scale={d:.3}{s})]\n", .{
+                adp.nameSlice(),
+                adp.rank,
+                adp.scale,
+                if (adp.use_dora) ", DoRA" else "",
+            });
+        } else {
+            try info_sink.writeAll("[LoRA active: off (base model)]\n");
+        }
+        try info_sink.writeAll("[LoRA mounted:");
+        var first = true;
+        for (0..aminfer.lora.MAX_ADAPTERS) |si| {
+            const sid: u32 = @intCast(si);
+            if (reg.adapterAt(sid)) |adp| {
+                if (!first) try info_sink.writeAll(",");
+                first = false;
+                try info_sink.print(" {s}(r={d}{s})", .{
+                    adp.nameSlice(),
+                    adp.rank,
+                    if (adp.use_dora) ",DoRA" else "",
+                });
+            }
+        }
+        try info_sink.writeAll("]\n");
+        return false;
+    }
+    if (std.mem.eql(u8, arg, "off")) {
+        active_slot.* = aminfer.lora.NO_ADAPTER;
+        try info_sink.writeAll("[LoRA disabled (base model); KV cache cleared]\n");
+        return true;
+    }
+    if (reg.findSlotByName(arg)) |sid| {
+        active_slot.* = sid;
+        const adp = reg.adapterAt(sid).?;
+        try info_sink.print("[LoRA active: {s} (rank={d}, scale={d:.3}{s}); KV cache cleared]\n", .{
+            arg,
+            adp.rank,
+            adp.scale,
+            if (adp.use_dora) ", DoRA" else "",
+        });
+        return true;
+    }
+    try info_sink.print("[LoRA error: adapter '{s}' not found]\n", .{arg});
+    return false;
+}
+
 const ChatEngineRunner = struct {
     model: *aminfer.qwen3.Qwen3Model,
     batch_rt: *aminfer.qwen3.Qwen3BatchRuntime,
     tok: *const aminfer.tokenizer.Tokenizer,
     chat_template: aminfer.chat_template.ChatTemplate,
+    active_lora_slot: u32 = aminfer.lora.NO_ADAPTER,
     max_seq_len: u32,
     bos_token_id: u32,
     stop_tokens: [4]u32,
@@ -8029,6 +8403,7 @@ const ChatEngineRunner = struct {
             .runTurnFn = runTurnCallback,
             .onClearFn = onClearCallback,
             .loadAttachmentFn = loadAttachmentCallback,
+            .onLoraCommandFn = onLoraCommandCallback,
         };
     }
 
@@ -8036,6 +8411,21 @@ const ChatEngineRunner = struct {
         const self: *ChatEngineRunner = @ptrCast(@alignCast(ctx));
         if (self.batch_rt.prefix_cache) |*pc| {
             pc.reset();
+        }
+    }
+
+    fn onLoraCommandCallback(
+        ctx: *anyopaque,
+        arg: []const u8,
+        info_sink: aminfer.chat_repl.ByteSink,
+    ) aminfer.chat_repl.Error!void {
+        const self: *ChatEngineRunner = @ptrCast(@alignCast(ctx));
+        if (try handleChatLoraCommand(self.model.lora_registry, &self.active_lora_slot, arg, info_sink)) {
+            self.model.setActiveLoraSlot(self.active_lora_slot);
+            self.batch_rt.setSlotLora(0, self.active_lora_slot);
+            if (self.batch_rt.prefix_cache) |*pc| {
+                pc.reset();
+            }
         }
     }
 
@@ -8074,6 +8464,8 @@ const ChatEngineRunner = struct {
         stream: *aminfer.chat_repl.TurnStream,
     ) aminfer.chat_repl.Error!aminfer.chat_repl.TurnStats {
         const self: *ChatEngineRunner = @ptrCast(@alignCast(ctx));
+        self.model.setActiveLoraSlot(self.active_lora_slot);
+        self.batch_rt.setSlotLora(0, self.active_lora_slot);
         const t0 = try aminfer.vmstat.nowNs();
 
         var prompt_ids = self.tok.encodeWithScratch(
@@ -8272,6 +8664,7 @@ const GraphChatEngineRunner = struct {
     spec_eng: ?*aminfer.engine.SpecEngine,
     tok: *const aminfer.tokenizer.Tokenizer,
     chat_template: aminfer.chat_template.ChatTemplate,
+    active_lora_slot: u32 = aminfer.lora.NO_ADAPTER,
     max_seq_len: u32,
     bos_token_id: u32,
     stop_tokens: [6]u32,
@@ -8371,6 +8764,7 @@ const GraphChatEngineRunner = struct {
             .ctx = self,
             .runTurnFn = runTurnCallback,
             .onClearFn = onClearCallback,
+            .onLoraCommandFn = onLoraCommandCallback,
         };
     }
 
@@ -8379,12 +8773,25 @@ const GraphChatEngineRunner = struct {
         self.model.resetKvCache();
     }
 
+    fn onLoraCommandCallback(
+        ctx: *anyopaque,
+        arg: []const u8,
+        info_sink: aminfer.chat_repl.ByteSink,
+    ) aminfer.chat_repl.Error!void {
+        const self: *GraphChatEngineRunner = @ptrCast(@alignCast(ctx));
+        if (try handleChatLoraCommand(self.model.lora_registry, &self.active_lora_slot, arg, info_sink)) {
+            self.model.setActiveLoraSlot(self.active_lora_slot);
+            self.model.resetKvCache();
+        }
+    }
+
     fn runTurnCallback(
         ctx: *anyopaque,
         req: *const aminfer.chat_repl.TurnRequest,
         stream: *aminfer.chat_repl.TurnStream,
     ) aminfer.chat_repl.Error!aminfer.chat_repl.TurnStats {
         const self: *GraphChatEngineRunner = @ptrCast(@alignCast(ctx));
+        self.model.setActiveLoraSlot(self.active_lora_slot);
         const t0 = try aminfer.vmstat.nowNs();
 
         var prompt_ids = self.tok.encodeWithScratch(
@@ -8552,6 +8959,35 @@ fn runChatGraph(
     });
     defer model.deinit(allocator);
 
+    var lora_reg_storage: aminfer.lora.LoraRegistry = undefined;
+    var lora_reg_ptr: ?*aminfer.lora.LoraRegistry = null;
+    defer if (lora_reg_ptr) |lr| {
+        model.attachLoraRegistry(null) catch |err| {
+            std.debug.panic("GraphModel.attachLoraRegistry(null) failed in defer: {}", .{err});
+        };
+        lr.deinit(allocator);
+    };
+    var active_lora_slot: u32 = aminfer.lora.NO_ADAPTER;
+    if (cli.lora_spec_count > 0) {
+        const lora_pool_bytes = try computeLoraPoolBytes(cli.lora_specs[0..cli.lora_spec_count]);
+        if (budget_override) |b| {
+            try b.checkPlan(model.totalWiredBytes() + lora_pool_bytes);
+        }
+        lora_reg_storage = try aminfer.lora.LoraRegistry.init(.{
+            .pool_bytes = lora_pool_bytes,
+            .base_shape = model.baseModelShape(),
+            .wired_budget = budget_override,
+        });
+        lora_reg_ptr = &lora_reg_storage;
+        for (cli.lora_specs[0..cli.lora_spec_count], 0..) |ls, idx| {
+            const loaded_slot = try lora_reg_storage.loadAdapterFromFile(allocator, ls.name, ls.path);
+            if (idx == 0) active_lora_slot = loaded_slot;
+        }
+        try model.attachLoraRegistry(lora_reg_ptr);
+        try model.calibrateLoraDora(allocator);
+        model.setActiveLoraSlot(active_lora_slot);
+    }
+
     var dflare_loaded: ?*aminfer.engine.LoadedDFlareProposer = null;
     defer if (dflare_loaded) |df| df.deinit(allocator);
     var dfly2_loaded: ?*aminfer.engine.LoadedDFly2Proposer = null;
@@ -8581,6 +9017,7 @@ fn runChatGraph(
     const chat_tpl = try resolveChatTemplateForAmf(allocator, amf_path, &tok);
     var chat_runner = try GraphChatEngineRunner.init(allocator, &model, spec_eng_ptr, &tok, chat_tpl, max_seq_len);
     defer chat_runner.deinit(allocator);
+    chat_runner.active_lora_slot = active_lora_slot;
 
     var effective_chat_cfg = cli.chat_cfg;
     effective_chat_cfg.chat_template = chat_tpl;
@@ -8624,15 +9061,20 @@ fn runChat(allocator: std.mem.Allocator, raw_args: []const [:0]const u8) !void {
     defer if (lora_reg_ptr) |lr| lr.deinit(allocator);
     var active_lora_slot: u32 = aminfer.lora.NO_ADAPTER;
     if (cli.lora_spec_count > 0) {
+        const lora_pool_bytes = try computeLoraPoolBytes(cli.lora_specs[0..cli.lora_spec_count]);
+        if (budget_override) |b| {
+            try b.checkPlan(model.totalWiredBytes() + lora_pool_bytes);
+        }
         lora_reg_storage = try aminfer.lora.LoraRegistry.init(.{
-            .pool_bytes = aminfer.lora.MAX_LORA_POOL_BYTES,
+            .pool_bytes = lora_pool_bytes,
             .base_shape = model.baseLoraShape(),
             .sme_dispatcher = if (model.sme_rt) |srt| &srt.dispatcher else null,
             .wired_budget = budget_override,
         });
         lora_reg_ptr = &lora_reg_storage;
-        for (cli.lora_specs[0..cli.lora_spec_count]) |ls| {
-            active_lora_slot = try lora_reg_storage.loadAdapterFromFile(allocator, ls.name, ls.path);
+        for (cli.lora_specs[0..cli.lora_spec_count], 0..) |ls, idx| {
+            const loaded_slot = try lora_reg_storage.loadAdapterFromFile(allocator, ls.name, ls.path);
+            if (idx == 0) active_lora_slot = loaded_slot;
         }
         model.attachLoraRegistry(lora_reg_ptr);
         model.setActiveLoraSlot(active_lora_slot);
@@ -8668,6 +9110,7 @@ fn runChat(allocator: std.mem.Allocator, raw_args: []const [:0]const u8) !void {
 
     var chat_runner = try ChatEngineRunner.init(allocator, &model, &batch_rt, &tok, max_seq_len);
     defer chat_runner.deinit(allocator);
+    chat_runner.active_lora_slot = active_lora_slot;
 
     var effective_chat_cfg = cli.chat_cfg;
     effective_chat_cfg.chat_template = model.chat_template orelse aminfer.chat_template.ChatTemplate.fromTokenizer(&tok);
@@ -10257,4 +10700,64 @@ test "M8.3 CLI parsers validate --tls-* flag combinations, PreparedServeTls env 
     const m83_json = try parseM83Args(&.{"--json"});
     try std.testing.expect(m83_json.json);
     try std.testing.expectError(error.UnknownFlag, parseM83Args(&.{"--bogus"}));
+}
+
+test "M9.5 & M9.6 CLI parsers, M82Runtime auto-serial routing, and vision prompt splitting" {
+    // 1. --cors-allow-origin, --max-media-bytes, --vision-sidecar
+    const s_def = try parseServeArgs(&.{ "--amf", "m.amf" });
+    try std.testing.expectEqualStrings("*", s_def.cors_allow_origin.?);
+    try std.testing.expectEqual(aminfer.server.DEFAULT_MAX_MEDIA_BYTES, s_def.max_media_bytes);
+
+    const s_custom = try parseServeArgs(&.{
+        "--amf",               "m.amf",
+        "--cors-allow-origin", "https://app.local",
+        "--max-media-bytes",   "8388608",
+        "--vision-sidecar",    "vis.amf",
+        "-L",                  "unbound=u.amlora",
+    });
+    try std.testing.expectEqualStrings("https://app.local", s_custom.cors_allow_origin.?);
+    try std.testing.expectEqual(@as(usize, 8388608), s_custom.max_media_bytes);
+    try std.testing.expectEqualStrings("vis.amf", s_custom.m6.vision_sidecar_path.?);
+    try std.testing.expectEqual(@as(usize, 1), s_custom.lora_spec_count);
+
+    const s_off = try parseServeArgs(&.{ "--amf", "m.amf", "--cors-allow-origin", "none" });
+    try std.testing.expect(s_off.cors_allow_origin == null);
+    const s_empty = try parseServeArgs(&.{ "--amf", "m.amf", "--cors-allow-origin", "" });
+    try std.testing.expect(s_empty.cors_allow_origin == null);
+
+    try std.testing.expectError(error.InvalidFlagValue, parseServeArgs(&.{ "--amf", "m.amf", "--cors-allow-origin", "bad\norigin" }));
+    try std.testing.expectError(error.MissingFlagValue, parseServeArgs(&.{ "--amf", "m.amf", "--cors-allow-origin" }));
+    try std.testing.expectError(error.MissingFlagValue, parseServeArgs(&.{ "--amf", "m.amf", "--max-media-bytes" }));
+
+    // 2. bench-m95 / bench-m96 --json CLI parser
+    const bj_def = try parseBenchJsonArgs(&.{});
+    try std.testing.expect(!bj_def.json);
+    const bj_json = try parseBenchJsonArgs(&.{"--json"});
+    try std.testing.expect(bj_json.json);
+    try std.testing.expectError(error.UnknownFlag, parseBenchJsonArgs(&.{"--nope"}));
+
+    // 3. M82Family & vision sidecar continuous-batching resolution
+    try std.testing.expectEqual(false, try resolveServeGraphUseContinuous(.auto, .inkling2_loop, false, false, 8));
+    try std.testing.expectEqual(false, try resolveServeGraphUseContinuous(.auto, .hy4, false, false, 8));
+    try std.testing.expectError(error.InvalidFlagCombination, resolveServeGraphUseContinuous(.continuous, .inkling2_loop, false, false, 8));
+    try std.testing.expectError(error.InvalidFlagCombination, resolveServeGraphUseContinuous(.continuous, .hy4, false, false, 8));
+    try std.testing.expectEqual(false, try resolveServeGraphUseContinuous(.auto, .none, true, false, 8));
+    try std.testing.expectEqual(true, try resolveServeGraphUseContinuous(.auto, .none, false, false, 8));
+
+    // 4. Multimodal prompt splitting across Inkling2 and ChatML
+    const ink_tpl = aminfer.chat_template.ChatTemplate.preset(.inkling2);
+    const ink_split = ServeRunner.splitVisionPrompt(
+        "<|message_user|><|content_image|><|unused_200054|><|end_message|><|end_message|><|message_user|><|content_text|>hi<|end_message|><|message_model|>",
+        &ink_tpl,
+    );
+    try std.testing.expectEqualStrings("<|message_user|><|content_image|>", ink_split.prefix);
+    try std.testing.expectEqualStrings("<|end_message|><|message_user|><|content_text|>hi<|end_message|><|message_model|>", ink_split.suffix);
+
+    const qwen_tpl = aminfer.chat_template.ChatTemplate.preset(.chatml);
+    const qwen_split = ServeRunner.splitVisionPrompt(
+        "<|im_start|>user\n<|vision_start|><|image_pad|><|vision_end|>what is this?<|im_end|>\n<|im_start|>assistant\n",
+        &qwen_tpl,
+    );
+    try std.testing.expectEqualStrings("<|im_start|>user\n<|vision_start|>", qwen_split.prefix);
+    try std.testing.expectEqualStrings("<|vision_end|>what is this?<|im_end|>\n<|im_start|>assistant\n", qwen_split.suffix);
 }

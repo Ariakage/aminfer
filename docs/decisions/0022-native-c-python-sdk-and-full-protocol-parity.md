@@ -291,23 +291,28 @@ and usage-accounting layer:
 
 ### 11. Universal `GraphModel` and `M82Runtime` multi-LoRA and DoRA hot-loading (`W30`, M9.5)
 
+- **Status (`W30`, `M9.5`):** Implemented.
 - **Extending `W19` `.amlora` and `LoraRegistry` beyond `Qwen3Model`:** Extend
   runtime multi-LoRA hot-loading (`-L`/`--lora <name>=<path.amlora>` and
-  `"<base>:<adapter>"` routing across `aminfer chat`, `aminfer serve`, `C28`
-  `GET /v1/models/{id}`, and the `C17` C/Python SDK) from `Qwen3Model` /
-  `BatchRuntime` to `GraphModel` and `M82Runtime`, covering `inkling2` /
-  `inkling2_loop` (`wq_du`, `wk_dv`, `wv_dv`, `wo_ud`, and `gate_attn` shared
-  and per-loop-pass projections, including `Inkling-2-Mini-Unbound`
-  `peft-r16`/`peft-r64` and DoRA adapters), `hy_v4`, `mimo_v2`,
-  `glm_moe_dsa`/`glm5_next`, `bailing_hybrid`, and `deepseek41`.
+  `"<base>:<adapter>"` routing across `aminfer chat` incl. interactive
+  `/lora [name|off]`, `aminfer serve`, `C28` `GET /v1/models/{id}`, and the
+  `C17` C/Python SDK) from `Qwen3Model` / `BatchRuntime` to `GraphModel`,
+  `GraphBatchRuntime`, and `M82Runtime`, covering `inkling2` / `inkling2_loop`
+  (`wq_du`, `wk_dv`, `wv_dv`, `wo_ud`, and `gate_attn` shared and per-loop-pass
+  projections, including `Inkling-2-Mini-Unbound` `peft-r16`/`peft-r64` and
+  DoRA adapters), `hy_v4`, `mimo_v2`, `glm_moe_dsa`/`glm5_next`,
+  `bailing_hybrid`, and `deepseek41`.
 - **Zero-flush GPU low-rank fusion and `SME2` coexistence:** Add a single-frame
-  Metal 4 GPU low-rank delta path (`B(A x)` plus optional DoRA row-wise
+  Metal 4 GPU low-rank delta path (`src/kernels/lora_ops.metal` +
+  `src/gpu/lora_gpu.zig`: `B(A x)` plus optional DoRA row-wise
   `lora_magnitude_vector` rescaling) that preserves `G29` `0` mid-pass
   `flushFrame()`
   ([ADR-0026](0026-m825-inkling2-single-frame-hot-path-and-full-wired-quant-parity.md))
   alongside `C24` `SME2` `sme2_panel64` offload for small L2-resident adapters,
-  raising an optional configurable wired pool cap inside the `R9` wired budget
-  for `r = 16..64` adapters without unpinning base weights.
+  auto-sizing the wired `LoraRegistry` pool up to `MAX_LORA_POOL_BYTES = 256 MiB`
+  inside the `R9` wired budget without unpinning base weights. In `runServeGraph`,
+  `--batch-mode auto` resolves `serial` (`M82Runtime` `G29` hot path) when the
+  model uses `M82Family != .none` or mounts `--vision-sidecar`.
 - **Offline PEFT `r <= 64` and DoRA `.amlora` import:** Extend
   `tools/src/aminfer_tools/lora.py` to import Hugging Face PEFT `r <= 64` and
   DoRA (`lora_magnitude_vector`) adapters into 16 KiB-aligned `.amlora`
@@ -316,8 +321,8 @@ and usage-accounting layer:
 
 ### 12. Full local OpenAI and Anthropic HTTP/SSE endpoint and multimodal parity (`C29`, M9.6)
 
-Scheduled as capability `C29` (`Status: Confirmed`, `Target: M9.6`, and
-user-prioritizable ahead of `M9.1`–`M9.5` because it is pure serving and
+Delivered as capability `C29` (`Status: Implemented`, `Target: M9.6`;
+user-prioritized ahead of `M9.1`–`M9.4` because it is pure serving and
 multimodal ingress with no dependency on frontier model-family converters), this
 extension closes the remaining local-inference OpenAI/ChatGPT and Anthropic
 HTTP/SSE protocol gaps while preserving `0` hot-path heap allocations:
@@ -350,21 +355,24 @@ HTTP/SSE protocol gaps while preserving `0` hot-path heap allocations:
    allocations.
 5. **OpenAI Legacy and FIM Text Completions (`POST /v1/completions` and `/completions`):**
    Provide a zero-allocation raw-prompt completion endpoint supporting both
-   streaming SSE and JSON responses, string or token-ID array `prompt`, `suffix`
-   Fill-in-the-Middle generation, and shared sampler, penalties, `logit_bias`,
-   `logprobs`, `stop`, and `seed` parameters.
+   streaming SSE and JSON responses, string or `[u32]` token-ID array `prompt`,
+   `suffix` Fill-in-the-Middle generation, and shared sampler, penalties,
+   `logit_bias`, `logprobs`, `stop`, and `seed` parameters.
 6. **HTTP `OPTIONS` and CORS preflight headers:**
-   Handle `OPTIONS` requests across routes and emit configurable
-   `Access-Control-Allow-Origin`, `Access-Control-Allow-Methods`, and
+   Handle unauthenticated `OPTIONS` requests across known routes and emit
+   configurable `--cors-allow-origin` (`Access-Control-Allow-Origin`, default
+   `"*"`; `"none"` disables), `Access-Control-Allow-Methods`, and
    `Access-Control-Allow-Headers` (`Authorization`, `x-api-key`,
    `anthropic-version`, `Content-Type`) headers for direct browser WebUI
    connectivity over both plaintext HTTP and native TLS 1.2/1.3 HTTPS (`C28`).
 7. **HTTP multimodal vision media pixel ingestion (`image_url` / `input_image` / Anthropic `image` / `video_url`):**
    Upgrade `http_sse.zig` from template-placeholder-only parsing to bounded
-   preallocated base64 (`data:image/...;base64,...`) image and video-frame
-   decoding wired into `G14` `ImageIO`/`VideoToolbox`/`CVPixelBuffer` zero-copy
-   IOSurface ingress and the `W20` vision encoder across
-   `POST /v1/chat/completions`, `POST /v1/responses`, and `POST /v1/messages`.
+   preallocated `--max-media-bytes` (`DEFAULT_MAX_MEDIA_BYTES = 4 MiB`, up to `4`
+   items per request) base64 (`data:image/...;base64,...`) image and video-frame
+   decoding wired into in-memory `G14` `ImageIO`/`VideoToolbox`/`CVPixelBuffer`
+   (`src/bridge/vision.zig` + `apple_bridge.m`) zero-copy IOSurface ingress and
+   the `W20` vision encoder across `POST /v1/chat/completions`,
+   `POST /v1/responses`, and `POST /v1/messages`.
 8. **Explicit non-goals (excluded by design):**
    Cloud-hosted storage, batch-job orchestration, and non-LLM endpoints — Audio
    (`/v1/audio/*`), Images (`/v1/images/*`), Moderations (`/v1/moderations`),

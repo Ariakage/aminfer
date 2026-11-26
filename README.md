@@ -35,8 +35,10 @@ full design starts at
 ## Technology
 
 - **Engine core** — Zig 0.17.1 + standalone ARMv9.2 SME2 `.s` microkernels:
-  scheduler, memory pools, lock-free rings, suffix automaton, async I/O, kqueue
-  HTTP/HTTPS SSE server.
+  scheduler, memory pools, lock-free rings, suffix automaton, async I/O, zero-alloc
+  kqueue HTTP/HTTPS SSE server (OpenAI Chat Completions / FIM Completions /
+  Stateful Responses / Anthropic Messages & Models, CORS, Base64 multimodal
+  vision ingress, universal multi-LoRA & DoRA).
 - **Hardware bridge** — pure Objective-C (ARC) behind the C header
   `apple_bridge.h`, used only to call Metal, CoreML, IOSurface, Network,
   Security and Foundation.

@@ -65,18 +65,30 @@
        heap allocations, HTTP/1.1 `keep-alive`, `503` saturation draining with
        TLS `close_notify`, constant-time `--api-key` auth, and concurrent
        `AF_UNIX` `--unix-socket` serving.
-   - M9.6 (`C29`, `C18`, `C28`, `G14`, `W20`;
-     [ADR-0022](../decisions/0022-native-c-python-sdk-and-full-protocol-parity.md#12-full-local-openai-and-anthropic-httpsse-endpoint-and-multimodal-parity-c29-m96),
-     user-prioritizable ahead of `M9.1`–`M9.5` as pure serving and multimodal
-     ingress) schedules the remaining local-inference OpenAI and Anthropic
-     HTTP/SSE compatibility extensions with zero hot-path heap allocation:
+   - **M9.5 universal multi-LoRA and DoRA routing (`W30`, `W19`, `G29`, `C28`;
+     [ADR-0022](../decisions/0022-native-c-python-sdk-and-full-protocol-parity.md#11-universal-graphmodel-and-m82runtime-multi-lora-and-dora-hot-loading-w30-m95)):**
+     extends `-L`/`--lora <name>=<path.amlora>` and `"<base>:<adapter>"`
+     routing across `aminfer chat` (with interactive `/lora [name|off]`),
+     `aminfer serve` (`ServeRunner` and `GraphBatchRuntime` / `BatchRuntime`),
+     `GET /v1/models/{id}`, and the C/Python SDK to universal `GraphModel` and
+     `M82Runtime` architectures (`inkling2`/`inkling2_loop`, `hy_v4`, `mimo_v2`,
+     `glm_moe_dsa`/`glm5_next`, `bailing_hybrid`, `deepseek41`), auto-sizing the
+     `LoraRegistry` pool up to `256 MiB` within `R9` and executing zero-flush
+     Metal 4 `lora_ops.metal` delta + DoRA scaling. In `runServeGraph`,
+     `--batch-mode auto` automatically resolves `serial` (`M82Runtime`) when
+     `model` uses `M82Family != .none` or `--vision-sidecar` is attached (`--batch-mode continuous`
+     returns `InvalidFlagCombination` when `m82_family != .none`).
+   - **M9.6 (`C29`, `C18`, `C28`, `G14`, `W20`;
+     [ADR-0022](../decisions/0022-native-c-python-sdk-and-full-protocol-parity.md#12-full-local-openai-and-anthropic-httpsse-endpoint-and-multimodal-parity-c29-m96)):**
+     delivers the remaining local-inference OpenAI and Anthropic HTTP/SSE
+     compatibility extensions with zero hot-path heap allocation:
      - **Anthropic Models API parity (`GET /v1/models` and `GET /v1/models/{model_id}`):**
        preserves all OpenAI and `C28` metadata fields while adding Anthropic
        model fields (`type: "model"`, `display_name`, RFC 3339 `created_at`,
        `max_input_tokens`, `max_tokens`) and cursor pagination (`first_id`,
        `last_id`, `has_more`, `limit`, `before_id`, `after_id`) inside static
        `16 KiB` response buffers.
-     - **Prefix-free route aliases, `OPTIONS`/CORS, and missing local endpoints:**
+     - **Prefix-free route aliases, `OPTIONS`/CORS, and local endpoints:**
        adds `/v1`-free route aliases (`/models`, `/models/{id}`, `/messages`,
        `/messages/count_tokens`, `/chat/completions`, `/completions`,
        `/responses`, `/responses/input_tokens`, `/responses/{id}`,
@@ -87,18 +99,20 @@
        via `W5` BPE and `ChatTemplate`), paginated
        `GET /v1/responses/{response_id}/input_items` from `StatefulResponseSlot`,
        zero-allocation legacy and Fill-in-the-Middle `POST /v1/completions`
-       (streaming SSE and JSON, string or token-ID array `prompt`, `suffix`,
-       shared sampler/penalties/`logit_bias`/`logprobs`/`stop`/`seed`), and
-       `OPTIONS` preflight handling with configurable CORS headers
-       (`Access-Control-Allow-Origin`, `Access-Control-Allow-Methods`,
-       `Access-Control-Allow-Headers`) over HTTP and native TLS HTTPS.
-     - **HTTP multimodal vision media pixel ingestion:** upgrades `http_sse.zig`
-       from template-placeholder-only parsing to bounded preallocated base64
-       (`data:image/...;base64,...`) image and video-frame decoding (`image_url`,
-       `input_image`, Anthropic `image`, `video_url`) wired into `G14`
-       `ImageIO`/`VideoToolbox`/`CVPixelBuffer` zero-copy IOSurface ingress and
-       the `W20` vision encoder across `/v1/chat/completions`, `/v1/responses`,
-       and `/v1/messages`.
+       (streaming SSE and JSON, string or `[u32]` token-ID array `prompt`,
+       `suffix`, shared sampler/penalties/`logit_bias`/`logprobs`/`stop`/`seed`),
+       and unauthenticated `OPTIONS` preflight handling with configurable
+       `--cors-allow-origin` headers (`Access-Control-Allow-Origin`,
+       `Access-Control-Allow-Methods`, `Access-Control-Allow-Headers`) over HTTP
+       and native TLS HTTPS.
+     - **HTTP multimodal vision media pixel ingestion:** decodes bounded
+       preallocated (`--max-media-bytes`) base64 (`data:image/...;base64,...`)
+       image and video-frame attachments (`image_url`, `input_image`, Anthropic
+       `image`, `video_url`) in `http_sse.zig` into zero-copy in-memory `G14`
+       `ImageIO`/`VideoToolbox`/`CVPixelBuffer` `IOSurface` frames
+       (`src/bridge/vision.zig` + `apple_bridge.m`) fed directly to
+       `GraphModel.prefillMultimodal` / `Qwen3Model` + `W20` across
+       `/v1/chat/completions`, `/v1/responses`, and `/v1/messages`.
      - **Explicit non-goals:** cloud-hosted and non-LLM endpoints — Audio
        (`/v1/audio/*`), Images (`/v1/images/*`), Moderations
        (`/v1/moderations`), Files (`/v1/files*`), Batches

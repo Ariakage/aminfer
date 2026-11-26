@@ -55,7 +55,7 @@ pub const HELP_TEXT: []const u8 =
     \\  -m, --model <path>              Model .amf path or directory
     \\  -c, --config <path>             Explicit config.json override (W18)
     \\  -k, --tokenizer <path>          Explicit tokenizer.json override (W18)
-    \\  -L, --lora <name>=<path.amlora> Load and activate a runtime LoRA adapter (W19)
+    \\  -L, --lora <name>=<path.amlora> Load and activate first runtime LoRA adapter (W19/W30)
     \\  -D, --disk-prefix-cache <dir>   Enable R10 F_NOCACHE persistent prefix cache
     \\  -W, --wired-cap-mib <n>         Override wired memory budget ceiling in MiB
     \\  -s, --system <prompt>           System prompt (default: "You are a helpful assistant.")
@@ -85,6 +85,7 @@ pub const HELP_TEXT: []const u8 =
     \\  /edit <new message>      Replace last user message from C15 boundary & regenerate
     \\  /image <path>            Attach image (G14 zero-copy IOSurface ingress) to next turn
     \\  /video <path>            Attach video (G14 VideoToolbox ingress) to next turn
+    \\  /lora [name|off]         Show active/loaded LoRA adapters, switch adapter, or revert to base
     \\  /help                    Print interactive slash-command help
     \\  /exit, /quit             Exit REPL
     \\
@@ -503,6 +504,11 @@ pub const TurnRunner = struct {
         kind: AttachmentKind,
         path: []const u8,
     ) Error!?*anyopaque = null,
+    onLoraCommandFn: ?*const fn (
+        ctx: *anyopaque,
+        arg: []const u8,
+        info_sink: ByteSink,
+    ) Error!void = null,
 };
 
 // ---------------------------------------------------------------------------
@@ -515,6 +521,7 @@ pub const SlashCommand = union(enum) {
     edit: []const u8,
     image: []const u8,
     video: []const u8,
+    lora: []const u8,
     help: void,
     exit: void,
 };
@@ -545,6 +552,9 @@ pub fn parseSlashCommand(line: []const u8) Error!?SlashCommand {
         const path = unquoteArg(raw_arg);
         if (path.len == 0) return error.EmptyAttachmentPath;
         return .{ .video = path };
+    }
+    if (std.mem.eql(u8, cmd, "/lora")) {
+        return .{ .lora = unquoteArg(raw_arg) };
     }
 
     return error.UnknownSlashCommand;
@@ -739,6 +749,14 @@ pub const ChatSession = struct {
                 .video => |p| {
                     try self.queueAttachment(.video, p, runner);
                     try info_sink.print("[attached video: {s}]\n", .{p});
+                    return .continued;
+                },
+                .lora => |arg| {
+                    if (runner.onLoraCommandFn) |cb| {
+                        try cb(runner.ctx, arg, info_sink);
+                    } else {
+                        try info_sink.writeAll("[no LoRA adapters loaded]\n");
+                    }
                     return .continued;
                 },
                 .retry => {
@@ -1650,17 +1668,28 @@ pub fn runPipedInput(
     out_sink: ByteSink,
     summary_sink: ByteSink,
 ) Error!void {
-    // Support optional leading `/image <path>` and `/video <path>` lines in piped stdin
-    // followed by the multi-line prompt body.
+    // Support optional leading `/image <path>`, `/video <path>`, and `/lora [name|off]`
+    // lines in piped stdin followed by the multi-line prompt body.
     var cursor: usize = 0;
     while (cursor < raw_input.len) {
         const line_end = std.mem.indexOfScalarPos(u8, raw_input, cursor, '\n') orelse raw_input.len;
         const line = std.mem.trim(u8, raw_input[cursor..line_end], " \t\r");
-        if (std.mem.startsWith(u8, line, "/image ") or std.mem.startsWith(u8, line, "/video ")) {
+        if (std.mem.startsWith(u8, line, "/image ") or
+            std.mem.startsWith(u8, line, "/video ") or
+            std.mem.eql(u8, line, "/lora") or
+            std.mem.startsWith(u8, line, "/lora "))
+        {
             const cmd = (try parseSlashCommand(line)) orelse break;
             switch (cmd) {
                 .image => |p| try session.queueAttachment(.image, p, runner),
                 .video => |p| try session.queueAttachment(.video, p, runner),
+                .lora => |arg| {
+                    if (runner.onLoraCommandFn) |cb| {
+                        try cb(runner.ctx, arg, summary_sink);
+                    } else {
+                        try summary_sink.writeAll("[no LoRA adapters loaded]\n");
+                    }
+                },
                 else => break,
             }
             cursor = if (line_end < raw_input.len) line_end + 1 else raw_input.len;
@@ -2287,4 +2316,71 @@ test "InteractiveLineEditor handles CJK wide-char backspace, emoji, Ctrl-W, Ctrl
         try std.testing.expectEqual(@as(usize, 1), r3.new_len);
         try std.testing.expectEqual(@as(usize, 1), r3.cols);
     }
+}
+
+test "M9.5 chat_repl parses /lora commands and dispatches onLoraCommandFn" {
+    const gpa = std.testing.allocator;
+
+    const c0 = (try parseSlashCommand("/lora")).?;
+    try std.testing.expectEqualStrings("", c0.lora);
+    const c1 = (try parseSlashCommand("/lora \"unbound\"")).?;
+    try std.testing.expectEqualStrings("unbound", c1.lora);
+    const c2 = (try parseSlashCommand("/lora off")).?;
+    try std.testing.expectEqualStrings("off", c2.lora);
+
+    const LoraMock = struct {
+        active: []const u8 = "base",
+        fn runTurn(ctx: *anyopaque, req: *const TurnRequest, stream: *TurnStream) Error!TurnStats {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            _ = req;
+            try stream.emitText(self.active);
+            return .{
+                .prompt_tokens = 4,
+                .generated_tokens = 1,
+                .prefix_hit_tokens = 0,
+                .ttft_ns = 1_000_000,
+                .total_ns = 2_000_000,
+            };
+        }
+        fn onLora(ctx: *anyopaque, arg: []const u8, info_sink: ByteSink) Error!void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (arg.len == 0) {
+                try info_sink.print("[LoRA active: {s}]\n", .{self.active});
+            } else if (std.mem.eql(u8, arg, "off")) {
+                self.active = "base";
+                try info_sink.writeAll("[LoRA disabled (base model)]\n");
+            } else {
+                self.active = arg;
+                try info_sink.print("[LoRA active: {s}]\n", .{arg});
+            }
+        }
+    };
+
+    var mock = LoraMock{};
+    const runner: TurnRunner = .{
+        .ctx = &mock,
+        .runTurnFn = LoraMock.runTurn,
+        .onLoraCommandFn = LoraMock.onLora,
+    };
+
+    const cfg = try ChatConfig.parseArgs(&.{"--no-stats"});
+    var sess = try ChatSession.init(gpa, cfg);
+    defer sess.deinit(gpa);
+
+    var out_b = CaptureBuf{};
+    var info_b = CaptureBuf{};
+    try std.testing.expectEqual(LineOutcome.continued, try sess.handleInteractiveLine("/lora", runner, out_b.sink(), info_b.sink()));
+    try std.testing.expectEqualStrings("[LoRA active: base]\n", info_b.written());
+
+    info_b.reset();
+    try std.testing.expectEqual(LineOutcome.continued, try sess.handleInteractiveLine("/lora unbound", runner, out_b.sink(), info_b.sink()));
+    try std.testing.expectEqualStrings("[LoRA active: unbound]\n", info_b.written());
+
+    try std.testing.expectEqual(LineOutcome.continued, try sess.handleInteractiveLine("hello", runner, out_b.sink(), info_b.sink()));
+    try std.testing.expect(std.mem.indexOf(u8, out_b.written(), "unbound") != null);
+
+    info_b.reset();
+    try std.testing.expectEqual(LineOutcome.continued, try sess.handleInteractiveLine("/lora off", runner, out_b.sink(), info_b.sink()));
+    try std.testing.expectEqualStrings("[LoRA disabled (base model)]\n", info_b.written());
+    try std.testing.expectEqualStrings("base", mock.active);
 }

@@ -6299,5 +6299,89 @@ All live runs used ephemeral PBES2-encrypted PKCS#8 credentials supplied via `--
 
 #### Server runtime note on `Inkling-2-Mini` `--batch-mode serial` vs `continuous`
 
-During live M8.3 HTTPS verification, running `aminfer serve` on `inkling-2-mini-gsq-rco-v2.amf` with default `--batch-mode auto` (`continuous`) executed generic `GraphBatchRuntime` rather than `M82Runtime` (`G29`), which bypassed `Inkling 2`'s specialized sublayer operators and produced physically impossible throughput (`~134–197 tok/s`) with incoherent tokens. Passing `--batch-mode serial` routes `runServeGraph` through `GraphModel`'s single-frame `M82Runtime` hot path, yielding coherent 48-token HTTPS TLS 1.3 SSE output at **`20.11 tok/s`** (`49.73 ms/tok`, `serve.swapouts_delta = 0`), consistent with M8.25 uncontended `decode` (`13.90–18.30 tok/s`). Wiring `M82Runtime` (`inkling2_loop` / `hy_v4`) into `GraphBatchRuntime` continuous batching is tracked in [process.md](../process.md#deferred-improvements--temporary-todo-backlog).
+During live M8.3 HTTPS verification, running `aminfer serve` on `inkling-2-mini-gsq-rco-v2.amf` with default `--batch-mode auto` (`continuous`) executed generic `GraphBatchRuntime` rather than `M82Runtime` (`G29`), which bypassed `Inkling 2`'s specialized sublayer operators and produced physically impossible throughput (`~134–197 tok/s`) with incoherent tokens. Passing `--batch-mode serial` routes `runServeGraph` through `GraphModel`'s single-frame `M82Runtime` hot path, yielding coherent 48-token HTTPS TLS 1.3 SSE output at **`20.11 tok/s`** (`49.73 ms/tok`, `serve.swapouts_delta = 0`), consistent with M8.25 uncontended `decode` (`13.90–18.30 tok/s`). `runServeGraph` now auto-resolves `--batch-mode auto` to `serial` for `M82Family != .none` (and `--vision-sidecar`) in M9.5 (`resolveServeGraphUseContinuous` in `src/main.zig`); wiring `M82Runtime` into `GraphBatchRuntime` continuous batching remains closed as superseded in [process.md](../process.md#deferred-improvements--temporary-todo-backlog).
+
+---
+
+## M9.5 & M9.6: Universal GraphModel Multi-LoRA/DoRA, Full OpenAI/Anthropic Protocol Parity, and Zero-Copy HTTP Vision Ingress
+
+### 1. Synthetic M9.5 benchmark (`./zig-out/bin/aminfer bench-m95`, `ReleaseFast`)
+
+Evaluates `W30` universal `GraphModel` and `M82Runtime` (`inkling2_loop`, `Core x 3`) dynamic `r = 16` LoRA and calibrated PEFT DoRA (`use_dora = true`) hot-loading (`hot_load_ms`), single-frame `M = 1` decode (`base_m1_us`, `lora_r16_m1_us`, `dora_m1_us`), `G29` `mid_pass_flushes == 0`, numerical parity against merged-weight reference `GraphModel` instances (`lora_max_logit_diff`, `dora_max_logit_diff`), bit-exact `NO_ADAPTER` and post-unload `u16` logit restore, 3-slot heterogeneous `GraphBatchRuntime` batching (`slot 0 = base`, `slot 1 = LoRA r=16`, `slot 2 = DoRA r=16`), `C28` `/v1/models/{id}` discovery, `malloc_blocks_delta`, and `swapouts_delta`:
+
+```text
+bench.m95.w30.hot_load_ms              1.794
+bench.m95.w30.base_m1_us               1531.82
+bench.m95.w30.lora_r16_m1_us           1948.28
+bench.m95.w30.dora_m1_us               1922.85
+bench.m95.w30.mid_pass_flushes         base=0 lora=0 dora=0
+bench.m95.w30.lora_max_logit_diff      0.002441
+bench.m95.w30.dora_max_logit_diff      0.001465
+bench.m95.w30.lora_parity_ok           true
+bench.m95.w30.dora_parity_ok           true
+bench.m95.w30.no_adapter_bit_exact     true
+bench.m95.w30.unload_bit_exact         true
+bench.m95.w30.batch_3slot_parity_ok    true
+bench.m95.w30.batch_max_logit_diff     0.001953
+bench.m95.w30.decode_malloc_blocks_delta 64
+bench.m95.c28.discovery_ok             true
+bench.m95.c28.discovery_mean_us        181.10
+bench.m95.malloc_blocks_delta          0
+bench.m95.swapouts_delta               0
+bench.m95.all_passed                   true
+```
+
+JSON mode (`./zig-out/bin/aminfer bench-m95 --json`):
+
+```json
+{"bench":"m95","hot_load_ms":1.798,"base_m1_us":1731.52,"lora_r16_m1_us":2078.40,"dora_m1_us":1921.07,"mid_pass_flushes":{"base":0,"lora":0,"dora":0},"lora_max_logit_diff":0.002441,"dora_max_logit_diff":0.001465,"lora_parity_ok":true,"dora_parity_ok":true,"no_adapter_bit_exact":true,"unload_bit_exact":true,"batch_3slot_parity_ok":true,"batch_max_logit_diff":0.001953,"decode_malloc_blocks_delta":64,"discovery_ok":true,"discovery_mean_us":157.16,"malloc_blocks_delta":0,"swapouts_delta":0,"all_passed":true}
+```
+
+### 2. Synthetic M9.6 benchmark (`./zig-out/bin/aminfer bench-m96`, `ReleaseFast`)
+
+Evaluates all 7 `C29` capabilities: (1) Anthropic Models API metadata + `limit`/`after_id`/`before_id` cursor pagination, (2) prefix-free route aliases without `/v1` + `--api-key` `401` enforcement, (3) zero-inference `POST /v1/responses/input_tokens` with `previous_response_id`, (4) paginated `GET /v1/responses/{id}/input_items` (`asc`/`desc`), (5) `POST /v1/completions` (SSE, JSON, `suffix` FIM, `[u32]` token-ID array `prompt`), (6) unauthenticated `OPTIONS` preflight (`204`) + CORS headers over plaintext HTTP and native TLS 1.3 (`0x0304`) HTTPS, and (7) in-memory Base64 PNG (`image_url` / `input_image` / Anthropic `image`) and H.264 `.mp4` (`video_url`) -> `vision_bridge` (`ImageIO`/`VideoToolbox` `IOSurface`) -> synthetic `W20` `ViT` `GraphModel` inference across `/v1/chat/completions`, `/v1/responses`, and `/v1/messages` with zero `IOSurface` leaks:
+
+```text
+bench.m96.c29.models_pagination_ok       true
+bench.m96.c29.prefix_free_routes_ok      true
+bench.m96.c29.responses_input_tokens_ok  true
+bench.m96.c29.responses_input_items_ok   true
+bench.m96.c29.completions_fim_ok         true
+bench.m96.c29.cors_http_https_ok         true
+bench.m96.c29.cors_options_mean_us       102.60
+bench.m96.c29.tls13_version              0x0304
+bench.m96.c29.tls13_cors_mean_us         1472.56
+bench.m96.c29.vision_png_chat_ok         true
+bench.m96.c29.vision_png_responses_ok    true
+bench.m96.c29.vision_png_messages_ok     true
+bench.m96.c29.vision_mp4_chat_ok         true
+bench.m96.c29.vision_png_encode_ms       1.255
+bench.m96.c29.vision_mp4_encode_ms       0.015
+bench.m96.c29.vision_tokens_last         8
+bench.m96.c29.iosurface_leak_count       0
+bench.m96.malloc_blocks_delta            0
+bench.m96.swapouts_delta                 0
+bench.m96.all_passed                     true
+```
+
+JSON mode (`./zig-out/bin/aminfer bench-m96 --json`):
+
+```json
+{"bench":"m96","models_pagination_ok":true,"prefix_free_routes_ok":true,"responses_input_tokens_ok":true,"responses_input_items_ok":true,"completions_fim_ok":true,"cors_http_https_ok":true,"cors_options_mean_us":91.09,"tls13_version":772,"tls13_cors_mean_us":1321.06,"vision_png_chat_ok":true,"vision_png_responses_ok":true,"vision_png_messages_ok":true,"vision_mp4_chat_ok":true,"vision_png_encode_ms":0.988,"vision_mp4_encode_ms":0.009,"vision_tokens_last":8,"iosurface_leak_count":0,"malloc_blocks_delta":0,"swapouts_delta":0,"all_passed":true}
+```
+
+### 3. Live real-model M9.5 & M9.6 HTTP/SSE verification (`ReleaseFast`)
+
+| Run & Configuration | Wired RAM (`serve.wired_mib`) | Protocol & Adapter Discovery | Live Streaming / API Output | `serve.swapouts_delta` |
+| --- | --- | --- | --- | --- |
+| **M9.5 Run 1a (`Inkling-2-Mini` Option B + 2 LoRA/DoRA)** (`<models>/amf/inkling-2-mini-gsq-rco-v2.amf`, `-L unbound=<models>/amf/inkling-2-mini-unbound-r16.amlora`, `-L dora=<models>/amf/inkling-2-mini-abliteration-dora.amlora`, `--max-seq-len 1024`, `--batch-mode auto` -> `serial`) | `11,146 MiB` | `GET /v1/models` `200` (`['inkling-2-mini-gsq-rco-v2', '...:unbound', '...:dora']`); `GET /models/...%3Aunbound` `200` (`type = "model"`, `rank = 16`, `lora_alpha = 16.0`, `scale = 1.0`, `wired_bytes = 18,481,152`); `GET /models/...%3Adora` `200` (`rank = 1`, `lora_alpha = 1.0`, `scale = 1.0`, `wired_bytes = 1,310,720`) | `POST /messages` `:unbound` (`-t 0.6`): coherent quaternion explanation (`31` in / `103` out, `ttft_ms = 925.7`, `wall_ms = 9,742.6`, **`11.57 tok/s`**); `:dora`: coherent RMSNorm vs LayerNorm explanation (`29` in / `134` out, `ttft_ms = 906.9`, `wall_ms = 12,158.1`, **`11.82 tok/s`**) | Co-tenant host `~18 GiB` active triggered shutdown `SwapOccurred`; verified `0` swap in Run 1b below |
+| **M9.5 Run 1b (Swap-free `Inkling-2-Mini` cold-tiered + LoRA/DoRA)** (`<models>/amf/inkling-2-mini.amf`, `-L unbound=...r16.amlora`, `-L dora=...dora.amlora`, `--max-seq-len 1024`, `--cold-slots 16`, `--batch-mode auto` -> `serial`) | `4,460 MiB` | `GET /v1/models` `200` (`['inkling-2-mini', 'inkling-2-mini:unbound', 'inkling-2-mini:dora']`); `GET /models/:unbound` `200` (`rank = 16`, `wired_bytes = 18,481,152`); `GET /models/:dora` `200` (`rank = 1`, `wired_bytes = 1,310,720`) | `POST /messages` `:unbound` (`200`, `input = 21`, `output = 12`, coherent response `"The user asks to say hello in one sentence."`); `:dora` (`200`, `input = 21`, `output = 12`, coherent `"The user asks: \"Say hello in one sentence"`); clean shutdown (`rc = 0`) | **`0`** (`serve.swapouts_delta 0`) |
+| **M9.6 Run 2 (`Qwen3-0.6B` `GSQ-RCO` `C29` HTTP parity)** (`<models>/amf/qwen3-0.6b-gsq-rco.amf`, `--model-id qwen3-0.6b-gsq`, `--max-seq-len 1024`, `--cors-allow-origin https://ui.local`, `--max-media-bytes 4194304`) | `3,093 MiB` | `OPTIONS /completions` -> `204` (`ACAO: https://ui.local`, `ACAM: GET, POST, DELETE, OPTIONS`); `GET /models?limit=1` `200` (`type = "model"`, `display_name = "qwen3-0.6b-gsq"`, `created_at = "2026-11-26T08:54:26Z"`, `max_input_tokens = 1024`, `max_tokens = 1024`, `first_id`, `last_id`, `has_more = false`) | Chained `POST /responses` (`resp_1` -> `resp_2`, `200 completed`), `POST /responses/input_tokens` (`13` -> `41`), `GET /responses/resp_2/input_items?order=asc` (`200`, `3` items, `serve.prefix_hit_tokens = 25`), `POST /completions` FIM (`"def add(a, b):\n    return "` + `suffix = "\n"` -> `"\ndef add(a, b):\n    return a + b"`, `13 -> 12`), `[u32]` prompt (`[100, 200, 300]`, `3 -> 8`), SSE (`200`, `10` chunks + `[DONE]`), clean shutdown (`rc = 0`) | **`0`** (`serve.swapouts_delta 0`) |
+| **M9.6 Run 3 (Live HTTP Base64 PNG ingress check)** (`<models>/amf/inkling-2-mini-gsq-rco-v2.amf`, `--vision-sidecar <models>/amf/inkling-2-mini-vision.amf`, `--max-seq-len 512`, `--batch-mode auto` -> `serial`) | `11,667 MiB` | `GET /models` `200` (`wired_mib = 11667`, `capabilities.vision = true`); Base64 `140x140` PNG decoded in-memory via `vision_bridge` into `IOSurface` (`0` leaks) | `POST /messages` `200` (`wall_ms = 25,576.1`); SSE `POST /chat/completions` `200` (`prompt_tokens = 46` = `30` text + `16` merged vision tokens, `completion_tokens = 160`, `reasoning_tokens = 158`, `7.83 tok/s`); **note:** model text did not semantically perceive the image due to 4 missing `Inkling-2-Mini` `23L` SigLIP/ViT conditioning steps documented below | Co-tenant host `~18 GiB` active triggered shutdown `SwapOccurred`; `0` `IOSurface` leaks |
+
+#### Live host memory co-tenancy and `Inkling-2-Mini` `23L` SigLIP/ViT diagnostic notes
+
+1. **Desktop host co-tenancy during `11.1–11.7 GiB` live runs:** On the `24 GB` baseline desktop with `~18 GiB` active memory across running background processes (including an unrelated co-tenant process holding `5,321 MiB`), `11,146 MiB` (`Run 1a`) and `11,667 MiB` (`Run 3`) `serve` allocations triggered background macOS pageouts on host memory unrelated to model weights (`error: SwapOccurred` on shutdown). Switching to cold-tiered `<models>/amf/inkling-2-mini.amf --cold-slots 16` (`4,460 MiB` wired, `Run 1b`) and `<models>/amf/qwen3-0.6b-gsq-rco.amf` (`3,093 MiB` wired, `Run 2`) confirmed strict `serve.swapouts_delta = 0` and clean `rc = 0` shutdowns under the same desktop load.
+2. **HTTP Base64 vision ingress vs `Inkling-2-Mini` `23L` ViT conditioning scope:** The HTTP Base64 `PNG`/`MP4` -> `vision_bridge` (`ImageIO` / `VideoToolbox` `IOSurface`) -> `GraphModel.prefillMultimodal` pipeline is verified end-to-end with zero `IOSurface` leaks and semantic correctness on `bench-m96` synthetic `W20` `ViT` fixtures, and on live `Inkling-2-Mini` `--vision-sidecar` it injected `16` vision feature tokens (`prompt_tokens = 46 = 30 + 16`) at `200 OK`. However, `<models>/amf/inkling-2-mini-vision.amf` (`23L` `bf16` SigLIP/ViT, `422` tensors, `patch_size = 20`, `spatial_merge = 2`, `vis_hidden = 1024`) exposes four family-specific conditioning operations not yet implemented in `src/gpu/vision.zig` / `src/model/graph.zig` / `src/model/m82_runtime.zig`: (1) `visual.blocks.{0..22}.{ls_1,ls_2}.gamma` LayerScale (`mean ~0.12–0.15`), (2) `visual.ln_pre` pre-encoder LayerNorm with bias, (3) `[1024, 1024]` learned `visual.embed.position_embedding` (`32x32` grid interpolation + `class_embedding` / `cls_position_embedding`), and (4) skipping `ink_embed_norm` over injected `vis_override` rows in `m82_runtime.zig`. Resolving those 4 ViT items is tracked in [process.md](../process.md#deferred-improvements--temporary-todo-backlog).
+
 
