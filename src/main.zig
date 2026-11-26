@@ -95,6 +95,8 @@ const usage =
     \\                    [-h] [--json]
     \\  bench-m96         run M9.6 C29 OpenAI/Anthropic parity, FIM completions, CORS/HTTPS & Base64 vision/video benchmark
     \\                    [-h] [--json]
+    \\  bench-m97         run M9.7 Inkling 2 23L ViT (CLS/pos-embed/LayerScale/2D-RoPE/GELU) GPU vs CPU parity benchmark
+    \\                    [-h] [--json]
     \\  peer-worker       start a zero-allocation kqueue expert-parallel peer worker (M7 X1-X3)
     \\                    [-hRV] -l|--listen <ip:port> -m|--amf <path> -c|--config <path> -r|--rank N -w|--world-size N
     \\                    [--partition contiguous|round-robin] [--cluster-transport auto|tcp|rdma]
@@ -329,6 +331,12 @@ pub fn main(init: std.process.Init) !void {
             try out.writeAll(usage);
         } else {
             try runBenchM96(arena, args[2..], out);
+        }
+    } else if (args.len >= 2 and std.mem.eql(u8, args[1], "bench-m97")) {
+        if (hasHelpFlag(args[2..])) {
+            try out.writeAll(usage);
+        } else {
+            try runBenchM97(arena, args[2..], out);
         }
     } else if (args.len >= 2 and std.mem.eql(u8, args[1], "peer-worker")) {
         if (hasHelpFlag(args[2..])) {
@@ -3028,6 +3036,18 @@ fn runBenchM95(allocator: std.mem.Allocator, raw_args: []const [:0]const u8, out
 fn runBenchM96(allocator: std.mem.Allocator, raw_args: []const [:0]const u8, out: *Io.Writer) !void {
     const cli = try parseBenchJsonArgs(raw_args);
     const report = try aminfer.bench_m95_m96.runM96WithConfig(allocator, .{});
+    if (cli.json) {
+        try report.writeJson(out);
+    } else {
+        try report.write(out);
+    }
+    try out.flush();
+    if (!report.all_passed) return error.BenchmarkGateFailed;
+}
+
+fn runBenchM97(allocator: std.mem.Allocator, raw_args: []const [:0]const u8, out: *Io.Writer) !void {
+    const cli = try parseBenchJsonArgs(raw_args);
+    const report = try aminfer.bench_m97.runM97WithConfig(allocator, .{});
     if (cli.json) {
         try report.writeJson(out);
     } else {
@@ -8660,6 +8680,7 @@ const ChatEngineRunner = struct {
 };
 
 const GraphChatEngineRunner = struct {
+    allocator: std.mem.Allocator,
     model: *aminfer.graph.GraphModel,
     spec_eng: ?*aminfer.engine.SpecEngine,
     tok: *const aminfer.tokenizer.Tokenizer,
@@ -8728,6 +8749,7 @@ const GraphChatEngineRunner = struct {
             }
         }
         return .{
+            .allocator = allocator,
             .model = model,
             .spec_eng = spec_eng,
             .tok = tok,
@@ -8764,6 +8786,7 @@ const GraphChatEngineRunner = struct {
             .ctx = self,
             .runTurnFn = runTurnCallback,
             .onClearFn = onClearCallback,
+            .loadAttachmentFn = loadAttachmentCallback,
             .onLoraCommandFn = onLoraCommandCallback,
         };
     }
@@ -8771,6 +8794,31 @@ const GraphChatEngineRunner = struct {
     fn onClearCallback(ctx: *anyopaque) void {
         const self: *GraphChatEngineRunner = @ptrCast(@alignCast(ctx));
         self.model.resetKvCache();
+    }
+
+    fn loadAttachmentCallback(
+        ctx: *anyopaque,
+        kind: aminfer.chat_repl.AttachmentKind,
+        path: []const u8,
+    ) aminfer.chat_repl.Error!?*anyopaque {
+        const self: *GraphChatEngineRunner = @ptrCast(@alignCast(ctx));
+        if (path.len == 0 or path.len >= std.fs.max_path_bytes) return error.BackendFailed;
+        var path_z_buf: [std.fs.max_path_bytes]u8 = undefined;
+        @memcpy(path_z_buf[0..path.len], path);
+        path_z_buf[path.len] = 0;
+        const path_z: [:0]const u8 = path_z_buf[0..path.len :0];
+
+        const fd = std.c.open(path_z.ptr, .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+        if (fd < 0) return error.BackendFailed;
+        defer _ = std.c.close(fd);
+        var st: std.c.Stat = undefined;
+        if (std.c.fstat(fd, &st) != 0 or st.size <= 0) return error.BackendFailed;
+
+        if (kind == .image) {
+            const vf = aminfer.metal.VisionFrame.loadImage(self.model.device, path_z) catch return error.BackendFailed;
+            vf.close();
+        }
+        return @ptrFromInt(1);
     }
 
     fn onLoraCommandCallback(
@@ -8794,17 +8842,6 @@ const GraphChatEngineRunner = struct {
         self.model.setActiveLoraSlot(self.active_lora_slot);
         const t0 = try aminfer.vmstat.nowNs();
 
-        var prompt_ids = self.tok.encodeWithScratch(
-            &self.encode_scratch,
-            req.chatml_prompt,
-            self.prompt_ids_buf,
-        ) catch return error.PromptTooLarge;
-        if (prompt_ids.len == 0) {
-            self.prompt_ids_buf[0] = self.bos_token_id;
-            prompt_ids = self.prompt_ids_buf[0..1];
-        }
-        if (prompt_ids.len + 1 >= self.max_seq_len) return error.PromptTooLarge;
-
         const sampling_params: aminfer.sampling.SamplingParams = .{
             .temperature = req.temperature,
             .top_p = req.top_p,
@@ -8816,56 +8853,65 @@ const GraphChatEngineRunner = struct {
         };
         const use_constrained = !sampling_params.isUnconstrainedGreedy();
         self.penalty_tracker.reset();
-        if (sampling_params.hasPenalties()) self.penalty_tracker.recordSlice(prompt_ids);
 
         var req_rng = aminfer.rng.RequestRng.init(req.seed) catch return error.BackendFailed;
-        const prompt_len_u32: u32 = @intCast(prompt_ids.len);
-        const room: u32 = self.max_seq_len - prompt_len_u32 - 1;
-        const max_gen: u32 = @min(req.max_tokens, room);
         var emitted: u32 = 0;
+        var prompt_len_u32: u32 = 0;
 
-        if (self.spec_eng) |eng| {
-            eng.reset();
-            eng.config.temperature = req.temperature;
-            const rng_opt: ?std.Random = if (req.temperature > 0.0) req_rng.random() else null;
-            const first_tok = eng.prefill(prompt_ids, rng_opt) catch return error.BackendFailed;
-            if (max_gen > 0 and !self.isStopToken(first_tok)) {
-                const p0 = self.tok.tokenBytes(first_tok) catch "";
-                if (!self.tok.isSpecialToken(first_tok) or self.chat_template.isStructuralControlToken(p0)) {
-                    try stream.emitText(p0);
-                }
-                emitted = 1;
-                var round_buf: [aminfer.engine.MAX_TREE_NODES]u32 = undefined;
-                while (emitted < max_gen) {
-                    const rem = max_gen - emitted;
-                    const rr = eng.stepRound(rng_opt, round_buf[0..@min(@as(usize, rem), round_buf.len)]) catch return error.BackendFailed;
-                    var hit_stop = false;
-                    for (round_buf[0..rr.emitted_count]) |tid| {
-                        if (self.isStopToken(tid)) {
-                            hit_stop = true;
-                            break;
-                        }
-                        const piece = self.tok.tokenBytes(tid) catch "";
-                        if (!self.tok.isSpecialToken(tid) or self.chat_template.isStructuralControlToken(piece)) {
-                            try stream.emitText(piece);
-                        }
-                        emitted += 1;
-                        if (emitted >= max_gen) break;
-                    }
-                    if (hit_stop or rr.emitted_count == 0) break;
-                }
+        const has_vision_attachments = (req.attachments.len > 0 and self.model.hasVisionTower());
+        if (has_vision_attachments) {
+            var frames_buf: [MAX_SERVE_VISION_FRAMES]aminfer.metal.VisionFrame = undefined;
+            var frame_count: usize = 0;
+            defer for (frames_buf[0..frame_count]) |fr| fr.close();
+
+            var path_z_buf: [std.fs.max_path_bytes]u8 = undefined;
+            for (req.attachments) |att| {
+                if (att.kind != .image) continue;
+                if (frame_count >= frames_buf.len) return error.BackendFailed;
+                if (att.path.len == 0 or att.path.len >= path_z_buf.len) return error.BackendFailed;
+                @memcpy(path_z_buf[0..att.path.len], att.path);
+                path_z_buf[att.path.len] = 0;
+                const path_z: [:0]const u8 = path_z_buf[0..att.path.len :0];
+                frames_buf[frame_count] = aminfer.metal.VisionFrame.loadImage(self.model.device, path_z) catch return error.BackendFailed;
+                frame_count += 1;
             }
-        } else {
-            self.model.resetKvCache();
-            const chunk_cap: usize = @max(@as(usize, 1), @as(usize, self.model.prefillChunkCap()));
-            var p_pos: usize = 0;
-            var cur_tok: u32 = 0;
-            while (p_pos < prompt_ids.len) {
-                const p_end = @min(prompt_ids.len, p_pos + chunk_cap);
-                const is_last = (p_end == prompt_ids.len);
-                cur_tok = self.model.prefillChunk(prompt_ids[p_pos..p_end], @intCast(p_pos), is_last) catch return error.BackendFailed;
-                p_pos = p_end;
+            if (frame_count == 0) return error.BackendFailed;
+
+            const split = ServeRunner.splitVisionPrompt(req.chatml_prompt, &self.chat_template);
+            var prefix_ids = self.tok.encodeWithScratch(&self.encode_scratch, split.prefix, self.prompt_ids_buf) catch return error.PromptTooLarge;
+            var suffix_ids = self.tok.encodeWithScratch(&self.encode_scratch, split.suffix, self.prompt_ids_buf[prefix_ids.len..]) catch return error.PromptTooLarge;
+            if (prefix_ids.len == 0 and suffix_ids.len == 0) {
+                self.prompt_ids_buf[0] = self.bos_token_id;
+                prefix_ids = self.prompt_ids_buf[0..1];
+                suffix_ids = &.{};
             }
+            if (sampling_params.hasPenalties()) {
+                self.penalty_tracker.recordSlice(prefix_ids);
+                self.penalty_tracker.recordSlice(suffix_ids);
+            }
+
+            const vis_norm: aminfer.vision.NormParams = if (self.model.config.m82_family.isInkling2() or self.chat_template.dialect == .inkling2)
+                aminfer.vision.NormParams.SIGLIP_DEFAULT
+            else
+                aminfer.vision.NormParams.QWEN_VL_DEFAULT;
+
+            const mm = self.model.prefillMultimodal(
+                self.allocator,
+                prefix_ids,
+                suffix_ids,
+                frames_buf[0..frame_count],
+                .{
+                    .norm = vis_norm,
+                    .compute_logits = true,
+                },
+            ) catch return error.BackendFailed;
+
+            prompt_len_u32 = mm.total_prompt_tokens;
+            if (prompt_len_u32 + 1 >= self.max_seq_len) return error.PromptTooLarge;
+            const room: u32 = self.max_seq_len - prompt_len_u32 - 1;
+            const max_gen: u32 = @min(req.max_tokens, room);
+
+            var cur_tok: u32 = mm.first_token;
             const v_size: usize = @min(@as(usize, self.model.config.vocab_size), self.p_res.len);
             if (use_constrained) {
                 const raw_lg = self.model.readLastLogitsF16();
@@ -8903,6 +8949,105 @@ const GraphChatEngineRunner = struct {
                         try stream.emitText(piece);
                     }
                     emitted += 1;
+                }
+            }
+        } else {
+            var prompt_ids = self.tok.encodeWithScratch(
+                &self.encode_scratch,
+                req.chatml_prompt,
+                self.prompt_ids_buf,
+            ) catch return error.PromptTooLarge;
+            if (prompt_ids.len == 0) {
+                self.prompt_ids_buf[0] = self.bos_token_id;
+                prompt_ids = self.prompt_ids_buf[0..1];
+            }
+            if (prompt_ids.len + 1 >= self.max_seq_len) return error.PromptTooLarge;
+            if (sampling_params.hasPenalties()) self.penalty_tracker.recordSlice(prompt_ids);
+
+            prompt_len_u32 = @intCast(prompt_ids.len);
+            const room: u32 = self.max_seq_len - prompt_len_u32 - 1;
+            const max_gen: u32 = @min(req.max_tokens, room);
+
+            if (self.spec_eng) |eng| {
+                eng.reset();
+                eng.config.temperature = req.temperature;
+                const rng_opt: ?std.Random = if (req.temperature > 0.0) req_rng.random() else null;
+                const first_tok = eng.prefill(prompt_ids, rng_opt) catch return error.BackendFailed;
+                if (max_gen > 0 and !self.isStopToken(first_tok)) {
+                    const p0 = self.tok.tokenBytes(first_tok) catch "";
+                    if (!self.tok.isSpecialToken(first_tok) or self.chat_template.isStructuralControlToken(p0)) {
+                        try stream.emitText(p0);
+                    }
+                    emitted = 1;
+                    var round_buf: [aminfer.engine.MAX_TREE_NODES]u32 = undefined;
+                    while (emitted < max_gen) {
+                        const rem = max_gen - emitted;
+                        const rr = eng.stepRound(rng_opt, round_buf[0..@min(@as(usize, rem), round_buf.len)]) catch return error.BackendFailed;
+                        var hit_stop = false;
+                        for (round_buf[0..rr.emitted_count]) |tid| {
+                            if (self.isStopToken(tid)) {
+                                hit_stop = true;
+                                break;
+                            }
+                            const piece = self.tok.tokenBytes(tid) catch "";
+                            if (!self.tok.isSpecialToken(tid) or self.chat_template.isStructuralControlToken(piece)) {
+                                try stream.emitText(piece);
+                            }
+                            emitted += 1;
+                            if (emitted >= max_gen) break;
+                        }
+                        if (hit_stop or rr.emitted_count == 0) break;
+                    }
+                }
+            } else {
+                self.model.resetKvCache();
+                const chunk_cap: usize = @max(@as(usize, 1), @as(usize, self.model.prefillChunkCap()));
+                var p_pos: usize = 0;
+                var cur_tok: u32 = 0;
+                while (p_pos < prompt_ids.len) {
+                    const p_end = @min(prompt_ids.len, p_pos + chunk_cap);
+                    const is_last = (p_end == prompt_ids.len);
+                    cur_tok = self.model.prefillChunk(prompt_ids[p_pos..p_end], @intCast(p_pos), is_last) catch return error.BackendFailed;
+                    p_pos = p_end;
+                }
+                const v_size: usize = @min(@as(usize, self.model.config.vocab_size), self.p_res.len);
+                if (use_constrained) {
+                    const raw_lg = self.model.readLastLogitsF16();
+                    const seen = if (sampling_params.hasPenalties()) self.penalty_tracker.activeEntries() else &.{};
+                    const s_out = aminfer.sampling.sampleToken(f16, raw_lg[0..@min(raw_lg.len, v_size)], sampling_params, seen, &req_rng, .{
+                        .logits_f32 = self.p_res[0..v_size],
+                        .cand_ids = self.sampler_cand_ids[0..v_size],
+                    }) catch return error.BackendFailed;
+                    cur_tok = s_out.token_id;
+                    if (sampling_params.hasPenalties()) self.penalty_tracker.recordToken(cur_tok);
+                }
+                if (max_gen > 0 and !self.isStopToken(cur_tok)) {
+                    const p0 = self.tok.tokenBytes(cur_tok) catch "";
+                    if (!self.tok.isSpecialToken(cur_tok) or self.chat_template.isStructuralControlToken(p0)) {
+                        try stream.emitText(p0);
+                    }
+                    emitted = 1;
+                    var pos: u32 = prompt_len_u32;
+                    while (emitted < max_gen) {
+                        cur_tok = self.model.stepDecode(cur_tok, pos) catch return error.BackendFailed;
+                        if (use_constrained) {
+                            const raw_lg = self.model.readLastLogitsF16();
+                            const seen = if (sampling_params.hasPenalties()) self.penalty_tracker.activeEntries() else &.{};
+                            const s_out = aminfer.sampling.sampleToken(f16, raw_lg[0..@min(raw_lg.len, v_size)], sampling_params, seen, &req_rng, .{
+                                .logits_f32 = self.p_res[0..v_size],
+                                .cand_ids = self.sampler_cand_ids[0..v_size],
+                            }) catch return error.BackendFailed;
+                            cur_tok = s_out.token_id;
+                            if (sampling_params.hasPenalties()) self.penalty_tracker.recordToken(cur_tok);
+                        }
+                        pos += 1;
+                        if (self.isStopToken(cur_tok)) break;
+                        const piece = self.tok.tokenBytes(cur_tok) catch "";
+                        if (!self.tok.isSpecialToken(cur_tok) or self.chat_template.isStructuralControlToken(piece)) {
+                            try stream.emitText(piece);
+                        }
+                        emitted += 1;
+                    }
                 }
             }
         }

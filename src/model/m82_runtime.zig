@@ -1755,7 +1755,9 @@ pub const M82Runtime = struct {
         var frame_opt: ?metal.Compute.Frame = null;
         errdefer if (frame_opt) |*f| f.abort();
 
-        // 1. Token embedding + optional vision override + optional `embed_norm`.
+        // 1. Token embedding + `embed_norm` (text tokens only, per `Inkling2NormedEmbedding`),
+        //    followed by optional multimodal vision embedding `masked_scatter` override
+        //    (per `Inkling2LoopModel.forward`, `image_embeds` bypass `embed_norm`).
         {
             const f = try ensureFrame(model, &frame_opt);
             try model.encodeEmbedLookupUnified(f, .{
@@ -1768,18 +1770,6 @@ pub const M82Runtime = struct {
                 .hidden_size = h,
             }, model.token_ids_host, model.x_host, false);
 
-            if (vis_override_src) |vsrc| {
-                const row_bytes: u64 = @as(u64, h) * @sizeOf(f16);
-                try model.moe_pipes.encodeCopyStrided(f, .{
-                    .src = .{ .buffer = vsrc.buffer, .offset = vsrc.offset + @as(u64, vis_src_row_off) * row_bytes },
-                    .dst = .{ .buffer = model.x_bind.buffer, .offset = model.x_bind.offset + @as(u64, vis_local_start) * row_bytes },
-                    .num_rows = vis_count,
-                    .copy_cols = h,
-                    .src_stride = h,
-                    .dst_stride = h,
-                }, true);
-            }
-
             if (self.ink_embed_norm) |enorm| {
                 try model.attn_pipes.encodeRmsNorm(f, .{
                     .x = model.x_bind,
@@ -1789,6 +1779,18 @@ pub const M82Runtime = struct {
                     .hidden_dim = h,
                     .eps = cfg.rms_norm_eps,
                     .w_dtype = enorm.dtype,
+                }, true);
+            }
+
+            if (vis_override_src) |vsrc| {
+                const row_bytes: u64 = @as(u64, h) * @sizeOf(f16);
+                try model.moe_pipes.encodeCopyStrided(f, .{
+                    .src = .{ .buffer = vsrc.buffer, .offset = vsrc.offset + @as(u64, vis_src_row_off) * row_bytes },
+                    .dst = .{ .buffer = model.x_bind.buffer, .offset = model.x_bind.offset + @as(u64, vis_local_start) * row_bytes },
+                    .num_rows = vis_count,
+                    .copy_cols = h,
+                    .src_stride = h,
+                    .dst_stride = h,
                 }, true);
             }
         }

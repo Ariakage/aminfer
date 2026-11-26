@@ -741,9 +741,9 @@ struct VisionRope2DParams {
     uint num_heads;
     uint head_dim;
     uint qkv_layout;       // 0 = [S, 3, H, D], 1 = [S, H, 3, D]
-    uint rope_interleaved; // 0 = half-split per axis (Qwen-VL), 1 = adjacent pairs
+    uint rope_interleaved; // 0 = half-split per axis (Qwen-VL), 1 = adjacent pairs (Inkling2)
     float rope_theta;
-    uint _pad0;
+    uint swap_hw_axes;     // 0 = [H, W] (Qwen-VL), 1 = [W, H] (Inkling2: cat([freq_w, freq_h]))
     uint _pad1;
 };
 
@@ -766,17 +766,18 @@ kernel void ami_vision_qkv_rope_2d(const device half *qkv [[buffer(0)]],
 
     const uint axis_dim = half_dim;      // D / 2 per spatial axis (H and W)
     const uint axis_pairs = axis_dim >> 1; // D / 4 rotary pairs per axis
-    const bool is_w = (tid >= axis_pairs);
-    const uint pair_idx = is_w ? (tid - axis_pairs) : tid;
+    const bool is_second_axis = (tid >= axis_pairs);
+    const uint pair_idx = is_second_axis ? (tid - axis_pairs) : tid;
 
     const uint2 hw = coords[tok];
-    const float pos = float(is_w ? hw.y : hw.x);
+    const bool use_w = (p.swap_hw_axes != 0u) ? (!is_second_axis) : is_second_axis;
+    const float pos = float(use_w ? hw.y : hw.x);
     const float inv_freq = pow(p.rope_theta, -float(2u * pair_idx) / float(axis_dim));
     const float angle = pos * inv_freq;
     const float cos_a = cos(angle);
     const float sin_a = sin(angle);
 
-    const uint axis_base = is_w ? axis_dim : 0u;
+    const uint axis_base = is_second_axis ? axis_dim : 0u;
     const uint d0 = (p.rope_interleaved == 0u) ? (axis_base + pair_idx) : (axis_base + 2u * pair_idx);
     const uint d1 = (p.rope_interleaved == 0u) ? (axis_base + pair_idx + axis_pairs) : (axis_base + 2u * pair_idx + 1u);
 
@@ -812,6 +813,51 @@ kernel void ami_vision_qkv_rope_2d(const device half *qkv [[buffer(0)]],
 
     v_out[out_base + d0] = qkv[v_in_base + d0];
     v_out[out_base + d1] = qkv[v_in_base + d1];
+}
+
+// M9.7: In-place 2D axial RoPE for split Q/K projections (Inkling 2 ViT).
+// Grid: (num_heads, num_tokens, 1), threadgroup: (64, 1, 1) (head_dim <= 128).
+kernel void ami_vision_qk_rope_2d_inplace(device half *q [[buffer(0)]],
+                                          device half *k [[buffer(1)]],
+                                          const device uint2 *coords [[buffer(2)]],
+                                          constant VisionRope2DParams &p [[buffer(3)]],
+                                          uint2 tg_pos [[threadgroup_position_in_grid]],
+                                          uint tid [[thread_index_in_threadgroup]]) {
+    const uint head = tg_pos.x;
+    const uint tok = tg_pos.y;
+    const uint half_dim = p.head_dim >> 1;
+    if (head >= p.num_heads || tok >= p.num_tokens || tid >= half_dim) {
+        return;
+    }
+
+    const uint axis_dim = half_dim;
+    const uint axis_pairs = axis_dim >> 1;
+    const bool is_second_axis = (tid >= axis_pairs);
+    const uint pair_idx = is_second_axis ? (tid - axis_pairs) : tid;
+
+    const uint2 hw = coords[tok];
+    const bool use_w = (p.swap_hw_axes != 0u) ? (!is_second_axis) : is_second_axis;
+    const float pos = float(use_w ? hw.y : hw.x);
+    const float inv_freq = pow(p.rope_theta, -float(2u * pair_idx) / float(axis_dim));
+    const float angle = pos * inv_freq;
+    const float cos_a = cos(angle);
+    const float sin_a = sin(angle);
+
+    const uint axis_base = is_second_axis ? axis_dim : 0u;
+    const uint d0 = (p.rope_interleaved == 0u) ? (axis_base + pair_idx) : (axis_base + 2u * pair_idx);
+    const uint d1 = (p.rope_interleaved == 0u) ? (axis_base + pair_idx + axis_pairs) : (axis_base + 2u * pair_idx + 1u);
+
+    const ulong base = ((ulong)tok * (ulong)p.num_heads + (ulong)head) * (ulong)p.head_dim;
+
+    const float q0 = float(q[base + d0]);
+    const float q1 = float(q[base + d1]);
+    q[base + d0] = half(fma(q0, cos_a, -q1 * sin_a));
+    q[base + d1] = half(fma(q0, sin_a, q1 * cos_a));
+
+    const float k0 = float(k[base + d0]);
+    const float k1 = float(k[base + d1]);
+    k[base + d0] = half(fma(k0, cos_a, -k1 * sin_a));
+    k[base + d1] = half(fma(k0, sin_a, k1 * cos_a));
 }
 
 // ===========================================================================
@@ -1631,8 +1677,8 @@ struct VisionMergeParams {
     uint spatial_merge;
     uint vis_hidden;
     uint tile_count;
-    uint _pad0;
-    uint _pad1;
+    uint has_cls_token;     // 0 = no CLS prefix per tile, 1 = skip leading [CLS] token per tile
+    uint preordered_blocks; // 0 = raster (ph, pw) input tokens, 1 = spatial-merge-block preordered tokens
     uint _pad2;
 };
 
@@ -1658,7 +1704,7 @@ kernel void ami_vision_spatial_merge_concat(const device half *in_tokens [[buffe
     const uint mh = local_tok / merged_w;
     const uint mw = local_tok - mh * merged_w;
 
-    const uint in_per_tile = p.grid_h * p.grid_w;
+    const uint in_per_tile = p.grid_h * p.grid_w + p.has_cls_token;
     const uint merge_sq = sm * sm;
     const uint out_dim = merge_sq * p.vis_hidden;
     const ulong out_base = (ulong)out_tok * (ulong)out_dim;
@@ -1666,11 +1712,382 @@ kernel void ami_vision_spatial_merge_concat(const device half *in_tokens [[buffe
     for (uint idx = tid; idx < out_dim; idx += tg_size) {
         const uint sub = idx / p.vis_hidden;
         const uint d = idx - sub * p.vis_hidden;
-        const uint sy = sub / sm;
-        const uint sx = sub - sy * sm;
-        const uint ph = mh * sm + sy;
-        const uint pw = mw * sm + sx;
-        const ulong in_tok = (ulong)tile_idx * (ulong)in_per_tile + (ulong)(ph * p.grid_w + pw);
+        ulong in_tok;
+        if (p.preordered_blocks != 0u) {
+            in_tok = (ulong)tile_idx * (ulong)in_per_tile + (ulong)p.has_cls_token +
+                     (ulong)local_tok * (ulong)merge_sq + (ulong)sub;
+        } else {
+            const uint sy = sub / sm;
+            const uint sx = sub - sy * sm;
+            const uint ph = mh * sm + sy;
+            const uint pw = mw * sm + sx;
+            in_tok = (ulong)tile_idx * (ulong)in_per_tile + (ulong)p.has_cls_token +
+                     (ulong)(ph * p.grid_w + pw);
+        }
         out_merged[out_base + idx] = in_tokens[in_tok * (ulong)p.vis_hidden + d];
+    }
+}
+
+// ===========================================================================
+// M9.7: Inkling 2 (`inkling2_vision`) LayerScale Residual Add
+//   out[tok, d] = half(float(residual[tok, d]) + float(x[tok, d]) * gamma[d])
+// Safe when `out == residual` (in-place update).
+// ===========================================================================
+
+struct VisionLayerScaleParams {
+    uint num_tokens;
+    uint dim;
+    uint _pad0;
+    uint _pad1;
+};
+
+static_assert(sizeof(VisionLayerScaleParams) == 16, "VisionLayerScaleParams must be 16 bytes");
+
+kernel void ami_vision_layerscale_residual_add(const device half *x [[buffer(0)]],
+                                               const device half *residual [[buffer(1)]],
+                                               const device uchar *gamma [[buffer(2)]],
+                                               device half *out [[buffer(3)]],
+                                               constant VisionLayerScaleParams &p [[buffer(4)]],
+                                               uint gid [[thread_position_in_grid]]) {
+    const uint total = p.num_tokens * p.dim;
+    if (gid >= total) {
+        return;
+    }
+    const uint d = gid % p.dim;
+    const float g = vision_load_f16_or_bf16(gamma, (ulong)d, VISION_EFF_W_BF16);
+    const float y = fma(float(x[gid]), g, float(residual[gid]));
+    out[gid] = half(y);
+}
+
+// ===========================================================================
+// M9.7: Inkling 2 (`inkling2_vision`) HWC Patchify + [CLS] + 2D Bilinear
+//       Position Embedding Interpolation (`align_corners=False`, border pad)
+//
+// Upstream reference:
+//   - `Inkling2ImageProcessor._preprocess`: right/bottom pad to multiples of
+//     `patch_size * spatial_merge` (`40`) with fill `-1.0` on `0..255` scale,
+//     rescale `/255`, normalize `(x - mean) * inv_std`, HWC per patch.
+//   - `Inkling2VisionEmbeddings.forward`: spatial-merge-block patch order
+//     `(block_row, block_col, in_row, in_col)`, HWC flatten `[ph, pw, 3]`,
+//     bilinear 2D interpolation of `[posemb_side, posemb_side, hidden]`,
+//     leading `[CLS] = class_embedding + cls_position_embedding` at `tok == 0`.
+// ===========================================================================
+
+struct VisionInkling2PatchParams {
+    uint src_width;
+    uint src_height;
+    uint pad_width;
+    uint pad_height;
+    uint patch_size;
+    uint spatial_merge;
+    uint hidden_size;
+    uint posemb_side;
+    uint token_offset;
+    uint has_cls_token;
+    uint has_bias;
+    uint is_full_range;
+    uint use_bilinear_resize;
+    float pad_fill_norm;
+    float mean_r;
+    float mean_g;
+    float mean_b;
+    float inv_std_r;
+    float inv_std_g;
+    float inv_std_b;
+};
+
+static_assert(sizeof(VisionInkling2PatchParams) == 80, "VisionInkling2PatchParams must be 80 bytes");
+
+static inline float3 vision_inkling2_norm_rgb(float3 rgb, constant VisionInkling2PatchParams &p) {
+    return float3(
+        (rgb.x - p.mean_r) * p.inv_std_r,
+        (rgb.y - p.mean_g) * p.inv_std_g,
+        (rgb.z - p.mean_b) * p.inv_std_b
+    );
+}
+
+static inline float3 vision_inkling2_sample_bgra8(texture2d<float, access::read> tex,
+                                                  uint dst_x,
+                                                  uint dst_y,
+                                                  constant VisionInkling2PatchParams &p) {
+    if (p.use_bilinear_resize == 0u) {
+        if (dst_x < p.src_width && dst_y < p.src_height) {
+            return vision_inkling2_norm_rgb(tex.read(uint2(dst_x, dst_y)).rgb, p);
+        }
+        return float3(p.pad_fill_norm);
+    }
+    float fx = (float(dst_x) + 0.5f) * (float(p.src_width) / float(p.pad_width)) - 0.5f;
+    float fy = (float(dst_y) + 0.5f) * (float(p.src_height) / float(p.pad_height)) - 0.5f;
+    fx = clamp(fx, 0.0f, float(p.src_width - 1u));
+    fy = clamp(fy, 0.0f, float(p.src_height - 1u));
+    const uint x0 = uint(floor(fx));
+    const uint y0 = uint(floor(fy));
+    const uint x1 = min(x0 + 1u, p.src_width - 1u);
+    const uint y1 = min(y0 + 1u, p.src_height - 1u);
+    const float wx = fx - float(x0);
+    const float wy = fy - float(y0);
+    const float3 c00 = tex.read(uint2(x0, y0)).rgb;
+    const float3 c10 = tex.read(uint2(x1, y0)).rgb;
+    const float3 c01 = tex.read(uint2(x0, y1)).rgb;
+    const float3 c11 = tex.read(uint2(x1, y1)).rgb;
+    return vision_inkling2_norm_rgb(mix(mix(c00, c10, wx), mix(c01, c11, wx), wy), p);
+}
+
+static inline float3 vision_inkling2_sample_nv12(texture2d<float, access::read> y_tex,
+                                                 texture2d<float, access::read> uv_tex,
+                                                 uint dst_x,
+                                                 uint dst_y,
+                                                 constant VisionInkling2PatchParams &p) {
+    if (p.use_bilinear_resize == 0u) {
+        if (dst_x < p.src_width && dst_y < p.src_height) {
+            const float3 rgb = vision_bt709_nv12_to_rgb(
+                y_tex.read(uint2(dst_x, dst_y)).r,
+                uv_tex.read(uint2(dst_x >> 1, dst_y >> 1)).rg,
+                p.is_full_range
+            );
+            return vision_inkling2_norm_rgb(rgb, p);
+        }
+        return float3(p.pad_fill_norm);
+    }
+    float fx = (float(dst_x) + 0.5f) * (float(p.src_width) / float(p.pad_width)) - 0.5f;
+    float fy = (float(dst_y) + 0.5f) * (float(p.src_height) / float(p.pad_height)) - 0.5f;
+    fx = clamp(fx, 0.0f, float(p.src_width - 1u));
+    fy = clamp(fy, 0.0f, float(p.src_height - 1u));
+    const uint x0 = uint(floor(fx));
+    const uint y0 = uint(floor(fy));
+    const uint x1 = min(x0 + 1u, p.src_width - 1u);
+    const uint y1 = min(y0 + 1u, p.src_height - 1u);
+    const float wx = fx - float(x0);
+    const float wy = fy - float(y0);
+    const float3 c00 = vision_bt709_nv12_to_rgb(y_tex.read(uint2(x0, y0)).r, uv_tex.read(uint2(x0 >> 1, y0 >> 1)).rg, p.is_full_range);
+    const float3 c10 = vision_bt709_nv12_to_rgb(y_tex.read(uint2(x1, y0)).r, uv_tex.read(uint2(x1 >> 1, y0 >> 1)).rg, p.is_full_range);
+    const float3 c01 = vision_bt709_nv12_to_rgb(y_tex.read(uint2(x0, y1)).r, uv_tex.read(uint2(x0 >> 1, y1 >> 1)).rg, p.is_full_range);
+    const float3 c11 = vision_bt709_nv12_to_rgb(y_tex.read(uint2(x1, y1)).r, uv_tex.read(uint2(x1 >> 1, y1 >> 1)).rg, p.is_full_range);
+    return vision_inkling2_norm_rgb(mix(mix(c00, c10, wx), mix(c01, c11, wx), wy), p);
+}
+
+static inline float vision_inkling2_interp_posemb(const device uchar *pos_embed,
+                                                  uint patch_row,
+                                                  uint patch_col,
+                                                  uint grid_h,
+                                                  uint grid_w,
+                                                  uint h,
+                                                  constant VisionInkling2PatchParams &p) {
+    const float side_f = float(p.posemb_side);
+    const float src_h = (float(patch_row) + 0.5f) * side_f / float(grid_h) - 0.5f;
+    const float src_w = (float(patch_col) + 0.5f) * side_f / float(grid_w) - 0.5f;
+    const float fh = floor(src_h);
+    const float fw = floor(src_w);
+    const int side_m1 = int(p.posemb_side) - 1;
+    const uint h0 = uint(clamp(int(fh), 0, side_m1));
+    const uint h1 = uint(clamp(int(fh) + 1, 0, side_m1));
+    const uint w0 = uint(clamp(int(fw), 0, side_m1));
+    const uint w1 = uint(clamp(int(fw) + 1, 0, side_m1));
+    const float wh1 = src_h - fh;
+    const float wh0 = 1.0f - wh1;
+    const float ww1 = src_w - fw;
+    const float ww0 = 1.0f - ww1;
+    const ulong hs = (ulong)p.hidden_size;
+    const float pe00 = vision_load_f16_or_bf16(pos_embed, (ulong)(h0 * p.posemb_side + w0) * hs + (ulong)h, VISION_EFF_W_BF16);
+    const float pe01 = vision_load_f16_or_bf16(pos_embed, (ulong)(h0 * p.posemb_side + w1) * hs + (ulong)h, VISION_EFF_W_BF16);
+    const float pe10 = vision_load_f16_or_bf16(pos_embed, (ulong)(h1 * p.posemb_side + w0) * hs + (ulong)h, VISION_EFF_W_BF16);
+    const float pe11 = vision_load_f16_or_bf16(pos_embed, (ulong)(h1 * p.posemb_side + w1) * hs + (ulong)h, VISION_EFF_W_BF16);
+    return (wh0 * ww0) * pe00 + (wh0 * ww1) * pe01 + (wh1 * ww0) * pe10 + (wh1 * ww1) * pe11;
+}
+
+kernel void ami_vision_inkling2_patchify_embed_bgra8(const device uchar *weight [[buffer(0)]],
+                                                     const device uchar *bias [[buffer(1)]],
+                                                     const device uchar *pos_embed [[buffer(2)]],
+                                                     const device uchar *class_embed [[buffer(3)]],
+                                                     const device uchar *cls_pos_embed [[buffer(4)]],
+                                                     device uchar *out [[buffer(5)]],
+                                                     constant VisionInkling2PatchParams &p [[buffer(6)]],
+                                                     texture2d<float, access::read> frame0 [[texture(0)]],
+                                                     uint2 tg_pos [[threadgroup_position_in_grid]],
+                                                     uint tid [[thread_index_in_threadgroup]],
+                                                     uint sg_id [[simdgroup_index_in_threadgroup]],
+                                                     uint lane [[thread_index_in_simdgroup]]) {
+    const uint grid_h = p.pad_height / p.patch_size;
+    const uint grid_w = p.pad_width / p.patch_size;
+    const uint num_patches = grid_h * grid_w;
+    const uint total_seq = num_patches + p.has_cls_token;
+    const uint tok = tg_pos.y;
+    if (tok >= total_seq) {
+        return;
+    }
+
+    const uint h = tg_pos.x * 8u + sg_id;
+    const bool valid_h = (h < p.hidden_size);
+
+    if (p.has_cls_token != 0u && tok == 0u) {
+        if (valid_h && lane == 0u) {
+            const float cls_v = vision_load_f16_or_bf16(class_embed, (ulong)h, VISION_EFF_W_BF16) +
+                                vision_load_f16_or_bf16(cls_pos_embed, (ulong)h, VISION_EFF_W_BF16);
+            const ulong out_idx = (ulong)p.token_offset * (ulong)p.hidden_size + (ulong)h;
+            vision_store_f16_or_bf16(out, out_idx, cls_v, VISION_EFF_O_BF16);
+        }
+        return;
+    }
+
+    const uint p_idx = tok - p.has_cls_token;
+    const uint sm = p.spatial_merge;
+    const uint blocks_w = grid_w / sm;
+    const uint sm_sq = sm * sm;
+    const uint block_idx = p_idx / sm_sq;
+    const uint sub = p_idx - block_idx * sm_sq;
+    const uint block_row = block_idx / blocks_w;
+    const uint block_col = block_idx - block_row * blocks_w;
+    const uint in_row = sub / sm;
+    const uint in_col = sub - in_row * sm;
+    const uint patch_row = block_row * sm + in_row;
+    const uint patch_col = block_col * sm + in_col;
+
+    const uint patch_area = p.patch_size * p.patch_size;
+    const uint token_in_dim = patch_area * 3u;
+    const ulong w_row = (ulong)h * (ulong)token_in_dim;
+
+    threadgroup float tg_rgb[256u * 3u];
+    float acc = 0.0f;
+
+    for (uint tile_start = 0u; tile_start < patch_area; tile_start += 256u) {
+        const uint tile_count = min(256u, patch_area - tile_start);
+        if (tid < tile_count) {
+            const uint pix = tile_start + tid;
+            const uint dy = pix / p.patch_size;
+            const uint dx = pix - dy * p.patch_size;
+            const uint dst_y = patch_row * p.patch_size + dy;
+            const uint dst_x = patch_col * p.patch_size + dx;
+            const float3 norm = vision_inkling2_sample_bgra8(frame0, dst_x, dst_y, p);
+            tg_rgb[tid * 3u + 0u] = norm.x;
+            tg_rgb[tid * 3u + 1u] = norm.y;
+            tg_rgb[tid * 3u + 2u] = norm.z;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (valid_h) {
+            for (uint i = lane; i < tile_count; i += 32u) {
+                const ulong kb = w_row + (ulong)(tile_start + i) * 3ul;
+                const float wr = vision_load_f16_or_bf16(weight, kb + 0ul, VISION_EFF_W_BF16);
+                const float wg = vision_load_f16_or_bf16(weight, kb + 1ul, VISION_EFF_W_BF16);
+                const float wb = vision_load_f16_or_bf16(weight, kb + 2ul, VISION_EFF_W_BF16);
+                acc = fma(tg_rgb[i * 3u + 0u], wr, acc);
+                acc = fma(tg_rgb[i * 3u + 1u], wg, acc);
+                acc = fma(tg_rgb[i * 3u + 2u], wb, acc);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (valid_h) {
+        acc = simd_sum(acc);
+        if (lane == 0u) {
+            if (p.has_bias != 0u) {
+                acc += vision_load_f16_or_bf16(bias, (ulong)h, VISION_EFF_W_BF16);
+            }
+            if (p.posemb_side > 0u) {
+                acc += vision_inkling2_interp_posemb(pos_embed, patch_row, patch_col, grid_h, grid_w, h, p);
+            }
+            const ulong out_idx = (ulong)(p.token_offset + tok) * (ulong)p.hidden_size + (ulong)h;
+            vision_store_f16_or_bf16(out, out_idx, acc, VISION_EFF_O_BF16);
+        }
+    }
+}
+
+kernel void ami_vision_inkling2_patchify_embed_nv12(const device uchar *weight [[buffer(0)]],
+                                                    const device uchar *bias [[buffer(1)]],
+                                                    const device uchar *pos_embed [[buffer(2)]],
+                                                    const device uchar *class_embed [[buffer(3)]],
+                                                    const device uchar *cls_pos_embed [[buffer(4)]],
+                                                    device uchar *out [[buffer(5)]],
+                                                    constant VisionInkling2PatchParams &p [[buffer(6)]],
+                                                    texture2d<float, access::read> y0 [[texture(0)]],
+                                                    texture2d<float, access::read> cbcr0 [[texture(1)]],
+                                                    uint2 tg_pos [[threadgroup_position_in_grid]],
+                                                    uint tid [[thread_index_in_threadgroup]],
+                                                    uint sg_id [[simdgroup_index_in_threadgroup]],
+                                                    uint lane [[thread_index_in_simdgroup]]) {
+    const uint grid_h = p.pad_height / p.patch_size;
+    const uint grid_w = p.pad_width / p.patch_size;
+    const uint num_patches = grid_h * grid_w;
+    const uint total_seq = num_patches + p.has_cls_token;
+    const uint tok = tg_pos.y;
+    if (tok >= total_seq) {
+        return;
+    }
+
+    const uint h = tg_pos.x * 8u + sg_id;
+    const bool valid_h = (h < p.hidden_size);
+
+    if (p.has_cls_token != 0u && tok == 0u) {
+        if (valid_h && lane == 0u) {
+            const float cls_v = vision_load_f16_or_bf16(class_embed, (ulong)h, VISION_EFF_W_BF16) +
+                                vision_load_f16_or_bf16(cls_pos_embed, (ulong)h, VISION_EFF_W_BF16);
+            const ulong out_idx = (ulong)p.token_offset * (ulong)p.hidden_size + (ulong)h;
+            vision_store_f16_or_bf16(out, out_idx, cls_v, VISION_EFF_O_BF16);
+        }
+        return;
+    }
+
+    const uint p_idx = tok - p.has_cls_token;
+    const uint sm = p.spatial_merge;
+    const uint blocks_w = grid_w / sm;
+    const uint sm_sq = sm * sm;
+    const uint block_idx = p_idx / sm_sq;
+    const uint sub = p_idx - block_idx * sm_sq;
+    const uint block_row = block_idx / blocks_w;
+    const uint block_col = block_idx - block_row * blocks_w;
+    const uint in_row = sub / sm;
+    const uint in_col = sub - in_row * sm;
+    const uint patch_row = block_row * sm + in_row;
+    const uint patch_col = block_col * sm + in_col;
+
+    const uint patch_area = p.patch_size * p.patch_size;
+    const uint token_in_dim = patch_area * 3u;
+    const ulong w_row = (ulong)h * (ulong)token_in_dim;
+
+    threadgroup float tg_rgb[256u * 3u];
+    float acc = 0.0f;
+
+    for (uint tile_start = 0u; tile_start < patch_area; tile_start += 256u) {
+        const uint tile_count = min(256u, patch_area - tile_start);
+        if (tid < tile_count) {
+            const uint pix = tile_start + tid;
+            const uint dy = pix / p.patch_size;
+            const uint dx = pix - dy * p.patch_size;
+            const uint dst_y = patch_row * p.patch_size + dy;
+            const uint dst_x = patch_col * p.patch_size + dx;
+            const float3 norm = vision_inkling2_sample_nv12(y0, cbcr0, dst_x, dst_y, p);
+            tg_rgb[tid * 3u + 0u] = norm.x;
+            tg_rgb[tid * 3u + 1u] = norm.y;
+            tg_rgb[tid * 3u + 2u] = norm.z;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (valid_h) {
+            for (uint i = lane; i < tile_count; i += 32u) {
+                const ulong kb = w_row + (ulong)(tile_start + i) * 3ul;
+                const float wr = vision_load_f16_or_bf16(weight, kb + 0ul, VISION_EFF_W_BF16);
+                const float wg = vision_load_f16_or_bf16(weight, kb + 1ul, VISION_EFF_W_BF16);
+                const float wb = vision_load_f16_or_bf16(weight, kb + 2ul, VISION_EFF_W_BF16);
+                acc = fma(tg_rgb[i * 3u + 0u], wr, acc);
+                acc = fma(tg_rgb[i * 3u + 1u], wg, acc);
+                acc = fma(tg_rgb[i * 3u + 2u], wb, acc);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (valid_h) {
+        acc = simd_sum(acc);
+        if (lane == 0u) {
+            if (p.has_bias != 0u) {
+                acc += vision_load_f16_or_bf16(bias, (ulong)h, VISION_EFF_W_BF16);
+            }
+            if (p.posemb_side > 0u) {
+                acc += vision_inkling2_interp_posemb(pos_embed, patch_row, patch_col, grid_h, grid_w, h, p);
+            }
+            const ulong out_idx = (ulong)(p.token_offset + tok) * (ulong)p.hidden_size + (ulong)h;
+            vision_store_f16_or_bf16(out, out_idx, acc, VISION_EFF_O_BF16);
+        }
     }
 }

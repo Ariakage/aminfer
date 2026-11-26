@@ -1346,6 +1346,9 @@ const VisionPatchEmbedWeights = struct {
     dtype: quant.FloatDType,
     bias: ?metal.BufferBinding = null,
     pos_embed: ?metal.BufferBinding = null,
+    class_embed: ?metal.BufferBinding = null,
+    cls_pos_embed: ?metal.BufferBinding = null,
+    pre_norm: ?vision_mod.VisionNormWeight = null,
     in_dim: u32,
 };
 
@@ -5154,12 +5157,14 @@ pub const GraphModel = struct {
         try self.retireExcessCompletedChunks();
     }
 
-    /// M6.5 G14 / M7.8 G22 multimodal prefill options for zero-copy `IOSurface` vision/video ingress.
+    /// M6.5 G14 / M7.8 G22 / M9.7 multimodal prefill options for zero-copy `IOSurface` vision/video ingress.
     pub const MultimodalPrefillOptions = struct {
         patch_size: u32 = 16,
         t_patch: u32 = 1,
         spatial_merge: u32 = 2,
-        norm: vision_mod.NormParams = vision_mod.NormParams.QWEN_VL_DEFAULT,
+        /// Optional RGB normalization override; `null` selects `SIGLIP_DEFAULT` for
+        /// `inkling2_vision` and `QWEN_VL_DEFAULT` otherwise.
+        norm: ?vision_mod.NormParams = null,
         compute_logits: bool = true,
         budget_override: ?budget_mod.Budget = null,
         anyres_mode: vision_mod.AnyResMode = .smart_resize,
@@ -5322,6 +5327,7 @@ pub const GraphModel = struct {
                     null;
                 const tok_off: u32 = tube * tokens_per_tube;
                 const proj_bind: metal.BufferBinding = .{ .buffer = proj_buf, .offset = 0 };
+                const fallback_norm = opts.norm orelse vision_mod.NormParams.QWEN_VL_DEFAULT;
                 switch (fmt0) {
                     .bgra8 => try ingress.encodePatchifyEmbedBgra8(
                         &vframe,
@@ -5333,7 +5339,7 @@ pub const GraphModel = struct {
                         .f16,
                         self.config.hidden_size,
                         geom,
-                        opts.norm,
+                        fallback_norm,
                         tok_off,
                         tube > 0,
                     ),
@@ -5348,7 +5354,7 @@ pub const GraphModel = struct {
                         self.config.hidden_size,
                         geom,
                         is_full_range,
-                        opts.norm,
+                        fallback_norm,
                         tok_off,
                         tube > 0,
                     ),
@@ -5524,27 +5530,52 @@ pub const GraphModel = struct {
         const max_patches_per_tube = vcfg.max_patches / tube_count;
         if (max_patches_per_tube == 0) return error.InvalidGeometry;
 
-        const factor = std.math.mul(u32, vcfg.patch_size, vcfg.spatial_merge) catch return error.Overflow;
-        const min_pixels = if (opts.anyres_min_pixels > 0) opts.anyres_min_pixels else factor * factor;
-        const max_pixels = std.math.mul(u32, max_patches_per_tube, vcfg.patch_size * vcfg.patch_size) catch return error.Overflow;
-        const def_tile_size = if (opts.anyres_tile_size > 0)
-            opts.anyres_tile_size
-        else
-            @max(factor, (@min(width, height) / factor) * factor);
-        const plan = try vision_mod.planAnyResGrid(width, height, .{
-            .mode = opts.anyres_mode,
-            .patch_size = vcfg.patch_size,
-            .t_patch = eff_t_patch,
-            .spatial_merge = vcfg.spatial_merge,
-            .min_pixels = min_pixels,
-            .max_pixels = max_pixels,
-            .tile_size = def_tile_size,
-            .max_tiles = opts.anyres_max_tiles,
-            .include_thumbnail = opts.anyres_include_thumbnail,
-        });
-        const total_patches = std.math.mul(u32, tube_count, plan.total_patches) catch return error.Overflow;
-        if (total_patches == 0 or total_patches > vcfg.max_patches) return error.InvalidGeometry;
-        const total_vis_tokens = std.math.mul(u32, tube_count, plan.total_merged_tokens) catch return error.Overflow;
+        const eff_norm: vision_mod.NormParams = opts.norm orelse
+            (if (vcfg.is_inkling2_vision) vision_mod.NormParams.SIGLIP_DEFAULT else vision_mod.NormParams.QWEN_VL_DEFAULT);
+
+        var ink_plan_opt: ?vision_mod.Inkling2GridPlan = null;
+        var anyres_plan_opt: ?vision_mod.AnyResPlan = null;
+        var total_patches: u32 = 0;
+        var total_vis_tokens: u32 = 0;
+        if (vcfg.is_inkling2_vision) {
+            const ink_plan = try vision_mod.planInkling2Grid(
+                width,
+                height,
+                vcfg.patch_size,
+                vcfg.spatial_merge,
+                vcfg.has_cls_token,
+                max_patches_per_tube,
+            );
+            total_patches = std.math.mul(u32, tube_count, ink_plan.num_patches) catch return error.Overflow;
+            total_vis_tokens = std.math.mul(u32, tube_count, ink_plan.num_merged_tokens) catch return error.Overflow;
+            const total_seq = std.math.mul(u32, tube_count, ink_plan.seq_tokens) catch return error.Overflow;
+            const max_seq = try vcfg.maxSeqTokens();
+            if (total_patches == 0 or total_patches > vcfg.max_patches or total_seq > max_seq) return error.InvalidGeometry;
+            ink_plan_opt = ink_plan;
+        } else {
+            const factor = std.math.mul(u32, vcfg.patch_size, vcfg.spatial_merge) catch return error.Overflow;
+            const min_pixels = if (opts.anyres_min_pixels > 0) opts.anyres_min_pixels else factor * factor;
+            const max_pixels = std.math.mul(u32, max_patches_per_tube, vcfg.patch_size * vcfg.patch_size) catch return error.Overflow;
+            const def_tile_size = if (opts.anyres_tile_size > 0)
+                opts.anyres_tile_size
+            else
+                @max(factor, (@min(width, height) / factor) * factor);
+            const plan = try vision_mod.planAnyResGrid(width, height, .{
+                .mode = opts.anyres_mode,
+                .patch_size = vcfg.patch_size,
+                .t_patch = eff_t_patch,
+                .spatial_merge = vcfg.spatial_merge,
+                .min_pixels = min_pixels,
+                .max_pixels = max_pixels,
+                .tile_size = def_tile_size,
+                .max_tiles = opts.anyres_max_tiles,
+                .include_thumbnail = opts.anyres_include_thumbnail,
+            });
+            total_patches = std.math.mul(u32, tube_count, plan.total_patches) catch return error.Overflow;
+            if (total_patches == 0 or total_patches > vcfg.max_patches) return error.InvalidGeometry;
+            total_vis_tokens = std.math.mul(u32, tube_count, plan.total_merged_tokens) catch return error.Overflow;
+            anyres_plan_opt = plan;
+        }
 
         const prefix_u32: u32 = @intCast(prefix_tokens.len);
         const suffix_u32: u32 = @intCast(suffix_tokens.len);
@@ -5552,16 +5583,33 @@ pub const GraphModel = struct {
         if (total_tokens == 0) return error.InvalidBatchSize;
         if (total_tokens > self.max_seq_len) return error.SequenceFull;
 
-        // Populate 2D-RoPE coordinates & tile-isolated bidirectional window bounds in aliased scratch.
+        // Populate 2D-RoPE coordinates & tile/image-isolated bidirectional window bounds in aliased scratch.
         const coords_sl = sc.coordsSlice();
         const bounds_sl = sc.windowBoundsSlice();
-        for (0..tube_count) |t_idx| {
-            const tube_off = @as(u32, @intCast(t_idx)) * plan.total_patches;
-            _ = try plan.fillRope2DCoords(coords_sl[tube_off .. tube_off + plan.total_patches]);
-            _ = try plan.fillWindowBounds(0, bounds_sl[tube_off .. tube_off + plan.total_patches]);
-            for (bounds_sl[tube_off .. tube_off + plan.total_patches]) |*wb| {
-                wb.kv_start += tube_off;
-                wb.kv_end += tube_off;
+        if (ink_plan_opt) |ink_plan| {
+            for (0..tube_count) |t_idx| {
+                const seq_off = @as(u32, @intCast(t_idx)) * ink_plan.seq_tokens;
+                _ = try vision_mod.fillInkling2Rope2DCoords(
+                    ink_plan.grid_h,
+                    ink_plan.grid_w,
+                    vcfg.spatial_merge,
+                    vcfg.has_cls_token,
+                    coords_sl[seq_off .. seq_off + ink_plan.seq_tokens],
+                );
+                for (bounds_sl[seq_off .. seq_off + ink_plan.seq_tokens]) |*wb| {
+                    wb.* = .{ .kv_start = seq_off, .kv_end = seq_off + ink_plan.seq_tokens };
+                }
+            }
+        } else {
+            const plan = anyres_plan_opt.?;
+            for (0..tube_count) |t_idx| {
+                const tube_off = @as(u32, @intCast(t_idx)) * plan.total_patches;
+                _ = try plan.fillRope2DCoords(coords_sl[tube_off .. tube_off + plan.total_patches]);
+                _ = try plan.fillWindowBounds(0, bounds_sl[tube_off .. tube_off + plan.total_patches]);
+                for (bounds_sl[tube_off .. tube_off + plan.total_patches]) |*wb| {
+                    wb.kv_start += tube_off;
+                    wb.kv_end += tube_off;
+                }
             }
         }
 
@@ -5601,7 +5649,8 @@ pub const GraphModel = struct {
         };
 
         const vis_t0 = try vmstat.nowNs();
-        const use_ane_offload = (rt.placement == .ane and
+        const use_ane_offload = (!vcfg.is_inkling2_vision and
+            rt.placement == .ane and
             self.vision_state.ane_offload != null and
             vcfg.spatial_merge == 1 and
             total_patches <= self.vision_state.ane_offload.?.token_bucket and
@@ -5611,54 +5660,52 @@ pub const GraphModel = struct {
             errdefer vframe.abort();
 
             var first_dispatch = true;
-            var tube: u32 = 0;
-            while (tube < tube_count) : (tube += 1) {
-                const f0_idx: usize = @as(usize, tube) * eff_t_patch;
-                const f1_opt: ?metal.VisionFrame = if (eff_t_patch == 2)
-                    frames[@min(f0_idx + 1, frames.len - 1)]
-                else
-                    null;
-                const tube_off = tube * plan.total_patches;
-                for (plan.activeTiles()) |tile| {
-                    var t_spec = tile;
-                    t_spec.token_offset = tube_off + tile.token_offset;
+            if (ink_plan_opt) |ink_plan| {
+                var tube: u32 = 0;
+                while (tube < tube_count) : (tube += 1) {
+                    const f0_idx: usize = @as(usize, tube) * eff_t_patch;
+                    const tok_off = tube * ink_plan.seq_tokens;
                     const barrier = !first_dispatch;
                     first_dispatch = false;
                     switch (fmt0) {
-                        .bgra8 => try pipes.encodeAnyResPatchifyEmbedBgra8(
+                        .bgra8 => try pipes.encodeInkling2PatchifyEmbedBgra8(
                             &vframe,
                             frames[f0_idx],
-                            f1_opt,
-                            width,
-                            height,
-                            t_spec,
+                            ink_plan,
                             vcfg.patch_size,
-                            eff_t_patch,
+                            vcfg.spatial_merge,
                             vcfg.vis_hidden,
-                            opts.norm,
+                            vcfg.posemb_grid_size,
+                            tok_off,
+                            vcfg.has_cls_token,
+                            eff_norm,
                             pe.weight,
                             pe.bias,
                             pe.pos_embed,
+                            pe.class_embed,
+                            pe.cls_pos_embed,
                             sc.hiddenABinding(),
                             pe.dtype,
                             .f16,
                             barrier,
                         ),
-                        .nv12 => try pipes.encodeAnyResPatchifyEmbedNv12(
+                        .nv12 => try pipes.encodeInkling2PatchifyEmbedNv12(
                             &vframe,
                             frames[f0_idx],
-                            f1_opt,
-                            width,
-                            height,
-                            t_spec,
+                            ink_plan,
                             vcfg.patch_size,
-                            eff_t_patch,
+                            vcfg.spatial_merge,
                             vcfg.vis_hidden,
+                            vcfg.posemb_grid_size,
+                            tok_off,
+                            vcfg.has_cls_token,
                             is_full_range,
-                            opts.norm,
+                            eff_norm,
                             pe.weight,
                             pe.bias,
                             pe.pos_embed,
+                            pe.class_embed,
+                            pe.cls_pos_embed,
                             sc.hiddenABinding(),
                             pe.dtype,
                             .f16,
@@ -5667,22 +5714,96 @@ pub const GraphModel = struct {
                         else => unreachable,
                     }
                 }
+            } else {
+                const plan = anyres_plan_opt.?;
+                var tube: u32 = 0;
+                while (tube < tube_count) : (tube += 1) {
+                    const f0_idx: usize = @as(usize, tube) * eff_t_patch;
+                    const f1_opt: ?metal.VisionFrame = if (eff_t_patch == 2)
+                        frames[@min(f0_idx + 1, frames.len - 1)]
+                    else
+                        null;
+                    const tube_off = tube * plan.total_patches;
+                    for (plan.activeTiles()) |tile| {
+                        var t_spec = tile;
+                        t_spec.token_offset = tube_off + tile.token_offset;
+                        const barrier = !first_dispatch;
+                        first_dispatch = false;
+                        switch (fmt0) {
+                            .bgra8 => try pipes.encodeAnyResPatchifyEmbedBgra8(
+                                &vframe,
+                                frames[f0_idx],
+                                f1_opt,
+                                width,
+                                height,
+                                t_spec,
+                                vcfg.patch_size,
+                                eff_t_patch,
+                                vcfg.vis_hidden,
+                                eff_norm,
+                                pe.weight,
+                                pe.bias,
+                                pe.pos_embed,
+                                sc.hiddenABinding(),
+                                pe.dtype,
+                                .f16,
+                                barrier,
+                            ),
+                            .nv12 => try pipes.encodeAnyResPatchifyEmbedNv12(
+                                &vframe,
+                                frames[f0_idx],
+                                f1_opt,
+                                width,
+                                height,
+                                t_spec,
+                                vcfg.patch_size,
+                                eff_t_patch,
+                                vcfg.vis_hidden,
+                                is_full_range,
+                                eff_norm,
+                                pe.weight,
+                                pe.bias,
+                                pe.pos_embed,
+                                sc.hiddenABinding(),
+                                pe.dtype,
+                                .f16,
+                                barrier,
+                            ),
+                            else => unreachable,
+                        }
+                    }
+                }
             }
 
             if (use_ane_offload) {
                 const vsig = try vframe.commit();
                 try self.compute.wait(vsig, self.timeout_ms);
             } else {
-                const tile0 = plan.tiles[0];
-                const emitted = try rt.encodeTowerForward(
-                    &vframe,
-                    self.vision_state.blocks,
-                    merger,
-                    tile0.grid_h,
-                    tile0.grid_w,
-                    tube_count * plan.num_tiles,
-                    true,
-                );
+                const emitted = if (ink_plan_opt) |ink_plan|
+                    try rt.encodeTowerForwardWithPreNorm(
+                        &vframe,
+                        pe.pre_norm,
+                        self.vision_state.blocks,
+                        merger,
+                        ink_plan.grid_h,
+                        ink_plan.grid_w,
+                        tube_count,
+                        true,
+                    )
+                else blk: {
+                    const plan = anyres_plan_opt.?;
+                    const tile0 = plan.tiles[0];
+                    break :blk try rt.encodeTowerForwardWithPreNorm(
+                        &vframe,
+                        pe.pre_norm,
+                        self.vision_state.blocks,
+                        merger,
+                        tile0.grid_h,
+                        tile0.grid_w,
+                        tube_count * plan.num_tiles,
+                        true,
+                    );
+                };
                 std.debug.assert(emitted == total_vis_tokens);
 
                 if (need_stage) {
@@ -5737,7 +5858,12 @@ pub const GraphModel = struct {
         const vis_t1 = try vmstat.nowNs();
         const vision_encode_us: f64 = @as(f64, @floatFromInt(vis_t1 - vis_t0)) / 1000.0;
 
-        const grid = plan.toVisionGridSpec(tube_count, 1);
+        const grid: vision_mod.VisionGridSpec = if (ink_plan_opt) |ink_plan| .{
+            .grid_t = tube_count,
+            .grid_h = ink_plan.merged_h,
+            .grid_w = ink_plan.merged_w,
+            .temporal_stride = 1,
+        } else anyres_plan_opt.?.toVisionGridSpec(tube_count, 1);
         const mrope_planar = try allocator.alloc(u32, @as(usize, total_tokens) * 3);
         defer allocator.free(mrope_planar);
         const all_pos3d = try allocator.alloc(hybrid.Pos3D, total_tokens);
@@ -15355,6 +15481,31 @@ fn inferVisionConfigFromEntries(
     }
     if (spatial_merge == 0) return error.TensorShapeMismatch;
 
+    var cls_buf: [128]u8 = undefined;
+    var cls_pos_buf: [128]u8 = undefined;
+    var posemb_buf: [128]u8 = undefined;
+    var ln_pre_buf: [128]u8 = undefined;
+    var ls1_buf: [128]u8 = undefined;
+    const cls_stem = std.fmt.bufPrint(&cls_buf, "{s}embed.class_embedding", .{pfx}) catch unreachable;
+    const cls_pos_stem = std.fmt.bufPrint(&cls_pos_buf, "{s}embed.cls_position_embedding", .{pfx}) catch unreachable;
+    const posemb_stem = std.fmt.bufPrint(&posemb_buf, "{s}embed.position_embedding", .{pfx}) catch unreachable;
+    const ln_pre_stem = std.fmt.bufPrint(&ln_pre_buf, "{s}ln_pre", .{pfx}) catch unreachable;
+    const ls1_stem = std.fmt.bufPrint(&ls1_buf, "{s}blocks.0.ls_1.gamma", .{pfx}) catch unreachable;
+
+    const has_cls_emb = (findVisionStemEntry(vsrc, cls_stem) != null and findVisionStemEntry(vsrc, cls_pos_stem) != null);
+    const posemb_entry = findVisionStemEntry(vsrc, posemb_stem);
+    const has_ln_pre = (findVisionStemEntry(vsrc, ln_pre_stem) != null);
+    const has_ls1 = (vsrc.find(ls1_stem) != null);
+    const is_inkling2_vision = (has_cls_emb or has_ls1 or (has_ln_pre and posemb_entry != null));
+
+    const posemb_grid_size: u32 = if (posemb_entry) |pe_pos|
+        integerExactSqrt(pe_pos.shape[0]) orelse return error.TensorShapeMismatch
+    else
+        0;
+    if (is_inkling2_vision and mlp_kind == .gelu_tanh) {
+        mlp_kind = .gelu_exact;
+    }
+
     const cfg: vision_mod.VisionTowerConfig = .{
         .has_vision = true,
         .num_layers = num_layers,
@@ -15370,8 +15521,14 @@ fn inferVisionConfigFromEntries(
         .max_patches = max_patches,
         .mlp_kind = mlp_kind,
         .qkv_layout = .split_3hd,
-        .rope_interleaved = false,
+        .rope_interleaved = is_inkling2_vision,
         .rope_theta = 10000.0,
+        .is_inkling2_vision = is_inkling2_vision,
+        .has_cls_token = has_cls_emb,
+        .posemb_grid_size = posemb_grid_size,
+        .layer_norm_eps = if (is_inkling2_vision) 1e-5 else 1e-6,
+        .rope_swap_hw_axes = is_inkling2_vision,
+        .apply_rope_on_split_qkv = is_inkling2_vision,
     };
     try cfg.validate();
     return cfg;
@@ -15409,7 +15566,17 @@ const VisionTensorResolver = struct {
         return .{ .bind = try self.bindingForEntry(be), .dtype = fdt };
     }
 
-    fn bindNorm(self: *const VisionTensorResolver, stem: []const u8, expected_len: u32) GraphLoadError!vision_mod.VisionNormWeight {
+    fn bindOptionalScale(self: *const VisionTensorResolver, name: []const u8, expected_len: u32) GraphLoadError!?vision_mod.VisionScaleWeight {
+        const se = self.vsrc.find(name) orelse return null;
+        if (se.shape[0] != expected_len) return error.TensorShapeMismatch;
+        const fdt = amfToFloatDType(try se.dataType()) orelse return error.UnsupportedDType;
+        return .{
+            .gamma = try self.bindingForEntry(se),
+            .dtype = fdt,
+        };
+    }
+
+    fn bindNorm(self: *const VisionTensorResolver, stem: []const u8, expected_len: u32, eps: f32) GraphLoadError!vision_mod.VisionNormWeight {
         const we = findVisionStemEntry(self.vsrc, stem) orelse return error.MissingTensor;
         if (we.shape[0] != expected_len) return error.TensorShapeMismatch;
         const fdt = amfToFloatDType(try we.dataType()) orelse return error.UnsupportedDType;
@@ -15420,7 +15587,7 @@ const VisionTensorResolver = struct {
             .beta = if (bias) |b| b.bind else null,
             .dtype = fdt,
             .kind = if (bias != null) .layer_norm else .rms_norm,
-            .eps = 1e-6,
+            .eps = eps,
         };
     }
 
@@ -15485,10 +15652,35 @@ fn bindVisionWeights(
     const pe_dtype = amfToFloatDType(try pe_found.entry.dataType()) orelse return error.UnsupportedDType;
     const pe_bias = try res.bindOptionalBias(pe_found.stem, vis_h);
 
-    var pos_b: [128]u8 = undefined;
-    const pos_stem = std.fmt.bufPrint(&pos_b, "{s}pos_embed", .{pfx}) catch unreachable;
-    const pos_bind: ?metal.BufferBinding = if (findVisionStemEntry(res.vsrc, pos_stem)) |pose|
-        try res.bindingForEntry(pose)
+    var pos0_b: [128]u8 = undefined;
+    var pos1_b: [128]u8 = undefined;
+    const pos_stems = [_][]const u8{
+        std.fmt.bufPrint(&pos0_b, "{s}embed.position_embedding", .{pfx}) catch unreachable,
+        std.fmt.bufPrint(&pos1_b, "{s}pos_embed", .{pfx}) catch unreachable,
+    };
+    const pos_bind: ?metal.BufferBinding = if (findVisionStemFirst(res.vsrc, &pos_stems)) |pf|
+        try res.bindingForEntry(pf.entry)
+    else
+        null;
+
+    var cls_b: [128]u8 = undefined;
+    const cls_stem = std.fmt.bufPrint(&cls_b, "{s}embed.class_embedding", .{pfx}) catch unreachable;
+    const class_embed_bind: ?metal.BufferBinding = if (findVisionStemEntry(res.vsrc, cls_stem)) |ce| blk: {
+        if (ce.shape[0] != vis_h) return error.TensorShapeMismatch;
+        break :blk try res.bindingForEntry(ce);
+    } else null;
+
+    var cls_pos_b: [128]u8 = undefined;
+    const cls_pos_stem = std.fmt.bufPrint(&cls_pos_b, "{s}embed.cls_position_embedding", .{pfx}) catch unreachable;
+    const cls_pos_embed_bind: ?metal.BufferBinding = if (findVisionStemEntry(res.vsrc, cls_pos_stem)) |cpe| blk: {
+        if (cpe.shape[0] != vis_h) return error.TensorShapeMismatch;
+        break :blk try res.bindingForEntry(cpe);
+    } else null;
+
+    var ln_pre_b: [128]u8 = undefined;
+    const ln_pre_stem = std.fmt.bufPrint(&ln_pre_b, "{s}ln_pre", .{pfx}) catch unreachable;
+    const pre_norm: ?vision_mod.VisionNormWeight = if (findVisionStemEntry(res.vsrc, ln_pre_stem) != null)
+        try res.bindNorm(ln_pre_stem, vis_h, cfg.layer_norm_eps)
     else
         null;
 
@@ -15497,6 +15689,9 @@ fn bindVisionWeights(
         .dtype = pe_dtype,
         .bias = if (pe_bias) |b| b.bind else null,
         .pos_embed = pos_bind,
+        .class_embed = class_embed_bind,
+        .cls_pos_embed = cls_pos_embed_bind,
+        .pre_norm = pre_norm,
         .in_dim = expected_in_dim,
     };
 
@@ -15509,9 +15704,14 @@ fn bindVisionWeights(
     var b3: [128]u8 = undefined;
     for (0..cfg.num_layers) |l| {
         const n1_stem = std.fmt.bufPrint(&b0, "{s}blocks.{d}.norm1", .{ pfx, l }) catch unreachable;
-        const norm1 = try res.bindNorm(n1_stem, vis_h);
+        const norm1 = try res.bindNorm(n1_stem, vis_h, cfg.layer_norm_eps);
         const n2_stem = std.fmt.bufPrint(&b1, "{s}blocks.{d}.norm2", .{ pfx, l }) catch unreachable;
-        const norm2 = try res.bindNorm(n2_stem, vis_h);
+        const norm2 = try res.bindNorm(n2_stem, vis_h, cfg.layer_norm_eps);
+
+        const ls1_name = std.fmt.bufPrint(&b2, "{s}blocks.{d}.ls_1.gamma", .{ pfx, l }) catch unreachable;
+        const ls1 = try res.bindOptionalScale(ls1_name, vis_h);
+        const ls2_name = std.fmt.bufPrint(&b3, "{s}blocks.{d}.ls_2.gamma", .{ pfx, l }) catch unreachable;
+        const ls2 = try res.bindOptionalScale(ls2_name, vis_h);
 
         const qkv_stems = [_][]const u8{
             std.fmt.bufPrint(&b0, "{s}blocks.{d}.attn.qkv", .{ pfx, l }) catch unreachable,
@@ -15580,14 +15780,15 @@ fn bindVisionWeights(
             .k_proj = k_proj_opt,
             .v_proj = v_proj_opt,
             .proj = proj,
+            .ls_1 = ls1,
             .norm2 = norm2,
             .mlp_fc1 = mlp_fc1,
             .mlp_up = mlp_up,
             .mlp_fc2 = mlp_fc2,
+            .ls_2 = ls2,
             .use_window_attn = false,
         };
     }
-    _ = &b3;
 
     const m1_stems = [_][]const u8{
         "visual.merger.linear_fc1",
@@ -15638,10 +15839,10 @@ fn bindVisionWeights(
         const nlen = mn.entry.shape[0];
         if (nlen == vis_h) {
             norm_placement = .pre_merge;
-            m_norm = try res.bindNorm(mn.stem, vis_h);
+            m_norm = try res.bindNorm(mn.stem, vis_h, cfg.layer_norm_eps);
         } else if (nlen == merged_in_dim) {
             norm_placement = .post_merge;
-            m_norm = try res.bindNorm(mn.stem, merged_in_dim);
+            m_norm = try res.bindNorm(mn.stem, merged_in_dim, cfg.layer_norm_eps);
         } else {
             return error.TensorShapeMismatch;
         }
@@ -15655,7 +15856,7 @@ fn bindVisionWeights(
             .fc1 = m_fc1,
             .fc2 = m_fc2,
             .merger_hidden_size = cfg.merger_hidden,
-            .act_kind = .gelu_tanh,
+            .act_kind = if (cfg.mlp_kind == .gelu_exact) .gelu_exact else .gelu_tanh,
         },
         .patch_embed = patch_embed,
     };
@@ -15848,7 +16049,7 @@ fn initGraphVisionState(
 //            All Four ADR-0019 Hybrid-Sparse Loop Isolations
 // ===========================================================================
 
-const TestTensorBlob = struct {
+pub const TestTensorBlob = struct {
     name: []const u8,
     kind: amf.TensorKind,
     dtype: amf.DType,
@@ -15863,7 +16064,7 @@ const TestTensorBlob = struct {
     params_bytes: u64 = 0,
 };
 
-fn buildTestAmf(allocator: std.mem.Allocator, model_id: []const u8, blobs: []const TestTensorBlob) ![]u8 {
+pub fn buildTestAmf(allocator: std.mem.Allocator, model_id: []const u8, blobs: []const TestTensorBlob) ![]u8 {
     const dir_offset: u64 = page.APPLE_PAGE_SIZE;
     const raw_dir_bytes: usize = blobs.len * @sizeOf(amf.TensorEntry);
     const dir_bytes: u64 = try page.alignUp(@max(raw_dir_bytes, page.APPLE_PAGE_SIZE));
@@ -18909,10 +19110,21 @@ fn applyOverlayToF16Weight(
     return out;
 }
 
+pub const SynthInkling2LoopBundle = struct {
+    cfg: GraphConfig,
+    amf_bytes: []u8,
+};
+
+pub fn buildSynthInkling2LoopBundle(
+    allocator: std.mem.Allocator,
+) !SynthInkling2LoopBundle {
+    return buildSynthInkling2LoopAmf(allocator, null);
+}
+
 fn buildSynthInkling2LoopAmf(
     allocator: std.mem.Allocator,
     overlay: ?SynthInkling2LoraOverlay,
-) !struct { cfg: GraphConfig, amf_bytes: []u8 } {
+) !SynthInkling2LoopBundle {
     const vocab: u32 = 64;
     const h: u32 = 64;
     const n_layers: u32 = 4;

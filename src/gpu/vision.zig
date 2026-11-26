@@ -1553,7 +1553,7 @@ pub const VisionRope2DParams = extern struct {
     qkv_layout: u32,
     rope_interleaved: u32,
     rope_theta: f32,
-    _pad0: u32 = 0,
+    swap_hw_axes: u32 = 0,
     _pad1: u32 = 0,
 
     comptime {
@@ -1608,14 +1608,185 @@ pub const VisionMergeParams = extern struct {
     spatial_merge: u32,
     vis_hidden: u32,
     tile_count: u32,
-    _pad0: u32 = 0,
-    _pad1: u32 = 0,
+    has_cls_token: u32 = 0,
+    preordered_blocks: u32 = 0,
     _pad2: u32 = 0,
 
     comptime {
         std.debug.assert(@sizeOf(VisionMergeParams) == 32);
     }
 };
+
+pub const VisionLayerScaleParams = extern struct {
+    num_tokens: u32,
+    dim: u32,
+    _pad0: u32 = 0,
+    _pad1: u32 = 0,
+
+    comptime {
+        std.debug.assert(@sizeOf(VisionLayerScaleParams) == 16);
+    }
+};
+
+pub const VisionInkling2PatchParams = extern struct {
+    src_width: u32,
+    src_height: u32,
+    pad_width: u32,
+    pad_height: u32,
+    patch_size: u32,
+    spatial_merge: u32,
+    hidden_size: u32,
+    posemb_side: u32,
+    token_offset: u32,
+    has_cls_token: u32,
+    has_bias: u32,
+    is_full_range: u32,
+    use_bilinear_resize: u32,
+    pad_fill_norm: f32,
+    mean_r: f32,
+    mean_g: f32,
+    mean_b: f32,
+    inv_std_r: f32,
+    inv_std_g: f32,
+    inv_std_b: f32,
+
+    comptime {
+        std.debug.assert(@sizeOf(VisionInkling2PatchParams) == 80);
+    }
+};
+
+/// Inkling 2 right/bottom pad fill value after `/255` rescale and `(x - 0.5) / 0.5` normalize:
+/// `((-1.0 / 255.0) - 0.5) * 2.0 = -257.0 / 255.0` (exact match to `Inkling2ImageProcessor._preprocess`).
+pub const INKLING2_PAD_FILL_NORM: f32 = -257.0 / 255.0;
+
+pub const Inkling2GridPlan = struct {
+    src_width: u32,
+    src_height: u32,
+    pad_width: u32,
+    pad_height: u32,
+    grid_h: u32,
+    grid_w: u32,
+    merged_h: u32,
+    merged_w: u32,
+    num_patches: u32,
+    num_merged_tokens: u32,
+    seq_tokens: u32,
+    use_bilinear_resize: bool,
+};
+
+/// Computes Inkling 2 grid geometry matching upstream `Inkling2ImageProcessor._preprocess`:
+/// right/bottom pads `(src_height, src_width)` to multiples of `patch_size * spatial_merge` (`40`),
+/// falling back to aspect-preserving bilinear downscale only if the padded grid would exceed
+/// `max_patches_per_img`.
+pub fn planInkling2Grid(
+    src_width: u32,
+    src_height: u32,
+    patch_size: u32,
+    spatial_merge: u32,
+    has_cls_token: bool,
+    max_patches_per_img: u32,
+) Error!Inkling2GridPlan {
+    if (src_width == 0 or src_height == 0 or
+        src_width > metal.MAX_TEXTURE_DIM or src_height > metal.MAX_TEXTURE_DIM)
+    {
+        return error.InvalidGeometry;
+    }
+    if (patch_size == 0 or patch_size > MAX_PATCH_SIZE or spatial_merge == 0 or spatial_merge > 4) {
+        return error.InvalidGeometry;
+    }
+    const factor = std.math.mul(u32, patch_size, spatial_merge) catch return error.Overflow;
+    const merge_sq = std.math.mul(u32, spatial_merge, spatial_merge) catch return error.Overflow;
+    if (max_patches_per_img < merge_sq) return error.InvalidGeometry;
+
+    var rows: u32 = (src_height + factor - 1) / factor;
+    var cols: u32 = (src_width + factor - 1) / factor;
+    var grid_h = std.math.mul(u32, rows, spatial_merge) catch return error.Overflow;
+    var grid_w = std.math.mul(u32, cols, spatial_merge) catch return error.Overflow;
+    var num_patches = std.math.mul(u32, grid_h, grid_w) catch return error.Overflow;
+    var use_bilinear_resize = false;
+
+    if (num_patches > max_patches_per_img) {
+        use_bilinear_resize = true;
+        const max_pixels: f64 = @as(f64, @floatFromInt(max_patches_per_img)) *
+            @as(f64, @floatFromInt(patch_size * patch_size));
+        const src_pixels: f64 = @as(f64, @floatFromInt(@as(u64, src_width) * @as(u64, src_height)));
+        const beta = @sqrt(src_pixels / max_pixels);
+        const f_f64: f64 = @floatFromInt(factor);
+        rows = @max(@as(u32, 1), @as(u32, @intFromFloat(@floor(@as(f64, @floatFromInt(src_height)) / beta / f_f64))));
+        cols = @max(@as(u32, 1), @as(u32, @intFromFloat(@floor(@as(f64, @floatFromInt(src_width)) / beta / f_f64))));
+        while (@as(u64, rows) * @as(u64, cols) * @as(u64, merge_sq) > @as(u64, max_patches_per_img)) {
+            if (rows >= cols and rows > 1) {
+                rows -= 1;
+            } else if (cols > 1) {
+                cols -= 1;
+            } else {
+                break;
+            }
+        }
+        grid_h = rows * spatial_merge;
+        grid_w = cols * spatial_merge;
+        num_patches = grid_h * grid_w;
+    }
+
+    const cls_extra: u32 = if (has_cls_token) 1 else 0;
+    return .{
+        .src_width = src_width,
+        .src_height = src_height,
+        .pad_width = cols * factor,
+        .pad_height = rows * factor,
+        .grid_h = grid_h,
+        .grid_w = grid_w,
+        .merged_h = rows,
+        .merged_w = cols,
+        .num_patches = num_patches,
+        .num_merged_tokens = rows * cols,
+        .seq_tokens = num_patches + cls_extra,
+        .use_bilinear_resize = use_bilinear_resize,
+    };
+}
+
+/// Populates 2D RoPE coordinates for one Inkling 2 image matching `Inkling2VisionModel.forward`:
+/// `[CLS]` sits at `(0, 0)`, and patches laid out in spatial-merge-block order
+/// `(block_row, block_col, in_row, in_col)` sit at 1-indexed `(patch_row + 1, patch_col + 1)`.
+pub fn fillInkling2Rope2DCoords(
+    grid_h: u32,
+    grid_w: u32,
+    spatial_merge: u32,
+    has_cls_token: bool,
+    out_coords: []RopeCoord2D,
+) Error!u32 {
+    if (grid_h == 0 or grid_w == 0 or spatial_merge == 0 or
+        (grid_h % spatial_merge) != 0 or (grid_w % spatial_merge) != 0)
+    {
+        return error.InvalidGeometry;
+    }
+    const num_patches = grid_h * grid_w;
+    const cls_extra: u32 = if (has_cls_token) 1 else 0;
+    const total = num_patches + cls_extra;
+    if (out_coords.len < total) return error.OutputBufferTooSmall;
+
+    var cursor: u32 = 0;
+    if (has_cls_token) {
+        out_coords[0] = .{ .h = 0, .w = 0 };
+        cursor = 1;
+    }
+    const blocks_h = grid_h / spatial_merge;
+    const blocks_w = grid_w / spatial_merge;
+    const idx_base: u32 = if (has_cls_token) 1 else 0;
+    for (0..blocks_h) |bh| {
+        for (0..blocks_w) |bw| {
+            for (0..spatial_merge) |ir| {
+                for (0..spatial_merge) |ic| {
+                    const pr: u32 = @intCast(bh * spatial_merge + ir);
+                    const pc: u32 = @intCast(bw * spatial_merge + ic);
+                    out_coords[cursor] = .{ .h = pr + idx_base, .w = pc + idx_base };
+                    cursor += 1;
+                }
+            }
+        }
+    }
+    return cursor;
+}
 
 pub const VisionBackend = enum(u8) {
     apple9_simdgroup_mma,
@@ -1681,15 +1852,23 @@ pub const VisionNormWeight = struct {
     eps: f32 = 1e-6,
 };
 
+pub const VisionScaleWeight = struct {
+    gamma: metal.BufferBinding,
+    dtype: quant.FloatDType = .bf16,
+};
+
 pub const VisionBlockWeights = struct {
     norm1: VisionNormWeight,
     qkv: VisionLinearWeight,
     /// Optional split Q/K/V projections (Inkling 2 `23L` ViT & Hy4 `27L`/`40L` ViT).
-    /// When set, `q_proj`/`k_proj`/`v_proj` run instead of fused `qkv` + `qkv_rope_2d`.
+    /// When set, `q_proj`/`k_proj`/`v_proj` run instead of fused `qkv` + `qkv_rope_2d`
+    /// (with in-place 2D RoPE on `Q`/`K` when `cfg.apply_rope_on_split_qkv == true`).
     q_proj: ?VisionLinearWeight = null,
     k_proj: ?VisionLinearWeight = null,
     v_proj: ?VisionLinearWeight = null,
     proj: VisionLinearWeight,
+    /// Optional post-attention LayerScale (`visual.blocks.{l}.ls_1.gamma`, Inkling 2).
+    ls_1: ?VisionScaleWeight = null,
     norm2: VisionNormWeight,
     /// `linear_fc1` / `w1` for GELU MLP, or `gate_proj` / `w1` for SwiGLU MLP.
     mlp_fc1: VisionLinearWeight,
@@ -1697,6 +1876,8 @@ pub const VisionBlockWeights = struct {
     mlp_up: ?VisionLinearWeight = null,
     /// `linear_fc2` / `w2` for GELU MLP, or `down_proj` / `w2` for SwiGLU MLP.
     mlp_fc2: VisionLinearWeight,
+    /// Optional post-MLP LayerScale (`visual.blocks.{l}.ls_2.gamma`, Inkling 2).
+    ls_2: ?VisionScaleWeight = null,
     use_window_attn: bool = false,
 };
 
@@ -1729,6 +1910,19 @@ pub const VisionTowerConfig = struct {
     qkv_layout: VisionQkvLayout = .split_3hd,
     rope_interleaved: bool = false,
     rope_theta: f32 = 10000.0,
+    /// True for `inkling2_vision`: HWC patches in spatial-merge-block order, right/bottom
+    /// `-1.0/255` pad, `[CLS]` token + 2D bilinear `posemb_grid_size^2` interpolation + `ln_pre`.
+    is_inkling2_vision: bool = false,
+    /// Prepends 1 `[CLS]` token per image/tile before encoder blocks and strips it before merger.
+    has_cls_token: bool = false,
+    /// Side length of square learned 2D position-embedding table (`32` for Inkling 2 = `1024` entries).
+    posemb_grid_size: u32 = 0,
+    /// LayerNorm epsilon (`1e-5` for Inkling 2, `1e-6` default for Qwen-VL / DeepSeek).
+    layer_norm_eps: f32 = 1e-6,
+    /// When `true`, puts width frequencies in dims `[0 .. D/2)` and height in `[D/2 .. D)` (Inkling 2).
+    rope_swap_hw_axes: bool = false,
+    /// When `true`, applies 2D axial RoPE in-place to split `q_proj`/`k_proj` outputs.
+    apply_rope_on_split_qkv: bool = false,
 
     pub fn validate(self: VisionTowerConfig) Error!void {
         if (!self.has_vision) return;
@@ -1756,15 +1950,26 @@ pub const VisionTowerConfig = struct {
         const sm_sq = std.math.mul(u32, self.spatial_merge, self.spatial_merge) catch return error.Overflow;
         return @max(@as(u32, 1), (self.max_patches + sm_sq - 1) / sm_sq);
     }
+
+    /// Maximum total sequence tokens in ViT scratch (`max_patches`, plus up to
+    /// `MAX_ANYRES_TILES` leading `[CLS]` tokens when `has_cls_token == true`).
+    pub fn maxSeqTokens(self: VisionTowerConfig) Error!u32 {
+        if (!self.has_cls_token) return self.max_patches;
+        return std.math.add(u32, self.max_patches, @as(u32, MAX_ANYRES_TILES)) catch return error.Overflow;
+    }
 };
 
-/// Startup-compiled Metal 4 pipelines for the full M7.8 G22 ViT tower.
+/// Startup-compiled Metal 4 pipelines for the full M7.8 G22 & M9.7 Inkling 2 ViT tower.
 /// Lazily instantiates `Apple10+` `NAX` TensorOps pipelines only on `gpu_apple_family >= 10`.
 pub const VisionTowerPipelines = struct {
     anyres_bgra8: [2][2]metal.Pipeline,
     anyres_nv12: [2][2]metal.Pipeline,
+    inkling2_bgra8: [2][2]metal.Pipeline,
+    inkling2_nv12: [2][2]metal.Pipeline,
     norm: [2]metal.Pipeline,
     qkv_rope_2d: metal.Pipeline,
+    qk_rope_2d_inplace: metal.Pipeline,
+    layerscale_residual_add: [2]metal.Pipeline,
     bidir_flash_attn_mma: metal.Pipeline,
     bidir_flash_attn_nax: ?metal.Pipeline,
     linear_mma: [2]metal.Pipeline,
@@ -1817,6 +2022,48 @@ pub const VisionTowerPipelines = struct {
         });
         errdefer an_bb.close();
 
+        const ib_ff = try metal.Pipeline.initSpecialized(device, library, "ami_vision_inkling2_patchify_embed_bgra8", &.{
+            .{ .index = 0, .value = .{ .bool = false } },
+            .{ .index = 1, .value = .{ .bool = false } },
+        });
+        errdefer ib_ff.close();
+        const ib_fb = try metal.Pipeline.initSpecialized(device, library, "ami_vision_inkling2_patchify_embed_bgra8", &.{
+            .{ .index = 0, .value = .{ .bool = false } },
+            .{ .index = 1, .value = .{ .bool = true } },
+        });
+        errdefer ib_fb.close();
+        const ib_bf = try metal.Pipeline.initSpecialized(device, library, "ami_vision_inkling2_patchify_embed_bgra8", &.{
+            .{ .index = 0, .value = .{ .bool = true } },
+            .{ .index = 1, .value = .{ .bool = false } },
+        });
+        errdefer ib_bf.close();
+        const ib_bb = try metal.Pipeline.initSpecialized(device, library, "ami_vision_inkling2_patchify_embed_bgra8", &.{
+            .{ .index = 0, .value = .{ .bool = true } },
+            .{ .index = 1, .value = .{ .bool = true } },
+        });
+        errdefer ib_bb.close();
+
+        const in_ff = try metal.Pipeline.initSpecialized(device, library, "ami_vision_inkling2_patchify_embed_nv12", &.{
+            .{ .index = 0, .value = .{ .bool = false } },
+            .{ .index = 1, .value = .{ .bool = false } },
+        });
+        errdefer in_ff.close();
+        const in_fb = try metal.Pipeline.initSpecialized(device, library, "ami_vision_inkling2_patchify_embed_nv12", &.{
+            .{ .index = 0, .value = .{ .bool = false } },
+            .{ .index = 1, .value = .{ .bool = true } },
+        });
+        errdefer in_fb.close();
+        const in_bf = try metal.Pipeline.initSpecialized(device, library, "ami_vision_inkling2_patchify_embed_nv12", &.{
+            .{ .index = 0, .value = .{ .bool = true } },
+            .{ .index = 1, .value = .{ .bool = false } },
+        });
+        errdefer in_bf.close();
+        const in_bb = try metal.Pipeline.initSpecialized(device, library, "ami_vision_inkling2_patchify_embed_nv12", &.{
+            .{ .index = 0, .value = .{ .bool = true } },
+            .{ .index = 1, .value = .{ .bool = true } },
+        });
+        errdefer in_bb.close();
+
         const norm_f16 = try metal.Pipeline.initSpecialized(device, library, "ami_vision_norm", &.{
             .{ .index = 0, .value = .{ .bool = false } },
         });
@@ -1828,6 +2075,18 @@ pub const VisionTowerPipelines = struct {
 
         const qkv_rope = try metal.Pipeline.init(device, library, "ami_vision_qkv_rope_2d");
         errdefer qkv_rope.close();
+
+        const qk_rope_in = try metal.Pipeline.init(device, library, "ami_vision_qk_rope_2d_inplace");
+        errdefer qk_rope_in.close();
+
+        const ls_f16 = try metal.Pipeline.initSpecialized(device, library, "ami_vision_layerscale_residual_add", &.{
+            .{ .index = 0, .value = .{ .bool = false } },
+        });
+        errdefer ls_f16.close();
+        const ls_bf16 = try metal.Pipeline.initSpecialized(device, library, "ami_vision_layerscale_residual_add", &.{
+            .{ .index = 0, .value = .{ .bool = true } },
+        });
+        errdefer ls_bf16.close();
 
         const fa_mma = try metal.Pipeline.init(device, library, "ami_vision_bidir_flash_attn_mma");
         errdefer fa_mma.close();
@@ -1876,8 +2135,12 @@ pub const VisionTowerPipelines = struct {
         return .{
             .anyres_bgra8 = .{ .{ ab_ff, ab_fb }, .{ ab_bf, ab_bb } },
             .anyres_nv12 = .{ .{ an_ff, an_fb }, .{ an_bf, an_bb } },
+            .inkling2_bgra8 = .{ .{ ib_ff, ib_fb }, .{ ib_bf, ib_bb } },
+            .inkling2_nv12 = .{ .{ in_ff, in_fb }, .{ in_bf, in_bb } },
             .norm = .{ norm_f16, norm_bf16 },
             .qkv_rope_2d = qkv_rope,
+            .qk_rope_2d_inplace = qk_rope_in,
+            .layerscale_residual_add = .{ ls_f16, ls_bf16 },
             .bidir_flash_attn_mma = fa_mma,
             .bidir_flash_attn_nax = fa_nax,
             .linear_mma = .{ lin_f16, lin_bf16 },
@@ -1896,8 +2159,16 @@ pub const VisionTowerPipelines = struct {
         for (self.anyres_nv12) |row| {
             for (row) |p| p.close();
         }
+        for (self.inkling2_bgra8) |row| {
+            for (row) |p| p.close();
+        }
+        for (self.inkling2_nv12) |row| {
+            for (row) |p| p.close();
+        }
         for (self.norm) |p| p.close();
         self.qkv_rope_2d.close();
+        self.qk_rope_2d_inplace.close();
+        for (self.layerscale_residual_add) |p| p.close();
         self.bidir_flash_attn_mma.close();
         if (self.bidir_flash_attn_nax) |p| p.close();
         for (self.linear_mma) |p| p.close();
@@ -2045,6 +2316,151 @@ pub const VisionTowerPipelines = struct {
         );
     }
 
+    pub fn encodeInkling2PatchifyEmbedBgra8(
+        self: *const VisionTowerPipelines,
+        frame: *metal.Compute.Frame,
+        frame0: metal.VisionFrame,
+        grid: Inkling2GridPlan,
+        patch_size: u32,
+        spatial_merge: u32,
+        hidden_size: u32,
+        posemb_side: u32,
+        token_offset: u32,
+        has_cls_token: bool,
+        norm: NormParams,
+        weight: metal.BufferBinding,
+        bias: ?metal.BufferBinding,
+        pos_embed: ?metal.BufferBinding,
+        class_embed: ?metal.BufferBinding,
+        cls_pos_embed: ?metal.BufferBinding,
+        out: metal.BufferBinding,
+        weight_dtype: quant.FloatDType,
+        out_dtype: quant.FloatDType,
+        insert_barrier_before: bool,
+    ) EncodeError!void {
+        if (hidden_size == 0 or grid.pad_width == 0 or grid.pad_height == 0 or
+            (grid.pad_width % patch_size) != 0 or (grid.pad_height % patch_size) != 0)
+        {
+            return error.InvalidGeometry;
+        }
+        if (has_cls_token and (class_embed == null or cls_pos_embed == null)) return error.InvalidBlockWeights;
+        if (posemb_side > 0 and pos_embed == null) return error.InvalidBlockWeights;
+        const params: VisionInkling2PatchParams = .{
+            .src_width = grid.src_width,
+            .src_height = grid.src_height,
+            .pad_width = grid.pad_width,
+            .pad_height = grid.pad_height,
+            .patch_size = patch_size,
+            .spatial_merge = spatial_merge,
+            .hidden_size = hidden_size,
+            .posemb_side = posemb_side,
+            .token_offset = token_offset,
+            .has_cls_token = if (has_cls_token) 1 else 0,
+            .has_bias = if (bias != null) 1 else 0,
+            .is_full_range = 1,
+            .use_bilinear_resize = if (grid.use_bilinear_resize) 1 else 0,
+            .pad_fill_norm = INKLING2_PAD_FILL_NORM,
+            .mean_r = norm.mean[0],
+            .mean_g = norm.mean[1],
+            .mean_b = norm.mean[2],
+            .inv_std_r = norm.inv_std[0],
+            .inv_std_g = norm.inv_std[1],
+            .inv_std_b = norm.inv_std[2],
+        };
+        const groups_x = (hidden_size + EMBED_TG_CHANNELS - 1) / EMBED_TG_CHANNELS;
+        try frame.encodeThreadgroupsWithVisionTextures(
+            self.inkling2_bgra8[@backingInt(weight_dtype)][@backingInt(out_dtype)],
+            &.{
+                weight,
+                bias orelse weight,
+                pos_embed orelse weight,
+                class_embed orelse weight,
+                cls_pos_embed orelse weight,
+                out,
+            },
+            &.{.{ .frame = frame0, .plane = 0 }},
+            std.mem.asBytes(&params),
+            .{ groups_x, grid.seq_tokens, 1 },
+            .{ PATCHIFY_TG_THREADS, 1, 1 },
+            insert_barrier_before,
+        );
+    }
+
+    pub fn encodeInkling2PatchifyEmbedNv12(
+        self: *const VisionTowerPipelines,
+        frame: *metal.Compute.Frame,
+        frame0: metal.VisionFrame,
+        grid: Inkling2GridPlan,
+        patch_size: u32,
+        spatial_merge: u32,
+        hidden_size: u32,
+        posemb_side: u32,
+        token_offset: u32,
+        has_cls_token: bool,
+        is_full_range: bool,
+        norm: NormParams,
+        weight: metal.BufferBinding,
+        bias: ?metal.BufferBinding,
+        pos_embed: ?metal.BufferBinding,
+        class_embed: ?metal.BufferBinding,
+        cls_pos_embed: ?metal.BufferBinding,
+        out: metal.BufferBinding,
+        weight_dtype: quant.FloatDType,
+        out_dtype: quant.FloatDType,
+        insert_barrier_before: bool,
+    ) EncodeError!void {
+        if (hidden_size == 0 or grid.pad_width == 0 or grid.pad_height == 0 or
+            (grid.pad_width % patch_size) != 0 or (grid.pad_height % patch_size) != 0 or
+            (grid.src_width & 1) != 0 or (grid.src_height & 1) != 0)
+        {
+            return error.InvalidGeometry;
+        }
+        if (has_cls_token and (class_embed == null or cls_pos_embed == null)) return error.InvalidBlockWeights;
+        if (posemb_side > 0 and pos_embed == null) return error.InvalidBlockWeights;
+        const params: VisionInkling2PatchParams = .{
+            .src_width = grid.src_width,
+            .src_height = grid.src_height,
+            .pad_width = grid.pad_width,
+            .pad_height = grid.pad_height,
+            .patch_size = patch_size,
+            .spatial_merge = spatial_merge,
+            .hidden_size = hidden_size,
+            .posemb_side = posemb_side,
+            .token_offset = token_offset,
+            .has_cls_token = if (has_cls_token) 1 else 0,
+            .has_bias = if (bias != null) 1 else 0,
+            .is_full_range = if (is_full_range) 1 else 0,
+            .use_bilinear_resize = if (grid.use_bilinear_resize) 1 else 0,
+            .pad_fill_norm = INKLING2_PAD_FILL_NORM,
+            .mean_r = norm.mean[0],
+            .mean_g = norm.mean[1],
+            .mean_b = norm.mean[2],
+            .inv_std_r = norm.inv_std[0],
+            .inv_std_g = norm.inv_std[1],
+            .inv_std_b = norm.inv_std[2],
+        };
+        const groups_x = (hidden_size + EMBED_TG_CHANNELS - 1) / EMBED_TG_CHANNELS;
+        try frame.encodeThreadgroupsWithVisionTextures(
+            self.inkling2_nv12[@backingInt(weight_dtype)][@backingInt(out_dtype)],
+            &.{
+                weight,
+                bias orelse weight,
+                pos_embed orelse weight,
+                class_embed orelse weight,
+                cls_pos_embed orelse weight,
+                out,
+            },
+            &.{
+                .{ .frame = frame0, .plane = 0 },
+                .{ .frame = frame0, .plane = 1 },
+            },
+            std.mem.asBytes(&params),
+            .{ groups_x, grid.seq_tokens, 1 },
+            .{ PATCHIFY_TG_THREADS, 1, 1 },
+            insert_barrier_before,
+        );
+    }
+
     pub fn encodeNorm(
         self: *const VisionTowerPipelines,
         frame: *metal.Compute.Frame,
@@ -2098,6 +2514,7 @@ pub const VisionTowerPipelines = struct {
             .qkv_layout = if (qkv_layout == .split_3hd) 0 else 1,
             .rope_interleaved = if (rope_interleaved) 1 else 0,
             .rope_theta = rope_theta,
+            .swap_hw_axes = 0,
         };
         try frame.encodeThreadgroups(
             self.qkv_rope_2d,
@@ -2105,6 +2522,68 @@ pub const VisionTowerPipelines = struct {
             std.mem.asBytes(&params),
             .{ num_heads, num_tokens, 1 },
             .{ 64, 1, 1 },
+            insert_barrier_before,
+        );
+    }
+
+    pub fn encodeQkRope2DInplace(
+        self: *const VisionTowerPipelines,
+        frame: *metal.Compute.Frame,
+        q: metal.BufferBinding,
+        k: metal.BufferBinding,
+        coords: metal.BufferBinding,
+        num_tokens: u32,
+        num_heads: u32,
+        head_dim: u32,
+        rope_interleaved: bool,
+        swap_hw_axes: bool,
+        rope_theta: f32,
+        insert_barrier_before: bool,
+    ) EncodeError!void {
+        if (num_tokens == 0 or num_heads == 0) return error.InvalidGeometry;
+        if (head_dim == 0 or head_dim > MAX_VIT_HEAD_DIM or (head_dim % 4) != 0) return error.InvalidHeadDim;
+        const params: VisionRope2DParams = .{
+            .num_tokens = num_tokens,
+            .num_heads = num_heads,
+            .head_dim = head_dim,
+            .qkv_layout = 0,
+            .rope_interleaved = if (rope_interleaved) 1 else 0,
+            .rope_theta = rope_theta,
+            .swap_hw_axes = if (swap_hw_axes) 1 else 0,
+        };
+        try frame.encodeThreadgroups(
+            self.qk_rope_2d_inplace,
+            &.{ q, k, coords },
+            std.mem.asBytes(&params),
+            .{ num_heads, num_tokens, 1 },
+            .{ 64, 1, 1 },
+            insert_barrier_before,
+        );
+    }
+
+    pub fn encodeLayerScaleResidualAdd(
+        self: *const VisionTowerPipelines,
+        frame: *metal.Compute.Frame,
+        x: metal.BufferBinding,
+        residual: metal.BufferBinding,
+        scale: VisionScaleWeight,
+        out: metal.BufferBinding,
+        num_tokens: u32,
+        dim: u32,
+        insert_barrier_before: bool,
+    ) EncodeError!void {
+        if (num_tokens == 0 or dim == 0) return error.InvalidGeometry;
+        const total = std.math.mul(u32, num_tokens, dim) catch return error.Overflow;
+        const params: VisionLayerScaleParams = .{
+            .num_tokens = num_tokens,
+            .dim = dim,
+        };
+        try frame.encodeThreads(
+            self.layerscale_residual_add[@backingInt(scale.dtype)],
+            &.{ x, residual, scale.gamma, out },
+            std.mem.asBytes(&params),
+            .{ total, 1, 1 },
+            .{ 256, 1, 1 },
             insert_barrier_before,
         );
     }
@@ -2245,6 +2724,35 @@ pub const VisionTowerPipelines = struct {
         tile_count: u32,
         insert_barrier_before: bool,
     ) EncodeError!void {
+        return self.encodeSpatialMergeConcatEx(
+            frame,
+            in_tokens,
+            out_merged,
+            grid_h,
+            grid_w,
+            spatial_merge,
+            vis_hidden,
+            tile_count,
+            false,
+            false,
+            insert_barrier_before,
+        );
+    }
+
+    pub fn encodeSpatialMergeConcatEx(
+        self: *const VisionTowerPipelines,
+        frame: *metal.Compute.Frame,
+        in_tokens: metal.BufferBinding,
+        out_merged: metal.BufferBinding,
+        grid_h: u32,
+        grid_w: u32,
+        spatial_merge: u32,
+        vis_hidden: u32,
+        tile_count: u32,
+        has_cls_token: bool,
+        preordered_blocks: bool,
+        insert_barrier_before: bool,
+    ) EncodeError!void {
         if (grid_h == 0 or grid_w == 0 or spatial_merge == 0 or vis_hidden == 0 or tile_count == 0 or
             (grid_h % spatial_merge) != 0 or (grid_w % spatial_merge) != 0)
         {
@@ -2257,6 +2765,8 @@ pub const VisionTowerPipelines = struct {
             .spatial_merge = spatial_merge,
             .vis_hidden = vis_hidden,
             .tile_count = tile_count,
+            .has_cls_token = if (has_cls_token) 1 else 0,
+            .preordered_blocks = if (preordered_blocks) 1 else 0,
         };
         try frame.encodeThreadgroups(
             self.spatial_merge_concat,
@@ -2320,7 +2830,7 @@ pub const VisionTowerScratch = struct {
 
     fn computeSizes(cfg: VisionTowerConfig) Error!SliceSizes {
         try cfg.validate();
-        const s: usize = cfg.max_patches;
+        const s: usize = try cfg.maxSeqTokens();
         const dv: usize = cfg.vis_hidden;
         const df: usize = cfg.vis_intermediate;
         const s_merged: usize = try cfg.maxMergedTokens();
@@ -2840,21 +3350,50 @@ pub const VisionTowerRuntime = struct {
         num_patches: u32,
         insert_barrier_before: bool,
     ) EncodeError!void {
+        return self.encodeBlockEx(frame, block, in_hidden, out_hidden, num_patches, false, insert_barrier_before);
+    }
+
+    pub fn encodeBlockEx(
+        self: *const VisionTowerRuntime,
+        frame: *metal.Compute.Frame,
+        block: VisionBlockWeights,
+        in_hidden: metal.BufferBinding,
+        out_hidden: metal.BufferBinding,
+        num_tokens: u32,
+        force_window_attn: bool,
+        insert_barrier_before: bool,
+    ) EncodeError!void {
         const pipes = self.pipelines orelse return error.InvalidBlockWeights;
         const sc = self.scratch orelse return error.InvalidBlockWeights;
         const cfg = self.config;
-        if (num_patches == 0 or num_patches > cfg.max_patches) return error.InvalidGeometry;
+        const max_seq = try cfg.maxSeqTokens();
+        if (num_tokens == 0 or num_tokens > max_seq) return error.InvalidGeometry;
 
         // 1. Pre-attention LayerNorm / RMSNorm -> sc.norm
-        try pipes.encodeNorm(frame, in_hidden, block.norm1, sc.normBinding(), num_patches, cfg.vis_hidden, insert_barrier_before);
+        try pipes.encodeNorm(frame, in_hidden, block.norm1, sc.normBinding(), num_tokens, cfg.vis_hidden, insert_barrier_before);
         // 2-3. QKV projection (split Q/K/V for Inkling 2 / Hy4 ViTs, or fused QKV + 2D-RoPE).
         if (block.q_proj != null and block.k_proj != null and block.v_proj != null) {
-            try pipes.encodeLinear(frame, sc.normBinding(), block.q_proj.?, null, sc.qBinding(), num_patches, cfg.vis_hidden, cfg.vis_hidden, .none, true);
-            try pipes.encodeLinear(frame, sc.normBinding(), block.k_proj.?, null, sc.kBinding(), num_patches, cfg.vis_hidden, cfg.vis_hidden, .none, false);
-            try pipes.encodeLinear(frame, sc.normBinding(), block.v_proj.?, null, sc.vBinding(), num_patches, cfg.vis_hidden, cfg.vis_hidden, .none, false);
+            try pipes.encodeLinear(frame, sc.normBinding(), block.q_proj.?, null, sc.qBinding(), num_tokens, cfg.vis_hidden, cfg.vis_hidden, .none, true);
+            try pipes.encodeLinear(frame, sc.normBinding(), block.k_proj.?, null, sc.kBinding(), num_tokens, cfg.vis_hidden, cfg.vis_hidden, .none, false);
+            try pipes.encodeLinear(frame, sc.normBinding(), block.v_proj.?, null, sc.vBinding(), num_tokens, cfg.vis_hidden, cfg.vis_hidden, .none, false);
+            if (cfg.apply_rope_on_split_qkv) {
+                try pipes.encodeQkRope2DInplace(
+                    frame,
+                    sc.qBinding(),
+                    sc.kBinding(),
+                    sc.coordsBinding(),
+                    num_tokens,
+                    cfg.num_heads,
+                    cfg.head_dim,
+                    cfg.rope_interleaved,
+                    cfg.rope_swap_hw_axes,
+                    cfg.rope_theta,
+                    true,
+                );
+            }
         } else {
             // 2. QKV linear projection: [S, D] -> [S, 3*D]
-            try pipes.encodeLinear(frame, sc.normBinding(), block.qkv, null, sc.qkvBinding(), num_patches, 3 * cfg.vis_hidden, cfg.vis_hidden, .none, true);
+            try pipes.encodeLinear(frame, sc.normBinding(), block.qkv, null, sc.qkvBinding(), num_tokens, 3 * cfg.vis_hidden, cfg.vis_hidden, .none, true);
             // 3. Fused QKV split + 2D-RoPE -> Q, K, V
             try pipes.encodeQkvRope2D(
                 frame,
@@ -2863,7 +3402,7 @@ pub const VisionTowerRuntime = struct {
                 sc.qBinding(),
                 sc.kBinding(),
                 sc.vBinding(),
-                num_patches,
+                num_tokens,
                 cfg.num_heads,
                 cfg.head_dim,
                 cfg.qkv_layout,
@@ -2873,7 +3412,7 @@ pub const VisionTowerRuntime = struct {
             );
         }
         // 4. Bidirectional full/windowed FlashAttention-2 (MMA / NAX) -> sc.attn_out
-        const win_opt: ?metal.BufferBinding = if (block.use_window_attn) sc.windowBoundsBinding() else null;
+        const win_opt: ?metal.BufferBinding = if (block.use_window_attn or force_window_attn) sc.windowBoundsBinding() else null;
         try pipes.encodeBidirFlashAttn(
             frame,
             sc.qBinding(),
@@ -2881,34 +3420,49 @@ pub const VisionTowerRuntime = struct {
             sc.vBinding(),
             win_opt,
             sc.attnOutBinding(),
-            num_patches,
+            num_tokens,
             cfg.num_heads,
             cfg.head_dim,
             true,
         );
-        // 5. Attention output projection + fused residual add -> out_hidden (intermediate residual state)
-        try pipes.encodeLinear(frame, sc.attnOutBinding(), block.proj, in_hidden, out_hidden, num_patches, cfg.vis_hidden, cfg.vis_hidden, .none, true);
+        // 5. Attention output projection + optional LayerScale + residual add -> out_hidden
+        if (block.ls_1) |ls1| {
+            try pipes.encodeLinear(frame, sc.attnOutBinding(), block.proj, null, sc.normBinding(), num_tokens, cfg.vis_hidden, cfg.vis_hidden, .none, true);
+            try pipes.encodeLayerScaleResidualAdd(frame, sc.normBinding(), in_hidden, ls1, out_hidden, num_tokens, cfg.vis_hidden, true);
+        } else {
+            try pipes.encodeLinear(frame, sc.attnOutBinding(), block.proj, in_hidden, out_hidden, num_tokens, cfg.vis_hidden, cfg.vis_hidden, .none, true);
+        }
         // 6. Pre-MLP LayerNorm / RMSNorm -> sc.norm
-        try pipes.encodeNorm(frame, out_hidden, block.norm2, sc.normBinding(), num_patches, cfg.vis_hidden, true);
-        // 7. MLP (GELU or SwiGLU) + fused residual add -> out_hidden (writing back to out_hidden via in-place residual read)
+        try pipes.encodeNorm(frame, out_hidden, block.norm2, sc.normBinding(), num_tokens, cfg.vis_hidden, true);
+        // 7. MLP (GELU or SwiGLU) + optional LayerScale + residual add -> out_hidden
         switch (cfg.mlp_kind) {
             .gelu_tanh, .gelu_exact => {
                 const act: VisionLinearAct = if (cfg.mlp_kind == .gelu_tanh) .gelu_tanh else .gelu_exact;
-                try pipes.encodeLinear(frame, sc.normBinding(), block.mlp_fc1, null, sc.mlpABinding(), num_patches, cfg.vis_intermediate, cfg.vis_hidden, act, true);
-                try pipes.encodeLinear(frame, sc.mlpABinding(), block.mlp_fc2, out_hidden, out_hidden, num_patches, cfg.vis_hidden, cfg.vis_intermediate, .none, true);
+                try pipes.encodeLinear(frame, sc.normBinding(), block.mlp_fc1, null, sc.mlpABinding(), num_tokens, cfg.vis_intermediate, cfg.vis_hidden, act, true);
+                if (block.ls_2) |ls2| {
+                    try pipes.encodeLinear(frame, sc.mlpABinding(), block.mlp_fc2, null, sc.normBinding(), num_tokens, cfg.vis_hidden, cfg.vis_intermediate, .none, true);
+                    try pipes.encodeLayerScaleResidualAdd(frame, sc.normBinding(), out_hidden, ls2, out_hidden, num_tokens, cfg.vis_hidden, true);
+                } else {
+                    try pipes.encodeLinear(frame, sc.mlpABinding(), block.mlp_fc2, out_hidden, out_hidden, num_tokens, cfg.vis_hidden, cfg.vis_intermediate, .none, true);
+                }
             },
             .swiglu => {
                 const up_w = block.mlp_up orelse return error.InvalidBlockWeights;
-                try pipes.encodeLinear(frame, sc.normBinding(), block.mlp_fc1, null, sc.mlpABinding(), num_patches, cfg.vis_intermediate, cfg.vis_hidden, .none, true);
-                try pipes.encodeLinear(frame, sc.normBinding(), up_w, null, sc.mlpBBinding(), num_patches, cfg.vis_intermediate, cfg.vis_hidden, .none, false);
-                try pipes.encodeSwiGlu(frame, sc.mlpABinding(), sc.mlpBBinding(), sc.mlpABinding(), num_patches * cfg.vis_intermediate, true);
-                try pipes.encodeLinear(frame, sc.mlpABinding(), block.mlp_fc2, out_hidden, out_hidden, num_patches, cfg.vis_hidden, cfg.vis_intermediate, .none, true);
+                try pipes.encodeLinear(frame, sc.normBinding(), block.mlp_fc1, null, sc.mlpABinding(), num_tokens, cfg.vis_intermediate, cfg.vis_hidden, .none, true);
+                try pipes.encodeLinear(frame, sc.normBinding(), up_w, null, sc.mlpBBinding(), num_tokens, cfg.vis_intermediate, cfg.vis_hidden, .none, false);
+                try pipes.encodeSwiGlu(frame, sc.mlpABinding(), sc.mlpBBinding(), sc.mlpABinding(), num_tokens * cfg.vis_intermediate, true);
+                if (block.ls_2) |ls2| {
+                    try pipes.encodeLinear(frame, sc.mlpABinding(), block.mlp_fc2, null, sc.normBinding(), num_tokens, cfg.vis_hidden, cfg.vis_intermediate, .none, true);
+                    try pipes.encodeLayerScaleResidualAdd(frame, sc.normBinding(), out_hidden, ls2, out_hidden, num_tokens, cfg.vis_hidden, true);
+                } else {
+                    try pipes.encodeLinear(frame, sc.mlpABinding(), block.mlp_fc2, out_hidden, out_hidden, num_tokens, cfg.vis_hidden, cfg.vis_intermediate, .none, true);
+                }
             },
         }
     }
 
     /// Encodes the 2-layer `PatchMerger` / `Aligner` MLP:
-    /// `[pre_merge norm] -> spatial_merge concat -> [post_merge norm] -> Linear + GELU -> Linear -> lm_embeds`.
+    /// `[pre_merge norm] -> [strip CLS] + spatial_merge concat -> [post_merge norm] -> Linear + GELU -> Linear -> lm_embeds`.
     pub fn encodePatchMerger(
         self: *const VisionTowerRuntime,
         frame: *metal.Compute.Frame,
@@ -2922,8 +3476,12 @@ pub const VisionTowerRuntime = struct {
         const pipes = self.pipelines orelse return error.InvalidBlockWeights;
         const sc = self.scratch orelse return error.InvalidBlockWeights;
         const cfg = self.config;
-        const num_patches = tile_count * grid_h * grid_w;
-        if (num_patches == 0 or num_patches > cfg.max_patches) return error.InvalidGeometry;
+        const patches_per_tile = grid_h * grid_w;
+        const num_patches = tile_count * patches_per_tile;
+        const seq_per_tile = patches_per_tile + @as(u32, if (cfg.has_cls_token) 1 else 0);
+        const total_seq = tile_count * seq_per_tile;
+        const max_seq = try cfg.maxSeqTokens();
+        if (num_patches == 0 or num_patches > cfg.max_patches or total_seq > max_seq) return error.InvalidGeometry;
         const merged_tokens = tile_count * (grid_h / cfg.spatial_merge) * (grid_w / cfg.spatial_merge);
         const merged_in_dim = try cfg.mergedInDim();
 
@@ -2931,14 +3489,14 @@ pub const VisionTowerRuntime = struct {
         var need_barrier = insert_barrier_before;
         if (merger.norm_placement == .pre_merge) {
             if (merger.norm) |nw| {
-                try pipes.encodeNorm(frame, in_hidden, nw, sc.normBinding(), num_patches, cfg.vis_hidden, need_barrier);
+                try pipes.encodeNorm(frame, in_hidden, nw, sc.normBinding(), total_seq, cfg.vis_hidden, need_barrier);
                 pre_concat_src = sc.normBinding();
                 need_barrier = true;
             }
         }
 
-        // Spatial `spatial_merge x spatial_merge` patch token concatenation.
-        try pipes.encodeSpatialMergeConcat(
+        // Spatial `spatial_merge x spatial_merge` patch token concatenation (+ optional [CLS] strip).
+        try pipes.encodeSpatialMergeConcatEx(
             frame,
             pre_concat_src,
             sc.mergerConcatBinding(),
@@ -2947,6 +3505,8 @@ pub const VisionTowerRuntime = struct {
             cfg.spatial_merge,
             cfg.vis_hidden,
             tile_count,
+            cfg.has_cls_token,
+            cfg.is_inkling2_vision,
             need_barrier,
         );
 
@@ -3004,7 +3564,7 @@ pub const VisionTowerRuntime = struct {
 
     /// Executes the full `L_vis`-layer ViT encoder tower + `PatchMerger` / `Aligner`
     /// starting from patch embeddings staged in `scratch.hiddenABinding()` (or populated
-    /// immediately beforehand by `encodeAnyResPatchifyEmbed*`).
+    /// immediately beforehand by `encodeAnyResPatchifyEmbed*` / `encodeInkling2PatchifyEmbed*`).
     ///
     /// Returns the count of emitted language-model visual tokens (`0` immediately on the
     /// text-only fast path with `0` GPU dispatches).
@@ -3018,16 +3578,57 @@ pub const VisionTowerRuntime = struct {
         tile_count: u32,
         insert_barrier_before: bool,
     ) EncodeError!u32 {
+        return self.encodeTowerForwardWithPreNorm(
+            frame,
+            null,
+            blocks,
+            merger,
+            grid_h,
+            grid_w,
+            tile_count,
+            insert_barrier_before,
+        );
+    }
+
+    /// Executes optional `pre_norm` (`visual.ln_pre`) -> `L_vis` ViT blocks -> `PatchMerger`.
+    pub fn encodeTowerForwardWithPreNorm(
+        self: *const VisionTowerRuntime,
+        frame: *metal.Compute.Frame,
+        pre_norm: ?VisionNormWeight,
+        blocks: []const VisionBlockWeights,
+        merger: VisionMergerWeights,
+        grid_h: u32,
+        grid_w: u32,
+        tile_count: u32,
+        insert_barrier_before: bool,
+    ) EncodeError!u32 {
         if (!self.has_vision) return 0;
+        const pipes = self.pipelines orelse return error.InvalidBlockWeights;
         const sc = self.scratch orelse return error.InvalidBlockWeights;
         if (blocks.len != self.config.num_layers) return error.InvalidLayerCount;
-        const num_patches = tile_count * grid_h * grid_w;
-        if (num_patches == 0 or num_patches > self.config.max_patches) return error.InvalidGeometry;
+        const patches_per_tile = grid_h * grid_w;
+        const num_patches = tile_count * patches_per_tile;
+        const seq_per_tile = patches_per_tile + @as(u32, if (self.config.has_cls_token) 1 else 0);
+        const total_seq = tile_count * seq_per_tile;
+        const max_seq = try self.config.maxSeqTokens();
+        if (num_patches == 0 or num_patches > self.config.max_patches or total_seq > max_seq) return error.InvalidGeometry;
 
         var cur_in = sc.hiddenABinding();
         var cur_out = sc.hiddenBBinding();
+        var next_barrier = insert_barrier_before;
+
+        if (pre_norm) |pn| {
+            try pipes.encodeNorm(frame, cur_in, pn, cur_out, total_seq, self.config.vis_hidden, next_barrier);
+            const tmp = cur_in;
+            cur_in = cur_out;
+            cur_out = tmp;
+            next_barrier = true;
+        }
+
+        // Isolate per-image attention when multiple tiles/images are batched with Inkling 2 `cu_seqlens`.
+        const force_win = self.config.is_inkling2_vision and tile_count > 1;
         for (blocks, 0..) |blk, i| {
-            try self.encodeBlock(frame, blk, cur_in, cur_out, num_patches, if (i == 0) insert_barrier_before else true);
+            try self.encodeBlockEx(frame, blk, cur_in, cur_out, total_seq, force_win, if (i == 0) next_barrier else true);
             const tmp = cur_in;
             cur_in = cur_out;
             cur_out = tmp;
@@ -3053,6 +3654,389 @@ fn geluExactF32(v: f32) f32 {
     const erf_a = 1.0 - poly * @exp(-az * az);
     const erf_z = if (z >= 0.0) erf_a else -erf_a;
     return 0.5 * v * (1.0 + erf_z);
+}
+
+pub const Inkling2BlockCpuRefWeights = struct {
+    norm1_w: []const f32,
+    norm1_b: []const f32,
+    q_w: []const f32,
+    q_b: []const f32,
+    k_w: []const f32,
+    k_b: []const f32,
+    v_w: []const f32,
+    v_b: []const f32,
+    proj_w: []const f32,
+    proj_b: []const f32,
+    ls_1: []const f32,
+    norm2_w: []const f32,
+    norm2_b: []const f32,
+    fc1_w: []const f32,
+    fc1_b: []const f32,
+    fc2_w: []const f32,
+    fc2_b: []const f32,
+    ls_2: []const f32,
+};
+
+pub const Inkling2VisionCpuRefWeights = struct {
+    patch_weight: []const f32,
+    pos_embed: []const f32,
+    class_embed: []const f32,
+    cls_pos_embed: []const f32,
+    ln_pre_w: []const f32,
+    ln_pre_b: []const f32,
+    blocks: []const Inkling2BlockCpuRefWeights,
+    proj_in_w: []const f32,
+    proj_out_w: []const f32,
+};
+
+fn layerNormRowsCpuRef(
+    x: []const f32,
+    w: []const f32,
+    b: []const f32,
+    out: []f32,
+    rows: usize,
+    dim: usize,
+    eps: f32,
+) void {
+    for (0..rows) |r| {
+        const base = r * dim;
+        var sum: f64 = 0.0;
+        for (0..dim) |d| sum += x[base + d];
+        const mean = sum / @as(f64, @floatFromInt(dim));
+        var var_sum: f64 = 0.0;
+        for (0..dim) |d| {
+            const diff = @as(f64, x[base + d]) - mean;
+            var_sum += diff * diff;
+        }
+        const inv_std = 1.0 / @sqrt(var_sum / @as(f64, @floatFromInt(dim)) + @as(f64, eps));
+        for (0..dim) |d| {
+            const norm = (@as(f64, x[base + d]) - mean) * inv_std;
+            out[base + d] = @floatCast(norm * @as(f64, w[d]) + @as(f64, b[d]));
+        }
+    }
+}
+
+fn linearRowsCpuRef(
+    x: []const f32,
+    w: []const f32,
+    b: ?[]const f32,
+    out: []f32,
+    rows: usize,
+    out_dim: usize,
+    in_dim: usize,
+) void {
+    for (0..rows) |r| {
+        const xb = r * in_dim;
+        const ob = r * out_dim;
+        for (0..out_dim) |n| {
+            const wb = n * in_dim;
+            var acc: f64 = if (b) |bv| @as(f64, bv[n]) else 0.0;
+            for (0..in_dim) |k| {
+                acc += @as(f64, x[xb + k]) * @as(f64, w[wb + k]);
+            }
+            out[ob + n] = @floatCast(acc);
+        }
+    }
+}
+
+/// Exact `f32` CPU reference of upstream `Inkling2ImageProcessor._preprocess` +
+/// `Inkling2VisionEmbeddings.forward` (HWC patches in spatial-merge-block order,
+/// `-1.0/255` right/bottom pad, bilinear 2D `position_embedding`, leading `[CLS]`).
+pub fn inkling2PatchifyEmbedBgra8CpuRef(
+    bgra_bytes: []const u8,
+    bpr: usize,
+    grid: Inkling2GridPlan,
+    patch_size: u32,
+    spatial_merge: u32,
+    vis_hidden: u32,
+    posemb_side: u32,
+    norm: NormParams,
+    patch_weight: []const f32,
+    pos_embed: []const f32,
+    class_embed: []const f32,
+    cls_pos_embed: []const f32,
+    out_seq: []f32,
+) void {
+    const hs: usize = vis_hidden;
+    const ps: usize = patch_size;
+    const sm: usize = spatial_merge;
+    const sm_sq = sm * sm;
+    const blocks_w: usize = grid.grid_w / spatial_merge;
+    const patch_in_dim = ps * ps * 3;
+
+    // Token 0: [CLS] = class_embedding + cls_position_embedding
+    for (0..hs) |h| {
+        out_seq[h] = class_embed[h] + cls_pos_embed[h];
+    }
+
+    const side_f: f64 = @floatFromInt(posemb_side);
+    const side_m1: i32 = @intCast(posemb_side - 1);
+    for (0..grid.num_patches) |p_idx| {
+        const block_idx = p_idx / sm_sq;
+        const sub = p_idx - block_idx * sm_sq;
+        const block_row = block_idx / blocks_w;
+        const block_col = block_idx - block_row * blocks_w;
+        const in_row = sub / sm;
+        const in_col = sub - in_row * sm;
+        const patch_row = block_row * sm + in_row;
+        const patch_col = block_col * sm + in_col;
+
+        // Bilinear 2D position embedding interpolation (`align_corners=False`, border clamp)
+        const src_h = (@as(f64, @floatFromInt(patch_row)) + 0.5) * side_f / @as(f64, @floatFromInt(grid.grid_h)) - 0.5;
+        const src_w = (@as(f64, @floatFromInt(patch_col)) + 0.5) * side_f / @as(f64, @floatFromInt(grid.grid_w)) - 0.5;
+        const fh = @floor(src_h);
+        const fw = @floor(src_w);
+        const h0: usize = @intCast(std.math.clamp(@as(i32, @intFromFloat(fh)), 0, side_m1));
+        const h1: usize = @intCast(std.math.clamp(@as(i32, @intFromFloat(fh)) + 1, 0, side_m1));
+        const w0: usize = @intCast(std.math.clamp(@as(i32, @intFromFloat(fw)), 0, side_m1));
+        const w1: usize = @intCast(std.math.clamp(@as(i32, @intFromFloat(fw)) + 1, 0, side_m1));
+        const wh1 = src_h - fh;
+        const wh0 = 1.0 - wh1;
+        const ww1 = src_w - fw;
+        const ww0 = 1.0 - ww1;
+
+        const tok_off = (1 + p_idx) * hs;
+        for (0..hs) |h| {
+            const w_row = h * patch_in_dim;
+            var acc: f64 = 0.0;
+            for (0..ps) |dy| {
+                const dst_y: u32 = @intCast(patch_row * ps + dy);
+                for (0..ps) |dx| {
+                    const dst_x: u32 = @intCast(patch_col * ps + dx);
+                    var r_n: f64 = INKLING2_PAD_FILL_NORM;
+                    var g_n: f64 = INKLING2_PAD_FILL_NORM;
+                    var b_n: f64 = INKLING2_PAD_FILL_NORM;
+                    if (!grid.use_bilinear_resize) {
+                        if (dst_x < grid.src_width and dst_y < grid.src_height) {
+                            const p_off = @as(usize, dst_y) * bpr + @as(usize, dst_x) * 4;
+                            const b_val = @as(f64, @floatFromInt(bgra_bytes[p_off + 0])) / 255.0;
+                            const g_val = @as(f64, @floatFromInt(bgra_bytes[p_off + 1])) / 255.0;
+                            const r_val = @as(f64, @floatFromInt(bgra_bytes[p_off + 2])) / 255.0;
+                            r_n = (r_val - @as(f64, norm.mean[0])) * @as(f64, norm.inv_std[0]);
+                            g_n = (g_val - @as(f64, norm.mean[1])) * @as(f64, norm.inv_std[1]);
+                            b_n = (b_val - @as(f64, norm.mean[2])) * @as(f64, norm.inv_std[2]);
+                        }
+                    } else {
+                        const fx_raw = (@as(f64, @floatFromInt(dst_x)) + 0.5) * (@as(f64, @floatFromInt(grid.src_width)) / @as(f64, @floatFromInt(grid.pad_width))) - 0.5;
+                        const fy_raw = (@as(f64, @floatFromInt(dst_y)) + 0.5) * (@as(f64, @floatFromInt(grid.src_height)) / @as(f64, @floatFromInt(grid.pad_height))) - 0.5;
+                        const fx = std.math.clamp(fx_raw, 0.0, @as(f64, @floatFromInt(grid.src_width - 1)));
+                        const fy = std.math.clamp(fy_raw, 0.0, @as(f64, @floatFromInt(grid.src_height - 1)));
+                        const x0: u32 = @intFromFloat(@floor(fx));
+                        const y0: u32 = @intFromFloat(@floor(fy));
+                        const x1: u32 = @min(x0 + 1, grid.src_width - 1);
+                        const y1: u32 = @min(y0 + 1, grid.src_height - 1);
+                        const wx = fx - @as(f64, @floatFromInt(x0));
+                        const wy = fy - @as(f64, @floatFromInt(y0));
+                        const p00 = @as(usize, y0) * bpr + @as(usize, x0) * 4;
+                        const p10 = @as(usize, y0) * bpr + @as(usize, x1) * 4;
+                        const p01 = @as(usize, y1) * bpr + @as(usize, x0) * 4;
+                        const p11 = @as(usize, y1) * bpr + @as(usize, x1) * 4;
+                        var rgb: [3]f64 = undefined;
+                        const bgr_map = [3]usize{ 2, 1, 0 };
+                        for (0..3) |c| {
+                            const bi = bgr_map[c];
+                            const c00 = @as(f64, @floatFromInt(bgra_bytes[p00 + bi])) / 255.0;
+                            const c10 = @as(f64, @floatFromInt(bgra_bytes[p10 + bi])) / 255.0;
+                            const c01 = @as(f64, @floatFromInt(bgra_bytes[p01 + bi])) / 255.0;
+                            const c11 = @as(f64, @floatFromInt(bgra_bytes[p11 + bi])) / 255.0;
+                            const top = c00 * (1.0 - wx) + c10 * wx;
+                            const bot = c01 * (1.0 - wx) + c11 * wx;
+                            rgb[c] = top * (1.0 - wy) + bot * wy;
+                        }
+                        r_n = (rgb[0] - @as(f64, norm.mean[0])) * @as(f64, norm.inv_std[0]);
+                        g_n = (rgb[1] - @as(f64, norm.mean[1])) * @as(f64, norm.inv_std[1]);
+                        b_n = (rgb[2] - @as(f64, norm.mean[2])) * @as(f64, norm.inv_std[2]);
+                    }
+                    const k_base = w_row + (dy * ps + dx) * 3;
+                    acc += r_n * @as(f64, patch_weight[k_base + 0]);
+                    acc += g_n * @as(f64, patch_weight[k_base + 1]);
+                    acc += b_n * @as(f64, patch_weight[k_base + 2]);
+                }
+            }
+            const pe00: f64 = pos_embed[(h0 * posemb_side + w0) * hs + h];
+            const pe01: f64 = pos_embed[(h0 * posemb_side + w1) * hs + h];
+            const pe10: f64 = pos_embed[(h1 * posemb_side + w0) * hs + h];
+            const pe11: f64 = pos_embed[(h1 * posemb_side + w1) * hs + h];
+            acc += (wh0 * ww0) * pe00 + (wh0 * ww1) * pe01 + (wh1 * ww0) * pe10 + (wh1 * ww1) * pe11;
+            out_seq[tok_off + h] = @floatCast(acc);
+        }
+    }
+}
+
+/// Complete exact `f32` CPU reference of upstream `Inkling2VisionModel.forward`
+/// (BGRA8 patchify+CLS+posemb -> `ln_pre` -> `L` blocks with `[W, H]` pairwise 2D RoPE +
+/// LayerScale `ls_1`/`ls_2` + exact GELU -> `[CLS]` strip + `2x2` merge -> `proj_in` -> exact GELU -> `proj_out`).
+pub fn inkling2VisionForwardCpuRef(
+    allocator: std.mem.Allocator,
+    cfg: VisionTowerConfig,
+    bgra_bytes: []const u8,
+    bpr: usize,
+    grid: Inkling2GridPlan,
+    norm: NormParams,
+    w: Inkling2VisionCpuRefWeights,
+    out_lm_embeds: []f32,
+) !void {
+    const seq_len: usize = grid.seq_tokens;
+    const hs: usize = cfg.vis_hidden;
+    const inter: usize = cfg.vis_intermediate;
+    const n_heads: usize = cfg.num_heads;
+    const hd: usize = cfg.head_dim;
+    const m_in: usize = try cfg.mergedInDim();
+    const m_hid: usize = cfg.merger_hidden;
+    const lm_h: usize = cfg.lm_hidden;
+    const n_merged: usize = grid.num_merged_tokens;
+
+    const h_cur = try allocator.alloc(f32, seq_len * hs);
+    defer allocator.free(h_cur);
+    const h_tmp = try allocator.alloc(f32, seq_len * hs);
+    defer allocator.free(h_tmp);
+    const q_buf = try allocator.alloc(f32, seq_len * hs);
+    defer allocator.free(q_buf);
+    const k_buf = try allocator.alloc(f32, seq_len * hs);
+    defer allocator.free(k_buf);
+    const v_buf = try allocator.alloc(f32, seq_len * hs);
+    defer allocator.free(v_buf);
+    const attn_buf = try allocator.alloc(f32, seq_len * hs);
+    defer allocator.free(attn_buf);
+    const mlp_buf = try allocator.alloc(f32, seq_len * inter);
+    defer allocator.free(mlp_buf);
+    const scores = try allocator.alloc(f32, seq_len);
+    defer allocator.free(scores);
+    const coords = try allocator.alloc(RopeCoord2D, seq_len);
+    defer allocator.free(coords);
+
+    // 1. Embeddings + [CLS] + bilinear 2D pos_embed
+    inkling2PatchifyEmbedBgra8CpuRef(
+        bgra_bytes,
+        bpr,
+        grid,
+        cfg.patch_size,
+        cfg.spatial_merge,
+        cfg.vis_hidden,
+        cfg.posemb_grid_size,
+        norm,
+        w.patch_weight,
+        w.pos_embed,
+        w.class_embed,
+        w.cls_pos_embed,
+        h_tmp,
+    );
+    // 2. ln_pre
+    layerNormRowsCpuRef(h_tmp, w.ln_pre_w, w.ln_pre_b, h_cur, seq_len, hs, cfg.layer_norm_eps);
+
+    // 3. 1-indexed 2D RoPE coords with [CLS] at (0, 0)
+    _ = try fillInkling2Rope2DCoords(grid.grid_h, grid.grid_w, cfg.spatial_merge, cfg.has_cls_token, coords);
+
+    const axis_dim: usize = hd / 2;
+    const axis_pairs: usize = axis_dim / 2;
+    const scale: f64 = 1.0 / @sqrt(@as(f64, @floatFromInt(hd)));
+
+    // 4. ViT Encoder Layers
+    for (w.blocks) |blk| {
+        layerNormRowsCpuRef(h_cur, blk.norm1_w, blk.norm1_b, h_tmp, seq_len, hs, cfg.layer_norm_eps);
+        linearRowsCpuRef(h_tmp, blk.q_w, blk.q_b, q_buf, seq_len, hs, hs);
+        linearRowsCpuRef(h_tmp, blk.k_w, blk.k_b, k_buf, seq_len, hs, hs);
+        linearRowsCpuRef(h_tmp, blk.v_w, blk.v_b, v_buf, seq_len, hs, hs);
+
+        // Axial 2D pairwise RoPE: [W in first half, H in second half]
+        for (0..seq_len) |t| {
+            const cw: f64 = @floatFromInt(coords[t].w);
+            const ch: f64 = @floatFromInt(coords[t].h);
+            for (0..n_heads) |hd_idx| {
+                const base = (t * n_heads + hd_idx) * hd;
+                for (0..axis_pairs) |p| {
+                    const inv_freq = std.math.pow(f64, @as(f64, cfg.rope_theta), -@as(f64, @floatFromInt(2 * p)) / @as(f64, @floatFromInt(axis_dim)));
+                    // First half: W
+                    const aw = cw * inv_freq;
+                    const cos_w = @cos(aw);
+                    const sin_w = @sin(aw);
+                    const dw0 = base + 2 * p;
+                    const dw1 = dw0 + 1;
+                    const qw0: f64 = q_buf[dw0];
+                    const qw1: f64 = q_buf[dw1];
+                    q_buf[dw0] = @floatCast(qw0 * cos_w - qw1 * sin_w);
+                    q_buf[dw1] = @floatCast(qw0 * sin_w + qw1 * cos_w);
+                    const kw0: f64 = k_buf[dw0];
+                    const kw1: f64 = k_buf[dw1];
+                    k_buf[dw0] = @floatCast(kw0 * cos_w - kw1 * sin_w);
+                    k_buf[dw1] = @floatCast(kw0 * sin_w + kw1 * cos_w);
+
+                    // Second half: H
+                    const ah = ch * inv_freq;
+                    const cos_h = @cos(ah);
+                    const sin_h = @sin(ah);
+                    const dh0 = base + axis_dim + 2 * p;
+                    const dh1 = dh0 + 1;
+                    const qh0: f64 = q_buf[dh0];
+                    const qh1: f64 = q_buf[dh1];
+                    q_buf[dh0] = @floatCast(qh0 * cos_h - qh1 * sin_h);
+                    q_buf[dh1] = @floatCast(qh0 * sin_h + qh1 * cos_h);
+                    const kh0: f64 = k_buf[dh0];
+                    const kh1: f64 = k_buf[dh1];
+                    k_buf[dh0] = @floatCast(kh0 * cos_h - kh1 * sin_h);
+                    k_buf[dh1] = @floatCast(kh0 * sin_h + kh1 * cos_h);
+                }
+            }
+        }
+
+        // Bidirectional self-attention
+        for (0..n_heads) |hd_idx| {
+            for (0..seq_len) |qi| {
+                const qb = (qi * n_heads + hd_idx) * hd;
+                var max_s: f64 = -std.math.inf(f64);
+                for (0..seq_len) |ki| {
+                    const kb = (ki * n_heads + hd_idx) * hd;
+                    var dot: f64 = 0.0;
+                    for (0..hd) |d| dot += @as(f64, q_buf[qb + d]) * @as(f64, k_buf[kb + d]);
+                    const s = dot * scale;
+                    scores[ki] = @floatCast(s);
+                    if (s > max_s) max_s = s;
+                }
+                var sum_p: f64 = 0.0;
+                for (0..seq_len) |ki| {
+                    const p = @exp(@as(f64, scores[ki]) - max_s);
+                    scores[ki] = @floatCast(p);
+                    sum_p += p;
+                }
+                const inv_sum = 1.0 / sum_p;
+                for (0..hd) |d| {
+                    var acc: f64 = 0.0;
+                    for (0..seq_len) |ki| {
+                        const vb = (ki * n_heads + hd_idx) * hd;
+                        acc += (@as(f64, scores[ki]) * inv_sum) * @as(f64, v_buf[vb + d]);
+                    }
+                    attn_buf[qb + d] = @floatCast(acc);
+                }
+            }
+        }
+
+        // out_proj + ls_1 residual
+        linearRowsCpuRef(attn_buf, blk.proj_w, blk.proj_b, h_tmp, seq_len, hs, hs);
+        for (0..seq_len) |t| {
+            for (0..hs) |d| {
+                h_cur[t * hs + d] += blk.ls_1[d] * h_tmp[t * hs + d];
+            }
+        }
+
+        // norm2 -> fc1 -> exact GELU -> fc2 + ls_2 residual
+        layerNormRowsCpuRef(h_cur, blk.norm2_w, blk.norm2_b, h_tmp, seq_len, hs, cfg.layer_norm_eps);
+        linearRowsCpuRef(h_tmp, blk.fc1_w, blk.fc1_b, mlp_buf, seq_len, inter, hs);
+        for (mlp_buf) |*v| v.* = geluExactF32(v.*);
+        linearRowsCpuRef(mlp_buf, blk.fc2_w, blk.fc2_b, h_tmp, seq_len, hs, inter);
+        for (0..seq_len) |t| {
+            for (0..hs) |d| {
+                h_cur[t * hs + d] += blk.ls_2[d] * h_tmp[t * hs + d];
+            }
+        }
+    }
+
+    // 5. Strip [CLS] at index 0 -> [n_merged, m_in] -> proj_in -> exact GELU -> proj_out -> out_lm_embeds
+    const patch_states = h_cur[hs..];
+    const m_mid = try allocator.alloc(f32, n_merged * m_hid);
+    defer allocator.free(m_mid);
+    linearRowsCpuRef(patch_states, w.proj_in_w, null, m_mid, n_merged, m_hid, m_in);
+    for (m_mid) |*v| v.* = geluExactF32(v.*);
+    linearRowsCpuRef(m_mid, w.proj_out_w, null, out_lm_embeds[0 .. n_merged * lm_h], n_merged, lm_h, m_hid);
 }
 
 pub fn anyresBilinearPatchifyEmbedBgra8CpuRef(
