@@ -196,6 +196,18 @@ Hard rules from the project charter. Rationale and evidence live in
   `docs/benchmarks/results.md`; other documents link to it instead of
   duplicating raw run outputs.
 
+## Multi-agent swarm conventions
+
+When running multi-agent `/swarm` sessions in this repository:
+
+- **Role-based model assignment**:
+  - **Coordinator and final verification / review (`verifier-*`)**: `gemini-4-carbon-high`.
+  - **Kernel and operator authors** (Metal `.metal` shaders, ARMv9.2 SME2 `.s` assembly, GPU dispatch wrappers, and fused runtime hot paths): `gemini-4-neon-xhigh`.
+  - **General engineering workers** (HTTP/SSE protocol, C/ObjC framework bridges without shaders, Python `tools/` offline toolchain, CLI wiring, benchmark harnesses, and documentation): `gemini-4-hydrogen-xhigh`.
+  - **Stall monitor (`monitor` / `monitor-N`)**: `gemini-4-hydrogen-xhigh` (never use `gemini-3.8-*` models for `monitor` or any other swarm role).
+- **No automatic model switching**: never automatically switch the coordinator's or any worker's model on quota warnings or turn errors without explicit user instruction. If quota is exhausted, preserve committed worktree state and wait for user guidance.
+- **Disjoint multi-worktree execution**: assign strictly non-overlapping file ownership per wave, isolate concurrent authors with `workspace: "share"`, always pass `-j1` to `zig build test`, land verified branch commits onto local `main` before calling `kill` (never `git push` unless requested), and sync `.ikat` after every commit.
+
 ## Delivery notes
 
 When reporting finished work, briefly state:
