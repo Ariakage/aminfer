@@ -897,9 +897,83 @@ pub const TargetModel = union(enum) {
             .graph => |g| dh.stepTreeBatchForGraph(g, tokens, parent_rows, positions, masks, slot_start, top_k, out_cands),
         };
     }
+
+    pub fn stepDraftHeadTreeBatchForStage(
+        self: TargetModel,
+        dh: *draft_mod.DraftHead,
+        stage_idx: u32,
+        tokens: []const u32,
+        parent_rows: []const u32,
+        positions: []const u32,
+        masks: []const u64,
+        slot_start: u32,
+        top_k: u32,
+        out_cands: ?[]moe.TopKCandidate,
+    ) draft_mod.DraftStepError!void {
+        return switch (self) {
+            .qwen3 => |m| dh.stepTreeBatchForStage(m, stage_idx, tokens, parent_rows, positions, masks, slot_start, top_k, out_cands),
+            .graph => |g| dh.stepTreeBatchForStageForGraph(g, stage_idx, tokens, parent_rows, positions, masks, slot_start, top_k, out_cands),
+        };
+    }
 };
 
 pub fn defaultCostModelForGraph(g: *const graph.GraphModel) tree_mod.PruneCostModel {
+    if (g.config.axes.ffn_kind == .moe_swiglu and
+        g.config.num_experts > 0 and
+        g.config.num_experts <= tree_mod.ExpertBitset.MAX_EXPERTS)
+    {
+        var moe_layers: u32 = 0;
+        var sample_dtype: quant.WeightDType = .q3_affine;
+        for (g.layers) |l| {
+            if (l.expert_table_host.len > 0) {
+                if (moe_layers == 0) sample_dtype = l.expert_weight_dtype;
+                moe_layers += 1;
+            }
+        }
+        if (moe_layers > 0) {
+            const sampled: u32 = @min(moe_layers, MAX_PRED_LAYERS);
+            const layer_scale: f64 = @as(f64, @floatFromInt(moe_layers)) / @as(f64, @floatFromInt(sampled));
+            const elems: u64 = 3 * @as(u64, g.config.hidden_size) * @as(u64, g.config.moe_intermediate_size);
+            const single_expert_bytes: u64 = switch (sample_dtype) {
+                .q2_affine => (elems * 2) / 8 + (elems / 64) * 4,
+                .q3_affine => (elems * 3) / 8 + (elems / 64) * 4,
+                .q4_affine => (elems * 4) / 8 + (elems / 64) * 4,
+                .f16, .bf16 => elems * 2,
+            };
+            const scaled_expert_bytes: f32 = @floatCast(
+                @as(f64, @floatFromInt(@max(single_expert_bytes, 1))) * layer_scale * 0.72,
+            );
+            const decode_bytes: u64 = g.bytesPerDecodeToken(256);
+            const active_moe_est: u64 = @as(u64, moe_layers) * @as(u64, g.config.maxLayerTopK()) * single_expert_bytes;
+            const fixed_bytes: u64 = decode_bytes -| active_moe_est;
+            const t_fixed_us: f32 = @floatCast(@as(f64, @floatFromInt(fixed_bytes)) / (75.0 * 1000.0) + 1500.0);
+
+            var beta: [65]f32 = undefined;
+            for (0..65) |m| {
+                beta[m] = if (m <= 2)
+                    66.0
+                else if (m <= 4)
+                    62.0
+                else if (m <= 8)
+                    56.0
+                else if (m <= 16)
+                    48.0
+                else
+                    42.0;
+            }
+            const cold_penalty: f32 = if (g.hasColdExperts()) scaled_expert_bytes * 10.0 else 0.0;
+            return .{
+                .t_fixed_us = t_fixed_us,
+                .c_tok_us = 160.0,
+                .expert_bytes = scaled_expert_bytes,
+                .cold_penalty_bytes = cold_penalty,
+                .beta_gbs_by_m = beta,
+                .num_layers = sampled,
+                .num_experts = g.config.num_experts,
+            };
+        }
+    }
+
     const decode_bytes: u64 = g.bytesPerDecodeToken(256);
     const t_fixed_us: f32 = @floatCast(@as(f64, @floatFromInt(decode_bytes)) / (75.0 * 1000.0) + 800.0);
     const c_tok_us: f32 = @max(120.0, t_fixed_us * 0.03);
@@ -1563,6 +1637,8 @@ pub const SpecEngine = struct {
     p_res: []f32,
     sampler_cand_ids: []u32,
     grammar_mask: []u32,
+    router_emb_scratch: []f32,
+    router_logits_scratch: []f32,
     penalty_tracker: *sampling_mod.DefaultPenaltyTracker,
     gpu_sampler: ?gpu_sampler_mod.GpuSampler,
     gpu_sampler_wired_bytes: u64,
@@ -1762,6 +1838,10 @@ pub const SpecEngine = struct {
         const grammar_mask = try allocator.alloc(u32, mask_words);
         errdefer allocator.free(grammar_mask);
         @memset(grammar_mask, 0xFFFF_FFFF);
+        const router_emb_scratch = try allocator.alloc(f32, @max(@as(usize, 1), target.hiddenSize()));
+        errdefer allocator.free(router_emb_scratch);
+        const router_logits_scratch = try allocator.alloc(f32, tree_mod.ExpertBitset.MAX_EXPERTS);
+        errdefer allocator.free(router_logits_scratch);
         const penalty_tracker = try allocator.create(sampling_mod.DefaultPenaltyTracker);
         errdefer allocator.destroy(penalty_tracker);
         penalty_tracker.* = sampling_mod.DefaultPenaltyTracker.init();
@@ -1908,6 +1988,8 @@ pub const SpecEngine = struct {
             .p_res = p_res,
             .sampler_cand_ids = sampler_cand_ids,
             .grammar_mask = grammar_mask,
+            .router_emb_scratch = router_emb_scratch,
+            .router_logits_scratch = router_logits_scratch,
             .penalty_tracker = penalty_tracker,
             .gpu_sampler = gpu_sampler_opt,
             .gpu_sampler_wired_bytes = gpu_sampler_wired,
@@ -1941,6 +2023,8 @@ pub const SpecEngine = struct {
         if (self.expert_bytes_sampled.len > 0) allocator.free(self.expert_bytes_sampled);
         if (self.expert_bw_sampled.len > 0) allocator.free(self.expert_bw_sampled);
         allocator.destroy(self.penalty_tracker);
+        allocator.free(self.router_logits_scratch);
+        allocator.free(self.router_emb_scratch);
         allocator.free(self.grammar_mask);
         allocator.free(self.sampler_cand_ids);
         allocator.free(self.p_res);
@@ -3398,7 +3482,13 @@ pub const SpecEngine = struct {
         // deduplicates automatically with L1 nodes in place per ADR-0005).
         _ = self.insertDraftCandidatesForParent(0, root_cands[0..root_take], candidate_cap, eff_top_k, null);
 
-        const target_depth: u16 = @min(self.config.max_draft_depth, max_allowed_depth);
+        const chained = dh.isChainedMtp();
+        const num_stages: usize = dh.numMtpStages();
+        const stage_depth_cap: u16 = if (chained and !dh.config.mtp_cycle_last_stage)
+            @intCast(num_stages)
+        else
+            max_allowed_depth;
+        const target_depth: u16 = @min(@min(self.config.max_draft_depth, max_allowed_depth), stage_depth_cap);
         if (target_depth <= 1) return;
 
         // If L1 already delivered a long high-confidence seed chain (`chain_len >= target_depth`),
@@ -3432,6 +3522,7 @@ pub const SpecEngine = struct {
                 for (0..path_len) |idx| {
                     const node_idx = seed_path[idx];
                     const node = self.draft_tree.nodes[node_idx];
+                    if (chained and node.depth >= target_depth) break;
                     const parent_row = self.tree_slot_of_node[node.parent];
                     const slot_idx = used_slots;
                     const parent_mask: u64 = if (parent_row == 0) 0 else self.slot_ancestor_masks[parent_row - 1];
@@ -3443,16 +3534,31 @@ pub const SpecEngine = struct {
 
                     const is_tail = (idx + 1 == path_len);
                     const step_k: u32 = if (is_tail and node.depth < target_depth) query_k else 0;
-                    try self.target.stepDraftHeadTreeBatch(
-                        dh,
-                        self.batch_tokens[0..1],
-                        self.batch_parent_rows[0..1],
-                        self.batch_positions[0..1],
-                        self.slot_ancestor_masks[0 .. slot_idx + 1],
-                        slot_idx,
-                        step_k,
-                        if (step_k > 0) self.batch_cands[0..step_k] else null,
-                    );
+                    if (chained) {
+                        const stage_k: u32 = @intCast(@min(@as(usize, node.depth), num_stages - 1));
+                        try self.target.stepDraftHeadTreeBatchForStage(
+                            dh,
+                            stage_k,
+                            self.batch_tokens[0..1],
+                            self.batch_parent_rows[0..1],
+                            self.batch_positions[0..1],
+                            self.slot_ancestor_masks[0 .. slot_idx + 1],
+                            slot_idx,
+                            step_k,
+                            if (step_k > 0) self.batch_cands[0..step_k] else null,
+                        );
+                    } else {
+                        try self.target.stepDraftHeadTreeBatch(
+                            dh,
+                            self.batch_tokens[0..1],
+                            self.batch_parent_rows[0..1],
+                            self.batch_positions[0..1],
+                            self.slot_ancestor_masks[0 .. slot_idx + 1],
+                            slot_idx,
+                            step_k,
+                            if (step_k > 0) self.batch_cands[0..step_k] else null,
+                        );
+                    }
 
                     self.tree_slot_of_node[node_idx] = @intCast(1 + slot_idx);
                     self.slot_expanded[node_idx] = is_tail;
@@ -3471,7 +3577,7 @@ pub const SpecEngine = struct {
             prev_best_score = try self.evaluateCurrentDraftScore(t_draft_start, hard_cap);
         }
 
-        // Dynamic EAGLE-2 frontier expansion (`depth = 2 .. target_depth`).
+        // Dynamic EAGLE-2 / chained D15 MTP frontier expansion (`depth = 2 .. target_depth`).
         var level: u16 = 1;
         while (level < target_depth) : (level += 1) {
             if (self.draft_tree.count >= candidate_cap) break;
@@ -3481,8 +3587,13 @@ pub const SpecEngine = struct {
                 @as(usize, self.config.branch_width),
                 @as(usize, dh.max_tree_slots - used_slots),
             );
-            const frontier_count = self.selectFrontier(target_depth, max_batch, level == 1);
-            if (frontier_count == 0) break;
+            const frontier_count = if (chained)
+                self.selectFrontierAtDepth(level, target_depth, max_batch, level == 1)
+            else
+                self.selectFrontier(target_depth, max_batch, level == 1);
+            if (frontier_count == 0) {
+                if (chained) continue else break;
+            }
 
             const slot_start = used_slots;
             for (0..frontier_count) |i| {
@@ -3500,16 +3611,31 @@ pub const SpecEngine = struct {
 
             const total_slots = slot_start + @as(u32, @intCast(frontier_count));
             const cand_len = frontier_count * @as(usize, query_k);
-            try self.target.stepDraftHeadTreeBatch(
-                dh,
-                self.batch_tokens[0..frontier_count],
-                self.batch_parent_rows[0..frontier_count],
-                self.batch_positions[0..frontier_count],
-                self.slot_ancestor_masks[0..total_slots],
-                slot_start,
-                query_k,
-                self.batch_cands[0..cand_len],
-            );
+            if (chained) {
+                const stage_k: u32 = @intCast(@min(@as(usize, level), num_stages - 1));
+                try self.target.stepDraftHeadTreeBatchForStage(
+                    dh,
+                    stage_k,
+                    self.batch_tokens[0..frontier_count],
+                    self.batch_parent_rows[0..frontier_count],
+                    self.batch_positions[0..frontier_count],
+                    self.slot_ancestor_masks[0..total_slots],
+                    slot_start,
+                    query_k,
+                    self.batch_cands[0..cand_len],
+                );
+            } else {
+                try self.target.stepDraftHeadTreeBatch(
+                    dh,
+                    self.batch_tokens[0..frontier_count],
+                    self.batch_parent_rows[0..frontier_count],
+                    self.batch_positions[0..frontier_count],
+                    self.slot_ancestor_masks[0..total_slots],
+                    slot_start,
+                    query_k,
+                    self.batch_cands[0..cand_len],
+                );
+            }
 
             for (0..frontier_count) |i| {
                 const v = self.batch_nodes[i];
@@ -3734,6 +3860,68 @@ pub const SpecEngine = struct {
         return picked;
     }
 
+    /// Selects highest-probability unexpanded frontier nodes strictly at `required_depth`
+    /// so chained `D15` `3L` MTP runs every batch against its matching stage (`k = required_depth`).
+    fn selectFrontierAtDepth(
+        self: *SpecEngine,
+        required_depth: u16,
+        target_depth: u16,
+        max_batch: usize,
+        allow_fallback: bool,
+    ) usize {
+        var picked: usize = 0;
+        var v: u16 = 1;
+        while (v < self.draft_tree.count) : (v += 1) {
+            if (self.slot_expanded[v]) continue;
+            const node = self.draft_tree.nodes[v];
+            if (node.depth != required_depth or node.depth >= target_depth) continue;
+            if (self.tree_slot_of_node[node.parent] == tree_mod.NO_NODE) continue;
+            if (node.cum_prob < self.config.min_frontier_prob) continue;
+
+            if (picked < max_batch) {
+                self.batch_nodes[picked] = v;
+                picked += 1;
+            } else if (node.cum_prob > self.draft_tree.nodes[self.batch_nodes[picked - 1]].cum_prob) {
+                self.batch_nodes[picked - 1] = v;
+            } else {
+                continue;
+            }
+            var j: usize = picked - 1;
+            while (j > 0) : (j -= 1) {
+                const cur_p = self.draft_tree.nodes[self.batch_nodes[j]].cum_prob;
+                const prev_p = self.draft_tree.nodes[self.batch_nodes[j - 1]].cum_prob;
+                if (cur_p > prev_p) {
+                    const tmp = self.batch_nodes[j - 1];
+                    self.batch_nodes[j - 1] = self.batch_nodes[j];
+                    self.batch_nodes[j] = tmp;
+                } else {
+                    break;
+                }
+            }
+        }
+
+        if (picked == 0 and allow_fallback and max_batch > 0) {
+            var best_v: u16 = tree_mod.NO_NODE;
+            var best_p: f32 = -1.0;
+            var u: u16 = 1;
+            while (u < self.draft_tree.count) : (u += 1) {
+                if (self.slot_expanded[u]) continue;
+                const node = self.draft_tree.nodes[u];
+                if (node.depth != required_depth or node.depth >= target_depth) continue;
+                if (self.tree_slot_of_node[node.parent] == tree_mod.NO_NODE) continue;
+                if (node.cum_prob > best_p) {
+                    best_p = node.cum_prob;
+                    best_v = u;
+                }
+            }
+            if (best_v != tree_mod.NO_NODE and best_p > 0.0) {
+                self.batch_nodes[0] = best_v;
+                picked = 1;
+            }
+        }
+        return picked;
+    }
+
     fn evaluateCurrentDraftScore(
         self: *SpecEngine,
         t_draft_start: std.Io.Timestamp,
@@ -3834,6 +4022,116 @@ pub const SpecEngine = struct {
         }
     }
 
+    /// Zero-allocation `D7` router predictor for MoE `GraphModel` targets (both dense+MoE
+    /// hybrids and pure MoE, up to `512` experts, with `cold_experts_by_layer` NVMe bitmasks).
+    fn predictGraphMoEExpertsForTokens(
+        self: *SpecEngine,
+        g: *const graph.GraphModel,
+        tokens: []const u32,
+    ) RunError!struct { sampled: u32, has_cold: bool } {
+        const n_experts = g.config.num_experts;
+        const h = g.config.hidden_size;
+        if (n_experts == 0 or n_experts > tree_mod.ExpertBitset.MAX_EXPERTS or h == 0) {
+            return .{ .sampled = 0, .has_cold = false };
+        }
+
+        // Collect all eligible MoE layer indices whose router weights are unquantized floats.
+        var moe_indices: [256]usize = undefined;
+        var moe_count: usize = 0;
+        for (g.layers, 0..) |layer, li| {
+            if (layer.expert_table_host.len == 0 or layer.router_quant_dtype != null) continue;
+            if (moe_count < moe_indices.len) {
+                moe_indices[moe_count] = li;
+                moe_count += 1;
+            }
+        }
+        if (moe_count == 0) return .{ .sampled = 0, .has_cold = false };
+
+        const sampled: u32 = @intCast(@min(moe_count, MAX_PRED_LAYERS));
+        var picked_layers: [MAX_PRED_LAYERS]usize = undefined;
+        var router_slices: [MAX_PRED_LAYERS][]const u8 = undefined;
+        var router_fmts: [MAX_PRED_LAYERS]tree_mod.RouterWeightFormat = undefined;
+        var has_cold = false;
+
+        for (0..sampled) |s| {
+            const pick_pos: usize = if (sampled == moe_count)
+                s
+            else
+                (s * (moe_count - 1)) / (sampled - 1);
+            const li = moe_indices[pick_pos];
+            picked_layers[s] = li;
+
+            const layer = g.layers[li];
+            const fmt: tree_mod.RouterWeightFormat = switch (layer.router_dtype) {
+                .f32 => .f32,
+                .f16 => .f16,
+                .bf16 => .bf16,
+            };
+            const elem_bytes: usize = if (fmt == .f32) 4 else 2;
+            const need_bytes: usize = @as(usize, n_experts) * @as(usize, h) * elem_bytes;
+
+            var shard_bytes_opt: ?[]const u8 = null;
+            for (g.weight_shards) |*ws| {
+                if (ws.buffer.handle == layer.router_binding.buffer.handle) {
+                    shard_bytes_opt = ws.arena.bytes();
+                    break;
+                }
+            }
+            const shard_bytes = shard_bytes_opt orelse return .{ .sampled = 0, .has_cold = false };
+            const off: usize = @intCast(layer.router_binding.offset);
+            if (off + need_bytes > shard_bytes.len) return .{ .sampled = 0, .has_cold = false };
+            router_slices[s] = shard_bytes[off .. off + need_bytes];
+            router_fmts[s] = fmt;
+
+            var cm = tree_mod.ExpertBitset.empty();
+            if (layer.has_cold_experts) {
+                if (g.cold_rt) |crt| {
+                    for (0..n_experts) |e| {
+                        const st = crt.expert_cache.residencyState(@intCast(li), @intCast(e));
+                        if (st == .cold_nvme or st == .remote_peer) {
+                            cm.set(@intCast(e));
+                            has_cold = true;
+                        }
+                    }
+                } else if (layer.expert_sources.len == n_experts) {
+                    for (layer.expert_sources, 0..) |src, e| {
+                        if (src != .local_wired_ram) {
+                            cm.set(@intCast(e));
+                            has_cold = true;
+                        }
+                    }
+                }
+            } else if (layer.has_remote_experts and layer.expert_sources.len == n_experts) {
+                for (layer.expert_sources, 0..) |src, e| {
+                    if (src != .local_wired_ram) {
+                        cm.set(@intCast(e));
+                        has_cold = true;
+                    }
+                }
+            }
+            self.cold_masks[s] = cm;
+        }
+
+        const emb = self.router_emb_scratch[0..h];
+        for (tokens, 0..) |tid, ni| {
+            try g.readTokenEmbedF32(tid, emb);
+            for (0..sampled) |s| {
+                const top_k = g.config.layerTopK(@intCast(picked_layers[s]));
+                self.node_experts[ni * sampled + s] = tree_mod.predictRouterTopK(
+                    router_slices[s],
+                    router_fmts[s],
+                    emb,
+                    n_experts,
+                    top_k,
+                    null,
+                    false,
+                    self.router_logits_scratch,
+                );
+            }
+        }
+        return .{ .sampled = sampled, .has_cold = has_cold };
+    }
+
     fn pruneTreeInPlace(
         self: *SpecEngine,
         t: *tree_mod.DraftTree(MAX_TREE_NODES),
@@ -3843,23 +4141,43 @@ pub const SpecEngine = struct {
         var cost = self.cost_model;
         cost.t_fixed_us += draft_us;
 
-        if (cost.isMoe() and self.target == .qwen3) {
-            const tm = self.target.qwen3;
+        var bitset_opt: ?[]const tree_mod.ExpertBitset = null;
+        var cold_opt: ?[]const tree_mod.ExpertBitset = null;
+
+        if (cost.isMoe()) {
             const m = t.count;
-            t.fillTokenIds(self.verify_tokens[0..m]);
-            const sampled = try tm.predictMoEExpertsForTokens(
-                self.verify_tokens[0..m],
-                self.node_experts[0..],
-            );
-            cost.num_layers = sampled;
-            const bitset_slice = self.node_experts[0 .. @as(usize, m) * sampled];
-            const cold_slice: ?[]const tree_mod.ExpertBitset = if (tm.hasColdExperts()) blk: {
-                const cm_layers = tm.fillSampledColdMasks(&self.cold_masks);
-                break :blk if (cm_layers == sampled) self.cold_masks[0..cm_layers] else null;
-            } else null;
-            return try t.pruneToOptimalSubtree(cost, bitset_slice, cold_slice, hard_cap);
+            switch (self.target) {
+                .qwen3 => |tm| {
+                    t.fillTokenIds(self.verify_tokens[0..m]);
+                    const sampled = try tm.predictMoEExpertsForTokens(
+                        self.verify_tokens[0..m],
+                        self.node_experts[0..],
+                    );
+                    cost.num_layers = sampled;
+                    bitset_opt = self.node_experts[0 .. @as(usize, m) * sampled];
+                    if (tm.hasColdExperts()) {
+                        const cm_layers = tm.fillSampledColdMasks(&self.cold_masks);
+                        if (cm_layers == sampled) cold_opt = self.cold_masks[0..cm_layers];
+                    }
+                },
+                .graph => |g| {
+                    t.fillTokenIds(self.verify_tokens[0..m]);
+                    const pred = try self.predictGraphMoEExpertsForTokens(g, self.verify_tokens[0..m]);
+                    if (pred.sampled > 0) {
+                        cost.num_layers = pred.sampled;
+                        bitset_opt = self.node_experts[0 .. @as(usize, m) * pred.sampled];
+                        if (pred.has_cold) cold_opt = self.cold_masks[0..pred.sampled];
+                    }
+                },
+            }
         }
-        return try t.pruneToOptimalSubtree(cost, null, null, hard_cap);
+
+        if (self.config.mode == .dflare and t == &self.draft_tree) {
+            if (self.dflare_proposer) |dfp| {
+                return try dfp.pruneWithD7(MAX_TREE_NODES, t, cost, bitset_opt, cold_opt, hard_cap);
+            }
+        }
+        return try t.pruneToOptimalSubtree(cost, bitset_opt, cold_opt, hard_cap);
     }
 };
 
@@ -5600,5 +5918,369 @@ test "M7.8 G21+C22 SpecEngine grammar bitmask propagation across draft trees (D1
             try std.testing.expect(prog.advanceBytes(&verify_st, vocab[tid].?));
         }
         eng.clearConstraints();
+    }
+}
+
+test "M9.1 D15 SpecEngine chained 3L native MTP (K=192, V=128, rope_dim=64, SWA, sink_bias, v_scale) T=0 bit-exact and T>0 lossless" {
+    const allocator = std.testing.allocator;
+    const tgt_cfg: qwen3.ModelConfig = .{
+        .arch = .qwen3_dense,
+        .vocab_size = 128,
+        .hidden_size = 128,
+        .num_hidden_layers = 2,
+        .num_attention_heads = 2,
+        .num_key_value_heads = 1,
+        .head_dim = 64,
+        .intermediate_size = 256,
+        .rope_theta = 10_000.0,
+        .rms_norm_eps = 1e-6,
+        .tie_word_embeddings = true,
+    };
+    const tgt_img = try draft_mod.buildSyntheticTargetBf16ForTest(allocator, tgt_cfg, 91501);
+    defer allocator.free(tgt_img);
+
+    const mtp3_cfg: draft_mod.DraftConfig = .{
+        .format = .mtp,
+        .mtp_chained = true,
+        .vocab_size = 128,
+        .draft_vocab_size = 128,
+        .hidden_size = 128,
+        .target_hidden_size = 128,
+        .num_hidden_layers = 3,
+        .num_attention_heads = 2,
+        .num_key_value_heads = 1,
+        .head_dim = 192,
+        .v_head_dim = 128,
+        .rope_dim = 64,
+        .sliding_window = 12,
+        .attention_value_scale = 0.70710678,
+        .add_swa_attention_sink_bias = true,
+        .intermediate_size = 256,
+        .rope_theta = 10_000.0,
+        .share_embed_tokens = true,
+        .share_lm_head = true,
+    };
+    const mtp3_img = try draft_mod.buildSyntheticDraftAmfImage(allocator, mtp3_cfg, 91502);
+    defer allocator.free(mtp3_img);
+
+    const prompt = [_]u32{ 4, 17, 29, 53, 81, 12 };
+    const gen_steps: usize = 14;
+
+    // Reference non-speculative greedy decode.
+    var ref_model = try qwen3.Qwen3Model.loadFromBytes(allocator, tgt_img, tgt_cfg, .{
+        .max_seq_len = 64,
+        .max_tree_nodes = 16,
+    });
+    defer ref_model.deinit(allocator);
+    var ref_tokens: [gen_steps]u32 = undefined;
+    ref_tokens[0] = try ref_model.prefillChunk(&prompt, 0, true);
+    for (1..gen_steps) |s| {
+        ref_tokens[s] = try ref_model.stepDecode(ref_tokens[s - 1], @intCast(prompt.len + s - 1));
+    }
+
+    // SpecEngine with chained 3L MTP (`max_draft_depth = 5` must cleanly clamp to 3 stages!).
+    var spec_model = try qwen3.Qwen3Model.loadFromBytes(allocator, tgt_img, tgt_cfg, .{
+        .max_seq_len = 64,
+        .max_tree_nodes = 16,
+        .enable_feature_taps = true,
+    });
+    defer spec_model.deinit(allocator);
+    var dh = try draft_mod.DraftHead.loadFromBytes(allocator, &spec_model, mtp3_img, mtp3_cfg, .{
+        .placement = .gpu,
+        .max_seq_len = 64,
+        .max_tree_slots = 16,
+    });
+    defer dh.deinit(allocator, &spec_model);
+
+    var eng = try SpecEngine.init(allocator, &spec_model, &dh, .{
+        .mode = .mtp,
+        .max_tree_nodes = 16,
+        .max_draft_depth = 5,
+        .branch_width = 2,
+        .top_k_per_node = 2,
+        .l1_max_draft = 0, // force pure 3L chained MTP tree expansion
+        .min_frontier_prob = 0.0,
+        .enable_pruning = false,
+        .temperature = 0.0,
+    });
+    defer eng.deinit(allocator);
+
+    var spec_tokens: [gen_steps]u32 = undefined;
+    spec_tokens[0] = try eng.prefill(&prompt, null);
+    var out_len: usize = 1;
+    var saw_depth3 = false;
+    while (out_len < gen_steps) {
+        const rs = try eng.stepRound(null, spec_tokens[out_len..]);
+        if (eng.draft_tree.max_depth == 3) saw_depth3 = true;
+        try std.testing.expect(eng.draft_tree.max_depth <= 3); // clamped to 3 stages
+        out_len += rs.emitted_count;
+    }
+    try std.testing.expect(saw_depth3);
+    try std.testing.expectEqualSlices(u32, &ref_tokens, &spec_tokens);
+
+    // Stochastic T=0.7 lossless rejection sampling round across chained 3L MTP.
+    eng.reset();
+    var prng = std.Random.DefaultPrng.init(0xD153_7777);
+    eng.config.temperature = 0.7;
+    var stoch: [8]u32 = undefined;
+    stoch[0] = try eng.prefill(&prompt, prng.random());
+    var slen: usize = 1;
+    while (slen < stoch.len) {
+        const rs = try eng.stepRound(prng.random(), stoch[slen..]);
+        try std.testing.expect(rs.emitted_count >= 1);
+        slen += rs.emitted_count;
+    }
+    for (stoch) |t| try std.testing.expect(t < tgt_cfg.vocab_size);
+}
+
+test "M9.1 D15 SpecEngine 8-16 tok DFlash block-diffusion on cold-expert NVMe MoE GraphModel: D7 reduces cold experts and matches T=0 bit-exact" {
+    const allocator = std.testing.allocator;
+    const tmp_dir = try graph.makeTestTempDir(allocator, "m91_d15_dflash_d7");
+    defer {
+        graph.removeTestDir(allocator, tmp_dir);
+        allocator.free(tmp_dir);
+    }
+
+    var synth = try graph.buildSynthQwen4Bundle(allocator, .{
+        .num_experts = 8,
+        .top_k = 2,
+        .cold_experts_per_layer = 4,
+        .max_loops = 1,
+        .ple_num_shards = 0,
+        .include_steplora = false,
+        .tmp_dir = tmp_dir,
+    });
+    defer {
+        if (synth.amf_file_path) |p| graph.removeTestFile(p);
+        for (synth.ple_paths) |p| graph.removeTestFile(p);
+        synth.deinit(allocator);
+    }
+
+    const prompt = [_]u32{ 3, 9, 15, 21, 27 };
+    const gen_steps: usize = 10;
+
+    // 1. Reference non-speculative greedy decode on cold-expert NVMe MoE GraphModel.
+    var ref_model = try graph.GraphModel.loadFromFile(allocator, synth.amf_file_path.?, synth.cfg, .{
+        .max_seq_len = 64,
+        .max_tree_nodes = 16,
+        .cold_slot_count = 16,
+        .startup_canary = false,
+    });
+    defer ref_model.deinit(allocator);
+    try std.testing.expect(ref_model.hasColdExperts());
+    const graph_cost = defaultCostModelForGraph(&ref_model);
+    try std.testing.expect(graph_cost.isMoe());
+    try std.testing.expect(graph_cost.cold_penalty_bytes > 0.0);
+
+    var ref_tokens: [gen_steps]u32 = undefined;
+    ref_tokens[0] = try ref_model.prefillChunk(&prompt, 0, true);
+    for (1..gen_steps) |s| {
+        ref_tokens[s] = try ref_model.stepDecode(ref_tokens[s - 1], @intCast(prompt.len + s - 1));
+    }
+
+    // 2. Build a 5-layer direct DFlash block-diffusion proposer (markov_rank=0, sink_bias,
+    //    v_scale=0.612, partial RoPE, SWA, mask_token_id) sharing target embed + lm_head hooks!
+    const h: usize = synth.cfg.hidden_size;
+    const inter: usize = h * 2;
+    const nh: u32 = 2;
+    const nkvh: u32 = 1;
+    const hd: u32 = 64;
+    const q_dim: usize = @as(usize, nh) * hd;
+    const kv_dim: usize = @as(usize, nkvh) * hd;
+    const taps: usize = 5;
+    const n_layers: usize = 5;
+
+    const l_q = try allocator.alloc(f32, n_layers * q_dim * h);
+    defer allocator.free(l_q);
+    const l_k = try allocator.alloc(f32, n_layers * kv_dim * h);
+    defer allocator.free(l_k);
+    const l_v = try allocator.alloc(f32, n_layers * kv_dim * h);
+    defer allocator.free(l_v);
+    const l_o = try allocator.alloc(f32, n_layers * h * q_dim);
+    defer allocator.free(l_o);
+    const l_gate = try allocator.alloc(f32, n_layers * inter * h);
+    defer allocator.free(l_gate);
+    const l_up = try allocator.alloc(f32, n_layers * inter * h);
+    defer allocator.free(l_up);
+    const l_down = try allocator.alloc(f32, n_layers * h * inter);
+    defer allocator.free(l_down);
+    const l_sink = try allocator.alloc(f32, n_layers * nh);
+    defer allocator.free(l_sink);
+    const fc = try allocator.alloc(f32, h * taps * h);
+    defer allocator.free(fc);
+    const h_norm = try allocator.alloc(f32, h);
+    defer allocator.free(h_norm);
+    const f_norm = try allocator.alloc(f32, h);
+    defer allocator.free(f_norm);
+
+    const fillW = struct {
+        fn run(dst: []f32, seed: u64, scale: f32) void {
+            var s = seed;
+            for (dst) |*slot| {
+                s = s *% 6364136223846793005 +% 1442695040888963407;
+                const u: f32 = @floatFromInt((s >> 40) & 0xFFFF);
+                slot.* = ((u / 32767.5) - 1.0) * scale;
+            }
+        }
+    }.run;
+
+    var layers: [n_layers]dflare_dfly.TransformerBlockWeights = undefined;
+    for (0..n_layers) |li| {
+        fillW(l_q[li * q_dim * h ..][0 .. q_dim * h], 9200 + li * 10 + 1, 0.08);
+        fillW(l_k[li * kv_dim * h ..][0 .. kv_dim * h], 9200 + li * 10 + 2, 0.08);
+        fillW(l_v[li * kv_dim * h ..][0 .. kv_dim * h], 9200 + li * 10 + 3, 0.08);
+        fillW(l_o[li * h * q_dim ..][0 .. h * q_dim], 9200 + li * 10 + 4, 0.08);
+        fillW(l_gate[li * inter * h ..][0 .. inter * h], 9200 + li * 10 + 5, 0.07);
+        fillW(l_up[li * inter * h ..][0 .. inter * h], 9200 + li * 10 + 6, 0.07);
+        fillW(l_down[li * h * inter ..][0 .. h * inter], 9200 + li * 10 + 7, 0.07);
+        for (0..nh) |hi| l_sink[li * nh + hi] = -0.25 + 0.3 * @as(f32, @floatFromInt(hi));
+        layers[li] = .{
+            .q_proj = l_q[li * q_dim * h ..][0 .. q_dim * h],
+            .k_proj = l_k[li * kv_dim * h ..][0 .. kv_dim * h],
+            .v_proj = l_v[li * kv_dim * h ..][0 .. kv_dim * h],
+            .sink_bias = l_sink[li * nh ..][0..nh],
+            .o_proj = l_o[li * h * q_dim ..][0 .. h * q_dim],
+            .mlp_gate_proj = l_gate[li * inter * h ..][0 .. inter * h],
+            .mlp_up_proj = l_up[li * inter * h ..][0 .. inter * h],
+            .mlp_down_proj = l_down[li * h * inter ..][0 .. h * inter],
+        };
+    }
+    fillW(fc, 9301, 0.05);
+    @memset(h_norm, 1.0);
+    @memset(f_norm, 1.0);
+
+    // 3. Test BOTH B=8 and B=16 with D7 cold-expert pruning ON and OFF -> 100% T=0 bit-exact!
+    for ([_]u8{ 8, 16 }) |block_w| {
+        for ([_]bool{ false, true }) |enable_prune| {
+            var spec_model = try graph.GraphModel.loadFromFile(allocator, synth.amf_file_path.?, synth.cfg, .{
+                .max_seq_len = 64,
+                .max_tree_nodes = 16,
+                .cold_slot_count = 16,
+                .startup_canary = false,
+            });
+            defer spec_model.deinit(allocator);
+
+            const df_cfg: dflare_dfly.DFlareConfig = .{
+                .variant = .dflash_standalone,
+                .num_layers = n_layers,
+                .block_size = block_w,
+                .top_k_per_pos = 1,
+                .max_tree_nodes = 16,
+                .hidden_size = @intCast(h),
+                .intermediate_size = @intCast(inter),
+                .num_attention_heads = nh,
+                .num_key_value_heads = nkvh,
+                .head_dim = hd,
+                .rope_dim = 32,
+                .attention_value_scale = 0.612,
+                .sliding_window = 16,
+                .vocab_size = synth.cfg.vocab_size,
+                .markov_rank = 0,
+                .num_target_taps = @intCast(taps),
+                .mask_token_id = synth.cfg.vocab_size - 1,
+            };
+            const df_weights: dflare_dfly.DFlareWeights = .{
+                .target_fusion_proj = fc,
+                .target_fusion_norm = h_norm,
+                .final_norm = f_norm,
+                .mask_embed = &.{},
+                .tok_embed_hook = .{ .callback = .{
+                    .ctx = &spec_model,
+                    .read_fn = LoadedDFlareProposer.readTargetTokEmbedCb,
+                } },
+                .layers = &layers,
+                .lm_head = .{ .callback = .{
+                    .ctx = &spec_model,
+                    .eval_fn = LoadedDFlareProposer.evalTargetLmHeadCb,
+                } },
+            };
+
+            var ws = try dflare_dfly.DFlareWorkspace.init(df_cfg, null);
+            defer ws.deinit();
+            var proposer = try dflare_dfly.DFlareProposer.init(df_cfg, df_weights, &ws);
+            try proposer.attachGpu(.{
+                .device = spec_model.device,
+                .library = spec_model.library,
+                .compute = &spec_model.compute,
+                .dequant_pipes = &spec_model.dequant_pipes,
+                .qf_pipes = if (spec_model.qf_pipes) |*qfp| qfp else null,
+                .target_lm_head = .{
+                    .amf_dtype = spec_model.lm_head.amf_dtype,
+                    .group_size = spec_model.lm_head.group_size,
+                    .tensor_scale_per_row = spec_model.lm_head.tensor_scale_per_row,
+                    .weight = spec_model.lm_head.weight,
+                    .params = spec_model.lm_head.scale_bias,
+                    .n = spec_model.lm_head.n,
+                    .k = spec_model.lm_head.k,
+                },
+                .timeout_ms = spec_model.timeout_ms,
+            });
+            defer proposer.detachGpu();
+
+            var eng = try SpecEngine.initWithDFlare(allocator, &spec_model, &proposer, .{
+                .mode = .dflare,
+                .max_tree_nodes = 16,
+                .max_draft_depth = 15,
+                .enable_pruning = enable_prune,
+                .temperature = 0.0,
+            });
+            defer eng.deinit(allocator);
+            try std.testing.expect(eng.cost_model.isMoe());
+            try std.testing.expect(eng.cost_model.cold_penalty_bytes > 0.0);
+
+            // On B=16 + enable_pruning=true, explicitly verify D7 GraphModel router prediction
+            // detects unwarmed NVMe cold experts and trims cold-expert tail slots from a full
+            // 16-node DFlash block BEFORE decode warms the small synthetic slot cache!
+            if (block_w == 16 and enable_prune) {
+                eng.draft_tree.reset(prompt[0]);
+                var parent: u16 = 0;
+                for (1..16) |slot| {
+                    const tok: u32 = @intCast((slot * 3) % synth.cfg.vocab_size);
+                    parent = eng.draft_tree.insertChild(parent, tok, 0.35, .l2) orelse break;
+                }
+                const before_n = eng.draft_tree.count;
+                try std.testing.expectEqual(@as(u16, 16), before_n);
+                eng.draft_tree.fillTokenIds(eng.verify_tokens[0..before_n]);
+                const pre_pred = try eng.predictGraphMoEExpertsForTokens(&spec_model, eng.verify_tokens[0..before_n]);
+                try std.testing.expect(pre_pred.sampled > 0);
+                try std.testing.expect(pre_pred.has_cold);
+                var pre_cold: u32 = 0;
+                for (0..pre_pred.sampled) |s| {
+                    var u_bs = tree_mod.ExpertBitset.empty();
+                    for (0..before_n) |ni| u_bs = u_bs.unionWith(eng.node_experts[ni * pre_pred.sampled + s]);
+                    pre_cold += u_bs.intersectWith(eng.cold_masks[s]).count();
+                }
+                try std.testing.expect(pre_cold > 0);
+
+                // Apply heavy cold NVMe penalty to confirm D7 prunes cold tail slots cleanly.
+                const saved_cost = eng.cost_model;
+                eng.cost_model.expert_bytes = 500_000.0;
+                eng.cost_model.cold_penalty_bytes = 10_000_000.0;
+                const ps = try eng.pruneTreeInPlace(&eng.draft_tree, 50.0, 16);
+                eng.cost_model = saved_cost;
+                try std.testing.expect(ps.kept_nodes < before_n);
+
+                eng.draft_tree.fillTokenIds(eng.verify_tokens[0..ps.kept_nodes]);
+                const post_pred = try eng.predictGraphMoEExpertsForTokens(&spec_model, eng.verify_tokens[0..ps.kept_nodes]);
+                var post_cold: u32 = 0;
+                for (0..post_pred.sampled) |s| {
+                    var u_bs = tree_mod.ExpertBitset.empty();
+                    for (0..ps.kept_nodes) |ni| u_bs = u_bs.unionWith(eng.node_experts[ni * post_pred.sampled + s]);
+                    post_cold += u_bs.intersectWith(eng.cold_masks[s]).count();
+                }
+                try std.testing.expect(post_cold < pre_cold);
+            }
+
+            var spec_tokens: [gen_steps]u32 = undefined;
+            spec_tokens[0] = try eng.prefill(&prompt, null);
+            var out_len: usize = 1;
+            while (out_len < gen_steps) {
+                const rs = try eng.stepRound(null, spec_tokens[out_len..]);
+                try std.testing.expect(rs.emitted_count >= 1);
+                out_len += rs.emitted_count;
+            }
+            try std.testing.expect(eng.stats.dflare_rounds > 0);
+            try std.testing.expectEqualSlices(u32, &ref_tokens, &spec_tokens);
+        }
     }
 }

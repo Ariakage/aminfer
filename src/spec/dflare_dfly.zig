@@ -216,6 +216,8 @@ pub fn detectDraftKindFromJson(json_bytes: []const u8) ?DraftKindDetected {
     }
     if (std.mem.indexOf(u8, json_bytes, "\"dflare\"") != null or
         std.mem.indexOf(u8, json_bytes, "\"dflash\"") != null or
+        std.mem.indexOf(u8, json_bytes, "\"dflash_config\"") != null or
+        std.mem.indexOf(u8, json_bytes, "\"DFlashDraftModel\"") != null or
         std.mem.indexOf(u8, json_bytes, "\"DFlashForCausalLM\"") != null or
         std.mem.indexOf(u8, json_bytes, "\"markov_head_type\"") != null)
     {
@@ -339,6 +341,8 @@ pub const TransformerBlockWeights = struct {
     ctx_norm_weight: ?[]const f32 = null,
     q_norm_weight: ?[]const f32 = null, // [head_dim]
     k_norm_weight: ?[]const f32 = null, // [head_dim]
+    /// Optional per-Q-head `attention_sink_bias` (`[num_attention_heads]`, MiMo-V2.6 `DFlash`).
+    sink_bias: ?[]const f32 = null,
     post_norm_weight: ?[]const f32 = null,
     mlp_gate_proj: []const f32 = &.{}, // [intermediate_size, hidden_size]
     mlp_up_proj: []const f32 = &.{}, // [intermediate_size, hidden_size]
@@ -385,6 +389,10 @@ pub const TransformerBlockWeights = struct {
             if (self.k_norm_weight) |w| {
                 if (w.len != head_dim) return error.InvalidWeights;
             }
+            if (self.sink_bias) |sb| {
+                const num_q_heads = q_dim / head_dim;
+                if (sb.len != num_q_heads) return error.InvalidWeights;
+            }
         }
         if (self.post_norm_weight) |w| {
             if (w.len != hidden_size) return error.InvalidWeights;
@@ -414,11 +422,28 @@ pub const DFlareConfig = struct {
     num_key_value_heads: u32,
     head_dim: u32,
     vocab_size: u32,
+    /// `0` enables direct parallel block-diffusion scoring through target `lm_head` (`D15` `DFlash`),
+    /// while `> 0` runs the `Inkling 2` / `dflash-Q8` low-rank Markov head.
     markov_rank: u32 = DFLARE_MARKOV_RANK,
     num_target_taps: u8 = 3,
     target_layer_ids: [MAX_TARGET_TAPS]u16 = .{ 2, 11, 20, 0, 0, 0, 0, 0 },
     rms_eps: f32 = 1e-6,
     rope_theta: f32 = 0.0,
+    /// Optional partial NeoX RoPE dimension (`0` => full `head_dim`; `64` on MiMo-V2.6 `DFlash`).
+    rope_dim: u32 = 0,
+    /// Optional attention value scale (`1.0` default; `0.612` on MiMo-V2.6 `DFlash`).
+    attention_value_scale: f32 = 1.0,
+    /// Optional causal sliding window over prior accepted context KV (`0` => full ctx ring; `1024` on MiMo-V2.6 `DFlash`).
+    sliding_window: u32 = 0,
+    /// Optional mask token ID (`151675` on MiMo-V2.6 `DFlash`) used to initialize slots `1..B-1` via `embed(mask_token_id)`.
+    mask_token_id: ?u32 = null,
+    /// Direct block-diffusion refinement passes (`1` = single-pass `8..16` block; `2` = optional 2-iteration refinement).
+    refinement_iters: u8 = 1,
+    /// Probability threshold for retaining predicted tokens in iteration 2 of direct block-diffusion refinement.
+    refine_confidence_threshold: f32 = 0.5,
+    /// When `> 0.0`, forks a runner-up top-2 branch at uncertain direct block-diffusion slots (`top1_prob < threshold`)
+    /// up to `max_tree_nodes` (e.g. `16`).
+    fork_top2_threshold: f32 = 0.0,
     unpadded_vocab_size: u32 = 0,
     final_logit_softcapping: f32 = 0.0,
     temperature: f32 = 1.0,
@@ -481,6 +506,14 @@ pub const DFlareConfig = struct {
         return self.num_key_value_heads * self.head_dim;
     }
 
+    pub inline fn effectiveRopeDim(self: DFlareConfig) u32 {
+        return if (self.rope_dim > 0) self.rope_dim else self.head_dim;
+    }
+
+    pub inline fn isDirectBlockDiffusion(self: DFlareConfig) bool {
+        return self.markov_rank == 0;
+    }
+
     pub fn validate(self: DFlareConfig) Error!void {
         if (self.num_layers == 0 or self.num_layers > MAX_LAYERS) return error.InvalidConfig;
         if (self.block_size == 0 or self.block_size > MAX_BLOCK_SIZE) return error.InvalidConfig;
@@ -490,14 +523,22 @@ pub const DFlareConfig = struct {
         if (self.num_attention_heads == 0 or self.num_key_value_heads == 0 or self.head_dim == 0) return error.InvalidConfig;
         if ((self.num_attention_heads % self.num_key_value_heads) != 0) return error.InvalidConfig;
         if (self.top_k_per_pos > self.vocab_size) return error.InvalidConfig;
-        if (self.markov_rank == 0) return error.InvalidConfig;
+        const rdim = self.effectiveRopeDim();
+        if (rdim == 0 or rdim > self.head_dim or (rdim % 2) != 0) return error.InvalidConfig;
+        if (!std.math.isFinite(self.attention_value_scale) or self.attention_value_scale <= 0.0) return error.InvalidConfig;
+        if (self.refinement_iters == 0 or self.refinement_iters > 2) return error.InvalidConfig;
+        if (!std.math.isFinite(self.refine_confidence_threshold) or self.refine_confidence_threshold < 0.0 or self.refine_confidence_threshold > 1.0) return error.InvalidConfig;
+        if (!std.math.isFinite(self.fork_top2_threshold) or self.fork_top2_threshold < 0.0 or self.fork_top2_threshold > 1.0) return error.InvalidConfig;
+        if (self.mask_token_id) |mtid| {
+            if (mtid >= self.vocab_size) return error.InvalidConfig;
+        }
         if (self.num_target_taps == 0 or self.num_target_taps > MAX_TARGET_TAPS) return error.InvalidConfig;
         if (!std.math.isFinite(self.rms_eps) or self.rms_eps <= 0.0) return error.InvalidConfig;
         if (!std.math.isFinite(self.temperature) or self.temperature <= 0.0) return error.InvalidConfig;
         if (self.l1_max_draft_len > MAX_L1_DRAFT_LEN) return error.InvalidConfig;
     }
 
-    /// Parses `dflare_config.json` or GGUF `arch=dflash` config JSON with target fallbacks.
+    /// Parses `dflare_config.json`, HF `dflash/config.json`, or GGUF `arch=dflash` config JSON with target fallbacks.
     pub fn fromJson(
         allocator: std.mem.Allocator,
         json_bytes: []const u8,
@@ -508,24 +549,59 @@ pub const DFlareConfig = struct {
         defer parsed.deinit();
         if (parsed.value != .object) return error.InvalidConfig;
         const obj = parsed.value.object;
+        const df_obj: ?std.json.ObjectMap = if (obj.get("dflash_config")) |dv| (if (dv == .object) dv.object else null) else null;
 
-        const num_layers: u8 = @intCast(jsonU32Opt(obj, "num_hidden_layers") orelse 3);
+        const is_dflash_arch: bool = blk: {
+            if (df_obj != null) break :blk true;
+            if (obj.get("draft_kind")) |dk| {
+                if (dk == .string and std.mem.eql(u8, dk.string, "dflash")) break :blk true;
+            }
+            if (obj.get("architectures")) |av| {
+                if (av == .array and av.array.items.len > 0 and av.array.items[0] == .string) {
+                    if (std.mem.indexOf(u8, av.array.items[0].string, "DFlash") != null) break :blk true;
+                }
+            }
+            break :blk false;
+        };
+
+        const num_layers: u8 = @intCast(jsonU32Opt(obj, "num_hidden_layers") orelse (if (is_dflash_arch) @as(u32, 5) else 3));
         const hidden_size: u32 = jsonU32Opt(obj, "hidden_size") orelse fallback_hidden;
         const inter_size: u32 = jsonU32Opt(obj, "intermediate_size") orelse (hidden_size * 4);
         const num_heads: u32 = jsonU32Opt(obj, "num_attention_heads") orelse 8;
         const num_kv_heads: u32 = jsonU32Opt(obj, "num_key_value_heads") orelse num_heads;
         const head_dim: u32 = jsonU32Opt(obj, "head_dim") orelse (hidden_size / @max(num_heads, 1));
         const vocab_size: u32 = if (fallback_vocab > 0) fallback_vocab else (jsonU32Opt(obj, "vocab_size") orelse 0);
-        const block_size: u8 = @intCast(jsonU32Opt(obj, "block_size") orelse DFLARE_BLOCK_SIZE);
-        const markov_rank: u32 = jsonU32Opt(obj, "markov_rank") orelse DFLARE_MARKOV_RANK;
+        const block_size_raw: u32 = jsonU32Opt(obj, "block_size") orelse
+            (if (df_obj) |dfo| jsonU32Opt(dfo, "block_size") else null) orelse DFLARE_BLOCK_SIZE;
+        const block_size: u8 = @intCast(block_size_raw);
+        const markov_rank_opt = jsonU32Opt(obj, "markov_rank");
+        const markov_rank: u32 = markov_rank_opt orelse (if (is_dflash_arch) @as(u32, 0) else DFLARE_MARKOV_RANK);
         const rms_eps: f32 = jsonF32Opt(obj, "rms_norm_eps") orelse 1e-6;
-        const rope_theta: f32 = jsonF32Opt(obj, "rope_theta") orelse 0.0;
+        const rope_theta: f32 = jsonF32Opt(obj, "rope_theta") orelse (if (is_dflash_arch) @as(f32, 10_000.0) else 0.0);
+        const explicit_rope_dim = jsonU32Opt(obj, "rope_dim") orelse jsonU32Opt(obj, "rotary_dim");
+        const partial_rotary_factor: f32 = jsonF32Opt(obj, "partial_rotary_factor") orelse 1.0;
+        const rope_dim: u32 = if (explicit_rope_dim) |rd|
+            rd
+        else if (partial_rotary_factor > 0.0 and partial_rotary_factor < 1.0) blk: {
+            const raw: u32 = @intFromFloat(@floor(@as(f32, @floatFromInt(head_dim)) * partial_rotary_factor));
+            break :blk raw & ~@as(u32, 1);
+        } else head_dim;
+        const v_scale: f32 = jsonF32Opt(obj, "attention_value_scale") orelse
+            (if (df_obj) |dfo| jsonF32Opt(dfo, "attention_value_scale") else null) orelse 1.0;
+        const sliding_window: u32 = jsonU32Opt(obj, "sliding_window") orelse
+            jsonU32Opt(obj, "sliding_window_size") orelse 0;
+        const mask_token_id: ?u32 = jsonU32Opt(obj, "mask_token_id") orelse
+            (if (df_obj) |dfo| jsonU32Opt(dfo, "mask_token_id") else null);
+        const refinement_iters: u8 = @intCast(jsonU32Opt(obj, "refinement_iters") orelse 1);
+        const refine_conf: f32 = jsonF32Opt(obj, "refine_confidence_threshold") orelse 0.5;
+        const fork_top2: f32 = jsonF32Opt(obj, "fork_top2_threshold") orelse 0.0;
         const unpadded_vocab: u32 = jsonU32Opt(obj, "unpadded_vocab_size") orelse 0;
         const final_softcap: f32 = jsonF32Opt(obj, "final_logit_softcapping") orelse 0.0;
 
         var tap_ids: [MAX_TARGET_TAPS]u16 = .{ 5, 23, 41, 48, 0, 0, 0, 0 };
         var num_taps: u8 = 4;
-        if (obj.get("target_layer_ids")) |v| {
+        const tap_arr_opt = obj.get("target_layer_ids") orelse (if (df_obj) |dfo| dfo.get("target_layer_ids") else null);
+        if (tap_arr_opt) |v| {
             if (v == .array and v.array.items.len > 0 and v.array.items.len <= MAX_TARGET_TAPS) {
                 num_taps = @intCast(v.array.items.len);
                 for (v.array.items, 0..) |item, i| {
@@ -535,10 +611,12 @@ pub const DFlareConfig = struct {
                 }
             }
         }
-        const variant: DFlareVariant = if (obj.get("draft_kind")) |dk| blk: {
-            if (dk == .string and std.mem.eql(u8, dk.string, "dflash")) break :blk .dflash_standalone;
-            break :blk if (num_layers >= 5) .inkling2_small_5l else .inkling2_mini_3l;
-        } else if (num_layers >= 5) .inkling2_small_5l else .inkling2_mini_3l;
+        const variant: DFlareVariant = if (is_dflash_arch)
+            .dflash_standalone
+        else if (num_layers >= 5)
+            .inkling2_small_5l
+        else
+            .inkling2_mini_3l;
 
         const cfg: DFlareConfig = .{
             .variant = variant,
@@ -555,6 +633,13 @@ pub const DFlareConfig = struct {
             .target_layer_ids = tap_ids,
             .rms_eps = rms_eps,
             .rope_theta = rope_theta,
+            .rope_dim = rope_dim,
+            .attention_value_scale = v_scale,
+            .sliding_window = sliding_window,
+            .mask_token_id = mask_token_id,
+            .refinement_iters = refinement_iters,
+            .refine_confidence_threshold = refine_conf,
+            .fork_top2_threshold = fork_top2,
             .unpadded_vocab_size = unpadded_vocab,
             .final_logit_softcapping = final_softcap,
         };
@@ -572,8 +657,9 @@ pub const DFlareWeights = struct {
     /// (real `Inkling-2-Mini` `fuse_weight [4, 4]` & `dflash-Q8` `ctx_mix`).
     fuse_scalar_weights: ?[]const f32 = null,
     target_fusion_norm: ?[]const f32 = null,
-    /// Mask embedding: `[block_size, hidden_size]`, `[(block_size - 1), hidden_size]`, or shared `[hidden_size]`.
-    mask_embed: []const f32,
+    /// Mask embedding: `[block_size, hidden_size]`, `[(block_size - 1), hidden_size]`, shared `[hidden_size]`,
+    /// or empty when `cfg.mask_token_id != null` (resolved from `embed(mask_token_id)`).
+    mask_embed: []const f32 = &.{},
     /// Token embeddings `[vocab_size, hidden_size]` for sequential Markov conditioning (or empty when `tok_embed_hook` is set).
     tok_embed: []const f32 = &.{},
     tok_embed_raw: ?RawLinearMat = null,
@@ -638,7 +724,8 @@ pub const DFlareWeights = struct {
         }
         const mask_ok = self.mask_embed.len == h or
             self.mask_embed.len == (std.math.mul(usize, cfg.block_size, h) catch return error.Overflow) or
-            (cfg.block_size > 1 and self.mask_embed.len == (std.math.mul(usize, cfg.block_size - 1, h) catch return error.Overflow));
+            (cfg.block_size > 1 and self.mask_embed.len == (std.math.mul(usize, cfg.block_size - 1, h) catch return error.Overflow)) or
+            (self.mask_embed.len == 0 and cfg.mask_token_id != null);
         if (!mask_ok) return error.InvalidWeights;
 
         const vh = std.math.mul(usize, v, h) catch return error.Overflow;
@@ -652,6 +739,16 @@ pub const DFlareWeights = struct {
         }
         if (self.final_norm) |fnw| {
             if (fnw.len != h) return error.InvalidWeights;
+        }
+
+        if (mr == 0) {
+            // Direct parallel block-diffusion mode (`D15` `DFlash`): no Markov head; scores via target `lm_head`.
+            if (self.lm_head_raw) |lhr| {
+                if (!lhr.matches(v, h)) return error.InvalidWeights;
+            } else {
+                try validateLmHeadHook(self.lm_head, vh);
+            }
+            return;
         }
 
         const has_gru = (self.markov_gru_proj_bf16 != null or self.markov_gru_proj_f32 != null or self.markov_gru_proj_raw != null);
@@ -712,6 +809,7 @@ pub const DFlareWorkspace = struct {
     ctx_hidden: []f32,
     ctx_markov: []f32,
     tok_embed_tmp: []f32,
+    mask_embed_tmp: []f32,
     slot_hiddens: []f32,
     norm_buf: []f32,
     q_buf: []f32,
@@ -738,6 +836,7 @@ pub const DFlareWorkspace = struct {
     // GPU zero-copy slices inside `self.arena` (`64`-byte aligned):
     gpu_taps_flat_f16: []f16,
     gpu_ctx_taps_f32: []f32,
+    gpu_ctx_taps_f16: []f16,
     gpu_ctx_in_f16: []f16,
     gpu_ctx_k_tmp_f16: []f16,
     gpu_ctx_v_tmp_f16: []f16,
@@ -777,12 +876,13 @@ pub const DFlareWorkspace = struct {
         const inter: usize = cfg.intermediate_size;
         const w: usize = cfg.block_size;
         const v: usize = cfg.vocab_size;
-        const mr: usize = cfg.markov_rank;
+        const mr: usize = @max(@as(usize, cfg.markov_rank), 1);
+        const topk_cap: usize = @max(@as(usize, cfg.top_k_per_pos), 2);
         const taps: usize = cfg.num_target_taps;
         const q_dim: usize = cfg.qDim();
         const kv_dim: usize = cfg.kvDim();
         const max_nodes: usize = cfg.max_tree_nodes;
-        const max_ctx: usize = if (cfg.hidden_size >= 1024) 1024 else 64;
+        const max_ctx: usize = if (cfg.sliding_window > 0) @min(@as(usize, cfg.sliding_window), 1024) else if (cfg.hidden_size >= 1024) 1024 else 64;
         const ctx_batch_cap: usize = @min(max_ctx, 64);
         const ctx_kv_elems: usize = @as(usize, cfg.num_layers) * max_ctx * kv_dim;
         const mask_words: usize = (v + 31) / 32;
@@ -793,6 +893,7 @@ pub const DFlareWorkspace = struct {
             try alignUp64(h * @sizeOf(f32)), // ctx_hidden
             try alignUp64(h * @sizeOf(f32)), // ctx_markov
             try alignUp64(h * @sizeOf(f32)), // tok_embed_tmp
+            try alignUp64(h * @sizeOf(f32)), // mask_embed_tmp
             try alignUp64((w * h) * @sizeOf(f32)), // slot_hiddens
             try alignUp64((w * h) * @sizeOf(f32)), // norm_buf
             try alignUp64((w * q_dim) * @sizeOf(f32)), // q_buf
@@ -812,12 +913,13 @@ pub const DFlareWorkspace = struct {
             try alignUp64(h * @sizeOf(f32)), // head_hidden
             try alignUp64((w * v) * @sizeOf(f32)), // base_logits_buf
             try alignUp64(v * @sizeOf(f32)), // logits_buf
-            try alignUp64(cfg.top_k_per_pos * @sizeOf(u32)), // topk_tokens
-            try alignUp64(cfg.top_k_per_pos * @sizeOf(f32)), // topk_probs
+            try alignUp64(topk_cap * @sizeOf(u32)), // topk_tokens
+            try alignUp64(topk_cap * @sizeOf(f32)), // topk_probs
             try alignUp64(max_nodes * @sizeOf(f32)), // node_log_probs
             try alignUp64(MAX_L1_DRAFT_LEN * @sizeOf(u32)), // l1_draft_buf
             try alignUp64((taps * h) * @sizeOf(f16)), // gpu_taps_flat_f16
             try alignUp64((ctx_batch_cap * taps * h) * @sizeOf(f32)), // gpu_ctx_taps_f32
+            try alignUp64((ctx_batch_cap * taps * h) * @sizeOf(f16)), // gpu_ctx_taps_f16
             try alignUp64((ctx_batch_cap * h) * @sizeOf(f16)), // gpu_ctx_in_f16
             try alignUp64((ctx_batch_cap * kv_dim) * @sizeOf(f16)), // gpu_ctx_k_tmp_f16
             try alignUp64((ctx_batch_cap * kv_dim) * @sizeOf(f16)), // gpu_ctx_v_tmp_f16
@@ -868,12 +970,13 @@ pub const DFlareWorkspace = struct {
         const inter: usize = cfg.intermediate_size;
         const w: usize = cfg.block_size;
         const v: usize = cfg.vocab_size;
-        const mr: usize = cfg.markov_rank;
+        const mr: usize = @max(@as(usize, cfg.markov_rank), 1);
+        const topk_cap: usize = @max(@as(usize, cfg.top_k_per_pos), 2);
         const taps: usize = cfg.num_target_taps;
         const q_dim: usize = cfg.qDim();
         const kv_dim: usize = cfg.kvDim();
         const max_nodes: usize = cfg.max_tree_nodes;
-        const max_ctx: usize = if (cfg.hidden_size >= 1024) 1024 else 64;
+        const max_ctx: usize = if (cfg.sliding_window > 0) @min(@as(usize, cfg.sliding_window), 1024) else if (cfg.hidden_size >= 1024) 1024 else 64;
         const ctx_batch_cap: usize = @min(max_ctx, 64);
         const ctx_kv_elems: usize = @as(usize, cfg.num_layers) * max_ctx * kv_dim;
         const mask_words: usize = (v + 31) / 32;
@@ -883,6 +986,7 @@ pub const DFlareWorkspace = struct {
         const ctx_hidden = try allocArenaSlice(f32, &mem_arena, h);
         const ctx_markov = try allocArenaSlice(f32, &mem_arena, h);
         const tok_embed_tmp = try allocArenaSlice(f32, &mem_arena, h);
+        const mask_embed_tmp = try allocArenaSlice(f32, &mem_arena, h);
         const slot_hiddens = try allocArenaSlice(f32, &mem_arena, w * h);
         const norm_buf = try allocArenaSlice(f32, &mem_arena, w * h);
         const q_buf = try allocArenaSlice(f32, &mem_arena, w * q_dim);
@@ -902,13 +1006,14 @@ pub const DFlareWorkspace = struct {
         const head_hidden = try allocArenaSlice(f32, &mem_arena, h);
         const base_logits_buf = try allocArenaSlice(f32, &mem_arena, w * v);
         const logits_buf = try allocArenaSlice(f32, &mem_arena, v);
-        const topk_tokens = try allocArenaSlice(u32, &mem_arena, cfg.top_k_per_pos);
-        const topk_probs = try allocArenaSlice(f32, &mem_arena, cfg.top_k_per_pos);
+        const topk_tokens = try allocArenaSlice(u32, &mem_arena, topk_cap);
+        const topk_probs = try allocArenaSlice(f32, &mem_arena, topk_cap);
         const node_log_probs = try allocArenaSlice(f32, &mem_arena, max_nodes);
         const l1_draft_buf = try allocArenaSlice(u32, &mem_arena, MAX_L1_DRAFT_LEN);
 
         const gpu_taps_flat_f16 = try allocArenaSlice(f16, &mem_arena, taps * h);
         const gpu_ctx_taps_f32 = try allocArenaSlice(f32, &mem_arena, ctx_batch_cap * taps * h);
+        const gpu_ctx_taps_f16 = try allocArenaSlice(f16, &mem_arena, ctx_batch_cap * taps * h);
         const gpu_ctx_in_f16 = try allocArenaSlice(f16, &mem_arena, ctx_batch_cap * h);
         const gpu_ctx_k_tmp_f16 = try allocArenaSlice(f16, &mem_arena, ctx_batch_cap * kv_dim);
         const gpu_ctx_v_tmp_f16 = try allocArenaSlice(f16, &mem_arena, ctx_batch_cap * kv_dim);
@@ -942,6 +1047,7 @@ pub const DFlareWorkspace = struct {
         const gpu_w1_row_f32 = try allocArenaSlice(f32, &mem_arena, mr);
         const cpu_quant_row_scratch = try allocArenaSlice(f32, &mem_arena, row_scratch_elems);
 
+        @memset(mask_embed_tmp, 0.0);
         @memset(node_log_probs, 0.0);
         @memset(node_rnn_hidden, 0.0);
         @memset(ctx_k_cache, 0.0);
@@ -958,6 +1064,7 @@ pub const DFlareWorkspace = struct {
             .ctx_hidden = ctx_hidden,
             .ctx_markov = ctx_markov,
             .tok_embed_tmp = tok_embed_tmp,
+            .mask_embed_tmp = mask_embed_tmp,
             .slot_hiddens = slot_hiddens,
             .norm_buf = norm_buf,
             .q_buf = q_buf,
@@ -983,6 +1090,7 @@ pub const DFlareWorkspace = struct {
             .l1_draft_buf = l1_draft_buf,
             .gpu_taps_flat_f16 = gpu_taps_flat_f16,
             .gpu_ctx_taps_f32 = gpu_ctx_taps_f32,
+            .gpu_ctx_taps_f16 = gpu_ctx_taps_f16,
             .gpu_ctx_in_f16 = gpu_ctx_in_f16,
             .gpu_ctx_k_tmp_f16 = gpu_ctx_k_tmp_f16,
             .gpu_ctx_v_tmp_f16 = gpu_ctx_v_tmp_f16,
@@ -1023,6 +1131,7 @@ pub const DFlareWorkspace = struct {
         self.ctx_hidden = &.{};
         self.ctx_markov = &.{};
         self.tok_embed_tmp = &.{};
+        self.mask_embed_tmp = &.{};
         self.slot_hiddens = &.{};
         self.norm_buf = &.{};
         self.q_buf = &.{};
@@ -1048,6 +1157,7 @@ pub const DFlareWorkspace = struct {
         self.l1_draft_buf = &.{};
         self.gpu_taps_flat_f16 = &.{};
         self.gpu_ctx_taps_f32 = &.{};
+        self.gpu_ctx_taps_f16 = &.{};
         self.gpu_ctx_in_f16 = &.{};
         self.gpu_ctx_k_tmp_f16 = &.{};
         self.gpu_ctx_v_tmp_f16 = &.{};
@@ -1146,7 +1256,7 @@ const DFlareQkNormRopeParams = extern struct {
     anchor_pos: u32,
     has_q_norm: u32,
     has_k_norm: u32,
-    _pad0: u32 = 0,
+    rope_dim: u32 = 0,
     rms_eps: f32,
     rope_theta: f32,
     _pad1: u32 = 0,
@@ -1164,7 +1274,7 @@ const DFlareCtxKvStoreParams = extern struct {
     rope_zero_pos: u32,
     rms_eps: f32,
     rope_theta: f32,
-    _pad0: u32 = 0,
+    rope_dim: u32 = 0,
     _pad1: u32 = 0,
 };
 
@@ -1176,7 +1286,22 @@ const DFlareBlockGqaParams = extern struct {
     head_dim: u32,
     layer_elem_off: u32,
     scale: f32,
+    v_scale: f32 = 1.0,
+    max_ctx: u32 = 0,
+    anchor_pos: u32 = 0,
+    sliding_window: u32 = 0,
+    has_sink_bias: u32 = 0,
+};
+
+const DFlarePackCtxTapsParams = extern struct {
+    num_pos: u32,
+    num_taps: u32,
+    hidden_size: u32,
+    taps_dtype: u32,
+    ring_cap: u32,
+    ring_start: u32,
     _pad0: u32 = 0,
+    _pad1: u32 = 0,
 };
 
 const DFlareElemParams = extern struct {
@@ -1296,7 +1421,8 @@ comptime {
     if (@sizeOf(DFlareRmsNormParams) != 32) @compileError("DFlareRmsNormParams size");
     if (@sizeOf(DFlareQkNormRopeParams) != 48) @compileError("DFlareQkNormRopeParams size");
     if (@sizeOf(DFlareCtxKvStoreParams) != 48) @compileError("DFlareCtxKvStoreParams size");
-    if (@sizeOf(DFlareBlockGqaParams) != 32) @compileError("DFlareBlockGqaParams size");
+    if (@sizeOf(DFlareBlockGqaParams) != 48) @compileError("DFlareBlockGqaParams size");
+    if (@sizeOf(DFlarePackCtxTapsParams) != 32) @compileError("DFlarePackCtxTapsParams size");
     if (@sizeOf(DFlareElemParams) != 16) @compileError("DFlareElemParams size");
     if (@sizeOf(DFlareGemvF32Params) != 32) @compileError("DFlareGemvF32Params size");
     if (@sizeOf(DFlareMarkovAssembleParams) != 48) @compileError("DFlareMarkovAssembleParams size");
@@ -1312,6 +1438,7 @@ comptime {
 /// Startup-compiled Metal 4 compute pipelines for `src/kernels/dflare_gpu.metal`.
 pub const DFlareGpuPipelines = struct {
     pack_taps8: metal.Pipeline,
+    pack_ctx_taps_f16: metal.Pipeline,
     mix_taps_rmsnorm: metal.Pipeline,
     seed_block: metal.Pipeline,
     rmsnorm_rows: metal.Pipeline,
@@ -1333,6 +1460,8 @@ pub const DFlareGpuPipelines = struct {
     pub fn init(device: metal.Device, library: metal.Library) metal.Error!DFlareGpuPipelines {
         const pack_taps8 = try metal.Pipeline.init(device, library, "dflare_pack_taps8");
         errdefer pack_taps8.close();
+        const pack_ctx_taps_f16 = try metal.Pipeline.init(device, library, "dflare_pack_ctx_taps_f16");
+        errdefer pack_ctx_taps_f16.close();
         const mix_taps_rmsnorm = try metal.Pipeline.init(device, library, "dflare_mix_taps_rmsnorm");
         errdefer mix_taps_rmsnorm.close();
         const seed_block = try metal.Pipeline.init(device, library, "dflare_seed_block");
@@ -1370,6 +1499,7 @@ pub const DFlareGpuPipelines = struct {
 
         return .{
             .pack_taps8 = pack_taps8,
+            .pack_ctx_taps_f16 = pack_ctx_taps_f16,
             .mix_taps_rmsnorm = mix_taps_rmsnorm,
             .seed_block = seed_block,
             .rmsnorm_rows = rmsnorm_rows,
@@ -1408,6 +1538,7 @@ pub const DFlareGpuPipelines = struct {
         self.rmsnorm_rows.close();
         self.seed_block.close();
         self.mix_taps_rmsnorm.close();
+        self.pack_ctx_taps_f16.close();
         self.pack_taps8.close();
     }
 };
@@ -1445,6 +1576,7 @@ const GpuLayerBindings = struct {
     k_norm_ctx_w: ?metal.BufferBinding = null,
     q_norm_w: ?metal.BufferBinding = null,
     k_norm_w: ?metal.BufferBinding = null,
+    sink_bias_w: ?metal.BufferBinding = null,
     post_norm_w: ?metal.BufferBinding = null,
     mlp_gate: GpuLinearBinding,
     mlp_up: GpuLinearBinding,
@@ -1587,6 +1719,37 @@ pub const DFlareProposer = struct {
             self.weights.markov_gru_proj_raw != null;
     }
 
+    pub inline fn isDirectBlockDiffusion(self: *const DFlareProposer) bool {
+        return self.config.markov_rank == 0;
+    }
+
+    inline fn usesAnchorMaskSeeding(self: *const DFlareProposer) bool {
+        return self.isRealGru() or self.isDirectBlockDiffusion();
+    }
+
+    fn resolveEffectiveMaskEmbed(self: *DFlareProposer) Error![]const f32 {
+        if (self.weights.mask_embed.len > 0) return self.weights.mask_embed;
+        const mtid = self.config.mask_token_id orelse return error.InvalidWeights;
+        const h: usize = self.config.hidden_size;
+        const raw = try resolveTokEmbed(
+            self.weights.tok_embed,
+            self.weights.tok_embed_raw,
+            self.weights.tok_embed_hook,
+            mtid,
+            h,
+            self.workspace.mask_embed_tmp,
+        );
+        if (raw.ptr != self.workspace.mask_embed_tmp.ptr) {
+            @memcpy(self.workspace.mask_embed_tmp[0..h], raw[0..h]);
+        }
+        if (self.weights.tok_embed_hook == null) {
+            if (self.weights.token_embd_norm) |ten| {
+                applyRmsNormInPlace(self.workspace.mask_embed_tmp[0..h], ten, self.config.rms_eps);
+            }
+        }
+        return self.workspace.mask_embed_tmp[0..h];
+    }
+
     inline fn hasMarkovW2Vocab(self: *const DFlareProposer) bool {
         return self.weights.markov_w2_vocab_bf16 != null or self.weights.markov_w2_vocab_raw != null;
     }
@@ -1700,7 +1863,9 @@ pub const DFlareProposer = struct {
         // Pass 1: measure staging bytes needed for any host slices NOT inside `wired_arena_bytes`.
         const wired_opt = self.weights.wired_arena_bytes;
         var stage_bytes: usize = 0;
-        stage_bytes += stageMeasureSlice(wired_opt, std.mem.sliceAsBytes(self.weights.mask_embed));
+        if (self.weights.mask_embed.len > 0) {
+            stage_bytes += stageMeasureSlice(wired_opt, std.mem.sliceAsBytes(self.weights.mask_embed));
+        }
         if (self.weights.fuse_scalar_weights) |fsw| stage_bytes += stageMeasureSlice(wired_opt, std.mem.sliceAsBytes(fsw));
         if (self.weights.target_fusion_norm) |fnw| stage_bytes += stageMeasureSlice(wired_opt, std.mem.sliceAsBytes(fnw));
         if (self.weights.target_fusion_proj_raw) |r| {
@@ -1728,6 +1893,7 @@ pub const DFlareProposer = struct {
             if (ly.k_norm_ctx_weight) |w| stage_bytes += stageMeasureSlice(wired_opt, std.mem.sliceAsBytes(w));
             if (ly.q_norm_weight) |w| stage_bytes += stageMeasureSlice(wired_opt, std.mem.sliceAsBytes(w));
             if (ly.k_norm_weight) |w| stage_bytes += stageMeasureSlice(wired_opt, std.mem.sliceAsBytes(w));
+            if (ly.sink_bias) |w| stage_bytes += stageMeasureSlice(wired_opt, std.mem.sliceAsBytes(w));
             if (ly.post_norm_weight) |w| stage_bytes += stageMeasureSlice(wired_opt, std.mem.sliceAsBytes(w));
             stage_bytes += stageMeasureLayerProj(wired_opt, ly.q_proj, ly.q_proj_bf16, ly.q_proj_raw);
             stage_bytes += stageMeasureLayerProj(wired_opt, ly.k_proj, ly.k_proj_bf16, ly.k_proj_raw);
@@ -1817,8 +1983,13 @@ pub const DFlareProposer = struct {
             .st_buf = ctx.staging_buf,
         };
 
-        ctx.mask_embed = try bind_ctx.bindSlice(std.mem.sliceAsBytes(self.weights.mask_embed));
-        ctx.mask_rows = @intCast(self.weights.mask_embed.len / h);
+        if (self.weights.mask_embed.len > 0) {
+            ctx.mask_embed = try bind_ctx.bindSlice(std.mem.sliceAsBytes(self.weights.mask_embed));
+            ctx.mask_rows = @intCast(self.weights.mask_embed.len / h);
+        } else {
+            ctx.mask_embed = self.workspace.sliceBinding(ctx.ws_buf, self.workspace.mask_embed_tmp);
+            ctx.mask_rows = 1;
+        }
         if (self.weights.fuse_scalar_weights) |fsw| {
             ctx.fuse_scalar_weights = try bind_ctx.bindSlice(std.mem.sliceAsBytes(fsw));
             ctx.fuse_rows = @intCast(fsw.len / self.config.num_target_taps);
@@ -1874,6 +2045,7 @@ pub const DFlareProposer = struct {
                 .k_norm_ctx_w = if (ly.k_norm_ctx_weight) |w| try bind_ctx.bindSlice(std.mem.sliceAsBytes(w)) else null,
                 .q_norm_w = if (ly.q_norm_weight) |w| try bind_ctx.bindSlice(std.mem.sliceAsBytes(w)) else null,
                 .k_norm_w = if (ly.k_norm_weight) |w| try bind_ctx.bindSlice(std.mem.sliceAsBytes(w)) else null,
+                .sink_bias_w = if (ly.sink_bias) |w| try bind_ctx.bindSlice(std.mem.sliceAsBytes(w)) else null,
                 .post_norm_w = if (ly.post_norm_weight) |w| try bind_ctx.bindSlice(std.mem.sliceAsBytes(w)) else null,
                 .mlp_gate = try bind_ctx.bindLayerProj(ly.mlp_gate_proj, ly.mlp_gate_bf16, ly.mlp_gate_raw, inter, h),
                 .mlp_up = try bind_ctx.bindLayerProj(ly.mlp_up_proj, ly.mlp_up_bf16, ly.mlp_up_raw, inter, h),
@@ -1881,55 +2053,57 @@ pub const DFlareProposer = struct {
             };
         }
 
-        if (self.weights.markov_gru_bias) |b| ctx.markov_gru_bias = try bind_ctx.bindSlice(std.mem.sliceAsBytes(b));
-        if (self.weights.markov_ctx_norm) |b| ctx.markov_ctx_norm = try bind_ctx.bindSlice(std.mem.sliceAsBytes(b));
-        if (self.weights.markov_b1) |b| ctx.markov_b1 = try bind_ctx.bindSlice(std.mem.sliceAsBytes(b));
-        if (self.weights.markov_hidden_bias) |b| ctx.markov_hidden_bias = try bind_ctx.bindSlice(std.mem.sliceAsBytes(b));
-        if (self.weights.markov_w2_vocab_bias) |b| ctx.markov_w2_vocab_bias = try bind_ctx.bindSlice(std.mem.sliceAsBytes(b));
-        if (self.weights.markov_norm) |b| ctx.markov_norm = try bind_ctx.bindSlice(std.mem.sliceAsBytes(b));
+        if (mr > 0) {
+            if (self.weights.markov_gru_bias) |b| ctx.markov_gru_bias = try bind_ctx.bindSlice(std.mem.sliceAsBytes(b));
+            if (self.weights.markov_ctx_norm) |b| ctx.markov_ctx_norm = try bind_ctx.bindSlice(std.mem.sliceAsBytes(b));
+            if (self.weights.markov_b1) |b| ctx.markov_b1 = try bind_ctx.bindSlice(std.mem.sliceAsBytes(b));
+            if (self.weights.markov_hidden_bias) |b| ctx.markov_hidden_bias = try bind_ctx.bindSlice(std.mem.sliceAsBytes(b));
+            if (self.weights.markov_w2_vocab_bias) |b| ctx.markov_w2_vocab_bias = try bind_ctx.bindSlice(std.mem.sliceAsBytes(b));
+            if (self.weights.markov_norm) |b| ctx.markov_norm = try bind_ctx.bindSlice(std.mem.sliceAsBytes(b));
 
-        if (self.weights.markov_w1_raw) |r| {
-            ctx.markov_w1 = try bind_ctx.bindRaw(r);
-        } else if (self.weights.markov_w1.len > 0) {
-            const w1_k: u32 = @intCast(self.weights.markov_w1.len / mr);
-            ctx.markov_w1 = try bind_ctx.bindF32Mat(self.weights.markov_w1, mr, w1_k);
-        }
-
-        if (self.weights.markov_w1_vocab_raw) |r| {
-            ctx.markov_w1_vocab_rows = self.weights.markov_w1_vocab_rows;
-            if (r.amf_dtype == .bf16 or r.amf_dtype == .f16 or r.amf_dtype == .f32 or (r.amf_dtype == .gguf_q8_0 and (mr % 32) == 0)) {
-                ctx.markov_w1_vocab = try bind_ctx.bindSlice(r.data);
-                ctx.markov_w1_vocab_dtype = switch (r.amf_dtype) {
-                    .bf16 => 0,
-                    .f16 => 1,
-                    .f32 => 2,
-                    .gguf_q8_0 => 3,
-                    else => 0,
-                };
-            } else {
-                ctx.markov_w1_vocab_raw = r;
-                ctx.markov_w1_vocab_dtype = 2;
+            if (self.weights.markov_w1_raw) |r| {
+                ctx.markov_w1 = try bind_ctx.bindRaw(r);
+            } else if (self.weights.markov_w1.len > 0) {
+                const w1_k: u32 = @intCast(self.weights.markov_w1.len / mr);
+                ctx.markov_w1 = try bind_ctx.bindF32Mat(self.weights.markov_w1, mr, w1_k);
             }
-        } else if (self.weights.markov_w1_vocab_bf16) |wb| {
-            ctx.markov_w1_vocab = try bind_ctx.bindSlice(std.mem.sliceAsBytes(wb));
-            ctx.markov_w1_vocab_dtype = 0;
-            ctx.markov_w1_vocab_rows = self.weights.markov_w1_vocab_rows;
-        }
 
-        ctx.markov_gru_proj = try bind_ctx.bindLayerProjOpt(self.weights.markov_gru_proj_f32, self.weights.markov_gru_proj_bf16, self.weights.markov_gru_proj_raw, 3 * mr, 2 * h + 2 * mr);
-        ctx.markov_rnn_proj = try bind_ctx.bindLayerProjOpt(self.weights.markov_rnn_proj, null, self.weights.markov_rnn_proj_raw, mr, mr);
-        if (self.weights.markov_w2_raw) |r| {
-            ctx.markov_w2 = try bind_ctx.bindRaw(r);
-        } else if (self.weights.markov_w2.len > 0) {
-            ctx.markov_w2 = try bind_ctx.bindF32Mat(self.weights.markov_w2, h, mr);
-        }
+            if (self.weights.markov_w1_vocab_raw) |r| {
+                ctx.markov_w1_vocab_rows = self.weights.markov_w1_vocab_rows;
+                if (r.amf_dtype == .bf16 or r.amf_dtype == .f16 or r.amf_dtype == .f32 or (r.amf_dtype == .gguf_q8_0 and (mr % 32) == 0)) {
+                    ctx.markov_w1_vocab = try bind_ctx.bindSlice(r.data);
+                    ctx.markov_w1_vocab_dtype = switch (r.amf_dtype) {
+                        .bf16 => 0,
+                        .f16 => 1,
+                        .f32 => 2,
+                        .gguf_q8_0 => 3,
+                        else => 0,
+                    };
+                } else {
+                    ctx.markov_w1_vocab_raw = r;
+                    ctx.markov_w1_vocab_dtype = 2;
+                }
+            } else if (self.weights.markov_w1_vocab_bf16) |wb| {
+                ctx.markov_w1_vocab = try bind_ctx.bindSlice(std.mem.sliceAsBytes(wb));
+                ctx.markov_w1_vocab_dtype = 0;
+                ctx.markov_w1_vocab_rows = self.weights.markov_w1_vocab_rows;
+            }
 
-        if (self.weights.markov_w2_vocab_raw) |r| {
-            ctx.markov_w2_vocab = try bind_ctx.bindRaw(r);
-            ctx.markov_w2_vocab_rows = self.weights.markov_w2_vocab_rows;
-        } else if (self.weights.markov_w2_vocab_bf16) |w2b| {
-            ctx.markov_w2_vocab = try bind_ctx.bindBf16Mat(w2b, self.weights.markov_w2_vocab_rows, mr);
-            ctx.markov_w2_vocab_rows = self.weights.markov_w2_vocab_rows;
+            ctx.markov_gru_proj = try bind_ctx.bindLayerProjOpt(self.weights.markov_gru_proj_f32, self.weights.markov_gru_proj_bf16, self.weights.markov_gru_proj_raw, 3 * mr, 2 * h + 2 * mr);
+            ctx.markov_rnn_proj = try bind_ctx.bindLayerProjOpt(self.weights.markov_rnn_proj, null, self.weights.markov_rnn_proj_raw, mr, mr);
+            if (self.weights.markov_w2_raw) |r| {
+                ctx.markov_w2 = try bind_ctx.bindRaw(r);
+            } else if (self.weights.markov_w2.len > 0) {
+                ctx.markov_w2 = try bind_ctx.bindF32Mat(self.weights.markov_w2, h, mr);
+            }
+
+            if (self.weights.markov_w2_vocab_raw) |r| {
+                ctx.markov_w2_vocab = try bind_ctx.bindRaw(r);
+                ctx.markov_w2_vocab_rows = self.weights.markov_w2_vocab_rows;
+            } else if (self.weights.markov_w2_vocab_bf16) |w2b| {
+                ctx.markov_w2_vocab = try bind_ctx.bindBf16Mat(w2b, self.weights.markov_w2_vocab_rows, mr);
+                ctx.markov_w2_vocab_rows = self.weights.markov_w2_vocab_rows;
+            }
         }
 
         if (opts.target_lm_head) |tlh| {
@@ -2148,7 +2322,7 @@ pub const DFlareProposer = struct {
             applyHeadRmsNorm(dst_k[0..kv_dim], self.config.num_key_value_heads, self.config.head_dim, kn, self.config.rms_eps);
         }
         if (self.config.rope_theta > 0.0) {
-            applyRopeNeoXInPlace(dst_k[0..kv_dim], self.config.num_key_value_heads, self.config.head_dim, pos, self.config.rope_theta);
+            applyRopeNeoXInPlace(dst_k[0..kv_dim], self.config.num_key_value_heads, self.config.head_dim, self.config.effectiveRopeDim(), pos, self.config.rope_theta);
         }
     }
 
@@ -2156,6 +2330,15 @@ pub const DFlareProposer = struct {
         self: *DFlareProposer,
         root_token: u32,
         target_hiddens: []const []const f32,
+    ) Error!void {
+        return self.runBlockBackboneOnceForRootImpl(root_token, target_hiddens, false);
+    }
+
+    fn runBlockBackboneOnceForRootImpl(
+        self: *DFlareProposer,
+        root_token: u32,
+        target_hiddens: []const []const f32,
+        preseeded_slots: bool,
     ) Error!void {
         if (self.gpu_ctx) |gpu| {
             return self.runBlockBackboneGpuImpl(gpu, root_token, target_hiddens, null, null, true);
@@ -2166,11 +2349,13 @@ pub const DFlareProposer = struct {
         const v: usize = self.config.vocab_size;
         const kv_dim: usize = self.config.kvDim();
         const is_real = self.isRealGru();
+        const anchor_mask_mode = self.usesAnchorMaskSeeding();
         if (target_hiddens.len != taps) return error.DimensionMismatch;
 
-        // 0. For real DFlare/DSpark, resolve the anchor token embedding FIRST
-        //    (this also registers GraphModel's context tap history provider on the exact target pointer).
-        if (is_real) {
+        // 0. For real DFlare/DFlash, resolve anchor token embedding (and mask_token_id embedding if needed)
+        //    FIRST (this also registers GraphModel's context tap history provider on the exact target pointer).
+        var eff_mask_embed: []const f32 = self.weights.mask_embed;
+        if (anchor_mask_mode and !preseeded_slots) {
             const raw_anchor = try resolveTokEmbed(self.weights.tok_embed, self.weights.tok_embed_raw, self.weights.tok_embed_hook, root_token, h, self.workspace.tok_embed_tmp);
             if (raw_anchor.ptr != self.workspace.tok_embed_tmp.ptr) {
                 @memcpy(self.workspace.tok_embed_tmp[0..h], raw_anchor[0..h]);
@@ -2180,6 +2365,9 @@ pub const DFlareProposer = struct {
                     applyRmsNormInPlace(self.workspace.tok_embed_tmp[0..h], ten, self.config.rms_eps);
                 }
             }
+            eff_mask_embed = try self.resolveEffectiveMaskEmbed();
+        } else if (!preseeded_slots and eff_mask_embed.len == 0) {
+            eff_mask_embed = try self.resolveEffectiveMaskEmbed();
         }
 
         // 1. Check for full committed-token context history (prompt + accepted decode tokens).
@@ -2188,7 +2376,7 @@ pub const DFlareProposer = struct {
         var anchor_pos: u32 = if (self.config.rope_theta > 0.0) 1 else 0;
         const max_ctx: usize = self.workspace.max_ctx_len;
 
-        if (is_real) {
+        if (anchor_mask_mode) {
             const cb_ctx: ?*anyopaque = if (self.weights.tok_embed_hook) |hk| switch (hk) {
                 .callback => |cb| cb.ctx,
                 .dense_f32 => null,
@@ -2214,6 +2402,27 @@ pub const DFlareProposer = struct {
                             }
                         }
                         if (!ok_all) break;
+                        // Fuse multi-tap target hidden states ONCE per context position when using `fc` + `hidden_norm` (`DFlash`).
+                        if (self.weights.fuse_scalar_weights == null) {
+                            if (self.weights.target_fusion_proj != null or self.weights.target_fusion_proj_raw != null) {
+                                matVecLayer(
+                                    self.weights.target_fusion_proj orelse &.{},
+                                    null,
+                                    self.weights.target_fusion_proj_raw,
+                                    self.workspace.taps_flat[0 .. taps * h],
+                                    h,
+                                    taps * h,
+                                    self.workspace.ctx_hidden[0..h],
+                                    false,
+                                    self.workspace.cpu_quant_row_scratch,
+                                );
+                            } else {
+                                @memcpy(self.workspace.ctx_hidden[0..h], self.workspace.taps_flat[0..h]);
+                            }
+                            if (self.weights.target_fusion_norm) |fnw| {
+                                applyRmsNormInPlace(self.workspace.ctx_hidden[0..h], fnw, self.config.rms_eps);
+                            }
+                        }
                         const slot: usize = @intCast(p % self.workspace.max_ctx_len);
                         for (self.weights.layers, 0..) |layer, li| {
                             self.projectCtxKvOnePos(layer, li, self.workspace.taps_flat, p, self.workspace.k_buf[0..kv_dim], self.workspace.v_buf[0..kv_dim]);
@@ -2268,46 +2477,54 @@ pub const DFlareProposer = struct {
             applyRmsNormInPlace(self.workspace.ctx_hidden[0..h], fnw, self.config.rms_eps);
         }
 
-        // 3. Seed noise block `slot_hiddens[0..w-1]`.
-        const per_pos_mask = self.weights.mask_embed.len == w * h;
-        const tail_pos_mask = (w > 1 and self.weights.mask_embed.len == (w - 1) * h);
-        if (is_real) {
-            // Exact `dspark.cpp:build_dspark_inp_block`:
-            // slot 0 = normed anchor token embedding; slots 1..w-1 = pure mask_embed (NO +ctx_hidden!).
-            @memcpy(self.workspace.slot_hiddens[0..h], self.workspace.tok_embed_tmp[0..h]);
-            for (1..w) |pos| {
-                const dst = self.workspace.slot_hiddens[pos * h ..][0..h];
-                const m_slice = if (tail_pos_mask)
-                    self.weights.mask_embed[(pos - 1) * h ..][0..h]
-                else if (per_pos_mask)
-                    self.weights.mask_embed[pos * h ..][0..h]
-                else
-                    self.weights.mask_embed[0..h];
-                @memcpy(dst, m_slice);
-            }
-        } else {
-            for (0..w) |pos| {
-                const dst = self.workspace.slot_hiddens[pos * h ..][0..h];
-                if (tail_pos_mask) {
-                    if (pos == 0) {
-                        @memcpy(dst, self.workspace.ctx_hidden[0..h]);
-                    } else {
-                        const m_slice = self.weights.mask_embed[(pos - 1) * h ..][0..h];
-                        for (0..h) |d| dst[d] = self.workspace.ctx_hidden[d] + m_slice[d];
-                    }
-                } else {
-                    const m_slice = if (per_pos_mask)
-                        self.weights.mask_embed[pos * h ..][0..h]
+        // 3. Seed noise block `slot_hiddens[0..w-1]` (skipped when caller pre-populated refined slot embeddings).
+        if (!preseeded_slots) {
+            const per_pos_mask = eff_mask_embed.len == w * h;
+            const tail_pos_mask = (w > 1 and eff_mask_embed.len == (w - 1) * h);
+            if (anchor_mask_mode) {
+                // Exact `dflash.py` / `dspark.cpp:build_dspark_inp_block`:
+                // slot 0 = anchor token embedding; slots 1..w-1 = pure mask_embed / embed(mask_token_id).
+                @memcpy(self.workspace.slot_hiddens[0..h], self.workspace.tok_embed_tmp[0..h]);
+                for (1..w) |pos| {
+                    const dst = self.workspace.slot_hiddens[pos * h ..][0..h];
+                    const m_slice = if (tail_pos_mask)
+                        eff_mask_embed[(pos - 1) * h ..][0..h]
+                    else if (per_pos_mask)
+                        eff_mask_embed[pos * h ..][0..h]
                     else
-                        self.weights.mask_embed[0..h];
-                    for (0..h) |d| {
-                        dst[d] = self.workspace.ctx_hidden[d] + m_slice[d];
+                        eff_mask_embed[0..h];
+                    @memcpy(dst, m_slice);
+                }
+            } else {
+                for (0..w) |pos| {
+                    const dst = self.workspace.slot_hiddens[pos * h ..][0..h];
+                    if (tail_pos_mask) {
+                        if (pos == 0) {
+                            @memcpy(dst, self.workspace.ctx_hidden[0..h]);
+                        } else {
+                            const m_slice = eff_mask_embed[(pos - 1) * h ..][0..h];
+                            for (0..h) |d| dst[d] = self.workspace.ctx_hidden[d] + m_slice[d];
+                        }
+                    } else {
+                        const m_slice = if (per_pos_mask)
+                            eff_mask_embed[pos * h ..][0..h]
+                        else
+                            eff_mask_embed[0..h];
+                        for (0..h) |d| {
+                            dst[d] = self.workspace.ctx_hidden[d] + m_slice[d];
+                        }
                     }
                 }
             }
         }
 
-        // 4. Execute `3L`/`5L` block-parallel transformer layers with cached context KV (or single-token fallback) + NeoX RoPE.
+        // 4. Execute `3L`/`5L` block-parallel transformer layers with cached context KV (or single-token fallback) + Partial NeoX RoPE + SWA + sink_bias + v_scale.
+        const block_extras: BlockAttnExtras = .{
+            .rope_dim = self.config.effectiveRopeDim(),
+            .sliding_window = self.config.sliding_window,
+            .max_ctx = max_ctx,
+            .v_scale = self.config.attention_value_scale,
+        };
         for (self.weights.layers, 0..) |layer, li| {
             if (use_cached_ctx) {
                 const layer_off = li * max_ctx * kv_dim;
@@ -2335,9 +2552,10 @@ pub const DFlareProposer = struct {
                     self.workspace.mlp_down,
                     self.config.rope_theta,
                     anchor_pos,
-                    self.workspace.ctx_k_cache[layer_off .. layer_off + active_ctx_len * kv_dim],
-                    self.workspace.ctx_v_cache[layer_off .. layer_off + active_ctx_len * kv_dim],
+                    self.workspace.ctx_k_cache[layer_off .. layer_off + max_ctx * kv_dim],
+                    self.workspace.ctx_v_cache[layer_off .. layer_off + max_ctx * kv_dim],
                     self.workspace.cpu_quant_row_scratch,
+                    block_extras,
                 );
             } else {
                 self.projectCtxKvOnePos(layer, li, self.workspace.taps_flat, 0, self.workspace.k_buf[0..kv_dim], self.workspace.v_buf[0..kv_dim]);
@@ -2368,6 +2586,7 @@ pub const DFlareProposer = struct {
                     null,
                     null,
                     self.workspace.cpu_quant_row_scratch,
+                    block_extras,
                 );
             }
         }
@@ -2782,6 +3001,30 @@ pub const DFlareProposer = struct {
         const base_backbone = self.backbone_runs;
         const base_markov = self.markov_steps;
 
+        if (self.isDirectBlockDiffusion()) {
+            try self.proposeDirectBlockDiffusionCpu(
+                max_nodes,
+                root_token,
+                target_hiddens,
+                node_limit,
+                gram_active,
+                grammar_opt,
+                &node_states,
+                &node_valid,
+                out_tree,
+            );
+            return .{
+                .tree_nodes = out_tree.count,
+                .max_depth = out_tree.max_depth,
+                .l1_match_len = l1.match_len,
+                .l1_inserted = l1.inserted,
+                .l1_is_seed = l1.is_seed,
+                .backbone_runs = self.backbone_runs - base_backbone,
+                .markov_steps = self.markov_steps - base_markov,
+                .expected_tokens = out_tree.expectedTokens(),
+            };
+        }
+
         // 1. Run the 3L/5L block-parallel backbone strictly ONCE.
         try self.runBlockBackboneOnceForRoot(root_token, target_hiddens);
 
@@ -2876,6 +3119,223 @@ pub const DFlareProposer = struct {
         };
     }
 
+    /// Inserts direct block-diffusion predictions (`slots 1..B-1`, each with up to 2 candidates)
+    /// into `out_tree` as a primary `B-1`-deep chain plus optional top-2 sibling forks at uncertain
+    /// block slots up to `node_limit` (e.g. `16` tree nodes). Zero dynamic heap allocations.
+    fn insertDirectBlockIntoTree(
+        self: *DFlareProposer,
+        comptime max_nodes: u16,
+        draft_slots: usize,
+        slot_cands: []const [2]moe.TopKCandidate,
+        slot_cand_counts: []const u8,
+        node_limit: u16,
+        gram_active: bool,
+        grammar_opt: ?accept_mod.GrammarTreeAdapter,
+        node_states: *[tree_mod.MAX_SUPPORTED_NODES]grammar_mod.GrammarState,
+        node_valid: *[tree_mod.MAX_SUPPORTED_NODES]bool,
+        out_tree: *tree_mod.DraftTree(max_nodes),
+    ) void {
+        const v: usize = self.config.vocab_size;
+        var parent_of_slot: [MAX_BLOCK_SIZE]u16 = @splat(tree_mod.NO_NODE);
+        var parent: u16 = 0;
+
+        // 1. Primary greedy/top-1 block chain `root -> slot 1 -> ... -> slot B-1`.
+        for (0..draft_slots) |si| {
+            if (gram_active and !node_valid[parent]) break;
+            if (slot_cand_counts[si] == 0) break;
+            const c0 = slot_cands[si][0];
+            if (c0.token_id == std.math.maxInt(u32) or c0.token_id >= v) break;
+            var child_state: grammar_mod.GrammarState = undefined;
+            if (gram_active) {
+                child_state = node_states[parent].snapshot();
+                if (!grammar_opt.?.advanceTokenOnState(&child_state, c0.token_id)) break;
+            }
+            parent_of_slot[si] = parent;
+            const child = if (out_tree.findChild(parent, c0.token_id)) |existing| blk: {
+                break :blk out_tree.insertChild(parent, c0.token_id, c0.prob, .l2) orelse existing;
+            } else blk: {
+                if (out_tree.count >= node_limit) break :blk null;
+                break :blk out_tree.insertChild(parent, c0.token_id, c0.prob, .l2);
+            };
+            if (child) |c_idx| {
+                self.workspace.node_log_probs[c_idx] = c0.log_prob;
+                if (gram_active) {
+                    node_states[c_idx] = child_state;
+                    node_valid[c_idx] = true;
+                }
+                parent = c_idx;
+            } else break;
+        }
+
+        // 2. Optional top-2 fork at uncertain block slots up to `node_limit` (`<= 16` nodes).
+        const want_fork = (self.config.fork_top2_threshold > 0.0 or self.config.top_k_per_pos >= 2);
+        if (!want_fork or out_tree.count >= node_limit) return;
+
+        const ForkCand = struct {
+            parent: u16,
+            cand: moe.TopKCandidate,
+            mass: f32,
+        };
+        var forks: [MAX_BLOCK_SIZE]ForkCand = undefined;
+        var fork_len: usize = 0;
+        for (0..draft_slots) |si| {
+            const p_node = parent_of_slot[si];
+            if (p_node == tree_mod.NO_NODE) continue;
+            if (slot_cand_counts[si] < 2) continue;
+            const c0 = slot_cands[si][0];
+            const c1 = slot_cands[si][1];
+            if (c1.token_id == std.math.maxInt(u32) or c1.token_id >= v or c1.token_id == c0.token_id) continue;
+            if (self.config.fork_top2_threshold > 0.0 and c0.prob >= self.config.fork_top2_threshold) continue;
+            forks[fork_len] = .{
+                .parent = p_node,
+                .cand = c1,
+                .mass = out_tree.nodes[p_node].cum_prob * c1.prob,
+            };
+            fork_len += 1;
+        }
+        // Deterministic descending selection sort by joint mass (tie-break by lower token_id).
+        var fi: usize = 0;
+        while (fi < fork_len) : (fi += 1) {
+            var best = fi;
+            var fj: usize = fi + 1;
+            while (fj < fork_len) : (fj += 1) {
+                if (forks[fj].mass > forks[best].mass or
+                    (forks[fj].mass == forks[best].mass and forks[fj].cand.token_id < forks[best].cand.token_id))
+                {
+                    best = fj;
+                }
+            }
+            const tmp = forks[fi];
+            forks[fi] = forks[best];
+            forks[best] = tmp;
+        }
+        for (forks[0..fork_len]) |fk| {
+            if (out_tree.count >= node_limit) break;
+            if (out_tree.findChild(fk.parent, fk.cand.token_id) != null) continue;
+            var child_state: grammar_mod.GrammarState = undefined;
+            if (gram_active) {
+                if (!node_valid[fk.parent]) continue;
+                child_state = node_states[fk.parent].snapshot();
+                if (!grammar_opt.?.advanceTokenOnState(&child_state, fk.cand.token_id)) continue;
+            }
+            if (out_tree.insertChild(fk.parent, fk.cand.token_id, fk.cand.prob, .l2)) |c_idx| {
+                self.workspace.node_log_probs[c_idx] = fk.cand.log_prob;
+                if (gram_active) {
+                    node_states[c_idx] = child_state;
+                    node_valid[c_idx] = true;
+                }
+            }
+        }
+    }
+
+    fn proposeDirectBlockDiffusionCpu(
+        self: *DFlareProposer,
+        comptime max_nodes: u16,
+        root_token: u32,
+        target_hiddens: []const []const f32,
+        node_limit: u16,
+        gram_active: bool,
+        grammar_opt: ?accept_mod.GrammarTreeAdapter,
+        node_states: *[tree_mod.MAX_SUPPORTED_NODES]grammar_mod.GrammarState,
+        node_valid: *[tree_mod.MAX_SUPPORTED_NODES]bool,
+        out_tree: *tree_mod.DraftTree(max_nodes),
+    ) Error!void {
+        const h: usize = self.config.hidden_size;
+        const w: usize = self.config.block_size;
+        const v: usize = self.config.vocab_size;
+        const eff_v: usize = if (self.config.unpadded_vocab_size > 0 and self.config.unpadded_vocab_size < v) self.config.unpadded_vocab_size else v;
+        const draft_slots: usize = if (w > 1) w - 1 else 1;
+        const slot_offset: usize = if (w > 1) 1 else 0;
+        const eff_k: usize = if (self.config.fork_top2_threshold > 0.0 or self.config.top_k_per_pos >= 2) 2 else 1;
+        const inv_temp: f32 = 1.0 / self.config.temperature;
+
+        var slot_cands: [MAX_BLOCK_SIZE][2]moe.TopKCandidate = undefined;
+        var slot_counts: [MAX_BLOCK_SIZE]u8 = @splat(0);
+
+        const iters: u8 = self.config.refinement_iters;
+        for (0..iters) |iter| {
+            if (iter == 0) {
+                try self.runBlockBackboneOnceForRootImpl(root_token, target_hiddens, false);
+            } else {
+                // Iteration 2 refinement: retain high-confidence predicted token embeddings, re-mask uncertain slots.
+                const eff_mask = try self.resolveEffectiveMaskEmbed();
+                const anchor_e = try resolveTokEmbed(self.weights.tok_embed, self.weights.tok_embed_raw, self.weights.tok_embed_hook, root_token, h, self.workspace.tok_embed_tmp);
+                @memcpy(self.workspace.slot_hiddens[0..h], anchor_e[0..h]);
+                if (self.weights.tok_embed_hook == null) {
+                    if (self.weights.token_embd_norm) |ten| applyRmsNormInPlace(self.workspace.slot_hiddens[0..h], ten, self.config.rms_eps);
+                }
+                for (0..draft_slots) |si| {
+                    const dst = self.workspace.slot_hiddens[(slot_offset + si) * h ..][0..h];
+                    if (slot_counts[si] > 0 and slot_cands[si][0].prob >= self.config.refine_confidence_threshold and slot_cands[si][0].token_id < v) {
+                        const te = try resolveTokEmbed(self.weights.tok_embed, self.weights.tok_embed_raw, self.weights.tok_embed_hook, slot_cands[si][0].token_id, h, self.workspace.tok_embed_tmp);
+                        @memcpy(dst, te[0..h]);
+                        if (self.weights.tok_embed_hook == null) {
+                            if (self.weights.token_embd_norm) |ten| applyRmsNormInPlace(dst, ten, self.config.rms_eps);
+                        }
+                    } else {
+                        const m_slice = if (eff_mask.len == w * h)
+                            eff_mask[(slot_offset + si) * h ..][0..h]
+                        else if (w > 1 and eff_mask.len == (w - 1) * h)
+                            eff_mask[si * h ..][0..h]
+                        else
+                            eff_mask[0..h];
+                        @memcpy(dst, m_slice);
+                    }
+                }
+                try self.runBlockBackboneOnceForRootImpl(root_token, target_hiddens, true);
+            }
+
+            // Score all `draft_slots` in ONE batched `lm_head` call.
+            try evalLmHead(
+                self.weights.lm_head,
+                self.weights.lm_head_raw,
+                self.workspace.slot_hiddens[slot_offset * h .. (slot_offset + draft_slots) * h],
+                @intCast(draft_slots),
+                self.config.hidden_size,
+                self.config.vocab_size,
+                self.workspace.base_logits_buf[0 .. draft_slots * v],
+                self.workspace.cpu_quant_row_scratch,
+            );
+
+            for (0..draft_slots) |si| {
+                const row = self.workspace.base_logits_buf[si * v ..][0..eff_v];
+                if (self.config.final_logit_softcapping > 0.0) {
+                    const cap = self.config.final_logit_softcapping;
+                    for (row) |*lv| lv.* = std.math.tanh(lv.* / cap) * cap;
+                }
+                const got = try extractDeterministicTopKMasked(
+                    row,
+                    inv_temp,
+                    null,
+                    self.workspace.topk_tokens[0..eff_k],
+                    self.workspace.topk_probs[0..eff_k],
+                );
+                slot_counts[si] = @intCast(got);
+                for (0..got) |ki| {
+                    const p = self.workspace.topk_probs[ki];
+                    slot_cands[si][ki] = .{
+                        .token_id = self.workspace.topk_tokens[ki],
+                        .prob = p,
+                        .log_prob = logProbOf(p),
+                    };
+                }
+            }
+        }
+
+        self.insertDirectBlockIntoTree(
+            max_nodes,
+            draft_slots,
+            slot_cands[0..draft_slots],
+            slot_counts[0..draft_slots],
+            node_limit,
+            gram_active,
+            grammar_opt,
+            node_states,
+            node_valid,
+            out_tree,
+        );
+    }
+
     // ========================================================================
     // Metal 4 GPU Execution Path (`D16`, ADR-0026)
     // ========================================================================
@@ -2950,6 +3410,7 @@ pub const DFlareProposer = struct {
         const taps: u32 = self.config.num_target_taps;
         const kv_dim: u32 = self.config.kvDim();
         const max_ctx: u32 = ws.max_ctx_len;
+        const ctx_taps_f16_b = ws.sliceBinding(wb, ws.gpu_ctx_taps_f16);
         const ctx_in_b = ws.sliceBinding(wb, ws.gpu_ctx_in_f16);
         const k_tmp_b = ws.sliceBinding(wb, ws.gpu_ctx_k_tmp_f16);
         const v_tmp_b = ws.sliceBinding(wb, ws.gpu_ctx_v_tmp_f16);
@@ -2958,13 +3419,92 @@ pub const DFlareProposer = struct {
         const ctx_h_b = ws.sliceBinding(wb, ws.gpu_ctx_hidden_f16);
         const dummy_b = ctx_h_b;
 
+        // `DFlash` (`fc.weight [H, taps*H]` + `hidden_norm.weight`): compute fused context hidden
+        // ONCE per new context position and share across all `num_layers` layers (`dflash.py:253`).
+        const use_shared_fc_ctx = (!use_ctx_hidden_direct and gpu.fuse_scalar_weights == null and gpu.target_fusion_proj != null);
+        var shared_ctx_ready = false;
+        if (use_shared_fc_ctx) {
+            const pcp: DFlarePackCtxTapsParams = .{
+                .num_pos = num_pos,
+                .num_taps = taps,
+                .hidden_size = h,
+                .taps_dtype = taps_dtype,
+                .ring_cap = ring_cap,
+                .ring_start = ring_start,
+            };
+            const row_cols: u32 = taps * h;
+            try frame.encodeThreads(
+                gpu.pipes.pack_ctx_taps_f16,
+                &.{ taps_src, ctx_taps_f16_b },
+                std.mem.asBytes(&pcp),
+                .{ row_cols, num_pos, 1 },
+                .{ @min(row_cols, 256), 1, 1 },
+                first_barrier,
+            );
+            try encodeGpuLinear(gpu, frame, gpu.target_fusion_proj.?, ctx_taps_f16_b, ctx_in_b, num_pos, null, false, true);
+            if (gpu.target_fusion_norm) |fnw| {
+                const np: DFlareRmsNormParams = .{
+                    .num_rows = num_pos,
+                    .dim = h,
+                    .x_is_f32 = 0,
+                    .has_weight = 1,
+                    .write_f32 = 0,
+                    .eps = self.config.rms_eps,
+                };
+                try frame.encodeThreadgroups(
+                    gpu.pipes.rmsnorm_rows,
+                    &.{ ctx_in_b, fnw, ctx_in_b, dummy_b },
+                    std.mem.asBytes(&np),
+                    .{ num_pos, 1, 1 },
+                    .{ 256, 1, 1 },
+                    true,
+                );
+            }
+            shared_ctx_ready = true;
+        }
+
         for (0..self.config.num_layers) |li| {
             const gl = gpu.layers[li];
-            const barrier = if (li == 0) first_barrier else true;
+            const barrier = if (li == 0 and !shared_ctx_ready) first_barrier else true;
             var kv_input = ctx_in_b;
             var kv_barrier = true;
 
-            if (use_ctx_hidden_direct) {
+            if (shared_ctx_ready) {
+                if (gl.ctx_norm_w) |cnw| {
+                    const np: DFlareRmsNormParams = .{
+                        .num_rows = num_pos,
+                        .dim = h,
+                        .x_is_f32 = 0,
+                        .has_weight = 1,
+                        .write_f32 = 0,
+                        .eps = self.config.rms_eps,
+                    };
+                    const tmp_norm_b = ws.sliceBinding(wb, ws.gpu_norm_f16);
+                    if (num_pos <= self.config.block_size) {
+                        try frame.encodeThreadgroups(
+                            gpu.pipes.rmsnorm_rows,
+                            &.{ ctx_in_b, cnw, tmp_norm_b, dummy_b },
+                            std.mem.asBytes(&np),
+                            .{ num_pos, 1, 1 },
+                            .{ 256, 1, 1 },
+                            barrier,
+                        );
+                        kv_input = tmp_norm_b;
+                    } else {
+                        try frame.encodeThreadgroups(
+                            gpu.pipes.rmsnorm_rows,
+                            &.{ ctx_in_b, cnw, ctx_in_b, dummy_b },
+                            std.mem.asBytes(&np),
+                            .{ num_pos, 1, 1 },
+                            .{ 256, 1, 1 },
+                            barrier,
+                        );
+                    }
+                } else {
+                    kv_input = ctx_in_b;
+                    kv_barrier = barrier;
+                }
+            } else if (use_ctx_hidden_direct) {
                 if (gl.ctx_norm_w) |cnw| {
                     const np: DFlareRmsNormParams = .{
                         .num_rows = 1,
@@ -2992,6 +3532,7 @@ pub const DFlareProposer = struct {
                     const row_idx: u64 = if ((li + 1) * taps <= gpu.fuse_rows * taps) li else 0;
                     break :blk .{ .buffer = fsw.buffer, .offset = fsw.offset + row_idx * taps * @sizeOf(f32) };
                 } else dummy_b;
+                const norm_opt = gl.ctx_norm_w orelse if (fsw_opt == null) gpu.target_fusion_norm else null;
                 const mp: MixTapsParams = .{
                     .num_pos = num_pos,
                     .num_taps = taps,
@@ -3000,14 +3541,14 @@ pub const DFlareProposer = struct {
                     .ring_cap = ring_cap,
                     .ring_start = ring_start,
                     .has_mix_w = if (fsw_opt != null) 1 else 0,
-                    .apply_norm = if (gl.ctx_norm_w != null) 1 else 0,
-                    .has_norm_w = if (gl.ctx_norm_w != null) 1 else 0,
+                    .apply_norm = if (norm_opt != null) 1 else 0,
+                    .has_norm_w = if (norm_opt != null) 1 else 0,
                     .write_f32 = 0,
                     .rms_eps = self.config.rms_eps,
                 };
                 try frame.encodeThreadgroups(
                     gpu.pipes.mix_taps_rmsnorm,
-                    &.{ taps_src, mix_b, gl.ctx_norm_w orelse dummy_b, ctx_in_b, dummy_b },
+                    &.{ taps_src, mix_b, norm_opt orelse dummy_b, ctx_in_b, dummy_b },
                     std.mem.asBytes(&mp),
                     .{ num_pos, 1, 1 },
                     .{ 256, 1, 1 },
@@ -3030,6 +3571,7 @@ pub const DFlareProposer = struct {
                 .rope_zero_pos = if (rope_zero_pos) 1 else 0,
                 .rms_eps = self.config.rms_eps,
                 .rope_theta = self.config.rope_theta,
+                .rope_dim = self.config.effectiveRopeDim(),
             };
             try frame.encodeThreadgroups(
                 gpu.pipes.ctx_kv_norm_rope_store,
@@ -3051,6 +3593,7 @@ pub const DFlareProposer = struct {
         need_ctx_kv_single: bool,
         gpu_taps_opt: ?GpuTargetTaps,
         first_barrier: bool,
+        preseeded_slots: bool,
     ) Error!void {
         const ws = self.workspace;
         const wb = gpu.ws_buf;
@@ -3060,7 +3603,7 @@ pub const DFlareProposer = struct {
         const q_dim: u32 = self.config.qDim();
         const kv_dim: u32 = self.config.kvDim();
         const taps: u32 = self.config.num_target_taps;
-        const is_real = self.isRealGru();
+        const anchor_mask_mode = self.usesAnchorMaskSeeding();
 
         const taps_f32_b = ws.sliceBinding(wb, ws.taps_flat);
         const taps_f16_b = ws.sliceBinding(wb, ws.gpu_taps_flat_f16);
@@ -3260,22 +3803,24 @@ pub const DFlareProposer = struct {
             );
         }
 
-        // Seed `slot_hiddens[0..w-1]`.
-        const seed_p: SeedBlockParams = .{
-            .block_size = w,
-            .hidden_size = h,
-            .is_real_gru = if (is_real) 1 else 0,
-            .mask_rows = gpu.mask_rows,
-            .anchor_is_f16 = 1,
-        };
-        try frame.encodeThreads(
-            gpu.pipes.seed_block,
-            &.{ anchor_b, ctx_h_b, gpu.mask_embed, slot_b },
-            std.mem.asBytes(&seed_p),
-            .{ h, w, 1 },
-            .{ @min(h, 256), 1, 1 },
-            true,
-        );
+        // Seed `slot_hiddens[0..w-1]` (skipped when caller pre-populated refined slot embeddings).
+        if (!preseeded_slots) {
+            const seed_p: SeedBlockParams = .{
+                .block_size = w,
+                .hidden_size = h,
+                .is_real_gru = if (anchor_mask_mode) 1 else 0,
+                .mask_rows = gpu.mask_rows,
+                .anchor_is_f16 = 1,
+            };
+            try frame.encodeThreads(
+                gpu.pipes.seed_block,
+                &.{ anchor_b, ctx_h_b, gpu.mask_embed, slot_b },
+                std.mem.asBytes(&seed_p),
+                .{ h, w, 1 },
+                .{ @min(h, 256), 1, 1 },
+                true,
+            );
+        }
 
         // Execute all `num_layers` (`3L` / `5L`) block-parallel transformer layers.
         const max_ctx: u32 = ws.max_ctx_len;
@@ -3312,6 +3857,7 @@ pub const DFlareProposer = struct {
                     .anchor_pos = anchor_pos,
                     .has_q_norm = if (gl.q_norm_w != null) 1 else 0,
                     .has_k_norm = if (gl.k_norm_w != null) 1 else 0,
+                    .rope_dim = self.config.effectiveRopeDim(),
                     .rms_eps = self.config.rms_eps,
                     .rope_theta = self.config.rope_theta,
                 };
@@ -3333,10 +3879,15 @@ pub const DFlareProposer = struct {
                 .head_dim = self.config.head_dim,
                 .layer_elem_off = @intCast(li * max_ctx * kv_dim),
                 .scale = attn_scale,
+                .v_scale = self.config.attention_value_scale,
+                .max_ctx = max_ctx,
+                .anchor_pos = anchor_pos,
+                .sliding_window = self.config.sliding_window,
+                .has_sink_bias = if (gl.sink_bias_w != null) 1 else 0,
             };
             try frame.encodeThreadgroups(
                 gpu.pipes.block_gqa_attn,
-                &.{ q_b, ctx_k_b, ctx_v_b, k_b, v_b, attn_out_b },
+                &.{ q_b, ctx_k_b, ctx_v_b, k_b, v_b, attn_out_b, gl.sink_bias_w orelse dummy_b },
                 std.mem.asBytes(&gqa_p),
                 .{ self.config.num_attention_heads, w, 1 },
                 .{ 128, 1, 1 },
@@ -3821,10 +4372,10 @@ pub const DFlareProposer = struct {
         const h: usize = self.config.hidden_size;
         const taps: usize = self.config.num_target_taps;
         const max_ctx: u32 = ws.max_ctx_len;
-        const is_real = self.isRealGru();
+        const anchor_mask_mode = self.usesAnchorMaskSeeding();
 
-        // 0. Resolve anchor token embedding -> `ws.gpu_anchor_f16` (and register ContextHistoryProvider).
-        if (is_real) {
+        // 0. Resolve anchor token embedding -> `ws.gpu_anchor_f16` (and mask_token_id embedding if needed).
+        if (anchor_mask_mode) {
             const raw_anchor = try resolveTokEmbed(self.weights.tok_embed, self.weights.tok_embed_raw, self.weights.tok_embed_hook, root_token, h, ws.tok_embed_tmp);
             if (raw_anchor.ptr != ws.tok_embed_tmp.ptr) {
                 @memcpy(ws.tok_embed_tmp[0..h], raw_anchor[0..h]);
@@ -3835,6 +4386,11 @@ pub const DFlareProposer = struct {
                 }
             }
             for (0..h) |d| ws.gpu_anchor_f16[d] = @floatCast(ws.tok_embed_tmp[d]);
+            if (self.weights.mask_embed.len == 0) {
+                _ = try self.resolveEffectiveMaskEmbed();
+            }
+        } else if (self.weights.mask_embed.len == 0) {
+            _ = try self.resolveEffectiveMaskEmbed();
         }
 
         // Copy host taps into `ws.taps_flat` and `ws.gpu_taps_flat_f16`.
@@ -3858,7 +4414,7 @@ pub const DFlareProposer = struct {
         var ring_start: u32 = 0;
         var taps_dtype: u32 = 0;
 
-        if (is_real) {
+        if (anchor_mask_mode) {
             if (gpu_ctx_hist_opt) |gch| {
                 if (gch.len > 0 and gch.cap > 0) {
                     if (gch.epoch != self.ctx_cache_epoch or gch.len < self.ctx_cache_len) {
@@ -4023,6 +4579,7 @@ pub const DFlareProposer = struct {
             !prep.use_cached_ctx,
             gpu_taps_opt,
             first_b,
+            false,
         );
 
         self.base_logits_ready = false;
@@ -4116,6 +4673,33 @@ pub const DFlareProposer = struct {
 
         const base_backbone = self.backbone_runs;
         const base_markov = self.markov_steps;
+        if (self.isDirectBlockDiffusion()) {
+            try self.proposeDirectBlockDiffusionGpu(
+                max_nodes,
+                gpu,
+                root_token,
+                host_taps_opt,
+                gpu_taps_opt,
+                gpu_ctx_hist_opt,
+                node_limit,
+                gram_active,
+                grammar_opt,
+                &node_states,
+                &node_valid,
+                out_tree,
+            );
+            return .{
+                .tree_nodes = out_tree.count,
+                .max_depth = out_tree.max_depth,
+                .l1_match_len = l1.match_len,
+                .l1_inserted = l1.inserted,
+                .l1_is_seed = l1.is_seed,
+                .backbone_runs = self.backbone_runs - base_backbone,
+                .markov_steps = self.markov_steps - base_markov,
+                .expected_tokens = out_tree.expectedTokens(),
+            };
+        }
+
         const pos_beg: usize = if (self.isRealGru() and w > 1) 1 else 0;
         const inv_temp: f32 = 1.0 / self.config.temperature;
 
@@ -4168,6 +4752,7 @@ pub const DFlareProposer = struct {
                 !prep.use_cached_ctx,
                 gpu_taps_opt,
                 first_b,
+                false,
             );
 
             self.base_logits_ready = false;
@@ -4422,6 +5007,199 @@ pub const DFlareProposer = struct {
         };
     }
 
+    /// Single-frame batched Metal 4 GPU path for `D15` `DFlash` direct parallel block-diffusion
+    /// (`markov_rank == 0`, `block_size = 8..16`, `0` scalar CPU loops on GPU path, optional
+    /// 2-iteration refinement and top-2 uncertain-slot branching up to `max_tree_nodes`).
+    fn proposeDirectBlockDiffusionGpu(
+        self: *DFlareProposer,
+        comptime max_nodes: u16,
+        gpu: *DFlareGpuContext,
+        root_token: u32,
+        host_taps_opt: ?[]const []const f32,
+        gpu_taps_opt: ?GpuTargetTaps,
+        gpu_ctx_hist_opt: ?GpuContextHistory,
+        node_limit: u16,
+        gram_active: bool,
+        grammar_opt: ?accept_mod.GrammarTreeAdapter,
+        node_states: *[tree_mod.MAX_SUPPORTED_NODES]grammar_mod.GrammarState,
+        node_valid: *[tree_mod.MAX_SUPPORTED_NODES]bool,
+        out_tree: *tree_mod.DraftTree(max_nodes),
+    ) Error!void {
+        const ws = self.workspace;
+        const wb = gpu.ws_buf;
+        const h: usize = self.config.hidden_size;
+        const w: usize = self.config.block_size;
+        const v: usize = self.config.vocab_size;
+        const eff_v: u32 = if (self.config.unpadded_vocab_size > 0 and self.config.unpadded_vocab_size < v) self.config.unpadded_vocab_size else self.config.vocab_size;
+        const draft_slots: usize = if (w > 1) w - 1 else 1;
+        const slot_offset: usize = if (w > 1) 1 else 0;
+        const eff_k: u32 = if (self.config.fork_top2_threshold > 0.0 or self.config.top_k_per_pos >= 2) 2 else 1;
+        const inv_temp: f32 = 1.0 / self.config.temperature;
+
+        const prep = try self.prepareAnchorAndContextGpu(gpu, root_token, host_taps_opt, gpu_taps_opt, gpu_ctx_hist_opt);
+        var slot_cands: [MAX_BLOCK_SIZE][2]moe.TopKCandidate = undefined;
+        var slot_counts: [MAX_BLOCK_SIZE]u8 = @splat(0);
+
+        const iters: u8 = self.config.refinement_iters;
+        for (0..iters) |iter| {
+            const is_refine = (iter > 0);
+            if (is_refine) {
+                const eff_mask = try self.resolveEffectiveMaskEmbed();
+                for (0..h) |d| ws.gpu_slot_hiddens_f16[d] = ws.gpu_anchor_f16[d];
+                for (0..draft_slots) |si| {
+                    const dst = ws.gpu_slot_hiddens_f16[(slot_offset + si) * h ..][0..h];
+                    if (slot_counts[si] > 0 and slot_cands[si][0].prob >= self.config.refine_confidence_threshold and slot_cands[si][0].token_id < v) {
+                        const te = try resolveTokEmbed(self.weights.tok_embed, self.weights.tok_embed_raw, self.weights.tok_embed_hook, slot_cands[si][0].token_id, h, ws.tok_embed_tmp);
+                        if (te.ptr != ws.tok_embed_tmp.ptr) @memcpy(ws.tok_embed_tmp[0..h], te[0..h]);
+                        if (self.weights.tok_embed_hook == null) {
+                            if (self.weights.token_embd_norm) |ten| applyRmsNormInPlace(ws.tok_embed_tmp[0..h], ten, self.config.rms_eps);
+                        }
+                        for (0..h) |d| dst[d] = @floatCast(ws.tok_embed_tmp[d]);
+                    } else {
+                        const m_slice = if (eff_mask.len == w * h)
+                            eff_mask[(slot_offset + si) * h ..][0..h]
+                        else if (w > 1 and eff_mask.len == (w - 1) * h)
+                            eff_mask[si * h ..][0..h]
+                        else
+                            eff_mask[0..h];
+                        for (0..h) |d| dst[d] = @floatCast(m_slice[d]);
+                    }
+                }
+            }
+
+            var frame = try gpu.compute_ptr.beginFrame(gpu.timeout_ms);
+            errdefer frame.abort();
+
+            var first_b = false;
+            if (!is_refine and prep.final_chunk_len > 0) {
+                const taps_b = if (gpu_ctx_hist_opt) |gch| gch.taps_ring else ws.sliceBinding(wb, ws.gpu_ctx_taps_f32);
+                try self.encodeGpuContextKvBatch(
+                    gpu,
+                    &frame,
+                    taps_b,
+                    prep.taps_dtype,
+                    prep.ring_cap,
+                    prep.ring_start,
+                    prep.final_chunk_len,
+                    prep.final_chunk_pos,
+                    false,
+                    false,
+                    false,
+                );
+                first_b = true;
+            }
+
+            try self.encodeGpuBackboneIntoFrame(
+                gpu,
+                &frame,
+                prep.anchor_pos,
+                prep.active_ctx_len,
+                !is_refine and !prep.use_cached_ctx,
+                gpu_taps_opt,
+                first_b,
+                is_refine,
+            );
+
+            if (gpu.lm_head) |lmh| {
+                const slot_draft_b: metal.BufferBinding = .{
+                    .buffer = wb,
+                    .offset = ws.sliceBinding(wb, ws.gpu_slot_hiddens_f16).offset + @as(u64, slot_offset) * h * @sizeOf(f16),
+                };
+                const base_logits_b = ws.sliceBinding(wb, ws.gpu_base_logits_f16);
+                try encodeGpuLinear(gpu, &frame, lmh, slot_draft_b, base_logits_b, @intCast(draft_slots), null, false, true);
+                const row_bytes: u64 = @as(u64, v) * @sizeOf(f16);
+                for (0..draft_slots) |si| {
+                    const row_b: metal.BufferBinding = .{
+                        .buffer = wb,
+                        .offset = base_logits_b.offset + @as(u64, si) * row_bytes,
+                    };
+                    try encodeGpuTopK(
+                        gpu,
+                        ws,
+                        &frame,
+                        row_b,
+                        true,
+                        eff_v,
+                        eff_k,
+                        inv_temp,
+                        self.config.final_logit_softcapping,
+                        false,
+                        @intCast(si * eff_k),
+                        false,
+                        0,
+                    );
+                }
+                const sig = try frame.commit();
+                try gpu.compute_ptr.wait(sig, gpu.timeout_ms);
+                self.backbone_runs += 1;
+
+                for (0..draft_slots) |si| {
+                    var cnt: u8 = 0;
+                    for (0..eff_k) |ki| {
+                        const c = ws.gpu_topk_cands[si * eff_k + ki];
+                        if (c.token_id == std.math.maxInt(u32) or c.token_id >= v) continue;
+                        slot_cands[si][cnt] = c;
+                        cnt += 1;
+                    }
+                    slot_counts[si] = cnt;
+                }
+            } else {
+                // Host `LmHeadHook.callback` fallback when no GPU `lm_head` binding was provided.
+                const sig = try frame.commit();
+                try gpu.compute_ptr.wait(sig, gpu.timeout_ms);
+                self.backbone_runs += 1;
+
+                for (0..w * h) |i| ws.slot_hiddens[i] = @floatCast(ws.gpu_slot_hiddens_f16[i]);
+                try evalLmHead(
+                    self.weights.lm_head,
+                    self.weights.lm_head_raw,
+                    ws.slot_hiddens[slot_offset * h .. (slot_offset + draft_slots) * h],
+                    @intCast(draft_slots),
+                    self.config.hidden_size,
+                    self.config.vocab_size,
+                    ws.base_logits_buf[0 .. draft_slots * v],
+                    ws.cpu_quant_row_scratch,
+                );
+                for (0..draft_slots) |si| {
+                    const row = ws.base_logits_buf[si * v ..][0..eff_v];
+                    if (self.config.final_logit_softcapping > 0.0) {
+                        const cap = self.config.final_logit_softcapping;
+                        for (row) |*lv| lv.* = std.math.tanh(lv.* / cap) * cap;
+                    }
+                    const got = try extractDeterministicTopKMasked(
+                        row,
+                        inv_temp,
+                        null,
+                        ws.topk_tokens[0..eff_k],
+                        ws.topk_probs[0..eff_k],
+                    );
+                    slot_counts[si] = @intCast(got);
+                    for (0..got) |ki| {
+                        const p = ws.topk_probs[ki];
+                        slot_cands[si][ki] = .{
+                            .token_id = ws.topk_tokens[ki],
+                            .prob = p,
+                            .log_prob = logProbOf(p),
+                        };
+                    }
+                }
+            }
+        }
+
+        self.insertDirectBlockIntoTree(
+            max_nodes,
+            draft_slots,
+            slot_cands[0..draft_slots],
+            slot_counts[0..draft_slots],
+            node_limit,
+            gram_active,
+            grammar_opt,
+            node_states,
+            node_valid,
+            out_tree,
+        );
+    }
+
     /// Returns token log-prob `ln(step_prob)` recorded for node `idx`.
     pub inline fn nodeLogProb(self: *const DFlareProposer, node_idx: u16) f32 {
         return self.workspace.node_log_probs[node_idx];
@@ -4519,6 +5297,7 @@ pub const LoadedDFlareBundle = struct {
         q_norm: ?*const amf.TensorEntry = null,
         k_norm: ?*const amf.TensorEntry = null,
         k_norm_ctx: ?*const amf.TensorEntry = null,
+        sink_bias: ?*const amf.TensorEntry = null,
         q_proj: *const amf.TensorEntry = undefined,
         k_proj: *const amf.TensorEntry = undefined,
         v_proj: *const amf.TensorEntry = undefined,
@@ -4614,11 +5393,18 @@ pub const LoadedDFlareBundle = struct {
             }
         }
 
-        const fc_norm_entry = findAnyEntry(amf_file, &.{ "dflare.fc_norm.weight", "fc_norm.weight" });
+        const fc_norm_entry = findAnyEntry(amf_file, &.{ "dflare.fc_norm.weight", "fc_norm.weight", "hidden_norm.weight" });
         if (fc_norm_entry) |e| _ = try planF32Bytes(&weight_bytes, &max_small_blob, e, h);
 
-        const mask_entry = findAnyEntry(amf_file, &.{ "dflare.mask_embed.weight", "dflare.mask_embed", "mask_embed", "mask_embd.weight" }) orelse return error.MissingTensor;
-        const mask_elems = try planF32Bytes(&weight_bytes, &max_small_blob, mask_entry, null);
+        const mask_entry = findAnyEntry(amf_file, &.{ "dflare.mask_embed.weight", "dflare.mask_embed", "mask_embed", "mask_embd.weight" });
+        var mask_elems: usize = 0;
+        if (mask_entry) |me| {
+            mask_elems = try planF32Bytes(&weight_bytes, &max_small_blob, me, null);
+        } else if (cfg.mask_token_id != null) {
+            weight_bytes = std.math.add(usize, weight_bytes, try alignUp64(h * @sizeOf(f32))) catch return error.Overflow;
+        } else {
+            return error.MissingTensor;
+        }
 
         const tok_embed_norm_entry = findAnyEntry(amf_file, &.{"token_embd_norm.weight"});
         if (tok_embed_norm_entry) |e| _ = try planF32Bytes(&weight_bytes, &max_small_blob, e, h);
@@ -4651,6 +5437,8 @@ pub const LoadedDFlareBundle = struct {
             if (refs.k_norm) |e| _ = try planF32Bytes(&weight_bytes, &max_small_blob, e, cfg.head_dim);
             refs.k_norm_ctx = try findLayerEntry(amf_file, l, &.{ "self_attn.k_norm_ctx.weight", "attn_k_ctx_norm.weight" }, &nb0, &nb1, &nb2);
             if (refs.k_norm_ctx) |e| _ = try planF32Bytes(&weight_bytes, &max_small_blob, e, cfg.head_dim);
+            refs.sink_bias = try findLayerEntry(amf_file, l, &.{ "self_attn.sink_bias", "self_attn.attention_sink_bias", "attn_sinks.weight" }, &nb0, &nb1, &nb2);
+            if (refs.sink_bias) |e| _ = try planF32Bytes(&weight_bytes, &max_small_blob, e, cfg.num_attention_heads);
 
             refs.q_proj = (try findLayerEntry(amf_file, l, &.{ "self_attn.q_proj.weight", "attn.q_proj.weight", "attn_q.weight" }, &nb0, &nb1, &nb2)) orelse return error.MissingTensor;
             try planRawBytes(&weight_bytes, refs.q_proj, q_dim, h, false);
@@ -4681,13 +5469,30 @@ pub const LoadedDFlareBundle = struct {
             layer_refs[l] = refs;
         }
 
-        // Markov head entries.
+        // Markov head entries (omitted in `D15` direct block-diffusion `DFlash` where `markov_rank == 0`).
         const gru_entry = findAnyEntry(amf_file, &.{ "markov_head.rnn_proj.weight", "joint_proj.weight" });
-        const is_real_gru: bool = if (gru_entry) |ge| (ge.shape[0] == 3 * mr and ge.shape[1] == 2 * h + 2 * mr) else false;
+        const any_markov_w1 = findAnyEntry(amf_file, &.{ "dflare.markov_w1.weight", "markov_head.markov_w1.weight", "markov_w1.weight" });
+        var eff_mr: usize = mr;
+        if (eff_mr == 0 and any_markov_w1 != null) {
+            // Auto-detect `dflash-Q8` / `Inkling 2` Markov rank when JSON omitted `markov_rank`.
+            const w1e = any_markov_w1.?;
+            if (gru_entry != null and w1e.rank >= 2 and w1e.shape[1] > 0) {
+                eff_mr = w1e.shape[1];
+                cfg.markov_rank = @intCast(eff_mr);
+            } else if (w1e.rank >= 2 and w1e.shape[0] > 0) {
+                eff_mr = w1e.shape[0];
+                cfg.markov_rank = @intCast(eff_mr);
+            }
+        } else if (eff_mr > 0 and gru_entry == null and any_markov_w1 == null and cfg.variant == .dflash_standalone) {
+            eff_mr = 0;
+            cfg.markov_rank = 0;
+        }
+        const is_direct_dflash: bool = (eff_mr == 0);
+        const is_real_gru: bool = if (!is_direct_dflash) (if (gru_entry) |ge| (ge.shape[0] == 3 * eff_mr and ge.shape[1] == 2 * h + 2 * eff_mr) else false) else false;
 
-        const markov_ctx_norm_entry = findAnyEntry(amf_file, &.{ "markov_head.dflare_norm.weight", "markov_ctx_norm.weight" });
+        const markov_ctx_norm_entry = if (!is_direct_dflash) findAnyEntry(amf_file, &.{ "markov_head.dflare_norm.weight", "markov_ctx_norm.weight" }) else null;
         if (markov_ctx_norm_entry) |e| _ = try planF32Bytes(&weight_bytes, &max_small_blob, e, h);
-        const markov_norm_entry = findAnyEntry(amf_file, &.{ "dflare.markov_norm.weight", "markov_norm.weight" });
+        const markov_norm_entry = if (!is_direct_dflash) findAnyEntry(amf_file, &.{ "dflare.markov_norm.weight", "markov_norm.weight" }) else null;
         if (markov_norm_entry) |e| _ = try planF32Bytes(&weight_bytes, &max_small_blob, e, h);
 
         var markov_gru_bias_entry: ?*const amf.TensorEntry = null;
@@ -4705,57 +5510,59 @@ pub const LoadedDFlareBundle = struct {
         var markov_b1_entry: ?*const amf.TensorEntry = null;
         var markov_w2_entry: ?*const amf.TensorEntry = null;
 
-        if (is_real_gru) {
-            try planRawBytes(&weight_bytes, gru_entry.?, 3 * mr, 2 * h + 2 * mr, false);
-            markov_gru_bias_entry = findAnyEntry(amf_file, &.{ "markov_head.rnn_proj.bias", "joint_proj.bias" });
-            if (markov_gru_bias_entry) |e| _ = try planF32Bytes(&weight_bytes, &max_small_blob, e, 3 * mr);
+        if (!is_direct_dflash) {
+            if (is_real_gru) {
+                try planRawBytes(&weight_bytes, gru_entry.?, 3 * eff_mr, 2 * h + 2 * eff_mr, false);
+                markov_gru_bias_entry = findAnyEntry(amf_file, &.{ "markov_head.rnn_proj.bias", "joint_proj.bias" });
+                if (markov_gru_bias_entry) |e| _ = try planF32Bytes(&weight_bytes, &max_small_blob, e, 3 * eff_mr);
 
-            const w1e = findAnyEntry(amf_file, &.{ "markov_head.markov_w1.weight", "markov_w1.weight" }) orelse return error.MissingTensor;
-            if (w1e.rank < 2 or w1e.shape[0] == 0 or w1e.shape[1] != mr) return error.DimensionMismatch;
-            markov_w1_vocab_entry = w1e;
-            markov_w1_vocab_rows = w1e.shape[0];
-            try planRawBytes(&weight_bytes, w1e, w1e.shape[0], mr, false);
+                const w1e = any_markov_w1 orelse return error.MissingTensor;
+                if (w1e.rank < 2 or w1e.shape[0] == 0 or w1e.shape[1] != eff_mr) return error.DimensionMismatch;
+                markov_w1_vocab_entry = w1e;
+                markov_w1_vocab_rows = w1e.shape[0];
+                try planRawBytes(&weight_bytes, w1e, w1e.shape[0], eff_mr, false);
 
-            if (findAnyEntry(amf_file, &.{ "markov_head.hidden_out.weight", "dflare.markov_w2.weight" })) |hoe| {
-                markov_hidden_out_entry = hoe;
-                try planRawBytes(&weight_bytes, hoe, h, mr, false);
+                if (findAnyEntry(amf_file, &.{ "markov_head.hidden_out.weight", "dflare.markov_w2.weight" })) |hoe| {
+                    markov_hidden_out_entry = hoe;
+                    try planRawBytes(&weight_bytes, hoe, h, eff_mr, false);
+                    markov_hidden_bias_entry = findAnyEntry(amf_file, &.{"markov_head.hidden_out.bias"});
+                    if (markov_hidden_bias_entry) |e| _ = try planF32Bytes(&weight_bytes, &max_small_blob, e, h);
+                } else if (amf_file.parsed.find("markov_w2.weight")) |w2e| {
+                    if (w2e.rank < 2 or w2e.shape[0] == 0 or w2e.shape[1] != eff_mr) return error.DimensionMismatch;
+                    markov_w2_vocab_entry = w2e;
+                    markov_w2_vocab_rows = w2e.shape[0];
+                    try planRawBytes(&weight_bytes, w2e, w2e.shape[0], eff_mr, false);
+                    markov_w2_vocab_bias_entry = amf_file.parsed.find("markov_w2.bias");
+                    if (markov_w2_vocab_bias_entry) |e| _ = try planF32Bytes(&weight_bytes, &max_small_blob, e, w2e.shape[0]);
+                } else {
+                    return error.MissingTensor;
+                }
+            } else {
+                const w1e = any_markov_w1 orelse return error.MissingTensor;
+                const w1_elems = try entryElems(w1e);
+                if (w1_elems == eff_mr * 2 * h) {
+                    markov_w1_k = 2 * h;
+                } else if (w1_elems == eff_mr * h) {
+                    markov_w1_k = h;
+                } else {
+                    return error.DimensionMismatch;
+                }
+                markov_w1_entry = w1e;
+                try planRawBytes(&weight_bytes, w1e, eff_mr, markov_w1_k, true);
+
+                markov_rnn_entry = findAnyEntry(amf_file, &.{ "dflare.rnn_proj.weight", "markov_head.rnn_proj.weight", "markov_rnn_proj.weight" });
+                if (markov_rnn_entry) |e| try planRawBytes(&weight_bytes, e, eff_mr, eff_mr, false);
+
+                markov_b1_entry = findAnyEntry(amf_file, &.{ "dflare.markov_b1", "markov_head.rnn_proj.bias", "markov_b1" });
+                if (markov_b1_entry) |e| _ = try planF32Bytes(&weight_bytes, &max_small_blob, e, eff_mr);
+
+                const w2e = findAnyEntry(amf_file, &.{ "dflare.markov_w2.weight", "markov_head.hidden_out.weight", "markov_w2.weight" }) orelse return error.MissingTensor;
+                markov_w2_entry = w2e;
+                try planRawBytes(&weight_bytes, w2e, h, eff_mr, false);
+
                 markov_hidden_bias_entry = findAnyEntry(amf_file, &.{"markov_head.hidden_out.bias"});
                 if (markov_hidden_bias_entry) |e| _ = try planF32Bytes(&weight_bytes, &max_small_blob, e, h);
-            } else if (amf_file.parsed.find("markov_w2.weight")) |w2e| {
-                if (w2e.rank < 2 or w2e.shape[0] == 0 or w2e.shape[1] != mr) return error.DimensionMismatch;
-                markov_w2_vocab_entry = w2e;
-                markov_w2_vocab_rows = w2e.shape[0];
-                try planRawBytes(&weight_bytes, w2e, w2e.shape[0], mr, false);
-                markov_w2_vocab_bias_entry = amf_file.parsed.find("markov_w2.bias");
-                if (markov_w2_vocab_bias_entry) |e| _ = try planF32Bytes(&weight_bytes, &max_small_blob, e, w2e.shape[0]);
-            } else {
-                return error.MissingTensor;
             }
-        } else {
-            const w1e = findAnyEntry(amf_file, &.{ "dflare.markov_w1.weight", "markov_head.markov_w1.weight", "markov_w1.weight" }) orelse return error.MissingTensor;
-            const w1_elems = try entryElems(w1e);
-            if (w1_elems == mr * 2 * h) {
-                markov_w1_k = 2 * h;
-            } else if (w1_elems == mr * h) {
-                markov_w1_k = h;
-            } else {
-                return error.DimensionMismatch;
-            }
-            markov_w1_entry = w1e;
-            try planRawBytes(&weight_bytes, w1e, mr, markov_w1_k, true);
-
-            markov_rnn_entry = findAnyEntry(amf_file, &.{ "dflare.rnn_proj.weight", "markov_head.rnn_proj.weight", "markov_rnn_proj.weight" });
-            if (markov_rnn_entry) |e| try planRawBytes(&weight_bytes, e, mr, mr, false);
-
-            markov_b1_entry = findAnyEntry(amf_file, &.{ "dflare.markov_b1", "markov_head.rnn_proj.bias", "markov_b1" });
-            if (markov_b1_entry) |e| _ = try planF32Bytes(&weight_bytes, &max_small_blob, e, mr);
-
-            const w2e = findAnyEntry(amf_file, &.{ "dflare.markov_w2.weight", "markov_head.hidden_out.weight", "markov_w2.weight" }) orelse return error.MissingTensor;
-            markov_w2_entry = w2e;
-            try planRawBytes(&weight_bytes, w2e, h, mr, false);
-
-            markov_hidden_bias_entry = findAnyEntry(amf_file, &.{"markov_head.hidden_out.bias"});
-            if (markov_hidden_bias_entry) |e| _ = try planF32Bytes(&weight_bytes, &max_small_blob, e, h);
         }
 
         var lm_head_entry: ?*const amf.TensorEntry = null;
@@ -4837,12 +5644,23 @@ pub const LoadedDFlareBundle = struct {
         }
 
         const fc_norm = if (fc_norm_entry) |e| try readF32EntryIntoArena(&weight_arena, small_scratch, amf_file, e, h) else null;
-        const mask_embed = try readF32EntryIntoArena(&weight_arena, small_scratch, amf_file, mask_entry, mask_elems);
         const tok_embed_norm = if (tok_embed_norm_entry) |e| try readF32EntryIntoArena(&weight_arena, small_scratch, amf_file, e, h) else null;
         const tok_embed_raw: ?RawLinearMat = if (tok_embed_entry) |te|
             try readRawEntryIntoArena(&weight_arena, amf_file, te, v, h, true)
         else
             null;
+        const mask_embed: []const f32 = if (mask_entry) |me|
+            try readF32EntryIntoArena(&weight_arena, small_scratch, amf_file, me, mask_elems)
+        else blk: {
+            const mtid = cfg.mask_token_id orelse return error.MissingTensor;
+            const dst = try allocArenaSlice(f32, &weight_arena, h);
+            const raw = try resolveTokEmbed(&.{}, tok_embed_raw, tok_embed_override, mtid, h, dst);
+            if (raw.ptr != dst.ptr) @memcpy(dst, raw[0..h]);
+            if (tok_embed_override == null) {
+                if (tok_embed_norm) |ten| applyRmsNormInPlace(dst, ten, cfg.rms_eps);
+            }
+            break :blk dst;
+        };
         const final_norm = if (final_norm_entry) |e| try readF32EntryIntoArena(&weight_arena, small_scratch, amf_file, e, h) else null;
 
         const layers = try allocator.alloc(TransformerBlockWeights, cfg.num_layers);
@@ -4855,6 +5673,7 @@ pub const LoadedDFlareBundle = struct {
                 .q_norm_weight = if (refs.q_norm) |e| try readF32EntryIntoArena(&weight_arena, small_scratch, amf_file, e, cfg.head_dim) else null,
                 .k_norm_weight = if (refs.k_norm) |e| try readF32EntryIntoArena(&weight_arena, small_scratch, amf_file, e, cfg.head_dim) else null,
                 .k_norm_ctx_weight = if (refs.k_norm_ctx) |e| try readF32EntryIntoArena(&weight_arena, small_scratch, amf_file, e, cfg.head_dim) else null,
+                .sink_bias = if (refs.sink_bias) |e| try readF32EntryIntoArena(&weight_arena, small_scratch, amf_file, e, cfg.num_attention_heads) else null,
                 .ctx_norm_weight = if (refs.ctx_norm) |e| try readF32EntryIntoArena(&weight_arena, small_scratch, amf_file, e, h) else null,
                 .post_norm_weight = if (refs.post_norm) |e| try readF32EntryIntoArena(&weight_arena, small_scratch, amf_file, e, h) else null,
                 .q_proj_raw = try readRawEntryIntoArena(&weight_arena, amf_file, refs.q_proj, q_dim, h, false),
@@ -4883,23 +5702,25 @@ pub const LoadedDFlareBundle = struct {
         var markov_w2_vocab_raw: ?RawLinearMat = null;
         var markov_w2_vocab_bias: ?[]const f32 = null;
 
-        if (is_real_gru) {
-            markov_gru_proj_raw = try readRawEntryIntoArena(&weight_arena, amf_file, gru_entry.?, 3 * mr, 2 * h + 2 * mr, false);
-            if (markov_gru_bias_entry) |e| markov_gru_bias = try readF32EntryIntoArena(&weight_arena, small_scratch, amf_file, e, 3 * mr);
-            markov_w1_vocab_raw = try readRawEntryIntoArena(&weight_arena, amf_file, markov_w1_vocab_entry.?, markov_w1_vocab_rows, mr, false);
-            if (markov_hidden_out_entry) |hoe| {
-                markov_w2_raw = try readRawEntryIntoArena(&weight_arena, amf_file, hoe, h, mr, false);
+        if (!is_direct_dflash) {
+            if (is_real_gru) {
+                markov_gru_proj_raw = try readRawEntryIntoArena(&weight_arena, amf_file, gru_entry.?, 3 * eff_mr, 2 * h + 2 * eff_mr, false);
+                if (markov_gru_bias_entry) |e| markov_gru_bias = try readF32EntryIntoArena(&weight_arena, small_scratch, amf_file, e, 3 * eff_mr);
+                markov_w1_vocab_raw = try readRawEntryIntoArena(&weight_arena, amf_file, markov_w1_vocab_entry.?, markov_w1_vocab_rows, eff_mr, false);
+                if (markov_hidden_out_entry) |hoe| {
+                    markov_w2_raw = try readRawEntryIntoArena(&weight_arena, amf_file, hoe, h, eff_mr, false);
+                    if (markov_hidden_bias_entry) |e| markov_hidden_bias = try readF32EntryIntoArena(&weight_arena, small_scratch, amf_file, e, h);
+                } else if (markov_w2_vocab_entry) |w2e| {
+                    markov_w2_vocab_raw = try readRawEntryIntoArena(&weight_arena, amf_file, w2e, markov_w2_vocab_rows, eff_mr, false);
+                    if (markov_w2_vocab_bias_entry) |e| markov_w2_vocab_bias = try readF32EntryIntoArena(&weight_arena, small_scratch, amf_file, e, markov_w2_vocab_rows);
+                }
+            } else {
+                markov_w1_raw = try readRawEntryIntoArena(&weight_arena, amf_file, markov_w1_entry.?, eff_mr, markov_w1_k, true);
+                if (markov_rnn_entry) |e| markov_rnn_proj_raw = try readRawEntryIntoArena(&weight_arena, amf_file, e, eff_mr, eff_mr, false);
+                if (markov_b1_entry) |e| markov_b1 = try readF32EntryIntoArena(&weight_arena, small_scratch, amf_file, e, eff_mr);
+                markov_w2_raw = try readRawEntryIntoArena(&weight_arena, amf_file, markov_w2_entry.?, h, eff_mr, false);
                 if (markov_hidden_bias_entry) |e| markov_hidden_bias = try readF32EntryIntoArena(&weight_arena, small_scratch, amf_file, e, h);
-            } else if (markov_w2_vocab_entry) |w2e| {
-                markov_w2_vocab_raw = try readRawEntryIntoArena(&weight_arena, amf_file, w2e, markov_w2_vocab_rows, mr, false);
-                if (markov_w2_vocab_bias_entry) |e| markov_w2_vocab_bias = try readF32EntryIntoArena(&weight_arena, small_scratch, amf_file, e, markov_w2_vocab_rows);
             }
-        } else {
-            markov_w1_raw = try readRawEntryIntoArena(&weight_arena, amf_file, markov_w1_entry.?, mr, markov_w1_k, true);
-            if (markov_rnn_entry) |e| markov_rnn_proj_raw = try readRawEntryIntoArena(&weight_arena, amf_file, e, mr, mr, false);
-            if (markov_b1_entry) |e| markov_b1 = try readF32EntryIntoArena(&weight_arena, small_scratch, amf_file, e, mr);
-            markov_w2_raw = try readRawEntryIntoArena(&weight_arena, amf_file, markov_w2_entry.?, h, mr, false);
-            if (markov_hidden_bias_entry) |e| markov_hidden_bias = try readF32EntryIntoArena(&weight_arena, small_scratch, amf_file, e, h);
         }
 
         const lm_head_raw: ?RawLinearMat = if (lm_head_entry) |lme|
@@ -5549,6 +6370,7 @@ pub const DFly2Proposer = struct {
                 null,
                 null,
                 null,
+                .{},
             );
         }
 
@@ -6070,15 +6892,24 @@ fn hasLmHeadHook(hook: LmHeadHook) bool {
     };
 }
 
-fn applyRopeNeoXInPlace(buf: []f32, num_heads: u32, head_dim: u32, pos: u32, theta: f32) void {
+const BlockAttnExtras = struct {
+    rope_dim: u32 = 0,
+    sliding_window: u32 = 0,
+    max_ctx: usize = 0,
+    v_scale: f32 = 1.0,
+};
+
+fn applyRopeNeoXInPlace(buf: []f32, num_heads: u32, head_dim: u32, rope_dim: u32, pos: u32, theta: f32) void {
     const hd: usize = head_dim;
-    const half: usize = hd / 2;
+    const eff_rope: usize = if (rope_dim > 0 and rope_dim <= head_dim) rope_dim else head_dim;
+    const half: usize = eff_rope / 2;
+    if (half == 0) return;
     const pos_f: f32 = @floatFromInt(pos);
-    const inv_hd: f32 = 2.0 / @as(f32, @floatFromInt(hd));
+    const inv_rd: f32 = 2.0 / @as(f32, @floatFromInt(eff_rope));
     for (0..num_heads) |hi| {
         const head = buf[hi * hd ..][0..hd];
         for (0..half) |i| {
-            const freq: f32 = 1.0 / std.math.pow(f32, theta, @as(f32, @floatFromInt(i)) * inv_hd);
+            const freq: f32 = 1.0 / std.math.pow(f32, theta, @as(f32, @floatFromInt(i)) * inv_rd);
             const angle = pos_f * freq;
             const c = @cos(angle);
             const s = @sin(angle);
@@ -6117,6 +6948,7 @@ fn runTransformerBlock(
     ctx_k_f16: ?[]const f16,
     ctx_v_f16: ?[]const f16,
     quant_row_scratch: ?[]f32,
+    extras: BlockAttnExtras,
 ) Error!void {
     if (layer.mla) |mla| {
         try runMlaTransformerBlock(
@@ -6145,10 +6977,13 @@ fn runTransformerBlock(
     const hd: usize = head_dim;
     const gqa_group: usize = num_heads / num_kv_heads;
     const inv_sqrt_hd: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(hd)));
-    const total_kv = ctx_len + seq_len;
-    if (attn_scores.len < total_kv) return error.BufferTooSmall;
+    const total_kv_cap = ctx_len + seq_len;
+    if (attn_scores.len < total_kv_cap) return error.BufferTooSmall;
     var empty_row_scratch: [0]f32 = .{};
     const scratch: []f32 = quant_row_scratch orelse &empty_row_scratch;
+    const eff_rope_dim: u32 = if (extras.rope_dim > 0) extras.rope_dim else head_dim;
+    const v_scale: f32 = extras.v_scale;
+    const max_ctx_ring: usize = if (extras.max_ctx > 0) extras.max_ctx else ctx_len;
 
     for (0..seq_len) |pos| {
         const src = hiddens[pos * hidden_size ..][0..hidden_size];
@@ -6168,23 +7003,37 @@ fn runTransformerBlock(
         }
         if (rope_theta > 0.0) {
             const tok_pos: u32 = anchor_pos + @as(u32, @intCast(pos));
-            applyRopeNeoXInPlace(q_buf[pos * q_dim ..][0..q_dim], num_heads, head_dim, tok_pos, rope_theta);
-            applyRopeNeoXInPlace(k_buf[pos * kv_dim ..][0..kv_dim], num_kv_heads, head_dim, tok_pos, rope_theta);
+            applyRopeNeoXInPlace(q_buf[pos * q_dim ..][0..q_dim], num_heads, head_dim, eff_rope_dim, tok_pos, rope_theta);
+            applyRopeNeoXInPlace(k_buf[pos * kv_dim ..][0..kv_dim], num_kv_heads, head_dim, eff_rope_dim, tok_pos, rope_theta);
         }
     }
 
-    // Bidirectional block-parallel attention over `[ctx_kv (0..ctx_len), block_kv (0..seq_len)]`.
+    // Bidirectional block-parallel attention over `[ctx_kv (causal SWA over circular ring), block_kv (0..seq_len)]`,
+    // plus optional `sink_bias` softmax column and `attention_value_scale`.
+    const ctx_base: usize = if (anchor_pos >= ctx_len) (@as(usize, anchor_pos) - ctx_len) else 0;
     for (0..seq_len) |q_pos| {
         const q_row = q_buf[q_pos * q_dim ..][0..q_dim];
         const out_row = attn_out[q_pos * q_dim ..][0..q_dim];
+        var eff_ctx_start: usize = ctx_base;
+        var eff_ctx_len: usize = ctx_len;
+        if (extras.sliding_window > 0 and anchor_pos >= ctx_len) {
+            const q_log_pos: usize = @as(usize, anchor_pos) + q_pos;
+            const swa: usize = extras.sliding_window;
+            const min_k_pos: usize = if (q_log_pos + 1 > swa) (q_log_pos + 1 - swa) else 0;
+            eff_ctx_start = @max(ctx_base, min_k_pos);
+            eff_ctx_len = if (anchor_pos > eff_ctx_start) (@as(usize, anchor_pos) - eff_ctx_start) else 0;
+        }
+        const total_kv = eff_ctx_len + seq_len;
+
         for (0..num_heads) |qh| {
             const kvh = qh / gqa_group;
             const q_head = q_row[qh * hd ..][0..hd];
             var max_s: f32 = -std.math.inf(f32);
 
             if (ctx_k_f16) |ck16| {
-                for (0..ctx_len) |kp| {
-                    const k_head = ck16[kp * kv_dim + kvh * hd ..][0..hd];
+                for (0..eff_ctx_len) |kp| {
+                    const slot = if (max_ctx_ring > 0) ((eff_ctx_start + kp) % max_ctx_ring) else (eff_ctx_start + kp);
+                    const k_head = ck16[slot * kv_dim + kvh * hd ..][0..hd];
                     var dot: f32 = 0.0;
                     for (0..hd) |d| dot += q_head[d] * @as(f32, @floatCast(k_head[d]));
                     const sc = dot * inv_sqrt_hd;
@@ -6192,7 +7041,7 @@ fn runTransformerBlock(
                     if (sc > max_s) max_s = sc;
                 }
             } else {
-                for (0..ctx_len) |kp| {
+                for (0..eff_ctx_len) |kp| {
                     const k_head = ctx_k[kp * kv_dim + kvh * hd ..][0..hd];
                     var dot: f32 = 0.0;
                     for (0..hd) |d| dot += q_head[d] * k_head[d];
@@ -6206,8 +7055,12 @@ fn runTransformerBlock(
                 var dot: f32 = 0.0;
                 for (0..hd) |d| dot += q_head[d] * k_head[d];
                 const sc = dot * inv_sqrt_hd;
-                attn_scores[ctx_len + kp] = sc;
+                attn_scores[eff_ctx_len + kp] = sc;
                 if (sc > max_s) max_s = sc;
+            }
+            const sink_opt: ?f32 = if (layer.sink_bias) |sb| sb[qh] else null;
+            if (sink_opt) |sv| {
+                if (sv > max_s) max_s = sv;
             }
 
             var sum_exp: f32 = 0.0;
@@ -6216,25 +7069,29 @@ fn runTransformerBlock(
                 attn_scores[ti] = e;
                 sum_exp += e;
             }
-            const inv_sum: f32 = if (sum_exp > 0.0) 1.0 / sum_exp else 0.0;
+            if (sink_opt) |sv| {
+                sum_exp += @exp(sv - max_s);
+            }
+            const inv_sum: f32 = if (sum_exp > 0.0) (1.0 / sum_exp) * v_scale else 0.0;
 
             const dst_head = out_row[qh * hd ..][0..hd];
             @memset(dst_head, 0.0);
             if (ctx_v_f16) |cv16| {
-                for (0..ctx_len) |kp| {
+                for (0..eff_ctx_len) |kp| {
+                    const slot = if (max_ctx_ring > 0) ((eff_ctx_start + kp) % max_ctx_ring) else (eff_ctx_start + kp);
                     const p = attn_scores[kp] * inv_sum;
-                    const v_head = cv16[kp * kv_dim + kvh * hd ..][0..hd];
+                    const v_head = cv16[slot * kv_dim + kvh * hd ..][0..hd];
                     for (0..hd) |d| dst_head[d] += p * @as(f32, @floatCast(v_head[d]));
                 }
             } else {
-                for (0..ctx_len) |kp| {
+                for (0..eff_ctx_len) |kp| {
                     const p = attn_scores[kp] * inv_sum;
                     const v_head = ctx_v[kp * kv_dim + kvh * hd ..][0..hd];
                     for (0..hd) |d| dst_head[d] += p * v_head[d];
                 }
             }
             for (0..seq_len) |kp| {
-                const p = attn_scores[ctx_len + kp] * inv_sum;
+                const p = attn_scores[eff_ctx_len + kp] * inv_sum;
                 const v_head = v_buf[kp * kv_dim + kvh * hd ..][0..hd];
                 for (0..hd) |d| dst_head[d] += p * v_head[d];
             }
@@ -9382,4 +10239,367 @@ test "D16 Metal 4 GPU simple non-GRU DFlare (dense fc + markov_w1/rnn_proj/w2 + 
         try std.testing.expectEqual(cpu_tree.nodes[ni].token_id, gpu_tree.nodes[ni].token_id);
         try std.testing.expect(@abs(cpu_tree.nodes[ni].step_prob - gpu_tree.nodes[ni].step_prob) < 1e-2);
     }
+}
+
+test "M9.1 D15 DFlash 5L direct block-diffusion (B=8 & B=16, markov_rank=0, 5-tap fc, rope_dim=64, SWA, v_scale=0.612, sink_bias, mask_token_id) GPU==CPU parity" {
+    const allocator = std.testing.allocator;
+
+    // 1. Verify DFlareConfig.fromJson parses MiMo-V2.6 dflash/config.json schema cleanly.
+    const mimo_dflash_json =
+        \\{
+        \\  "architectures": ["DFlashDraftModel"],
+        \\  "hidden_size": 4096,
+        \\  "intermediate_size": 16384,
+        \\  "num_hidden_layers": 5,
+        \\  "num_attention_heads": 64,
+        \\  "num_key_value_heads": 8,
+        \\  "head_dim": 128,
+        \\  "partial_rotary_factor": 0.5,
+        \\  "rope_theta": 10000.0,
+        \\  "sliding_window": 1024,
+        \\  "attention_value_scale": 0.612,
+        \\  "vocab_size": 151936,
+        \\  "rms_norm_eps": 1e-6,
+        \\  "block_size": 16,
+        \\  "dflash_config": {
+        \\    "mask_token_id": 151675,
+        \\    "target_layer_ids": [0, 11, 23, 35, 47]
+        \\  }
+        \\}
+    ;
+    try std.testing.expectEqual(@as(?DraftKindDetected, .dflare), detectDraftKindFromJson(mimo_dflash_json));
+    const parsed_cfg = try DFlareConfig.fromJson(allocator, mimo_dflash_json, 4096, 151936);
+    try std.testing.expectEqual(@as(u32, 5), parsed_cfg.num_layers);
+    try std.testing.expectEqual(@as(u8, 16), parsed_cfg.block_size);
+    try std.testing.expectEqual(@as(u32, 0), parsed_cfg.markov_rank);
+    try std.testing.expectEqual(@as(u32, 5), parsed_cfg.num_target_taps);
+    try std.testing.expectEqual(@as(u32, 64), parsed_cfg.effectiveRopeDim());
+    try std.testing.expectEqual(@as(u32, 1024), parsed_cfg.sliding_window);
+    try std.testing.expectEqual(@as(?u32, 151675), parsed_cfg.mask_token_id);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.612), parsed_cfg.attention_value_scale, 1e-5);
+
+    // 2. Exercise 5-layer direct block-diffusion (markov_rank=0) with 5-tap fc + hidden_norm,
+    //    q_norm, k_norm, sink_bias, v_scale=0.612, partial RoPE (64/128), circular SWA wraparound,
+    //    and mask_token_id seeding across BOTH B=8 and B=16 (plus 2-iter refinement + top-2 fork)!
+    const device = try metal.Device.open();
+    defer device.close();
+    const library = try metal.Library.openEmbedded(device);
+    defer library.close();
+
+    const h: usize = 128;
+    const inter: usize = 256;
+    const nh: u32 = 2;
+    const nkvh: u32 = 1;
+    const hd: u32 = 128;
+    const q_dim: usize = @as(usize, nh) * hd;
+    const kv_dim: usize = @as(usize, nkvh) * hd;
+    const v: usize = 32;
+    const taps: usize = 5;
+    const num_layers: usize = 5;
+
+    const l_q = try allocator.alloc(f32, num_layers * q_dim * h);
+    defer allocator.free(l_q);
+    const l_k = try allocator.alloc(f32, num_layers * kv_dim * h);
+    defer allocator.free(l_k);
+    const l_v = try allocator.alloc(f32, num_layers * kv_dim * h);
+    defer allocator.free(l_v);
+    const l_o = try allocator.alloc(f32, num_layers * h * q_dim);
+    defer allocator.free(l_o);
+    const l_gate = try allocator.alloc(f32, num_layers * inter * h);
+    defer allocator.free(l_gate);
+    const l_up = try allocator.alloc(f32, num_layers * inter * h);
+    defer allocator.free(l_up);
+    const l_down = try allocator.alloc(f32, num_layers * h * inter);
+    defer allocator.free(l_down);
+    const l_in_norm = try allocator.alloc(f32, num_layers * h);
+    defer allocator.free(l_in_norm);
+    const l_post_norm = try allocator.alloc(f32, num_layers * h);
+    defer allocator.free(l_post_norm);
+    const l_q_norm = try allocator.alloc(f32, num_layers * hd);
+    defer allocator.free(l_q_norm);
+    const l_k_norm = try allocator.alloc(f32, num_layers * hd);
+    defer allocator.free(l_k_norm);
+    const l_sink = try allocator.alloc(f32, num_layers * nh);
+    defer allocator.free(l_sink);
+
+    var layers: [num_layers]TransformerBlockWeights = undefined;
+    for (0..num_layers) |li| {
+        fillDetWeight(l_q[li * q_dim * h ..][0 .. q_dim * h], 7100 + li * 16 + 1, 0.08);
+        fillDetWeight(l_k[li * kv_dim * h ..][0 .. kv_dim * h], 7100 + li * 16 + 2, 0.08);
+        fillDetWeight(l_v[li * kv_dim * h ..][0 .. kv_dim * h], 7100 + li * 16 + 3, 0.08);
+        fillDetWeight(l_o[li * h * q_dim ..][0 .. h * q_dim], 7100 + li * 16 + 4, 0.08);
+        fillDetWeight(l_gate[li * inter * h ..][0 .. inter * h], 7100 + li * 16 + 5, 0.07);
+        fillDetWeight(l_up[li * inter * h ..][0 .. inter * h], 7100 + li * 16 + 6, 0.07);
+        fillDetWeight(l_down[li * h * inter ..][0 .. h * inter], 7100 + li * 16 + 7, 0.07);
+        for (0..h) |d| {
+            l_in_norm[li * h + d] = 1.0 + 0.05 * @sin(@as(f32, @floatFromInt(li * 31 + d)));
+            l_post_norm[li * h + d] = 1.0 + 0.05 * @cos(@as(f32, @floatFromInt(li * 17 + d)));
+        }
+        for (0..hd) |d| {
+            l_q_norm[li * hd + d] = 1.0 + 0.04 * @sin(@as(f32, @floatFromInt(li * 13 + d)));
+            l_k_norm[li * hd + d] = 1.0 + 0.04 * @cos(@as(f32, @floatFromInt(li * 11 + d)));
+        }
+        for (0..nh) |hi| {
+            l_sink[li * nh + hi] = -0.35 + 0.4 * @as(f32, @floatFromInt(hi)) + 0.1 * @as(f32, @floatFromInt(li));
+        }
+        layers[li] = .{
+            .in_norm_weight = l_in_norm[li * h ..][0..h],
+            .q_proj = l_q[li * q_dim * h ..][0 .. q_dim * h],
+            .k_proj = l_k[li * kv_dim * h ..][0 .. kv_dim * h],
+            .v_proj = l_v[li * kv_dim * h ..][0 .. kv_dim * h],
+            .q_norm_weight = l_q_norm[li * hd ..][0..hd],
+            .k_norm_weight = l_k_norm[li * hd ..][0..hd],
+            .sink_bias = l_sink[li * nh ..][0..nh],
+            .o_proj = l_o[li * h * q_dim ..][0 .. h * q_dim],
+            .post_norm_weight = l_post_norm[li * h ..][0..h],
+            .mlp_gate_proj = l_gate[li * inter * h ..][0 .. inter * h],
+            .mlp_up_proj = l_up[li * inter * h ..][0 .. inter * h],
+            .mlp_down_proj = l_down[li * h * inter ..][0 .. h * inter],
+        };
+    }
+
+    const fc = try allocator.alloc(f32, h * taps * h);
+    defer allocator.free(fc);
+    fillDetWeight(fc, 7501, 0.06);
+    var hidden_norm: [h]f32 = undefined;
+    var final_norm: [h]f32 = undefined;
+    for (0..h) |d| {
+        hidden_norm[d] = 1.0 + 0.05 * @sin(@as(f32, @floatFromInt(d)));
+        final_norm[d] = 1.0 + 0.05 * @cos(@as(f32, @floatFromInt(d)));
+    }
+    const tok_embed = try allocator.alloc(f32, v * h);
+    defer allocator.free(tok_embed);
+    fillDetWeight(tok_embed, 7502, 0.30);
+    const lm_head = try allocator.alloc(f32, v * h);
+    defer allocator.free(lm_head);
+    fillDetWeight(lm_head, 7503, 0.14);
+    for (0..v) |tok| lm_head[tok * h + (tok % h)] += 1.5 + 0.07 * @as(f32, @floatFromInt(tok));
+
+    const weights: DFlareWeights = .{
+        .target_fusion_proj = fc,
+        .target_fusion_norm = &hidden_norm,
+        .final_norm = &final_norm,
+        .mask_embed = &.{}, // Resolved from tok_embed[mask_token_id]
+        .tok_embed = tok_embed,
+        .layers = &layers,
+        .lm_head = .{ .dense_f32 = lm_head },
+    };
+
+    var tap_storage: [taps][h]f32 = undefined;
+    var tap_slices: [taps][]const f32 = undefined;
+    for (0..taps) |ti| {
+        fillDetWeight(&tap_storage[ti], 7600 + ti, 0.40);
+        tap_slices[ti] = &tap_storage[ti];
+    }
+
+    // Build 10 positions of deterministic 5-tap target hidden history so circular SWA (`sliding_window=6`)
+    // wraps around across multiple rounds!
+    const hist_cap: usize = 12;
+    const hist_f32 = try allocator.alloc(f32, hist_cap * taps * h);
+    defer allocator.free(hist_f32);
+    fillDetWeight(hist_f32, 7700, 0.40);
+
+    const HistState = struct {
+        data: []const f32,
+        len: u32,
+        epoch: u64,
+        h_dim: usize,
+        n_taps: usize,
+        fn read(c: *const anyopaque, out_len: *u32, out_epoch: *u64, pos: u32, tap_idx: usize, dst: []f32) bool {
+            const self_p: *const @This() = @ptrCast(@alignCast(c));
+            out_len.* = self_p.len;
+            out_epoch.* = self_p.epoch;
+            if (pos >= self_p.len or tap_idx >= self_p.n_taps or dst.len < self_p.h_dim) return false;
+            const off = (@as(usize, pos) * self_p.n_taps + tap_idx) * self_p.h_dim;
+            @memcpy(dst[0..self_p.h_dim], self_p.data[off..][0..self_p.h_dim]);
+            return true;
+        }
+    };
+    const DualHookCtx = struct {
+        tok: []const f32,
+        h_dim: usize,
+        v_len: usize,
+        hist: *HistState,
+        fn readTok(c: ?*anyopaque, token_id: u32, dst: []f32) Error!void {
+            const dc: *const @This() = @ptrCast(@alignCast(c.?));
+            if (token_id >= dc.v_len or dst.len < dc.h_dim) return error.TokenOutOfRange;
+            @memcpy(dst[0..dc.h_dim], dc.tok[@as(usize, token_id) * dc.h_dim ..][0..dc.h_dim]);
+        }
+        fn readHist(c: *const anyopaque, out_len: *u32, out_epoch: *u64, pos: u32, tap_idx: usize, dst: []f32) bool {
+            const dc: *const @This() = @ptrCast(@alignCast(c));
+            return HistState.read(dc.hist, out_len, out_epoch, pos, tap_idx, dst);
+        }
+    };
+
+    var hist_state: HistState = .{ .data = hist_f32, .len = 0, .epoch = 1, .h_dim = h, .n_taps = taps };
+    var dual_ctx: DualHookCtx = .{ .tok = tok_embed, .h_dim = h, .v_len = v, .hist = &hist_state };
+    registerContextHistoryProvider(&dual_ctx, DualHookCtx.readHist);
+    defer unregisterContextHistoryProvider(&dual_ctx);
+
+    var weights_hooked = weights;
+    weights_hooked.tok_embed = &.{};
+    weights_hooked.tok_embed_hook = .{ .callback = .{ .ctx = &dual_ctx, .read_fn = DualHookCtx.readTok } };
+
+    for ([_]u8{ 8, 16 }) |block_w| {
+        const cfg: DFlareConfig = .{
+            .variant = .dflash_standalone,
+            .num_layers = num_layers,
+            .block_size = block_w,
+            .top_k_per_pos = 1,
+            .max_tree_nodes = 16,
+            .hidden_size = @intCast(h),
+            .intermediate_size = @intCast(inter),
+            .num_attention_heads = nh,
+            .num_key_value_heads = nkvh,
+            .head_dim = hd,
+            .rope_dim = 64,
+            .rope_theta = 10_000.0,
+            .attention_value_scale = 0.612,
+            .sliding_window = 6,
+            .vocab_size = @intCast(v),
+            .markov_rank = 0,
+            .num_target_taps = @intCast(taps),
+            .mask_token_id = 31,
+            .rms_eps = 1e-6,
+        };
+
+        var ws_cpu = try DFlareWorkspace.init(cfg, null);
+        defer ws_cpu.deinit();
+        var ws_gpu = try DFlareWorkspace.init(cfg, null);
+        defer ws_gpu.deinit();
+
+        var cpu_p = try DFlareProposer.init(cfg, weights_hooked, &ws_cpu);
+        var gpu_p = try DFlareProposer.init(cfg, weights_hooked, &ws_gpu);
+        try gpu_p.attachGpu(.{ .device = device, .library = library });
+        defer gpu_p.detachGpu();
+
+        // Advance through 3, 7, 10 context positions (exceeds sliding_window=6 -> circular SWA KV wraparound!).
+        for ([_]u32{ 3, 7, 10 }) |ctx_len| {
+            hist_state.len = ctx_len;
+            const pos_off = (@as(usize, ctx_len) - 1) * taps * h;
+            for (0..taps) |ti| tap_slices[ti] = hist_f32[pos_off + ti * h ..][0..h];
+
+            var cpu_tree: CandidateTree = undefined;
+            var gpu_tree: CandidateTree = undefined;
+            const cpu_res = try cpu_p.propose(4, &tap_slices, null, &cpu_tree);
+            const gpu_res = try gpu_p.propose(4, &tap_slices, null, &gpu_tree);
+
+            try std.testing.expectEqual(@as(u16, block_w), cpu_res.tree_nodes);
+            try std.testing.expectEqual(cpu_res.tree_nodes, gpu_res.tree_nodes);
+
+            // Assert cosine similarity >= 0.9999 across ALL B block hidden vectors (CPU vs Metal 4 GPU)!
+            var dot_sum: f64 = 0.0;
+            var na_sum: f64 = 0.0;
+            var nb_sum: f64 = 0.0;
+            for (0..@as(usize, block_w) * h) |idx| {
+                const ca: f64 = ws_cpu.slot_hiddens[idx];
+                const gb: f64 = @floatCast(ws_gpu.gpu_slot_hiddens_f16[idx]);
+                dot_sum += ca * gb;
+                na_sum += ca * ca;
+                nb_sum += gb * gb;
+            }
+            const cos_sim = dot_sum / (@sqrt(na_sum) * @sqrt(nb_sum));
+            try std.testing.expect(cos_sim >= 0.9999);
+
+            // Also verify full-vocab logit parity across all draft slots (`f32` CPU vs `f16` Metal 4 GPU).
+            const draft_slots = @as(usize, block_w) - 1;
+            var max_logit_diff: f32 = 0.0;
+            for (0..draft_slots * v) |li_idx| {
+                const c_l = ws_cpu.base_logits_buf[li_idx];
+                const g_l: f32 = @floatCast(ws_gpu.gpu_base_logits_f16[li_idx]);
+                max_logit_diff = @max(max_logit_diff, @abs(c_l - g_l));
+            }
+            try std.testing.expect(max_logit_diff < 2e-2);
+
+            for (0..cpu_tree.count) |ni| {
+                try std.testing.expectEqual(cpu_tree.nodes[ni].token_id, gpu_tree.nodes[ni].token_id);
+                try std.testing.expect(@abs(cpu_tree.nodes[ni].step_prob - gpu_tree.nodes[ni].step_prob) < 1e-2);
+            }
+        }
+    }
+
+    // 3. Verify 2-iteration refinement + top-2 fork at uncertain slots (<= 16 tree nodes) GPU == CPU parity!
+    const refine_cfg: DFlareConfig = .{
+        .variant = .dflash_standalone,
+        .num_layers = 2,
+        .block_size = 8,
+        .top_k_per_pos = 2,
+        .max_tree_nodes = 16,
+        .hidden_size = @intCast(h),
+        .intermediate_size = @intCast(inter),
+        .num_attention_heads = nh,
+        .num_key_value_heads = nkvh,
+        .head_dim = hd,
+        .rope_dim = 64,
+        .attention_value_scale = 0.612,
+        .sliding_window = 6,
+        .vocab_size = @intCast(v),
+        .markov_rank = 0,
+        .num_target_taps = @intCast(taps),
+        .mask_token_id = 31,
+        .refinement_iters = 2,
+        .refine_confidence_threshold = 0.05,
+        .fork_top2_threshold = 0.99,
+    };
+    var refine_weights = weights;
+    refine_weights.layers = layers[0..2];
+    var ws_rc = try DFlareWorkspace.init(refine_cfg, null);
+    defer ws_rc.deinit();
+    var ws_rg = try DFlareWorkspace.init(refine_cfg, null);
+    defer ws_rg.deinit();
+    var p_rc = try DFlareProposer.init(refine_cfg, refine_weights, &ws_rc);
+    var p_rg = try DFlareProposer.init(refine_cfg, refine_weights, &ws_rg);
+    try p_rg.attachGpu(.{ .device = device, .library = library });
+    defer p_rg.detachGpu();
+
+    var r_cpu_tree: CandidateTree = undefined;
+    var r_gpu_tree: CandidateTree = undefined;
+    _ = try p_rc.propose(7, &tap_slices, null, &r_cpu_tree);
+    _ = try p_rg.propose(7, &tap_slices, null, &r_gpu_tree);
+    try std.testing.expectEqual(@as(u64, 2), p_rc.backbone_runs);
+    try std.testing.expectEqual(@as(u64, 2), p_rg.backbone_runs);
+    try std.testing.expect(r_gpu_tree.count > 8 and r_gpu_tree.count <= 16);
+    try std.testing.expectEqual(r_cpu_tree.count, r_gpu_tree.count);
+    for (0..r_cpu_tree.count) |ni| {
+        try std.testing.expectEqual(r_cpu_tree.nodes[ni].token_id, r_gpu_tree.nodes[ni].token_id);
+    }
+
+    // 4. Verify D7 cold-expert block pruning reduces unique cold experts and remaps node_log_probs.
+    const d7_layers: u32 = 2;
+    var node_exps: [16 * d7_layers]tree_mod.ExpertBitset = @splat(tree_mod.ExpertBitset.empty());
+    var cold_masks: [d7_layers]tree_mod.ExpertBitset = @splat(tree_mod.ExpertBitset.empty());
+    for (0..d7_layers) |l| {
+        for (8..16) |e| cold_masks[l].set(@intCast(e));
+    }
+    var pre_cold: u32 = 0;
+    for (0..r_gpu_tree.count) |ni| {
+        const depth = r_gpu_tree.nodes[ni].depth;
+        for (0..d7_layers) |l| {
+            if (depth <= 2) {
+                node_exps[ni * d7_layers + l].set(0); // hot
+            } else {
+                const cold_e: u32 = 8 + @as(u32, @intCast(ni % 8));
+                node_exps[ni * d7_layers + l].set(cold_e);
+            }
+        }
+    }
+    for (0..d7_layers) |l| {
+        var u_bs = tree_mod.ExpertBitset.empty();
+        for (0..r_gpu_tree.count) |ni| u_bs = u_bs.unionWith(node_exps[ni * d7_layers + l]);
+        pre_cold += u_bs.intersectWith(cold_masks[l]).count();
+    }
+    try std.testing.expect(pre_cold > 0);
+    const pre_nodes = r_gpu_tree.count;
+    const d7_cost = tree_mod.PruneCostModel.uniformBeta(100.0, 2.0, 300_000.0, 6_000_000.0, 60.0, d7_layers, 16);
+    const ps = try p_rg.pruneWithD7(
+        32,
+        &r_gpu_tree,
+        d7_cost,
+        node_exps[0 .. @as(usize, pre_nodes) * d7_layers],
+        &cold_masks,
+        16,
+    );
+    try std.testing.expect(ps.kept_nodes < pre_nodes);
+    try std.testing.expect(ps.kept_nodes >= 1);
+    try std.testing.expectEqual(@as(f32, 0.0), p_rg.nodeLogProb(0));
 }

@@ -27,6 +27,9 @@ const vmstat = @import("../platform/vmstat.zig");
 /// Maximum top-K candidates extracted per draft node via `encodeTopKLogitsRows`.
 pub const MAX_DRAFT_TOP_K: u32 = moe.MAX_TOP_K;
 
+/// Maximum independent chained native MTP predictor stages (`D15`, MiMo-V2.6 `3L` MTP).
+pub const MAX_MTP_STAGES: usize = 8;
+
 /// Maximum rows batched through the optional CoreML ANE `innerProduct` projection.
 pub const ANE_MAX_BATCH_ROWS: u32 = 8;
 
@@ -108,6 +111,22 @@ pub const DraftConfig = struct {
     num_attention_heads: u32,
     num_key_value_heads: u32,
     head_dim: u32,
+    /// Optional asymmetric value head dim (`0` => equals `head_dim`; `128` with `head_dim = 192` on MiMo-V2.6 MTP).
+    v_head_dim: u32 = 0,
+    /// Optional partial NeoX RoPE dim (`0` => equals `head_dim`; `64` on MiMo-V2.6 MTP).
+    rope_dim: u32 = 0,
+    /// Optional causal sliding window (`0` => full causal; `128` on MiMo-V2.6 MTP).
+    sliding_window: u32 = 0,
+    /// Optional attention value scale (`1.0` default; `0.707` Flash / `0.612` Pro on MiMo-V2.6 MTP).
+    attention_value_scale: f32 = 1.0,
+    /// Whether SWA layers include per-head `attention_sink_bias` softmax column (`MiMo-V2.6` MTP).
+    add_swa_attention_sink_bias: bool = false,
+    /// Chained multi-stage native MTP (`D15`, `num_nextn_predict_layers = 3`): each stage `k = 0..num_hidden_layers-1`
+    /// has its own `enorm`/`hnorm`/`eh_proj`/transformer/KV/final_layernorm predicting depth `k + 1`.
+    mtp_chained: bool = false,
+    /// When `mtp_chained == true` and requested draft depth exceeds `num_hidden_layers`,
+    /// cycle the last MTP stage (`false` = cleanly stop at `num_hidden_layers`).
+    mtp_cycle_last_stage: bool = false,
     intermediate_size: u32,
     rms_norm_eps: f32 = 1e-6,
     rope_theta: f32 = 10_000.0,
@@ -125,12 +144,37 @@ pub const DraftConfig = struct {
         OutOfMemory,
     };
 
+    pub fn effectiveVHeadDim(self: DraftConfig) u32 {
+        return if (self.v_head_dim > 0) self.v_head_dim else self.head_dim;
+    }
+
+    pub fn effectiveRopeDim(self: DraftConfig) u32 {
+        return if (self.rope_dim > 0) self.rope_dim else self.head_dim;
+    }
+
     pub fn qDim(self: DraftConfig) u32 {
         return self.num_attention_heads * self.head_dim;
     }
 
     pub fn kvDim(self: DraftConfig) u32 {
         return self.num_key_value_heads * self.head_dim;
+    }
+
+    pub fn vDim(self: DraftConfig) u32 {
+        return self.num_key_value_heads * self.effectiveVHeadDim();
+    }
+
+    pub fn oInDim(self: DraftConfig) u32 {
+        return self.num_attention_heads * self.effectiveVHeadDim();
+    }
+
+    pub fn usesCustomMtpAttn(self: DraftConfig) bool {
+        return self.effectiveVHeadDim() != self.head_dim or
+            self.effectiveRopeDim() != self.head_dim or
+            self.head_dim > 128 or
+            self.sliding_window > 0 or
+            self.attention_value_scale != 1.0 or
+            self.add_swa_attention_sink_bias;
     }
 
     pub fn validate(self: DraftConfig) ConfigError!void {
@@ -147,15 +191,29 @@ pub const DraftConfig = struct {
         {
             return error.InvalidConfig;
         }
-        if (self.head_dim != 64 and self.head_dim != 128) return error.InvalidConfig;
+        if (self.mtp_chained) {
+            if (self.format != .mtp or self.num_hidden_layers > MAX_MTP_STAGES) {
+                return error.InvalidConfig;
+            }
+        }
+        const vhd = self.effectiveVHeadDim();
+        const rdim = self.effectiveRopeDim();
+        if (self.usesCustomMtpAttn() or self.mtp_chained) {
+            if (self.head_dim == 0 or self.head_dim > 256 or (self.head_dim % 4) != 0) return error.InvalidConfig;
+            if (vhd == 0 or vhd > 256 or (vhd % 4) != 0) return error.InvalidConfig;
+            if (rdim == 0 or rdim > self.head_dim or (rdim % 2) != 0) return error.InvalidConfig;
+        } else {
+            if (self.head_dim != 64 and self.head_dim != 128) return error.InvalidConfig;
+        }
         if ((self.hidden_size % 4) != 0 or (self.target_hidden_size % 4) != 0 or (self.intermediate_size % 4) != 0) {
             return error.InvalidConfig;
         }
         if ((self.num_attention_heads % self.num_key_value_heads) != 0) return error.InvalidConfig;
         if (self.rms_norm_eps <= 0.0 or self.rope_theta <= 0.0) return error.InvalidConfig;
+        if (!std.math.isFinite(self.attention_value_scale) or self.attention_value_scale <= 0.0) return error.InvalidConfig;
     }
 
-    /// Parses an EAGLE-3, EAGLE-2, or MTP `config.json` document at startup.
+    /// Parses an EAGLE-3, EAGLE-2, or MTP (1L or chained 3L) `config.json` document at startup.
     pub fn fromJson(allocator: std.mem.Allocator, json_bytes: []const u8) ConfigError!DraftConfig {
         var parsed = std.json.parseFromSlice(std.json.Value, allocator, json_bytes, .{}) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
@@ -180,17 +238,53 @@ pub const DraftConfig = struct {
         const draft_vocab_size = jsonOptU32(obj, "draft_vocab_size") orelse vocab_size;
         const hidden_size = jsonOptU32(layer_obj, "hidden_size") orelse jsonOptU32(obj, "hidden_size") orelse return error.InvalidJson;
         const target_hidden_size = jsonOptU32(obj, "target_hidden_size") orelse hidden_size;
-        const num_layers = jsonOptU32(layer_obj, "num_hidden_layers") orelse jsonOptU32(obj, "num_hidden_layers") orelse 1;
-        const num_q_heads = jsonOptU32(layer_obj, "num_attention_heads") orelse jsonOptU32(obj, "num_attention_heads") orelse return error.InvalidJson;
-        const num_kv_heads = jsonOptU32(layer_obj, "num_key_value_heads") orelse jsonOptU32(obj, "num_key_value_heads") orelse num_q_heads;
-        const head_dim = jsonOptU32(layer_obj, "head_dim") orelse jsonOptU32(obj, "head_dim") orelse blk: {
+        const num_layers = jsonOptU32(layer_obj, "num_hidden_layers") orelse
+            jsonOptU32(obj, "num_hidden_layers") orelse
+            jsonOptU32(obj, "num_nextn_predict_layers") orelse 1;
+        const num_q_heads = jsonOptU32(layer_obj, "num_attention_heads") orelse
+            jsonOptU32(obj, "num_attention_heads") orelse
+            jsonOptU32(obj, "swa_num_attention_heads") orelse return error.InvalidJson;
+        const num_kv_heads = jsonOptU32(layer_obj, "num_key_value_heads") orelse
+            jsonOptU32(obj, "num_key_value_heads") orelse
+            jsonOptU32(obj, "swa_num_key_value_heads") orelse num_q_heads;
+        const head_dim = jsonOptU32(layer_obj, "head_dim") orelse
+            jsonOptU32(obj, "head_dim") orelse
+            jsonOptU32(obj, "swa_head_dim") orelse blk: {
             if (num_q_heads == 0) return error.InvalidConfig;
             break :blk hidden_size / num_q_heads;
         };
+        const v_head_dim = jsonOptU32(layer_obj, "v_head_dim") orelse
+            jsonOptU32(obj, "v_head_dim") orelse
+            jsonOptU32(obj, "swa_v_head_dim") orelse head_dim;
+        const explicit_rope_dim = jsonOptU32(layer_obj, "rope_dim") orelse
+            jsonOptU32(obj, "rope_dim") orelse
+            jsonOptU32(layer_obj, "rotary_dim") orelse
+            jsonOptU32(obj, "rotary_dim");
+        const partial_rotary_factor = jsonOptF32(layer_obj, "partial_rotary_factor") orelse
+            jsonOptF32(obj, "partial_rotary_factor") orelse 1.0;
+        const rope_dim: u32 = if (explicit_rope_dim) |rd|
+            rd
+        else if (partial_rotary_factor > 0.0 and partial_rotary_factor < 1.0) blk: {
+            const raw: u32 = @intFromFloat(@floor(@as(f32, @floatFromInt(head_dim)) * partial_rotary_factor));
+            break :blk raw & ~@as(u32, 1);
+        } else head_dim;
+        const sliding_window = jsonOptU32(layer_obj, "sliding_window") orelse
+            jsonOptU32(obj, "sliding_window") orelse
+            jsonOptU32(obj, "sliding_window_size") orelse 0;
+        const v_scale = jsonOptF32(layer_obj, "attention_value_scale") orelse
+            jsonOptF32(obj, "attention_value_scale") orelse 1.0;
+        const add_swa_sink = jsonOptBool(layer_obj, "add_swa_attention_sink_bias") orelse
+            jsonOptBool(obj, "add_swa_attention_sink_bias") orelse false;
+        const mtp_chained = jsonOptBool(obj, "mtp_chained") orelse false;
+        const mtp_cycle_last = jsonOptBool(obj, "mtp_cycle_last_stage") orelse false;
         const inter = jsonOptU32(layer_obj, "intermediate_size") orelse jsonOptU32(obj, "intermediate_size") orelse return error.InvalidJson;
-        const rms_eps = jsonOptF32(layer_obj, "rms_norm_eps") orelse jsonOptF32(obj, "rms_norm_eps") orelse 1e-6;
-        const default_theta: f32 = if (format == .eagle3) 10_000.0 else 1_000_000.0;
-        const rope_theta = jsonOptF32(layer_obj, "rope_theta") orelse jsonOptF32(obj, "rope_theta") orelse default_theta;
+        const rms_eps = jsonOptF32(layer_obj, "rms_norm_eps") orelse
+            jsonOptF32(obj, "rms_norm_eps") orelse
+            jsonOptF32(obj, "layernorm_epsilon") orelse 1e-6;
+        const default_theta: f32 = if (format == .eagle3 or mtp_chained) 10_000.0 else 1_000_000.0;
+        const rope_theta = jsonOptF32(layer_obj, "rope_theta") orelse
+            jsonOptF32(obj, "rope_theta") orelse
+            jsonOptF32(obj, "swa_rope_theta") orelse default_theta;
         const max_pos = jsonOptU32(layer_obj, "max_position_embeddings") orelse jsonOptU32(obj, "max_position_embeddings") orelse 40960;
         const norm_before_res = jsonOptBool(obj, "norm_before_residual") orelse true;
         const share_embed = jsonOptBool(obj, "share_embed_tokens") orelse false;
@@ -222,6 +316,13 @@ pub const DraftConfig = struct {
             .num_attention_heads = num_q_heads,
             .num_key_value_heads = num_kv_heads,
             .head_dim = head_dim,
+            .v_head_dim = v_head_dim,
+            .rope_dim = rope_dim,
+            .sliding_window = sliding_window,
+            .attention_value_scale = v_scale,
+            .add_swa_attention_sink_bias = add_swa_sink,
+            .mtp_chained = mtp_chained,
+            .mtp_cycle_last_stage = mtp_cycle_last,
             .intermediate_size = inter,
             .rms_norm_eps = rms_eps,
             .rope_theta = rope_theta,
@@ -262,6 +363,12 @@ fn detectFormat(obj: std.json.ObjectMap) ?DraftMode {
             }
         }
     }
+    if (jsonOptString(obj, "format")) |s| {
+        if (std.mem.eql(u8, s, "eagle3")) return .eagle3;
+        if (std.mem.eql(u8, s, "eagle2") or std.mem.eql(u8, s, "eagle")) return .eagle2;
+        if (std.mem.eql(u8, s, "mtp")) return .mtp;
+    }
+    if (jsonOptBool(obj, "mtp_chained") orelse false) return .mtp;
     return null;
 }
 
@@ -333,9 +440,91 @@ pub const DraftStepError = error{
     BatchTooLarge,
 } || metal.Error || dequant.EncodeError || moe.EncodeError || sme.Error;
 
+const MtpTreeQkNormRopeParams = extern struct {
+    num_nodes: u32,
+    num_q_heads: u32,
+    num_kv_heads: u32,
+    head_dim: u32,
+    v_head_dim: u32,
+    rope_dim: u32,
+    has_q_norm: u32,
+    has_k_norm: u32,
+    norm_dtype: u32,
+    rms_eps: f32,
+    rope_theta: f32,
+    v_scale: f32,
+};
+
+const MtpKvCommitParams = extern struct {
+    num_nodes: u32,
+    num_kv_heads: u32,
+    head_dim: u32,
+    v_head_dim: u32,
+    base_pos: u32,
+    kv_cap: u32,
+    layer_k_elem_off: u32,
+    layer_v_elem_off: u32,
+};
+
+const MtpGqaTreeAttnParams = extern struct {
+    num_nodes: u32,
+    slot_start: u32,
+    q_count: u32,
+    base_pos: u32,
+    kv_cap: u32,
+    sliding_window: u32,
+    num_q_heads: u32,
+    num_kv_heads: u32,
+    head_dim: u32,
+    v_head_dim: u32,
+    layer_k_elem_off: u32,
+    layer_v_elem_off: u32,
+    has_sink_bias: u32,
+    sink_dtype: u32,
+    scale: f32,
+    _pad0: u32 = 0,
+};
+
+comptime {
+    if (@sizeOf(MtpTreeQkNormRopeParams) != 48) @compileError("MtpTreeQkNormRopeParams size mismatch");
+    if (@sizeOf(MtpKvCommitParams) != 32) @compileError("MtpKvCommitParams size mismatch");
+    if (@sizeOf(MtpGqaTreeAttnParams) != 64) @compileError("MtpGqaTreeAttnParams size mismatch");
+}
+
+const MtpAttnPipelines = struct {
+    qk_norm_rope_vscale: metal.Pipeline,
+    kv_ring_commit: metal.Pipeline,
+    gqa_tree_verify_attn: metal.Pipeline,
+
+    fn init(device: metal.Device, library: metal.Library) metal.Error!MtpAttnPipelines {
+        const p0 = try metal.Pipeline.init(device, library, "mtp_tree_qk_norm_rope_vscale");
+        errdefer p0.close();
+        const p1 = try metal.Pipeline.init(device, library, "mtp_kv_ring_commit");
+        errdefer p1.close();
+        const p2 = try metal.Pipeline.init(device, library, "mtp_gqa_tree_verify_attn");
+        errdefer p2.close();
+        return .{
+            .qk_norm_rope_vscale = p0,
+            .kv_ring_commit = p1,
+            .gqa_tree_verify_attn = p2,
+        };
+    }
+
+    fn close(self: MtpAttnPipelines) void {
+        self.gqa_tree_verify_attn.close();
+        self.kv_ring_commit.close();
+        self.qk_norm_rope_vscale.close();
+    }
+};
+
 const DraftLayerWeights = struct {
     input_layernorm: qwen3.NormBinding,
     hidden_norm: ?qwen3.NormBinding,
+    /// Optional per-stage chained MTP fusion weights (`D15`, `layers.{k}.{enorm,hnorm,eh_proj,final_layernorm}`).
+    stage_enorm: ?qwen3.NormBinding = null,
+    stage_hnorm: ?qwen3.NormBinding = null,
+    stage_eh_proj: ?qwen3.LinearBinding = null,
+    stage_final_norm: ?qwen3.NormBinding = null,
     q_proj: qwen3.LinearBinding,
     k_proj: qwen3.LinearBinding,
     v_proj: qwen3.LinearBinding,
@@ -343,6 +532,9 @@ const DraftLayerWeights = struct {
     q_norm: ?metal.BufferBinding,
     k_norm: ?metal.BufferBinding,
     qk_norm_dtype: quant.FloatDType,
+    /// Optional per-head `attention_sink_bias` (`[num_attention_heads]`, `0=f16, 1=bf16, 2=f32`).
+    sink_bias: ?metal.BufferBinding = null,
+    sink_bias_dtype: u32 = 1,
     post_attention_layernorm: qwen3.NormBinding,
     gate_proj: qwen3.LinearBinding,
     up_proj: qwen3.LinearBinding,
@@ -570,13 +762,25 @@ pub const DraftHead = struct {
 
     // Optional zero-copy CoreML ANE projection for `layers[0].o_proj` (D5).
     ane_proj: ?AneProjection,
-    // Optional L2-resident P-core SME2 projection for `fc` / `eh_proj` (D13).
+    // Optional L2-resident P-core SME2 projection for `fc` / stage-0 `eh_proj` (D13).
     sme_proj: ?*SmeProjectionRuntime,
+    // Optional per-stage L2-resident SME2 `eh_proj` runtimes for chained MTP stages `k >= 1`.
+    extra_stage_sme_projs: [MAX_MTP_STAGES]?*SmeProjectionRuntime = @splat(null),
+
+    // D15 custom MTP attention runtime (asymmetric head_dim/v_head_dim, partial RoPE, SWA, v_scale, sink_bias).
+    use_custom_attn: bool = false,
+    kv_ring_cap: u32 = 0,
+    mtp_pipes: ?MtpAttnPipelines = null,
+    kv_ring_k_bind: metal.BufferBinding = undefined,
+    kv_ring_v_bind: metal.BufferBinding = undefined,
+    stage_h_prev_bind: metal.BufferBinding = undefined,
+    stage_tree_slots_mask: [MAX_MTP_STAGES]u64 = @splat(0),
 
     // Preallocated scratch buffers & bindings (zero hot-path heap alloc)
     token_ids_host: []u32,
     parent_slots_host: []u32,
     positions_host: []u32,
+    positions_pool_host: []u32,
     ancestor_masks_host: []u64,
     topk_host: []moe.TopKCandidate,
     hidden_pool_host: []f16,
@@ -587,6 +791,7 @@ pub const DraftHead = struct {
     token_ids_bind: metal.BufferBinding,
     parent_slots_bind: metal.BufferBinding,
     positions_bind: metal.BufferBinding,
+    positions_pool_bind: metal.BufferBinding,
     ancestor_masks_bind: metal.BufferBinding,
     hidden_pool_bind: metal.BufferBinding, // [(1 + max_tree_slots), H]: [0]=root, [1+s]=tree slot s
     h_in_bind: metal.BufferBinding, // [max_tree_slots, H]
@@ -598,8 +803,8 @@ pub const DraftHead = struct {
     x_norm_bind: metal.BufferBinding, // [max_tree_slots, H]
     q_pool_bind: metal.BufferBinding, // [max_tree_slots, q_dim]
     k_bind: metal.BufferBinding, // [max_tree_slots, kv_dim]
-    v_bind: metal.BufferBinding, // [max_tree_slots, kv_dim]
-    attn_pool_bind: metal.BufferBinding, // [max_tree_slots, q_dim]
+    v_bind: metal.BufferBinding, // [max_tree_slots, v_dim]
+    attn_pool_bind: metal.BufferBinding, // [max_tree_slots, o_in_dim]
     proj_out_bind: metal.BufferBinding, // [max_tree_slots, H]
     mlp_gate_bind: metal.BufferBinding, // [max_tree_slots, inter]
     mlp_up_bind: metal.BufferBinding, // [max_tree_slots, inter]
@@ -610,6 +815,7 @@ pub const DraftHead = struct {
     tree_k_base_off: u64,
     tree_v_base_off: u64,
     tree_kv_layer_stride: u64,
+    tree_v_layer_stride: u64,
 
     // Cached root-step predictions computed by the most recent `syncAccepted`.
     root_top_k_count: u32,
@@ -682,6 +888,17 @@ pub const DraftHead = struct {
             allocator.destroy(sp);
             self.sme_proj = null;
         }
+        for (&self.extra_stage_sme_projs) |*slot| {
+            if (slot.*) |sp| {
+                sp.deinit(allocator);
+                allocator.destroy(sp);
+                slot.* = null;
+            }
+        }
+        if (self.mtp_pipes) |mp| {
+            mp.close();
+            self.mtp_pipes = null;
+        }
         if (self.ane_proj) |*ap| {
             ap.close(&target.compute);
             self.ane_proj = null;
@@ -697,14 +914,16 @@ pub const DraftHead = struct {
             allocator.free(ed);
             self.embed_dequant_f32 = null;
         }
-        target.compute.removeTilesResident(self.kv_tiles) catch |err| {
-            std.debug.panic("removeTilesResident failed in DraftHead.deinit: {}", .{err});
-        };
+        if (self.kv_tiles.len > 0) {
+            target.compute.removeTilesResident(self.kv_tiles) catch |err| {
+                std.debug.panic("removeTilesResident failed in DraftHead.deinit: {}", .{err});
+            };
+            for (self.kv_tiles) |tile| tile.close();
+            allocator.free(self.kv_tiles);
+        }
         target.compute.removeResident(&.{ self.weights_buf, self.scratch_buf }) catch |err| {
             std.debug.panic("removeResident failed in DraftHead.deinit: {}", .{err});
         };
-        for (self.kv_tiles) |tile| tile.close();
-        allocator.free(self.kv_tiles);
         self.scratch_buf.close();
         self.weights_buf.close();
         self.scratch_arena.deinit();
@@ -715,6 +934,15 @@ pub const DraftHead = struct {
     pub fn reset(self: *DraftHead) void {
         self.seq_len = 0;
         self.root_top_k_count = 0;
+        self.stage_tree_slots_mask = @splat(0);
+    }
+
+    pub inline fn isChainedMtp(self: *const DraftHead) bool {
+        return self.config.format == .mtp and self.config.mtp_chained;
+    }
+
+    pub inline fn numMtpStages(self: *const DraftHead) u32 {
+        return if (self.isChainedMtp()) self.config.num_hidden_layers else 1;
     }
 
     pub fn totalWiredBytes(self: *const DraftHead) u64 {
@@ -795,11 +1023,41 @@ pub const DraftHead = struct {
     }
 
     fn treeVBinding(self: *const DraftHead, layer_idx: usize, slot_offset: u32) metal.BufferBinding {
-        const kv_row_bytes = @as(u64, self.config.kvDim()) * @sizeOf(f16);
+        const v_row_bytes = @as(u64, self.config.vDim()) * @sizeOf(f16);
         return .{
             .buffer = self.scratch_buf,
-            .offset = self.tree_v_base_off + @as(u64, layer_idx) * self.tree_kv_layer_stride + @as(u64, slot_offset) * kv_row_bytes,
+            .offset = self.tree_v_base_off + @as(u64, layer_idx) * self.tree_v_layer_stride + @as(u64, slot_offset) * v_row_bytes,
         };
+    }
+
+    fn stagePrevHBinding(self: *const DraftHead, stage_idx: usize) metal.BufferBinding {
+        const row_bytes = @as(u64, self.config.hidden_size) * @sizeOf(f16);
+        return .{
+            .buffer = self.scratch_buf,
+            .offset = self.stage_h_prev_bind.offset + @as(u64, stage_idx) * row_bytes,
+        };
+    }
+
+    fn stageSmeProj(self: *const DraftHead, stage_idx: usize) ?*SmeProjectionRuntime {
+        if (stage_idx == 0) return self.sme_proj;
+        if (stage_idx < MAX_MTP_STAGES) return self.extra_stage_sme_projs[stage_idx];
+        return null;
+    }
+
+    fn stageEnorm(self: *const DraftHead, stage_idx: usize) qwen3.NormBinding {
+        return self.layers[stage_idx].stage_enorm orelse self.enorm.?;
+    }
+
+    fn stageHnorm(self: *const DraftHead, stage_idx: usize) qwen3.NormBinding {
+        return self.layers[stage_idx].stage_hnorm orelse self.hnorm.?;
+    }
+
+    fn stageEhProj(self: *const DraftHead, stage_idx: usize) qwen3.LinearBinding {
+        return self.layers[stage_idx].stage_eh_proj orelse self.eh_proj.?;
+    }
+
+    fn stageFinalNorm(self: *const DraftHead, stage_idx: usize) qwen3.NormBinding {
+        return self.layers[stage_idx].stage_final_norm orelse self.final_norm;
     }
 
     fn mapCandidateToTarget(self: *const DraftHead, cand: moe.TopKCandidate) moe.TopKCandidate {
@@ -864,8 +1122,10 @@ pub const DraftHead = struct {
             if (tid >= self.config.vocab_size) return error.TokenOutOfRange;
             self.token_ids_host[i] = tid;
             self.positions_host[i] = base_pos + @as(u32, @intCast(i));
+            self.positions_pool_host[i] = base_pos + @as(u32, @intCast(i));
             self.ancestor_masks_host[i] = if (i == 63) ~@as(u64, 0) else (@as(u64, 1) << @as(u6, @intCast(i + 1))) - 1;
         }
+        self.stage_tree_slots_mask = @splat(0);
 
         try self.runForwardInternal(
             target,
@@ -877,6 +1137,7 @@ pub const DraftHead = struct {
             true, // commit_kv
             top_k,
             true, // logits_last_row_only
+            0, // active_stage_idx
         );
 
         if (top_k > 0) {
@@ -911,7 +1172,8 @@ pub const DraftHead = struct {
         top_k: u32,
         out_candidates: ?[]moe.TopKCandidate,
     ) DraftStepError!void {
-        return self.stepTreeBatchImpl(target, tokens, parent_hidden_rows, positions, slot_ancestor_masks, slot_start, top_k, out_candidates);
+        const default_stage: usize = if (self.isChainedMtp()) @min(@as(usize, 1), self.layers.len - 1) else 0;
+        return self.stepTreeBatchImpl(target, tokens, parent_hidden_rows, positions, slot_ancestor_masks, slot_start, top_k, out_candidates, default_stage);
     }
 
     pub fn stepTreeBatchForGraph(
@@ -925,7 +1187,41 @@ pub const DraftHead = struct {
         top_k: u32,
         out_candidates: ?[]moe.TopKCandidate,
     ) DraftStepError!void {
-        return self.stepTreeBatchImpl(target, tokens, parent_hidden_rows, positions, slot_ancestor_masks, slot_start, top_k, out_candidates);
+        const default_stage: usize = if (self.isChainedMtp()) @min(@as(usize, 1), self.layers.len - 1) else 0;
+        return self.stepTreeBatchImpl(target, tokens, parent_hidden_rows, positions, slot_ancestor_masks, slot_start, top_k, out_candidates, default_stage);
+    }
+
+    /// Chained `D15` native MTP variant selecting explicit predictor stage `stage_idx`
+    /// (`k = 0..num_hidden_layers-1`: stage `k = 1` predicts depth-2 from `h_0` + depth-1 token;
+    /// stage `k = 2` predicts depth-3 from `h_1` + depth-2 token).
+    pub fn stepTreeBatchForStage(
+        self: *DraftHead,
+        target: *qwen3.Qwen3Model,
+        stage_idx: u32,
+        tokens: []const u32,
+        parent_hidden_rows: []const u32,
+        positions: []const u32,
+        slot_ancestor_masks: []const u64,
+        slot_start: u32,
+        top_k: u32,
+        out_candidates: ?[]moe.TopKCandidate,
+    ) DraftStepError!void {
+        return self.stepTreeBatchImpl(target, tokens, parent_hidden_rows, positions, slot_ancestor_masks, slot_start, top_k, out_candidates, @intCast(stage_idx));
+    }
+
+    pub fn stepTreeBatchForStageForGraph(
+        self: *DraftHead,
+        target: *graph.GraphModel,
+        stage_idx: u32,
+        tokens: []const u32,
+        parent_hidden_rows: []const u32,
+        positions: []const u32,
+        slot_ancestor_masks: []const u64,
+        slot_start: u32,
+        top_k: u32,
+        out_candidates: ?[]moe.TopKCandidate,
+    ) DraftStepError!void {
+        return self.stepTreeBatchImpl(target, tokens, parent_hidden_rows, positions, slot_ancestor_masks, slot_start, top_k, out_candidates, @intCast(stage_idx));
     }
 
     fn stepTreeBatchImpl(
@@ -938,6 +1234,7 @@ pub const DraftHead = struct {
         slot_start: u32,
         top_k: u32,
         out_candidates: ?[]moe.TopKCandidate,
+        stage_idx_raw: usize,
     ) DraftStepError!void {
         if (tokens.len == 0 or tokens.len != parent_hidden_rows.len or tokens.len != positions.len) {
             return error.InvalidArgument;
@@ -952,6 +1249,12 @@ pub const DraftHead = struct {
             if (dst.len < @as(usize, m) * top_k) return error.InvalidArgument;
         }
 
+        const eff_stage: usize = if (self.isChainedMtp())
+            @min(stage_idx_raw, self.layers.len - 1)
+        else
+            0;
+
+        var batch_bits: u64 = 0;
         for (0..m) |i| {
             if (tokens[i] >= self.config.vocab_size) return error.TokenOutOfRange;
             if (positions[i] >= self.max_seq_len) return error.PositionOutOfRange;
@@ -959,8 +1262,18 @@ pub const DraftHead = struct {
             self.token_ids_host[i] = tokens[i];
             self.parent_slots_host[i] = parent_hidden_rows[i];
             self.positions_host[i] = positions[i];
+            self.positions_pool_host[slot_start + @as(u32, @intCast(i))] = positions[i];
+            batch_bits |= (@as(u64, 1) << @as(u6, @intCast(slot_start + @as(u32, @intCast(i)))));
         }
-        @memcpy(self.ancestor_masks_host[0..total_slots], slot_ancestor_masks[0..total_slots]);
+        if (self.isChainedMtp()) {
+            const allowed_mask = self.stage_tree_slots_mask[eff_stage] | batch_bits;
+            for (0..total_slots) |s| {
+                const self_bit: u64 = @as(u64, 1) << @as(u6, @intCast(s));
+                self.ancestor_masks_host[s] = (slot_ancestor_masks[s] & allowed_mask) | self_bit;
+            }
+        } else {
+            @memcpy(self.ancestor_masks_host[0..total_slots], slot_ancestor_masks[0..total_slots]);
+        }
 
         try self.runForwardInternal(
             target,
@@ -972,7 +1285,11 @@ pub const DraftHead = struct {
             false, // commit_kv
             top_k,
             false, // logits_last_row_only
+            eff_stage,
         );
+        if (self.isChainedMtp()) {
+            self.stage_tree_slots_mask[eff_stage] |= batch_bits;
+        }
 
         if (top_k > 0) {
             const dst = out_candidates.?;
@@ -980,6 +1297,335 @@ pub const DraftHead = struct {
             for (0..m) |r| {
                 for (0..eff_k) |k_idx| {
                     dst[r * top_k + k_idx] = self.mapCandidateToTarget(self.topk_host[r * eff_k + k_idx]);
+                }
+            }
+        }
+    }
+
+    fn encodeMtpStageFusion(
+        self: *const DraftHead,
+        target: anytype,
+        frame: *metal.Compute.Frame,
+        stage_idx: usize,
+        h_in_active: metal.BufferBinding,
+        m: u32,
+        first_barrier: bool,
+    ) DraftStepError!void {
+        const h = self.config.hidden_size;
+        const enorm_b = self.stageEnorm(stage_idx);
+        const hnorm_b = self.stageHnorm(stage_idx);
+        const eh_proj_b = self.stageEhProj(stage_idx);
+        try target.attn_pipes.encodeRmsNorm(frame, .{
+            .x = self.emb_bind,
+            .w = enorm_b.binding,
+            .y = self.e_norm_bind,
+            .num_rows = m,
+            .hidden_dim = h,
+            .eps = self.config.rms_norm_eps,
+            .w_dtype = enorm_b.dtype,
+        }, first_barrier);
+        try target.attn_pipes.encodeRmsNorm(frame, .{
+            .x = h_in_active,
+            .w = hnorm_b.binding,
+            .y = self.h_norm_bind,
+            .num_rows = m,
+            .hidden_dim = h,
+            .eps = self.config.rms_norm_eps,
+            .w_dtype = hnorm_b.dtype,
+        }, false);
+        try target.moe_pipes.encodeCopyStrided(frame, .{
+            .src = self.e_norm_bind,
+            .dst = self.x_cat_bind,
+            .num_rows = m,
+            .copy_cols = h,
+            .src_stride = h,
+            .dst_stride = 2 * h,
+            .dst_col_off = 0,
+        }, true);
+        try target.moe_pipes.encodeCopyStrided(frame, .{
+            .src = self.h_norm_bind,
+            .dst = self.x_cat_bind,
+            .num_rows = m,
+            .copy_cols = h,
+            .src_stride = h,
+            .dst_stride = 2 * h,
+            .dst_col_off = h,
+        }, false);
+        try self.encodeDraftLinearBatched(target, frame, eh_proj_b, self.x_cat_bind, self.x_bind, m, true);
+    }
+
+    fn encodeDraftLayerBody(
+        self: *DraftHead,
+        target: anytype,
+        frame: *metal.Compute.Frame,
+        l: usize,
+        m: u32,
+        slot_start: u32,
+        base_pos: u32,
+        total_tree_nodes: u32,
+        commit_kv: bool,
+        use_ane_o_proj: bool,
+    ) DraftStepError!void {
+        const layer = self.layers[l];
+        const h = self.config.hidden_size;
+        const q_dim = self.config.qDim();
+        const o_in_dim = self.config.oInDim();
+        const q_slot_bind: metal.BufferBinding = .{
+            .buffer = self.scratch_buf,
+            .offset = self.q_pool_bind.offset + @as(u64, slot_start) * q_dim * @sizeOf(f16),
+        };
+        const attn_slot_bind: metal.BufferBinding = .{
+            .buffer = self.scratch_buf,
+            .offset = self.attn_pool_bind.offset + @as(u64, slot_start) * o_in_dim * @sizeOf(f16),
+        };
+
+        const qkv_in: metal.BufferBinding = if (self.config.format == .eagle3 and l == 0)
+            self.x_cat_bind
+        else blk: {
+            try target.attn_pipes.encodeRmsNorm(frame, .{
+                .x = self.x_bind,
+                .w = layer.input_layernorm.binding,
+                .y = self.x_norm_bind,
+                .num_rows = m,
+                .hidden_dim = h,
+                .eps = self.config.rms_norm_eps,
+                .w_dtype = layer.input_layernorm.dtype,
+            }, true);
+            break :blk self.x_norm_bind;
+        };
+
+        const seq_b = target.act_quant_policy.isEnabled();
+        try self.encodeDraftLinearBatched(target, frame, layer.q_proj, qkv_in, q_slot_bind, m, true);
+        try self.encodeDraftLinearBatched(target, frame, layer.k_proj, qkv_in, self.k_bind, m, seq_b);
+        try self.encodeDraftLinearBatched(target, frame, layer.v_proj, qkv_in, self.v_bind, m, seq_b);
+
+        if (self.use_custom_attn) {
+            const mp = self.mtp_pipes.?;
+            const dummy_b = self.x_bind;
+            const norm_dt_u32: u32 = switch (layer.qk_norm_dtype) {
+                .f16 => 0,
+                .bf16 => 1,
+            };
+            const qkp: MtpTreeQkNormRopeParams = .{
+                .num_nodes = m,
+                .num_q_heads = self.config.num_attention_heads,
+                .num_kv_heads = self.config.num_key_value_heads,
+                .head_dim = self.config.head_dim,
+                .v_head_dim = self.config.effectiveVHeadDim(),
+                .rope_dim = self.config.effectiveRopeDim(),
+                .has_q_norm = if (layer.q_norm != null) 1 else 0,
+                .has_k_norm = if (layer.k_norm != null) 1 else 0,
+                .norm_dtype = norm_dt_u32,
+                .rms_eps = self.config.rms_norm_eps,
+                .rope_theta = self.config.rope_theta,
+                .v_scale = self.config.attention_value_scale,
+            };
+            try frame.encodeThreadgroups(
+                mp.qk_norm_rope_vscale,
+                &.{
+                    q_slot_bind,
+                    self.k_bind,
+                    self.v_bind,
+                    layer.q_norm orelse dummy_b,
+                    layer.k_norm orelse dummy_b,
+                    self.positions_bind,
+                    self.treeKBinding(l, slot_start),
+                    self.treeVBinding(l, slot_start),
+                },
+                std.mem.asBytes(&qkp),
+                .{ self.config.num_attention_heads + self.config.num_key_value_heads, m, 1 },
+                .{ 128, 1, 1 },
+                true,
+            );
+
+            const kv_k_layer_elems: u32 = @intCast(@as(u64, l) * self.kv_ring_cap * self.config.kvDim());
+            const kv_v_layer_elems: u32 = @intCast(@as(u64, l) * self.kv_ring_cap * self.config.vDim());
+            const gqa_p: MtpGqaTreeAttnParams = .{
+                .num_nodes = total_tree_nodes,
+                .slot_start = slot_start,
+                .q_count = m,
+                .base_pos = base_pos,
+                .kv_cap = self.kv_ring_cap,
+                .sliding_window = self.config.sliding_window,
+                .num_q_heads = self.config.num_attention_heads,
+                .num_kv_heads = self.config.num_key_value_heads,
+                .head_dim = self.config.head_dim,
+                .v_head_dim = self.config.effectiveVHeadDim(),
+                .layer_k_elem_off = kv_k_layer_elems,
+                .layer_v_elem_off = kv_v_layer_elems,
+                .has_sink_bias = if (layer.sink_bias != null) 1 else 0,
+                .sink_dtype = layer.sink_bias_dtype,
+                .scale = 1.0 / @sqrt(@as(f32, @floatFromInt(self.config.head_dim))),
+            };
+            try frame.encodeThreadgroups(
+                mp.gqa_tree_verify_attn,
+                &.{
+                    q_slot_bind,
+                    self.kv_ring_k_bind,
+                    self.kv_ring_v_bind,
+                    self.treeKBinding(l, 0),
+                    self.treeVBinding(l, 0),
+                    self.positions_pool_bind,
+                    self.ancestor_masks_bind,
+                    layer.sink_bias orelse dummy_b,
+                    attn_slot_bind,
+                },
+                std.mem.asBytes(&gqa_p),
+                .{ self.config.num_attention_heads, m, 1 },
+                .{ 128, 1, 1 },
+                true,
+            );
+        } else {
+            try target.attn_pipes.encodeTreeQkNormRope(frame, .{
+                .q = q_slot_bind,
+                .k = self.k_bind,
+                .v = self.v_bind,
+                .q_norm = layer.q_norm,
+                .k_norm = layer.k_norm,
+                .positions = self.positions_bind,
+                .k_tree_out = self.treeKBinding(l, slot_start),
+                .v_tree_out = self.treeVBinding(l, slot_start),
+                .num_nodes = m,
+                .num_q_heads = self.config.num_attention_heads,
+                .num_kv_heads = self.config.num_key_value_heads,
+                .head_dim = self.config.head_dim,
+                .rms_eps = self.config.rms_norm_eps,
+                .rope_theta = self.config.rope_theta,
+                .norm_dtype = layer.qk_norm_dtype,
+            }, true);
+
+            try target.attn_pipes.encodeGqaTreeVerifyAttn(frame, .{
+                .q = self.q_pool_bind,
+                .kv_tiles = if (base_pos > 0) layer.kv_tiles_binding else null,
+                .base_pos = base_pos,
+                .k_tree = self.treeKBinding(l, 0),
+                .v_tree = self.treeVBinding(l, 0),
+                .ancestor_masks = self.ancestor_masks_bind,
+                .out = self.attn_pool_bind,
+                .scratch = self.gqa_tree_scratch_bind,
+                .max_splits = attention.MAX_SPLITS,
+                .num_nodes = total_tree_nodes,
+                .num_q_heads = self.config.num_attention_heads,
+                .num_kv_heads = self.config.num_key_value_heads,
+                .head_dim = self.config.head_dim,
+                .chunk_tokens = self.chunk_tokens,
+            }, true);
+        }
+
+        // D5 Placement: either run `layers[0].o_proj` on ANE over zero-copy IOSurface
+        // or stay in the same Metal 4 command buffer on GPU!
+        if (l == 0 and use_ane_o_proj) {
+            const ap = &(self.ane_proj.?);
+            try target.moe_pipes.encodeCopyStrided(frame, .{
+                .src = attn_slot_bind,
+                .dst = ap.inBinding(),
+                .num_rows = m,
+                .copy_cols = o_in_dim,
+                .src_stride = o_in_dim,
+                .dst_stride = o_in_dim,
+            }, true);
+            const mid_sig = try frame.commit();
+            try target.compute.wait(mid_sig, self.timeout_ms);
+
+            const pinfo = try ap.model.predict(ap.plan);
+            ap.zero_copy_ok = pinfo.allOutputsZeroCopy();
+
+            frame.* = try target.compute.beginFrame(self.timeout_ms);
+            try target.moe_pipes.encodeResidualAdd(frame, .{
+                .x = self.x_bind,
+                .delta = ap.outBinding(),
+                .count = m * h,
+            }, false);
+        } else {
+            try self.encodeDraftLinearBatched(target, frame, layer.o_proj, attn_slot_bind, self.proj_out_bind, m, true);
+            try target.moe_pipes.encodeResidualAdd(frame, .{
+                .x = self.x_bind,
+                .delta = self.proj_out_bind,
+                .count = m * h,
+            }, true);
+        }
+
+        try target.attn_pipes.encodeRmsNorm(frame, .{
+            .x = self.x_bind,
+            .w = layer.post_attention_layernorm.binding,
+            .y = self.x_norm_bind,
+            .num_rows = m,
+            .hidden_dim = h,
+            .eps = self.config.rms_norm_eps,
+            .w_dtype = layer.post_attention_layernorm.dtype,
+        }, true);
+
+        try self.encodeDraftLinearBatched(target, frame, layer.gate_proj, self.x_norm_bind, self.mlp_gate_bind, m, true);
+        try self.encodeDraftLinearBatched(target, frame, layer.up_proj, self.x_norm_bind, self.mlp_up_bind, m, seq_b);
+        try target.moe_pipes.encodeSiluMul(frame, .{
+            .gate = self.mlp_gate_bind,
+            .up = self.mlp_up_bind,
+            .out = self.mlp_act_bind,
+            .count = m * self.config.intermediate_size,
+        }, true);
+        try self.encodeDraftLinearBatched(target, frame, layer.down_proj, self.mlp_act_bind, self.proj_out_bind, m, true);
+        try target.moe_pipes.encodeResidualAdd(frame, .{
+            .x = self.x_bind,
+            .delta = self.proj_out_bind,
+            .count = m * h,
+        }, true);
+
+        // If syncing accepted tokens, commit draft K/V rows into KV ring or IOSurface KvTiles now.
+        if (commit_kv) {
+            if (self.use_custom_attn) {
+                const mp = self.mtp_pipes.?;
+                const kv_k_layer_elems: u32 = @intCast(@as(u64, l) * self.kv_ring_cap * self.config.kvDim());
+                const kv_v_layer_elems: u32 = @intCast(@as(u64, l) * self.kv_ring_cap * self.config.vDim());
+                const cp: MtpKvCommitParams = .{
+                    .num_nodes = m,
+                    .num_kv_heads = self.config.num_key_value_heads,
+                    .head_dim = self.config.head_dim,
+                    .v_head_dim = self.config.effectiveVHeadDim(),
+                    .base_pos = base_pos,
+                    .kv_cap = self.kv_ring_cap,
+                    .layer_k_elem_off = kv_k_layer_elems,
+                    .layer_v_elem_off = kv_v_layer_elems,
+                };
+                try frame.encodeThreadgroups(
+                    mp.kv_ring_commit,
+                    &.{
+                        self.treeKBinding(l, 0),
+                        self.treeVBinding(l, 0),
+                        self.kv_ring_k_bind,
+                        self.kv_ring_v_bind,
+                    },
+                    std.mem.asBytes(&cp),
+                    .{ self.config.num_key_value_heads, m, 1 },
+                    .{ 128, 1, 1 },
+                    true,
+                );
+            } else {
+                var identity_nodes: [attention.MAX_TREE_NODES]u16 = undefined;
+                for (0..m) |idx| identity_nodes[idx] = @intCast(idx);
+                var offset: u32 = 0;
+                while (offset < m) {
+                    const cur_base = base_pos + offset;
+                    const chunk0: u32 = cur_base / self.chunk_tokens;
+                    const max_end: u32 = (chunk0 + 2) * self.chunk_tokens;
+                    const take: u32 = @min(m - offset, max_end - cur_base);
+                    const crosses = ((cur_base + take - 1) / self.chunk_tokens) > chunk0;
+                    const t0 = self.kvTileAt(l, @intCast(chunk0));
+                    const t1 = if (crosses) self.kvTileAt(l, @intCast(chunk0 + 1)) else null;
+                    try target.attn_pipes.encodeKvTreeCommit(frame, .{
+                        .k_tree = self.treeKBinding(l, 0),
+                        .v_tree = self.treeVBinding(l, 0),
+                        .accepted_nodes = .{ .inline_u16 = identity_nodes[offset .. offset + take] },
+                        .accepted_count = take,
+                        .k_tile0 = t0.k,
+                        .v_tile0 = t0.v,
+                        .k_tile1 = if (t1) |p| p.k else null,
+                        .v_tile1 = if (t1) |p| p.v else null,
+                        .num_kv_heads = self.config.num_key_value_heads,
+                        .head_dim = self.config.head_dim,
+                        .base_pos = cur_base,
+                        .chunk_tokens = self.chunk_tokens,
+                    }, true);
+                    offset += take;
                 }
             }
         }
@@ -996,19 +1642,12 @@ pub const DraftHead = struct {
         commit_kv: bool,
         top_k: u32,
         logits_last_row_only: bool,
+        active_stage_idx: usize,
     ) DraftStepError!void {
         const h = self.config.hidden_size;
-        const q_dim = self.config.qDim();
         const total_tree_nodes = slot_start + m;
-        const q_slot_bind: metal.BufferBinding = .{
-            .buffer = self.scratch_buf,
-            .offset = self.q_pool_bind.offset + @as(u64, slot_start) * q_dim * @sizeOf(f16),
-        };
-        const attn_slot_bind: metal.BufferBinding = .{
-            .buffer = self.scratch_buf,
-            .offset = self.attn_pool_bind.offset + @as(u64, slot_start) * q_dim * @sizeOf(f16),
-        };
-
+        const chained_mtp = self.isChainedMtp();
+        const sme_stage: usize = if (chained_mtp and !is_target_sync) active_stage_idx else 0;
         const use_ane_o_proj = (self.effective_placement == .ane and self.ane_proj != null and m <= self.ane_proj.?.batch_rows);
 
         // D13 Placement (`Placement.cpu_sme2`): evaluate compact L2-resident (`<= 16 MiB`)
@@ -1017,7 +1656,7 @@ pub const DraftHead = struct {
         var sme_did_fc = false;
         var sme_did_fusion = false;
         if (self.effective_placement == .cpu_sme2) {
-            if (self.sme_proj) |sp| {
+            if (self.stageSmeProj(sme_stage)) |sp| {
                 if (m <= sp.proj.max_m) {
                     switch (sp.kind) {
                         .eagle3_fc => {
@@ -1054,8 +1693,8 @@ pub const DraftHead = struct {
                                     }
                                     break :blk self.h_in_host[0 .. @as(usize, m) * h];
                                 };
-                                const en_w: ?sme.NormWeightSlice = if (self.enorm) |en| normToSmeSlice(en, h) else null;
-                                const hn_w: ?sme.NormWeightSlice = if (self.hnorm) |hn| normToSmeSlice(hn, h) else null;
+                                const en_w: ?sme.NormWeightSlice = normToSmeSlice(self.stageEnorm(sme_stage), h);
+                                const hn_w: ?sme.NormWeightSlice = normToSmeSlice(self.stageHnorm(sme_stage), h);
                                 try sp.proj.evalDualNormConcatLinear(
                                     &sp.dispatcher,
                                     .{ .f16 = self.emb_host[0 .. @as(usize, m) * h] },
@@ -1153,7 +1792,7 @@ pub const DraftHead = struct {
                 }, false);
             }
 
-            // 3. Format-specific feature fusion before layer 0.
+            // 3. Format-specific feature fusion before active layer/stage.
             switch (self.config.format) {
                 .eagle3 => {
                     const l0 = self.layers[0];
@@ -1227,254 +1866,196 @@ pub const DraftHead = struct {
                     try self.encodeDraftLinearBatched(target, &frame, self.fc.?, self.x_cat_bind, self.x_bind, m, true);
                 },
                 .mtp => {
-                    try target.attn_pipes.encodeRmsNorm(&frame, .{
-                        .x = self.emb_bind,
-                        .w = self.enorm.?.binding,
-                        .y = self.e_norm_bind,
-                        .num_rows = m,
-                        .hidden_dim = h,
-                        .eps = self.config.rms_norm_eps,
-                        .w_dtype = self.enorm.?.dtype,
-                    }, true);
-                    try target.attn_pipes.encodeRmsNorm(&frame, .{
-                        .x = h_in_active,
-                        .w = self.hnorm.?.binding,
-                        .y = self.h_norm_bind,
-                        .num_rows = m,
-                        .hidden_dim = h,
-                        .eps = self.config.rms_norm_eps,
-                        .w_dtype = self.hnorm.?.dtype,
-                    }, false);
-                    try target.moe_pipes.encodeCopyStrided(&frame, .{
-                        .src = self.e_norm_bind,
-                        .dst = self.x_cat_bind,
-                        .num_rows = m,
-                        .copy_cols = h,
-                        .src_stride = h,
-                        .dst_stride = 2 * h,
-                        .dst_col_off = 0,
-                    }, true);
-                    try target.moe_pipes.encodeCopyStrided(&frame, .{
-                        .src = self.h_norm_bind,
-                        .dst = self.x_cat_bind,
-                        .num_rows = m,
-                        .copy_cols = h,
-                        .src_stride = h,
-                        .dst_stride = 2 * h,
-                        .dst_col_off = h,
-                    }, false);
-                    try self.encodeDraftLinearBatched(target, &frame, self.eh_proj.?, self.x_cat_bind, self.x_bind, m, true);
+                    try self.encodeMtpStageFusion(target, &frame, sme_stage, h_in_active, m, true);
                 },
                 .l1_only, .small_draft, .self_recurrent, .dspark, .dflare, .dfly2 => unreachable,
             }
         }
 
-        // 4. Draft transformer layer(s).
-        for (self.layers, 0..) |layer, l| {
-            const qkv_in: metal.BufferBinding = if (self.config.format == .eagle3 and l == 0)
-                self.x_cat_bind
-            else blk: {
-                try target.attn_pipes.encodeRmsNorm(&frame, .{
-                    .x = self.x_bind,
-                    .w = layer.input_layernorm.binding,
-                    .y = self.x_norm_bind,
-                    .num_rows = m,
-                    .hidden_dim = h,
-                    .eps = self.config.rms_norm_eps,
-                    .w_dtype = layer.input_layernorm.dtype,
-                }, true);
-                break :blk self.x_norm_bind;
-            };
+        const row_bytes = @as(u64, h) * @sizeOf(f16);
+        if (chained_mtp) {
+            if (is_target_sync) {
+                // Stage 0 predicts depth-1 (`root_candidates`) and updates stage-0 KV along accepted prefix.
+                try self.encodeDraftLayerBody(target, &frame, 0, m, slot_start, base_pos, total_tree_nodes, commit_kv, use_ane_o_proj);
 
-            const seq_b = target.act_quant_policy.isEnabled();
-            try self.encodeDraftLinearBatched(target, &frame, layer.q_proj, qkv_in, q_slot_bind, m, true);
-            try self.encodeDraftLinearBatched(target, &frame, layer.k_proj, qkv_in, self.k_bind, m, seq_b);
-            try self.encodeDraftLinearBatched(target, &frame, layer.v_proj, qkv_in, self.v_bind, m, seq_b);
-
-            try target.attn_pipes.encodeTreeQkNormRope(&frame, .{
-                .q = q_slot_bind,
-                .k = self.k_bind,
-                .v = self.v_bind,
-                .q_norm = layer.q_norm,
-                .k_norm = layer.k_norm,
-                .positions = self.positions_bind,
-                .k_tree_out = self.treeKBinding(l, slot_start),
-                .v_tree_out = self.treeVBinding(l, slot_start),
-                .num_nodes = m,
-                .num_q_heads = self.config.num_attention_heads,
-                .num_kv_heads = self.config.num_key_value_heads,
-                .head_dim = self.config.head_dim,
-                .rms_eps = self.config.rms_norm_eps,
-                .rope_theta = self.config.rope_theta,
-                .norm_dtype = layer.qk_norm_dtype,
-            }, true);
-
-            try target.attn_pipes.encodeGqaTreeVerifyAttn(&frame, .{
-                .q = self.q_pool_bind,
-                .kv_tiles = if (base_pos > 0) layer.kv_tiles_binding else null,
-                .base_pos = base_pos,
-                .k_tree = self.treeKBinding(l, 0),
-                .v_tree = self.treeVBinding(l, 0),
-                .ancestor_masks = self.ancestor_masks_bind,
-                .out = self.attn_pool_bind,
-                .scratch = self.gqa_tree_scratch_bind,
-                .max_splits = attention.MAX_SPLITS,
-                .num_nodes = total_tree_nodes,
-                .num_q_heads = self.config.num_attention_heads,
-                .num_kv_heads = self.config.num_key_value_heads,
-                .head_dim = self.config.head_dim,
-                .chunk_tokens = self.chunk_tokens,
-            }, true);
-
-            // D5 Placement: either run `layers[0].o_proj` on ANE over zero-copy IOSurface
-            // or stay in the same Metal 4 command buffer on GPU!
-            if (l == 0 and use_ane_o_proj) {
-                const ap = &(self.ane_proj.?);
+                const last_src: metal.BufferBinding = .{
+                    .buffer = self.scratch_buf,
+                    .offset = self.x_bind.offset + @as(u64, m - 1) * row_bytes,
+                };
                 try target.moe_pipes.encodeCopyStrided(&frame, .{
-                    .src = attn_slot_bind,
-                    .dst = ap.inBinding(),
-                    .num_rows = m,
-                    .copy_cols = q_dim,
-                    .src_stride = q_dim,
-                    .dst_stride = q_dim,
+                    .src = last_src,
+                    .dst = self.hidden_pool_bind,
+                    .num_rows = 1,
+                    .copy_cols = h,
+                    .src_stride = h,
+                    .dst_stride = h,
                 }, true);
-                const mid_sig = try frame.commit();
-                try target.compute.wait(mid_sig, self.timeout_ms);
 
-                const pinfo = try ap.model.predict(ap.plan);
-                ap.zero_copy_ok = pinfo.allOutputsZeroCopy();
-
-                frame = try target.compute.beginFrame(self.timeout_ms);
-                try target.moe_pipes.encodeResidualAdd(&frame, .{
-                    .x = self.x_bind,
-                    .delta = ap.outBinding(),
-                    .count = m * h,
-                }, false);
-            } else {
-                try self.encodeDraftLinearBatched(target, &frame, layer.o_proj, attn_slot_bind, self.proj_out_bind, m, true);
-                try target.moe_pipes.encodeResidualAdd(&frame, .{
-                    .x = self.x_bind,
-                    .delta = self.proj_out_bind,
-                    .count = m * h,
-                }, true);
-            }
-
-            try target.attn_pipes.encodeRmsNorm(&frame, .{
-                .x = self.x_bind,
-                .w = layer.post_attention_layernorm.binding,
-                .y = self.x_norm_bind,
-                .num_rows = m,
-                .hidden_dim = h,
-                .eps = self.config.rms_norm_eps,
-                .w_dtype = layer.post_attention_layernorm.dtype,
-            }, true);
-
-            try self.encodeDraftLinearBatched(target, &frame, layer.gate_proj, self.x_norm_bind, self.mlp_gate_bind, m, true);
-            try self.encodeDraftLinearBatched(target, &frame, layer.up_proj, self.x_norm_bind, self.mlp_up_bind, m, seq_b);
-            try target.moe_pipes.encodeSiluMul(&frame, .{
-                .gate = self.mlp_gate_bind,
-                .up = self.mlp_up_bind,
-                .out = self.mlp_act_bind,
-                .count = m * self.config.intermediate_size,
-            }, true);
-            try self.encodeDraftLinearBatched(target, &frame, layer.down_proj, self.mlp_act_bind, self.proj_out_bind, m, true);
-            try target.moe_pipes.encodeResidualAdd(&frame, .{
-                .x = self.x_bind,
-                .delta = self.proj_out_bind,
-                .count = m * h,
-            }, true);
-
-            // If syncing accepted tokens, commit draft K/V rows into IOSurface KvTiles now.
-            if (commit_kv) {
-                var identity_nodes: [attention.MAX_TREE_NODES]u16 = undefined;
-                for (0..m) |idx| identity_nodes[idx] = @intCast(idx);
-                var offset: u32 = 0;
-                while (offset < m) {
-                    const cur_base = base_pos + offset;
-                    const chunk0: u32 = cur_base / self.chunk_tokens;
-                    const max_end: u32 = (chunk0 + 2) * self.chunk_tokens;
-                    const take: u32 = @min(m - offset, max_end - cur_base);
-                    const crosses = ((cur_base + take - 1) / self.chunk_tokens) > chunk0;
-                    const t0 = self.kvTileAt(l, @intCast(chunk0));
-                    const t1 = if (crosses) self.kvTileAt(l, @intCast(chunk0 + 1)) else null;
-                    try target.attn_pipes.encodeKvTreeCommit(&frame, .{
-                        .k_tree = self.treeKBinding(l, 0),
-                        .v_tree = self.treeVBinding(l, 0),
-                        .accepted_nodes = .{ .inline_u16 = identity_nodes[offset .. offset + take] },
-                        .accepted_count = take,
-                        .k_tile0 = t0.k,
-                        .v_tile0 = t0.v,
-                        .k_tile1 = if (t1) |p| p.k else null,
-                        .v_tile1 = if (t1) |p| p.v else null,
-                        .num_kv_heads = self.config.num_key_value_heads,
-                        .head_dim = self.config.head_dim,
-                        .base_pos = cur_base,
-                        .chunk_tokens = self.chunk_tokens,
+                if (top_k > 0) {
+                    const eff_k = @min(top_k, self.config.draft_vocab_size);
+                    const fn0 = self.stageFinalNorm(0);
+                    try target.attn_pipes.encodeRmsNorm(&frame, .{
+                        .x = last_src,
+                        .w = fn0.binding,
+                        .y = self.x_norm_bind,
+                        .num_rows = 1,
+                        .hidden_dim = h,
+                        .eps = self.config.rms_norm_eps,
+                        .w_dtype = fn0.dtype,
                     }, true);
-                    offset += take;
+                    try self.encodeDraftLinearBatched(target, &frame, self.lm_head, self.x_norm_bind, self.logits_bind, 1, true);
+                    try target.moe_pipes.encodeTopKLogitsRows(&frame, .{
+                        .logits = self.logits_bind,
+                        .out_candidates = self.topk_bind,
+                        .num_rows = 1,
+                        .vocab_size = self.config.draft_vocab_size,
+                        .top_k = eff_k,
+                        .logits_dtype = .f16,
+                    }, true);
+                }
+
+                // Advance stages `k = 1 .. num_stages - 1` along the accepted prefix in the SAME
+                // Metal 4 command buffer, chaining `(h_{k-1}[i-1], tok[i])` into stage `k`'s KV cache.
+                for (1..self.layers.len) |stage_k| {
+                    const prev_h_slot = self.stagePrevHBinding(stage_k - 1);
+                    const row0_src = if (base_pos > 0) prev_h_slot else self.x_bind;
+                    try target.moe_pipes.encodeCopyStrided(&frame, .{
+                        .src = row0_src,
+                        .dst = self.h_in_bind,
+                        .num_rows = 1,
+                        .copy_cols = h,
+                        .src_stride = h,
+                        .dst_stride = h,
+                    }, true);
+                    if (m > 1) {
+                        const h_in_row1: metal.BufferBinding = .{
+                            .buffer = self.scratch_buf,
+                            .offset = self.h_in_bind.offset + row_bytes,
+                        };
+                        try target.moe_pipes.encodeCopyStrided(&frame, .{
+                            .src = self.x_bind,
+                            .dst = h_in_row1,
+                            .num_rows = m - 1,
+                            .copy_cols = h,
+                            .src_stride = h,
+                            .dst_stride = h,
+                        }, false);
+                    }
+                    try target.moe_pipes.encodeCopyStrided(&frame, .{
+                        .src = last_src,
+                        .dst = prev_h_slot,
+                        .num_rows = 1,
+                        .copy_cols = h,
+                        .src_stride = h,
+                        .dst_stride = h,
+                    }, true);
+
+                    try self.encodeMtpStageFusion(target, &frame, stage_k, self.h_in_bind, m, true);
+                    try self.encodeDraftLayerBody(target, &frame, stage_k, m, slot_start, base_pos, total_tree_nodes, commit_kv, false);
+                }
+            } else {
+                // Speculative tree/chain step for explicit predictor stage `active_stage_idx`.
+                try self.encodeDraftLayerBody(target, &frame, active_stage_idx, m, slot_start, base_pos, total_tree_nodes, false, active_stage_idx == 0 and use_ane_o_proj);
+
+                const dst_pool: metal.BufferBinding = .{
+                    .buffer = self.scratch_buf,
+                    .offset = self.hidden_pool_bind.offset + @as(u64, 1 + slot_start) * row_bytes,
+                };
+                try target.moe_pipes.encodeCopyStrided(&frame, .{
+                    .src = self.x_bind,
+                    .dst = dst_pool,
+                    .num_rows = m,
+                    .copy_cols = h,
+                    .src_stride = h,
+                    .dst_stride = h,
+                }, true);
+
+                if (top_k > 0) {
+                    const eff_k = @min(top_k, self.config.draft_vocab_size);
+                    const fn_k = self.stageFinalNorm(active_stage_idx);
+                    try target.attn_pipes.encodeRmsNorm(&frame, .{
+                        .x = self.x_bind,
+                        .w = fn_k.binding,
+                        .y = self.x_norm_bind,
+                        .num_rows = m,
+                        .hidden_dim = h,
+                        .eps = self.config.rms_norm_eps,
+                        .w_dtype = fn_k.dtype,
+                    }, true);
+                    try self.encodeDraftLinearBatched(target, &frame, self.lm_head, self.x_norm_bind, self.logits_bind, m, true);
+                    try target.moe_pipes.encodeTopKLogitsRows(&frame, .{
+                        .logits = self.logits_bind,
+                        .out_candidates = self.topk_bind,
+                        .num_rows = m,
+                        .vocab_size = self.config.draft_vocab_size,
+                        .top_k = eff_k,
+                        .logits_dtype = .f16,
+                    }, true);
                 }
             }
-        }
-
-        // 5. Persist feedback hidden state `h_prenorm` into `hidden_pool`:
-        //    - syncAccepted: row `m - 1` -> `hidden_pool[0]` (root state)
-        //    - stepTreeBatch: rows `0..m` -> `hidden_pool[1 + slot_start .. 1 + slot_start + m]`
-        const row_bytes = @as(u64, h) * @sizeOf(f16);
-        if (commit_kv) {
-            const last_src: metal.BufferBinding = .{
-                .buffer = self.scratch_buf,
-                .offset = self.x_bind.offset + @as(u64, m - 1) * row_bytes,
-            };
-            try target.moe_pipes.encodeCopyStrided(&frame, .{
-                .src = last_src,
-                .dst = self.hidden_pool_bind,
-                .num_rows = 1,
-                .copy_cols = h,
-                .src_stride = h,
-                .dst_stride = h,
-            }, true);
         } else {
-            const dst_pool: metal.BufferBinding = .{
-                .buffer = self.scratch_buf,
-                .offset = self.hidden_pool_bind.offset + @as(u64, 1 + slot_start) * row_bytes,
-            };
-            try target.moe_pipes.encodeCopyStrided(&frame, .{
-                .src = self.x_bind,
-                .dst = dst_pool,
-                .num_rows = m,
-                .copy_cols = h,
-                .src_stride = h,
-                .dst_stride = h,
-            }, true);
-        }
+            // Legacy stacked draft transformer layers (EAGLE-3, EAGLE-2, 1L MTP).
+            for (0..self.layers.len) |l| {
+                try self.encodeDraftLayerBody(target, &frame, l, m, slot_start, base_pos, total_tree_nodes, commit_kv, use_ane_o_proj);
+            }
 
-        // 6. Optional final norm + `lm_head` + single-dispatch FP32 softmax top-K.
-        if (top_k > 0) {
-            const eff_k = @min(top_k, self.config.draft_vocab_size);
-            const logit_rows: u32 = if (logits_last_row_only) 1 else m;
-            const norm_src: metal.BufferBinding = if (logits_last_row_only) .{
-                .buffer = self.scratch_buf,
-                .offset = self.x_bind.offset + @as(u64, m - 1) * row_bytes,
-            } else self.x_bind;
+            // 5. Persist feedback hidden state `h_prenorm` into `hidden_pool`:
+            if (commit_kv) {
+                const last_src: metal.BufferBinding = .{
+                    .buffer = self.scratch_buf,
+                    .offset = self.x_bind.offset + @as(u64, m - 1) * row_bytes,
+                };
+                try target.moe_pipes.encodeCopyStrided(&frame, .{
+                    .src = last_src,
+                    .dst = self.hidden_pool_bind,
+                    .num_rows = 1,
+                    .copy_cols = h,
+                    .src_stride = h,
+                    .dst_stride = h,
+                }, true);
+            } else {
+                const dst_pool: metal.BufferBinding = .{
+                    .buffer = self.scratch_buf,
+                    .offset = self.hidden_pool_bind.offset + @as(u64, 1 + slot_start) * row_bytes,
+                };
+                try target.moe_pipes.encodeCopyStrided(&frame, .{
+                    .src = self.x_bind,
+                    .dst = dst_pool,
+                    .num_rows = m,
+                    .copy_cols = h,
+                    .src_stride = h,
+                    .dst_stride = h,
+                }, true);
+            }
 
-            try target.attn_pipes.encodeRmsNorm(&frame, .{
-                .x = norm_src,
-                .w = self.final_norm.binding,
-                .y = self.x_norm_bind,
-                .num_rows = logit_rows,
-                .hidden_dim = h,
-                .eps = self.config.rms_norm_eps,
-                .w_dtype = self.final_norm.dtype,
-            }, true);
-            try self.encodeDraftLinearBatched(target, &frame, self.lm_head, self.x_norm_bind, self.logits_bind, logit_rows, true);
-            try target.moe_pipes.encodeTopKLogitsRows(&frame, .{
-                .logits = self.logits_bind,
-                .out_candidates = self.topk_bind,
-                .num_rows = logit_rows,
-                .vocab_size = self.config.draft_vocab_size,
-                .top_k = eff_k,
-                .logits_dtype = .f16,
-            }, true);
+            // 6. Optional final norm + `lm_head` + single-dispatch FP32 softmax top-K.
+            if (top_k > 0) {
+                const eff_k = @min(top_k, self.config.draft_vocab_size);
+                const logit_rows: u32 = if (logits_last_row_only) 1 else m;
+                const norm_src: metal.BufferBinding = if (logits_last_row_only) .{
+                    .buffer = self.scratch_buf,
+                    .offset = self.x_bind.offset + @as(u64, m - 1) * row_bytes,
+                } else self.x_bind;
+
+                try target.attn_pipes.encodeRmsNorm(&frame, .{
+                    .x = norm_src,
+                    .w = self.final_norm.binding,
+                    .y = self.x_norm_bind,
+                    .num_rows = logit_rows,
+                    .hidden_dim = h,
+                    .eps = self.config.rms_norm_eps,
+                    .w_dtype = self.final_norm.dtype,
+                }, true);
+                try self.encodeDraftLinearBatched(target, &frame, self.lm_head, self.x_norm_bind, self.logits_bind, logit_rows, true);
+                try target.moe_pipes.encodeTopKLogitsRows(&frame, .{
+                    .logits = self.logits_bind,
+                    .out_candidates = self.topk_bind,
+                    .num_rows = logit_rows,
+                    .vocab_size = self.config.draft_vocab_size,
+                    .top_k = eff_k,
+                    .logits_dtype = .f16,
+                }, true);
+            }
         }
 
         const sig = try frame.commit();
@@ -1901,6 +2482,30 @@ fn validateNorm1D(entry: *const amf.TensorEntry, dim: u32) DraftLoadError!quant.
         .bf16 => .bf16,
         else => error.UnexpectedTensorDType,
     };
+}
+
+fn validateSink1D(entry: *const amf.TensorEntry, dim: u32) DraftLoadError!u32 {
+    const dt = try entry.dataType();
+    if (entry.rank != 1 or entry.shape[0] != dim) return error.UnexpectedTensorShape;
+    return switch (dt) {
+        .f16 => 0,
+        .bf16 => 1,
+        .f32 => 2,
+        else => error.UnexpectedTensorDType,
+    };
+}
+
+fn findLayerSinkOpt(parsed: *const amf.Parsed, l: usize, buf: *[64]u8) ?*const amf.TensorEntry {
+    if (parsed.find(std.fmt.bufPrint(buf, "layers.{d}.self_attn.sink_bias", .{l}) catch return null)) |e| return e;
+    if (parsed.find(std.fmt.bufPrint(buf, "layers.{d}.self_attn.attention_sink_bias", .{l}) catch return null)) |e| return e;
+    if (parsed.find(std.fmt.bufPrint(buf, "layers.{d}.self_attn.sinks", .{l}) catch return null)) |e| return e;
+    return null;
+}
+
+fn findLayerPostNormReq(parsed: *const amf.Parsed, l: usize, buf: *[64]u8) DraftLoadError!*const amf.TensorEntry {
+    if (parsed.find(std.fmt.bufPrint(buf, "layers.{d}.post_attention_layernorm.weight", .{l}) catch unreachable)) |e| return e;
+    if (parsed.find(std.fmt.bufPrint(buf, "layers.{d}.pre_mlp_layernorm.weight", .{l}) catch unreachable)) |e| return e;
+    return error.MissingTensor;
 }
 
 fn validateLinear2D(entry: *const amf.TensorEntry, n: u32, k: u32) DraftLoadError!quant.WeightDType {
@@ -2457,9 +3062,16 @@ fn loadInternal(
     allocator: std.mem.Allocator,
     target: anytype,
     source: AmfSource,
-    config: DraftConfig,
+    config_in: DraftConfig,
     options: DraftLoadOptions,
 ) DraftLoadError!DraftHead {
+    const parsed = source.parsed();
+    var config = config_in;
+    if (config.format == .mtp and !config.mtp_chained) {
+        if (findLinearOpt(parsed, "eh_proj") == null and findLinearOpt(parsed, "layers.0.eh_proj") != null) {
+            config.mtp_chained = true;
+        }
+    }
     try config.validate();
     if (options.max_seq_len == 0 or options.chunk_tokens == 0 or
         options.max_tree_slots == 0 or options.max_tree_slots > attention.MAX_TREE_NODES)
@@ -2470,12 +3082,14 @@ fn loadInternal(
         return error.TargetIncompatible;
     }
 
-    const parsed = source.parsed();
     const num_layers: usize = config.num_hidden_layers;
     const h = config.hidden_size;
     const h_tgt = config.target_hidden_size;
     const q_dim = config.qDim();
     const kv_dim = config.kvDim();
+    const v_dim = config.vDim();
+    const o_in_dim = config.oInDim();
+    const chained_mtp = (config.format == .mtp and config.mtp_chained);
     const max_seq_len = @min(options.max_seq_len, config.max_position_embeddings);
     const num_chunks: u32 = (max_seq_len + options.chunk_tokens - 1) / options.chunk_tokens;
 
@@ -2523,34 +3137,63 @@ fn loadInternal(
         .l1_only, .small_draft, .self_recurrent, .dspark, .dflare, .dfly2 => unreachable,
     };
 
-    const enorm_entry: ?*const amf.TensorEntry = if (config.format == .mtp) blk: {
+    const enorm_entry: ?*const amf.TensorEntry = if (config.format == .mtp and !chained_mtp) blk: {
         const e = try findRequired(parsed, "enorm.weight");
         _ = try validateNorm1D(e, h);
         weights_bytes += e.blob_bytes;
         break :blk e;
     } else null;
-    const hnorm_entry: ?*const amf.TensorEntry = if (config.format == .mtp) blk: {
+    const hnorm_entry: ?*const amf.TensorEntry = if (config.format == .mtp and !chained_mtp) blk: {
         const e = try findRequired(parsed, "hnorm.weight");
         _ = try validateNorm1D(e, h);
         weights_bytes += e.blob_bytes;
         break :blk e;
     } else null;
-    const eh_proj_entry: ?*const amf.TensorEntry = if (config.format == .mtp) blk: {
+    const eh_proj_entry: ?*const amf.TensorEntry = if (config.format == .mtp and !chained_mtp) blk: {
         const e = try findLinearReq(parsed, "eh_proj");
         _ = try validateLinear2D(e, h, 2 * h);
         weights_bytes += e.blob_bytes;
         break :blk e;
     } else null;
 
-    const final_norm_entry = if (config.format == .mtp)
-        parsed.find("shared_head.norm.weight") orelse try findRequired(parsed, "norm.weight")
+    const root_final_norm_entry: ?*const amf.TensorEntry = if (config.format == .mtp)
+        parsed.find("shared_head.norm.weight") orelse parsed.find("norm.weight")
     else
         try findRequired(parsed, "norm.weight");
-    const final_norm_dt = try validateNorm1D(final_norm_entry, h);
-    weights_bytes += final_norm_entry.blob_bytes;
+    if (root_final_norm_entry) |fne| {
+        _ = try validateNorm1D(fne, h);
+        weights_bytes += fne.blob_bytes;
+    } else if (!chained_mtp) {
+        return error.MissingTensor;
+    }
 
     var name_buf: [64]u8 = undefined;
+    var any_layer_has_sink_bias = false;
     for (0..num_layers) |l| {
+        if (chained_mtp) {
+            const sen = parsed.find(std.fmt.bufPrint(&name_buf, "layers.{d}.enorm.weight", .{l}) catch unreachable) orelse
+                if (l == 0) try findRequired(parsed, "enorm.weight") else return error.MissingTensor;
+            _ = try validateNorm1D(sen, h);
+            weights_bytes += sen.blob_bytes;
+
+            const shn = parsed.find(std.fmt.bufPrint(&name_buf, "layers.{d}.hnorm.weight", .{l}) catch unreachable) orelse
+                if (l == 0) try findRequired(parsed, "hnorm.weight") else return error.MissingTensor;
+            _ = try validateNorm1D(shn, h);
+            weights_bytes += shn.blob_bytes;
+
+            const seh = findLinearOpt(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.eh_proj", .{l}) catch unreachable) orelse
+                if (l == 0) try findLinearReq(parsed, "eh_proj") else return error.MissingTensor;
+            _ = try validateLinear2D(seh, h, 2 * h);
+            weights_bytes += seh.blob_bytes;
+
+            if (parsed.find(std.fmt.bufPrint(&name_buf, "layers.{d}.final_layernorm.weight", .{l}) catch unreachable)) |sfn| {
+                _ = try validateNorm1D(sfn, h);
+                weights_bytes += sfn.blob_bytes;
+            } else if (root_final_norm_entry == null) {
+                return error.MissingTensor;
+            }
+        }
+
         const qkv_in: u32 = if (config.format == .eagle3 and l == 0) 2 * h else h;
         const in_ln = try findRequired(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.input_layernorm.weight", .{l}) catch unreachable);
         _ = try validateNorm1D(in_ln, h);
@@ -2570,11 +3213,11 @@ fn loadInternal(
         weights_bytes += ke.blob_bytes;
 
         const ve = try findLinearReq(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.self_attn.v_proj", .{l}) catch unreachable);
-        _ = try validateLinear2D(ve, kv_dim, qkv_in);
+        _ = try validateLinear2D(ve, v_dim, qkv_in);
         weights_bytes += ve.blob_bytes;
 
         const oe = try findLinearReq(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.self_attn.o_proj", .{l}) catch unreachable);
-        _ = try validateLinear2D(oe, h, q_dim);
+        _ = try validateLinear2D(oe, h, o_in_dim);
         weights_bytes += oe.blob_bytes;
 
         const qn = parsed.find(std.fmt.bufPrint(&name_buf, "layers.{d}.self_attn.q_norm.weight", .{l}) catch unreachable);
@@ -2587,7 +3230,13 @@ fn loadInternal(
             weights_bytes += qne.blob_bytes + kn.?.blob_bytes;
         }
 
-        const pln = try findRequired(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.post_attention_layernorm.weight", .{l}) catch unreachable);
+        if (findLayerSinkOpt(parsed, l, &name_buf)) |se| {
+            _ = try validateSink1D(se, config.num_attention_heads);
+            weights_bytes += se.blob_bytes;
+            any_layer_has_sink_bias = true;
+        }
+
+        const pln = try findLayerPostNormReq(parsed, l, &name_buf);
         _ = try validateNorm1D(pln, h);
         weights_bytes += pln.blob_bytes;
 
@@ -2604,39 +3253,62 @@ fn loadInternal(
         weights_bytes += dp.blob_bytes;
     }
 
+    const use_custom_attn = config.usesCustomMtpAttn() or any_layer_has_sink_bias;
     const weights_arena_bytes = try page.alignUp(@max(@as(usize, @intCast(weights_bytes)), page.APPLE_PAGE_SIZE));
 
-    // --- 2. Compute draft scratch & KV tile footprint and enforce remaining wired budget ---
+    // --- 2. Compute draft scratch & KV cache footprint and enforce remaining wired budget ---
     const m_cap: usize = options.max_tree_slots;
-    const kv_tbl_per_layer = amf.align64(@as(usize, num_chunks) * @sizeOf(attention.KvTilePair));
+    const kv_tbl_per_layer = if (use_custom_attn) 0 else amf.align64(@as(usize, num_chunks) * @sizeOf(attention.KvTilePair));
     const tree_kv_layer_stride = amf.align64(m_cap * @as(usize, kv_dim) * @sizeOf(f16));
-    const gqa_tree_bytes = amf.align64(attention.gqaTreeScratchLayout(
-        options.max_tree_slots,
-        config.num_attention_heads,
-        config.head_dim,
-        attention.MAX_SPLITS,
-    ).total_bytes);
+    const tree_v_layer_stride = amf.align64(m_cap * @as(usize, v_dim) * @sizeOf(f16));
+    const kv_ring_cap: u32 = if (use_custom_attn)
+        (if (config.sliding_window > 0) config.sliding_window else max_seq_len)
+    else
+        0;
+    const kv_ring_k_bytes: usize = if (use_custom_attn)
+        amf.align64(num_layers * @as(usize, kv_ring_cap) * @as(usize, kv_dim) * @sizeOf(f16))
+    else
+        64;
+    const kv_ring_v_bytes: usize = if (use_custom_attn)
+        amf.align64(num_layers * @as(usize, kv_ring_cap) * @as(usize, v_dim) * @sizeOf(f16))
+    else
+        64;
+    const gqa_tree_bytes: usize = if (use_custom_attn)
+        64
+    else
+        amf.align64(attention.gqaTreeScratchLayout(
+            options.max_tree_slots,
+            config.num_attention_heads,
+            config.head_dim,
+            attention.MAX_SPLITS,
+        ).total_bytes);
 
     const scratch_raw: usize =
-        amf.align64(m_cap * @sizeOf(u32)) * 3 + // token_ids, parent_slots, positions
+        amf.align64(m_cap * @sizeOf(u32)) * 4 + // token_ids, parent_slots, positions, positions_pool
         amf.align64(m_cap * @sizeOf(u64)) + // ancestor_masks
         amf.align64((1 + m_cap) * @as(usize, h) * @sizeOf(f16)) + // hidden_pool
+        amf.align64(MAX_MTP_STAGES * @as(usize, h) * @sizeOf(f16)) + // stage_h_prev
         amf.align64(m_cap * @as(usize, h) * @sizeOf(f16)) * 7 + // h_in, emb, e_norm, h_norm, x, x_norm, proj_out
         amf.align64(m_cap * 2 * @as(usize, h) * @sizeOf(f16)) + // x_cat
-        amf.align64(m_cap * @as(usize, q_dim) * @sizeOf(f16)) * 2 + // q_pool, attn_pool
-        amf.align64(m_cap * @as(usize, kv_dim) * @sizeOf(f16)) * 2 + // k, v
+        amf.align64(m_cap * @as(usize, q_dim) * @sizeOf(f16)) + // q_pool
+        amf.align64(m_cap * @as(usize, o_in_dim) * @sizeOf(f16)) + // attn_pool
+        amf.align64(m_cap * @as(usize, kv_dim) * @sizeOf(f16)) + // k
+        amf.align64(m_cap * @as(usize, v_dim) * @sizeOf(f16)) + // v
         amf.align64(m_cap * @as(usize, config.intermediate_size) * @sizeOf(f16)) * 3 + // mlp gate/up/act
         amf.align64(m_cap * @as(usize, config.draft_vocab_size) * @sizeOf(f16)) + // logits
         amf.align64(m_cap * MAX_DRAFT_TOP_K * @sizeOf(moe.TopKCandidate)) + // topk
         gqa_tree_bytes +
+        kv_ring_k_bytes +
+        kv_ring_v_bytes +
         num_layers * kv_tbl_per_layer +
-        2 * num_layers * tree_kv_layer_stride +
+        num_layers * tree_kv_layer_stride +
+        num_layers * tree_v_layer_stride +
         8 * page.APPLE_PAGE_SIZE;
     const scratch_arena_bytes = try page.alignUp(scratch_raw);
 
     const kv_tile_rows: u32 = config.num_key_value_heads * options.chunk_tokens;
-    const kv_tile_alloc_bytes: u64 = try page.alignUp(@as(usize, kv_tile_rows) * config.head_dim * @sizeOf(f16));
-    const total_kv_tiles: usize = num_layers * @as(usize, num_chunks) * 2;
+    const kv_tile_alloc_bytes: u64 = if (use_custom_attn) 0 else try page.alignUp(@as(usize, kv_tile_rows) * config.head_dim * @sizeOf(f16));
+    const total_kv_tiles: usize = if (use_custom_attn) 0 else num_layers * @as(usize, num_chunks) * 2;
     const total_kv_bytes: u64 = @as(u64, total_kv_tiles) * kv_tile_alloc_bytes;
     const total_wired_bytes: u64 = @as(u64, weights_arena_bytes) + scratch_arena_bytes + total_kv_bytes;
 
@@ -2664,24 +3336,34 @@ fn loadInternal(
     const scratch_buf = try metal.Buffer.wrap(target.device, scratch_arena.bytes());
     errdefer scratch_buf.close();
 
-    const kv_tiles = try allocator.alloc(metal.KvTile, total_kv_tiles);
+    const kv_tiles: []metal.KvTile = if (total_kv_tiles > 0) try allocator.alloc(metal.KvTile, total_kv_tiles) else &.{};
     var tiles_inited: usize = 0;
     errdefer {
         for (0..tiles_inited) |i| kv_tiles[i].close();
-        allocator.free(kv_tiles);
+        if (kv_tiles.len > 0) allocator.free(kv_tiles);
     }
     for (0..total_kv_tiles) |i| {
         kv_tiles[i] = try metal.KvTile.init(target.device, config.head_dim, kv_tile_rows, .{});
         tiles_inited += 1;
     }
 
+    var mtp_pipes: ?MtpAttnPipelines = null;
+    errdefer if (mtp_pipes) |mp| mp.close();
+    if (use_custom_attn) {
+        mtp_pipes = try MtpAttnPipelines.init(target.device, target.library);
+    }
+
     try target.compute.makeResident(&.{ weights_buf, scratch_buf });
     errdefer target.compute.removeResident(&.{ weights_buf, scratch_buf }) catch |err| {
         std.debug.panic("removeResident failed in DraftHead errdefer: {}", .{err});
     };
-    try target.compute.makeTilesResident(kv_tiles);
-    errdefer target.compute.removeTilesResident(kv_tiles) catch |err| {
-        std.debug.panic("removeTilesResident failed in DraftHead errdefer: {}", .{err});
+    if (kv_tiles.len > 0) {
+        try target.compute.makeTilesResident(kv_tiles);
+    }
+    errdefer if (kv_tiles.len > 0) {
+        target.compute.removeTilesResident(kv_tiles) catch |err| {
+            std.debug.panic("removeTilesResident failed in DraftHead errdefer: {}", .{err});
+        };
     };
 
     // M8.1 (`G23`): compile optional `QuantFormatPipelines` strictly for any non-legacy
@@ -2738,8 +3420,10 @@ fn loadInternal(
     const tok_raw = try scratch_arena.allocAligned(m_cap * @sizeOf(u32), 64);
     const par_raw = try scratch_arena.allocAligned(m_cap * @sizeOf(u32), 64);
     const pos_raw = try scratch_arena.allocAligned(m_cap * @sizeOf(u32), 64);
+    const pos_pool_raw = try scratch_arena.allocAligned(m_cap * @sizeOf(u32), 64);
     const msk_raw = try scratch_arena.allocAligned(m_cap * @sizeOf(u64), 64);
     const hp_raw = try scratch_arena.allocAligned((1 + m_cap) * @as(usize, h) * @sizeOf(f16), 64);
+    const stage_prev_raw = try scratch_arena.allocAligned(MAX_MTP_STAGES * @as(usize, h) * @sizeOf(f16), 64);
     const hin_raw = try scratch_arena.allocAligned(m_cap * @as(usize, h) * @sizeOf(f16), 64);
     const emb_raw = try scratch_arena.allocAligned(m_cap * @as(usize, h) * @sizeOf(f16), 64);
     const en_raw = try scratch_arena.allocAligned(m_cap * @as(usize, h) * @sizeOf(f16), 64);
@@ -2749,8 +3433,8 @@ fn loadInternal(
     const xn_raw = try scratch_arena.allocAligned(m_cap * @as(usize, h) * @sizeOf(f16), 64);
     const qp_raw = try scratch_arena.allocAligned(m_cap * @as(usize, q_dim) * @sizeOf(f16), 64);
     const k_raw = try scratch_arena.allocAligned(m_cap * @as(usize, kv_dim) * @sizeOf(f16), 64);
-    const v_raw = try scratch_arena.allocAligned(m_cap * @as(usize, kv_dim) * @sizeOf(f16), 64);
-    const ap_raw = try scratch_arena.allocAligned(m_cap * @as(usize, q_dim) * @sizeOf(f16), 64);
+    const v_raw = try scratch_arena.allocAligned(m_cap * @as(usize, v_dim) * @sizeOf(f16), 64);
+    const ap_raw = try scratch_arena.allocAligned(m_cap * @as(usize, o_in_dim) * @sizeOf(f16), 64);
     const po_raw = try scratch_arena.allocAligned(m_cap * @as(usize, h) * @sizeOf(f16), 64);
     const mg_raw = try scratch_arena.allocAligned(m_cap * @as(usize, config.intermediate_size) * @sizeOf(f16), 64);
     const mu_raw = try scratch_arena.allocAligned(m_cap * @as(usize, config.intermediate_size) * @sizeOf(f16), 64);
@@ -2758,14 +3442,22 @@ fn loadInternal(
     const log_raw = try scratch_arena.allocAligned(m_cap * @as(usize, config.draft_vocab_size) * @sizeOf(f16), 64);
     const tk_out_raw = try scratch_arena.allocAligned(m_cap * MAX_DRAFT_TOP_K * @sizeOf(moe.TopKCandidate), 64);
     const gqa_raw = try scratch_arena.allocAligned(gqa_tree_bytes, 64);
+    const kv_ring_k_raw = try scratch_arena.allocAligned(kv_ring_k_bytes, 64);
+    const kv_ring_v_raw = try scratch_arena.allocAligned(kv_ring_v_bytes, 64);
     const tree_k_raw = try scratch_arena.allocAligned(num_layers * tree_kv_layer_stride, 64);
-    const tree_v_raw = try scratch_arena.allocAligned(num_layers * tree_kv_layer_stride, 64);
+    const tree_v_raw = try scratch_arena.allocAligned(num_layers * tree_v_layer_stride, 64);
     @memset(tok_raw, 0);
     @memset(par_raw, 0);
     @memset(pos_raw, 0);
+    @memset(pos_pool_raw, 0);
     @memset(msk_raw, 0);
     @memset(hp_raw, 0);
+    @memset(stage_prev_raw, 0);
     @memset(tk_out_raw, 0);
+    if (use_custom_attn) {
+        @memset(kv_ring_k_raw, 0);
+        @memset(kv_ring_v_raw, 0);
+    }
 
     // --- 5. Load global draft weights ---
     var d2t_host: []const u32 = &.{};
@@ -2799,17 +3491,17 @@ fn loadInternal(
         break :blk fblob.asLinearBinding(fdt);
     } else null;
 
-    const enorm_b: ?qwen3.NormBinding = if (enorm_entry) |ee|
+    var enorm_b: ?qwen3.NormBinding = if (enorm_entry) |ee|
         (try loadBlobIntoArena(source, ee, &weights_arena, weights_buf, options.verify_crcs)).asNormBinding(try validateNorm1D(ee, h))
     else
         null;
-    const hnorm_b: ?qwen3.NormBinding = if (hnorm_entry) |he|
+    var hnorm_b: ?qwen3.NormBinding = if (hnorm_entry) |he|
         (try loadBlobIntoArena(source, he, &weights_arena, weights_buf, options.verify_crcs)).asNormBinding(try validateNorm1D(he, h))
     else
         null;
     var eh_blob_opt: ?LoadedBlob = null;
     var eh_dt_opt: ?quant.WeightDType = null;
-    const eh_proj_b: ?qwen3.LinearBinding = if (eh_proj_entry) |pe| blk: {
+    var eh_proj_b: ?qwen3.LinearBinding = if (eh_proj_entry) |pe| blk: {
         const edt = try validateLinear2D(pe, h, 2 * h);
         const eblob = try loadBlobIntoArena(source, pe, &weights_arena, weights_buf, options.verify_crcs);
         eh_blob_opt = eblob;
@@ -2817,22 +3509,66 @@ fn loadInternal(
         break :blk eblob.asLinearBinding(edt);
     } else null;
 
-    const final_norm_b = (try loadBlobIntoArena(source, final_norm_entry, &weights_arena, weights_buf, options.verify_crcs)).asNormBinding(final_norm_dt);
+    var final_norm_opt: ?qwen3.NormBinding = if (root_final_norm_entry) |fne|
+        (try loadBlobIntoArena(source, fne, &weights_arena, weights_buf, options.verify_crcs)).asNormBinding(try validateNorm1D(fne, h))
+    else
+        null;
 
     // --- 6. Load draft layer weights & build bindless KV tile tables ---
     const layers = try allocator.alloc(DraftLayerWeights, num_layers);
     errdefer allocator.free(layers);
+
+    var stage_eh_blobs: [MAX_MTP_STAGES]?LoadedBlob = @splat(null);
+    var stage_eh_dts: [MAX_MTP_STAGES]?quant.WeightDType = @splat(null);
 
     var l0_o_proj_blob: LoadedBlob = undefined;
     var l0_o_proj_dtype: quant.WeightDType = .bf16;
 
     for (0..num_layers) |l| {
         const qkv_in: u32 = if (config.format == .eagle3 and l == 0) 2 * h else h;
-        const kv_tbl_raw = try scratch_arena.allocAligned(@as(usize, num_chunks) * @sizeOf(attention.KvTilePair), 64);
-        const kv_tbl: []attention.KvTilePair = @alignCast(std.mem.bytesAsSlice(attention.KvTilePair, kv_tbl_raw));
-        for (0..num_chunks) |c_idx| {
-            const tbase = (l * @as(usize, num_chunks) + c_idx) * 2;
-            kv_tbl[c_idx] = attention.KvTilePair.fromTiles(kv_tiles[tbase], kv_tiles[tbase + 1], .rgba16f);
+        const kv_tbl_bind: metal.BufferBinding = if (!use_custom_attn) blk: {
+            const kv_tbl_raw = try scratch_arena.allocAligned(@as(usize, num_chunks) * @sizeOf(attention.KvTilePair), 64);
+            const kv_tbl: []attention.KvTilePair = @alignCast(std.mem.bytesAsSlice(attention.KvTilePair, kv_tbl_raw));
+            for (0..num_chunks) |c_idx| {
+                const tbase = (l * @as(usize, num_chunks) + c_idx) * 2;
+                kv_tbl[c_idx] = attention.KvTilePair.fromTiles(kv_tiles[tbase], kv_tiles[tbase + 1], .rgba16f);
+            }
+            break :blk .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(kv_tbl_raw.ptr) };
+        } else .{ .buffer = scratch_buf, .offset = 0 };
+
+        var stage_enorm_b: ?qwen3.NormBinding = null;
+        var stage_hnorm_b: ?qwen3.NormBinding = null;
+        var stage_eh_proj_b: ?qwen3.LinearBinding = null;
+        var stage_final_norm_b: ?qwen3.NormBinding = null;
+        if (chained_mtp) {
+            const sen_e = parsed.find(std.fmt.bufPrint(&name_buf, "layers.{d}.enorm.weight", .{l}) catch unreachable) orelse
+                try findRequired(parsed, "enorm.weight");
+            stage_enorm_b = (try loadBlobIntoArena(source, sen_e, &weights_arena, weights_buf, options.verify_crcs)).asNormBinding(try validateNorm1D(sen_e, h));
+
+            const shn_e = parsed.find(std.fmt.bufPrint(&name_buf, "layers.{d}.hnorm.weight", .{l}) catch unreachable) orelse
+                try findRequired(parsed, "hnorm.weight");
+            stage_hnorm_b = (try loadBlobIntoArena(source, shn_e, &weights_arena, weights_buf, options.verify_crcs)).asNormBinding(try validateNorm1D(shn_e, h));
+
+            const seh_e = findLinearOpt(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.eh_proj", .{l}) catch unreachable) orelse
+                try findLinearReq(parsed, "eh_proj");
+            const seh_dt = try validateLinear2D(seh_e, h, 2 * h);
+            const seh_blob = try loadBlobIntoArena(source, seh_e, &weights_arena, weights_buf, options.verify_crcs);
+            stage_eh_proj_b = seh_blob.asLinearBinding(seh_dt);
+            if (l < MAX_MTP_STAGES) {
+                stage_eh_blobs[l] = seh_blob;
+                stage_eh_dts[l] = seh_dt;
+            }
+            if (l == 0) {
+                enorm_b = stage_enorm_b;
+                hnorm_b = stage_hnorm_b;
+                eh_proj_b = stage_eh_proj_b;
+                eh_blob_opt = seh_blob;
+                eh_dt_opt = seh_dt;
+            }
+            if (parsed.find(std.fmt.bufPrint(&name_buf, "layers.{d}.final_layernorm.weight", .{l}) catch unreachable)) |sfn_e| {
+                stage_final_norm_b = (try loadBlobIntoArena(source, sfn_e, &weights_arena, weights_buf, options.verify_crcs)).asNormBinding(try validateNorm1D(sfn_e, h));
+                if (final_norm_opt == null) final_norm_opt = stage_final_norm_b;
+            }
         }
 
         const in_ln_e = try findRequired(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.input_layernorm.weight", .{l}) catch unreachable);
@@ -2850,10 +3586,10 @@ fn loadInternal(
         const k_b = (try loadBlobIntoArena(source, k_e, &weights_arena, weights_buf, options.verify_crcs)).asLinearBinding(try validateLinear2D(k_e, kv_dim, qkv_in));
 
         const v_e = try findLinearReq(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.self_attn.v_proj", .{l}) catch unreachable);
-        const v_b = (try loadBlobIntoArena(source, v_e, &weights_arena, weights_buf, options.verify_crcs)).asLinearBinding(try validateLinear2D(v_e, kv_dim, qkv_in));
+        const v_b = (try loadBlobIntoArena(source, v_e, &weights_arena, weights_buf, options.verify_crcs)).asLinearBinding(try validateLinear2D(v_e, v_dim, qkv_in));
 
         const o_e = try findLinearReq(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.self_attn.o_proj", .{l}) catch unreachable);
-        const o_dt = try validateLinear2D(o_e, h, q_dim);
+        const o_dt = try validateLinear2D(o_e, h, o_in_dim);
         const o_blob = try loadBlobIntoArena(source, o_e, &weights_arena, weights_buf, options.verify_crcs);
         const o_b = o_blob.asLinearBinding(o_dt);
         if (l == 0) {
@@ -2872,7 +3608,14 @@ fn loadInternal(
             k_norm_bind = (try loadBlobIntoArena(source, kn_e, &weights_arena, weights_buf, options.verify_crcs)).asBinding();
         }
 
-        const pln_e = try findRequired(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.post_attention_layernorm.weight", .{l}) catch unreachable);
+        var sink_bias_bind: ?metal.BufferBinding = null;
+        var sink_bias_dtype: u32 = 1;
+        if (findLayerSinkOpt(parsed, l, &name_buf)) |se| {
+            sink_bias_dtype = try validateSink1D(se, config.num_attention_heads);
+            sink_bias_bind = (try loadBlobIntoArena(source, se, &weights_arena, weights_buf, options.verify_crcs)).asBinding();
+        }
+
+        const pln_e = try findLayerPostNormReq(parsed, l, &name_buf);
         const pln_b = (try loadBlobIntoArena(source, pln_e, &weights_arena, weights_buf, options.verify_crcs)).asNormBinding(try validateNorm1D(pln_e, h));
 
         const gp_e = try findLinearReq(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.gate_proj", .{l}) catch unreachable);
@@ -2887,6 +3630,10 @@ fn loadInternal(
         layers[l] = .{
             .input_layernorm = in_ln_b,
             .hidden_norm = hid_ln_b,
+            .stage_enorm = stage_enorm_b,
+            .stage_hnorm = stage_hnorm_b,
+            .stage_eh_proj = stage_eh_proj_b,
+            .stage_final_norm = stage_final_norm_b,
             .q_proj = q_b,
             .k_proj = k_b,
             .v_proj = v_b,
@@ -2894,13 +3641,17 @@ fn loadInternal(
             .q_norm = q_norm_bind,
             .k_norm = k_norm_bind,
             .qk_norm_dtype = qk_norm_dtype,
+            .sink_bias = sink_bias_bind,
+            .sink_bias_dtype = sink_bias_dtype,
             .post_attention_layernorm = pln_b,
             .gate_proj = gp_b,
             .up_proj = up_b,
             .down_proj = dp_b,
-            .kv_tiles_binding = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(kv_tbl_raw.ptr) },
+            .kv_tiles_binding = kv_tbl_bind,
         };
     }
+
+    const final_norm_b = final_norm_opt orelse return error.MissingTensor;
 
     // --- 7. D5 + D13 Benchmark-Gated Placement (`auto`, `gpu`, `ane`, `sme2`, ADR-0008, ADR-0019) ---
     var effective_placement: Placement = .gpu;
@@ -2911,6 +3662,14 @@ fn loadInternal(
         sp.deinit(allocator);
         allocator.destroy(sp);
     };
+    var extra_stage_sme_projs: [MAX_MTP_STAGES]?*SmeProjectionRuntime = @splat(null);
+    errdefer for (&extra_stage_sme_projs) |*slot| {
+        if (slot.*) |sp| {
+            sp.deinit(allocator);
+            allocator.destroy(sp);
+            slot.* = null;
+        }
+    };
     var gate_ane_us: f64 = 0.0;
     var gate_gpu_us: f64 = 0.0;
     var gate_sme2_us: f64 = 0.0;
@@ -2920,7 +3679,7 @@ fn loadInternal(
     const dev_info = try target.device.info();
     const can_ane = (dev_info.aneCoreCount() > 0) and
         (l0_o_proj_dtype == .f16 or l0_o_proj_dtype == .bf16) and
-        (q_dim % metal.KV_TILE_ROW_ALIGN_F16 == 0) and
+        (o_in_dim % metal.KV_TILE_ROW_ALIGN_F16 == 0) and
         (h % metal.KV_TILE_ROW_ALIGN_F16 == 0);
 
     // Prepare candidate D13 L2-resident (`<= 16 MiB`) SME2 projection for `fc` or `eh_proj`.
@@ -2979,14 +3738,14 @@ fn loadInternal(
     } else if (options.placement == .ane and can_ane) {
         const wf16 = try convertWeightBlobToF16(allocator, l0_o_proj_blob, l0_o_proj_dtype);
         defer allocator.free(wf16);
-        ane_proj = try AneProjection.init(allocator, target.device, &target.compute, q_dim, h, ANE_MAX_BATCH_ROWS, wf16);
+        ane_proj = try AneProjection.init(allocator, target.device, &target.compute, o_in_dim, h, ANE_MAX_BATCH_ROWS, wf16);
         effective_placement = .ane;
     } else if (options.placement == .auto) {
         var best_us: f64 = std.math.inf(f64);
         if (can_ane) {
             const wf16 = try convertWeightBlobToF16(allocator, l0_o_proj_blob, l0_o_proj_dtype);
             defer allocator.free(wf16);
-            var probe_ap = try AneProjection.init(allocator, target.device, &target.compute, q_dim, h, 1, wf16);
+            var probe_ap = try AneProjection.init(allocator, target.device, &target.compute, o_in_dim, h, 1, wf16);
             const cal = try calibrateD5Placement(
                 target,
                 &probe_ap,
@@ -3001,7 +3760,7 @@ fn loadInternal(
             effective_placement = cal.winner;
             best_us = @min(cal.ane_us, cal.gpu_us);
             if (effective_placement == .ane) {
-                ane_proj = try AneProjection.init(allocator, target.device, &target.compute, q_dim, h, ANE_MAX_BATCH_ROWS, wf16);
+                ane_proj = try AneProjection.init(allocator, target.device, &target.compute, o_in_dim, h, ANE_MAX_BATCH_ROWS, wf16);
             }
         }
         if (sme_proj) |sp| {
@@ -3044,6 +3803,30 @@ fn loadInternal(
         sme_proj = null;
     }
 
+    // For chained MTP under D13 SME2, opportunistically keep stage `k >= 1` `eh_proj`
+    // L2-resident as long as cumulative SME2 draft projection weights fit the 16 MiB L2 cap.
+    if (chained_mtp and effective_placement == .cpu_sme2 and sme_proj != null) {
+        var cum_sme_bytes: usize = sme2_proj_bytes;
+        for (1..@min(num_layers, MAX_MTP_STAGES)) |l| {
+            if (stage_eh_blobs[l] != null and stage_eh_dts[l] != null) {
+                const candidate = try tryInitSmeProjectionRuntime(allocator, stage_eh_blobs[l].?, stage_eh_dts[l].?, .mtp_eh_proj, options.max_tree_slots, draft_budget);
+                if (candidate) |csp| {
+                    if (cum_sme_bytes + csp.weight_bytes <= sme.MAX_L2_DRAFT_PROJ_BYTES and
+                        target.total_wired_bytes + wired_total_out + csp.totalWiredBytes() <= target.wired_budget_bytes)
+                    {
+                        extra_stage_sme_projs[l] = csp;
+                        cum_sme_bytes += csp.weight_bytes;
+                        wired_total_out += csp.totalWiredBytes();
+                    } else {
+                        csp.deinit(allocator);
+                        allocator.destroy(csp);
+                    }
+                }
+            }
+        }
+        sme2_proj_bytes = cum_sme_bytes;
+    }
+
     return .{
         .config = config,
         .requested_placement = options.placement,
@@ -3076,9 +3859,18 @@ fn loadInternal(
         .final_norm = final_norm_b,
         .ane_proj = ane_proj,
         .sme_proj = sme_proj,
+        .extra_stage_sme_projs = extra_stage_sme_projs,
+        .use_custom_attn = use_custom_attn,
+        .kv_ring_cap = kv_ring_cap,
+        .mtp_pipes = mtp_pipes,
+        .kv_ring_k_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(kv_ring_k_raw.ptr) },
+        .kv_ring_v_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(kv_ring_v_raw.ptr) },
+        .stage_h_prev_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(stage_prev_raw.ptr) },
+        .stage_tree_slots_mask = @splat(0),
         .token_ids_host = @alignCast(std.mem.bytesAsSlice(u32, tok_raw)),
         .parent_slots_host = @alignCast(std.mem.bytesAsSlice(u32, par_raw)),
         .positions_host = @alignCast(std.mem.bytesAsSlice(u32, pos_raw)),
+        .positions_pool_host = @alignCast(std.mem.bytesAsSlice(u32, pos_pool_raw)),
         .ancestor_masks_host = @alignCast(std.mem.bytesAsSlice(u64, msk_raw)),
         .topk_host = @alignCast(std.mem.bytesAsSlice(moe.TopKCandidate, tk_out_raw)),
         .hidden_pool_host = @alignCast(std.mem.bytesAsSlice(f16, hp_raw)),
@@ -3088,6 +3880,7 @@ fn loadInternal(
         .token_ids_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(tok_raw.ptr) },
         .parent_slots_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(par_raw.ptr) },
         .positions_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(pos_raw.ptr) },
+        .positions_pool_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(pos_pool_raw.ptr) },
         .ancestor_masks_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(msk_raw.ptr) },
         .hidden_pool_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(hp_raw.ptr) },
         .h_in_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(hin_raw.ptr) },
@@ -3111,6 +3904,7 @@ fn loadInternal(
         .tree_k_base_off = scratch_arena.offsetOf(tree_k_raw.ptr),
         .tree_v_base_off = scratch_arena.offsetOf(tree_v_raw.ptr),
         .tree_kv_layer_stride = tree_kv_layer_stride,
+        .tree_v_layer_stride = tree_v_layer_stride,
         .root_top_k_count = 0,
         .root_candidates = undefined,
         .qf_pipes = draft_qf_pipes,
@@ -3167,9 +3961,11 @@ pub fn buildSyntheticDraftAmfImage(allocator: std.mem.Allocator, cfg: DraftConfi
     const h_tgt = cfg.target_hidden_size;
     const q_dim = cfg.qDim();
     const kv_dim = cfg.kvDim();
+    const v_dim = cfg.vDim();
+    const o_in_dim = cfg.oInDim();
     const inter = cfg.intermediate_size;
     const inv_h = 0.5 / @sqrt(@as(f32, @floatFromInt(h)));
-    const inv_q = 0.5 / @sqrt(@as(f32, @floatFromInt(q_dim)));
+    const inv_o = 0.5 / @sqrt(@as(f32, @floatFromInt(o_in_dim)));
     const inv_i = 0.5 / @sqrt(@as(f32, @floatFromInt(inter)));
     var tidx: u64 = 1;
 
@@ -3225,18 +4021,30 @@ pub fn buildSyntheticDraftAmfImage(allocator: std.mem.Allocator, cfg: DraftConfi
             tidx += 1;
         },
         .mtp => {
-            try add1d(allocator, &recs, "enorm.weight", h, seed + tidx);
-            tidx += 1;
-            try add1d(allocator, &recs, "hnorm.weight", h, seed + tidx);
-            tidx += 1;
-            try add2d(allocator, &recs, "eh_proj.weight", .dense, h, 2 * h, 0.5 / @sqrt(@as(f32, @floatFromInt(2 * h))), seed + tidx);
-            tidx += 1;
+            if (!cfg.mtp_chained) {
+                try add1d(allocator, &recs, "enorm.weight", h, seed + tidx);
+                tidx += 1;
+                try add1d(allocator, &recs, "hnorm.weight", h, seed + tidx);
+                tidx += 1;
+                try add2d(allocator, &recs, "eh_proj.weight", .dense, h, 2 * h, 0.5 / @sqrt(@as(f32, @floatFromInt(2 * h))), seed + tidx);
+                tidx += 1;
+            }
         },
         .l1_only, .small_draft, .self_recurrent, .dspark, .dflare, .dfly2 => unreachable,
     }
 
     var nbuf: [64]u8 = undefined;
     for (0..cfg.num_hidden_layers) |l| {
+        if (cfg.format == .mtp and cfg.mtp_chained) {
+            try add1d(allocator, &recs, std.fmt.bufPrint(&nbuf, "layers.{d}.enorm.weight", .{l}) catch unreachable, h, seed + tidx);
+            tidx += 1;
+            try add1d(allocator, &recs, std.fmt.bufPrint(&nbuf, "layers.{d}.hnorm.weight", .{l}) catch unreachable, h, seed + tidx);
+            tidx += 1;
+            try add2d(allocator, &recs, std.fmt.bufPrint(&nbuf, "layers.{d}.eh_proj.weight", .{l}) catch unreachable, .dense, h, 2 * h, 0.5 / @sqrt(@as(f32, @floatFromInt(2 * h))), seed + tidx);
+            tidx += 1;
+            try add1d(allocator, &recs, std.fmt.bufPrint(&nbuf, "layers.{d}.final_layernorm.weight", .{l}) catch unreachable, h, seed + tidx);
+            tidx += 1;
+        }
         const qkv_in: u32 = if (cfg.format == .eagle3 and l == 0) 2 * h else h;
         const inv_qkv = 0.5 / @sqrt(@as(f32, @floatFromInt(qkv_in)));
         try add1d(allocator, &recs, std.fmt.bufPrint(&nbuf, "layers.{d}.input_layernorm.weight", .{l}) catch unreachable, h, seed + tidx);
@@ -3249,14 +4057,22 @@ pub fn buildSyntheticDraftAmfImage(allocator: std.mem.Allocator, cfg: DraftConfi
         tidx += 1;
         try add2d(allocator, &recs, std.fmt.bufPrint(&nbuf, "layers.{d}.self_attn.k_proj.weight", .{l}) catch unreachable, .dense, kv_dim, qkv_in, inv_qkv, seed + tidx);
         tidx += 1;
-        try add2d(allocator, &recs, std.fmt.bufPrint(&nbuf, "layers.{d}.self_attn.v_proj.weight", .{l}) catch unreachable, .dense, kv_dim, qkv_in, inv_qkv, seed + tidx);
+        try add2d(allocator, &recs, std.fmt.bufPrint(&nbuf, "layers.{d}.self_attn.v_proj.weight", .{l}) catch unreachable, .dense, v_dim, qkv_in, inv_qkv, seed + tidx);
         tidx += 1;
-        try add2d(allocator, &recs, std.fmt.bufPrint(&nbuf, "layers.{d}.self_attn.o_proj.weight", .{l}) catch unreachable, .dense, h, q_dim, inv_q, seed + tidx);
+        try add2d(allocator, &recs, std.fmt.bufPrint(&nbuf, "layers.{d}.self_attn.o_proj.weight", .{l}) catch unreachable, .dense, h, o_in_dim, inv_o, seed + tidx);
         tidx += 1;
-        if (cfg.format == .mtp) {
+        if (cfg.format == .mtp and !cfg.mtp_chained) {
             try add1d(allocator, &recs, std.fmt.bufPrint(&nbuf, "layers.{d}.self_attn.q_norm.weight", .{l}) catch unreachable, cfg.head_dim, seed + tidx);
             tidx += 1;
             try add1d(allocator, &recs, std.fmt.bufPrint(&nbuf, "layers.{d}.self_attn.k_norm.weight", .{l}) catch unreachable, cfg.head_dim, seed + tidx);
+            tidx += 1;
+        }
+        if (cfg.add_swa_attention_sink_bias) {
+            const nm = try allocator.dupe(u8, std.fmt.bufPrint(&nbuf, "layers.{d}.self_attn.sink_bias", .{l}) catch unreachable);
+            errdefer allocator.free(nm);
+            const sdata = try fillBf16(allocator, cfg.num_attention_heads, 1.5, false, seed + tidx);
+            errdefer allocator.free(sdata);
+            try recs.append(allocator, .{ .name = nm, .kind = .norm, .dtype = .bf16, .shape = .{ cfg.num_attention_heads, 0, 0, 0 }, .rank = 1, .data = sdata });
             tidx += 1;
         }
         try add1d(allocator, &recs, std.fmt.bufPrint(&nbuf, "layers.{d}.post_attention_layernorm.weight", .{l}) catch unreachable, h, seed + tidx);
@@ -3269,9 +4085,11 @@ pub fn buildSyntheticDraftAmfImage(allocator: std.mem.Allocator, cfg: DraftConfi
         tidx += 1;
     }
 
-    const fn_name = if (cfg.format == .mtp) "shared_head.norm.weight" else "norm.weight";
-    try add1d(allocator, &recs, fn_name, h, seed + tidx);
-    tidx += 1;
+    if (!(cfg.format == .mtp and cfg.mtp_chained)) {
+        const fn_name = if (cfg.format == .mtp) "shared_head.norm.weight" else "norm.weight";
+        try add1d(allocator, &recs, fn_name, h, seed + tidx);
+        tidx += 1;
+    }
     if (!cfg.share_lm_head) {
         try add2d(allocator, &recs, "lm_head.weight", .lm_head, cfg.draft_vocab_size, h, inv_h, seed + tidx);
     }
@@ -3939,4 +4757,156 @@ test "C16: D5 and D13 placement selectors are generation-agnostic across M1-M3, 
     // M5+ (has_sme2, has_nax): when faster GPU beats both ANE and SME2, routes cleanly to .gpu.
     try std.testing.expectEqual(Placement.gpu, selectAutoPlacement(true, 28.0, 9.0, true, false, 12.0));
     try std.testing.expectEqual(Placement.cpu_sme2, selectAutoPlacement(true, 28.0, 14.0, true, true, 11.0));
+}
+
+test "M9.1 D15 chained 3L native MTP (K=192, V=128, rope_dim=64, SWA, v_scale=0.707, sink_bias) multi-stage and D13 SME2 parity" {
+    const allocator = std.testing.allocator;
+
+    // 1. Verify DraftConfig.fromJson parses MiMo-V2.6 chained 3L MTP schema accurately.
+    const mimo_mtp_json =
+        \\{
+        \\  "format": "mtp",
+        \\  "mtp_chained": true,
+        \\  "vocab_size": 151936,
+        \\  "hidden_size": 4096,
+        \\  "intermediate_size": 16384,
+        \\  "num_nextn_predict_layers": 3,
+        \\  "num_attention_heads": 64,
+        \\  "num_key_value_heads": 8,
+        \\  "head_dim": 192,
+        \\  "v_head_dim": 128,
+        \\  "partial_rotary_factor": 0.3333333333333333,
+        \\  "rope_theta": 10000.0,
+        \\  "sliding_window_size": 128,
+        \\  "attention_value_scale": 0.70710678,
+        \\  "add_swa_attention_sink_bias": true,
+        \\  "rms_norm_eps": 1e-6
+        \\}
+    ;
+    const parsed_cfg = try DraftConfig.fromJson(allocator, mimo_mtp_json);
+    try std.testing.expectEqual(DraftMode.mtp, parsed_cfg.format);
+    try std.testing.expect(parsed_cfg.mtp_chained);
+    try std.testing.expectEqual(@as(u32, 3), parsed_cfg.num_hidden_layers);
+    try std.testing.expectEqual(@as(u32, 192), parsed_cfg.head_dim);
+    try std.testing.expectEqual(@as(u32, 128), parsed_cfg.effectiveVHeadDim());
+    try std.testing.expectEqual(@as(u32, 64), parsed_cfg.effectiveRopeDim());
+    try std.testing.expectEqual(@as(u32, 128), parsed_cfg.sliding_window);
+    try std.testing.expect(parsed_cfg.add_swa_attention_sink_bias);
+    try std.testing.expect(parsed_cfg.usesCustomMtpAttn());
+
+    // 2. Build synthetic target + chained 3L native MTP with asymmetric K=192/V=128, partial RoPE=64,
+    //    sliding_window=8, attention_value_scale=0.707, and sink_bias.
+    const tgt_cfg: qwen3.ModelConfig = .{
+        .arch = .qwen3_dense,
+        .vocab_size = 128,
+        .hidden_size = 128,
+        .num_hidden_layers = 2,
+        .num_attention_heads = 2,
+        .num_key_value_heads = 1,
+        .head_dim = 64,
+        .intermediate_size = 256,
+        .rope_theta = 10_000.0,
+        .rms_norm_eps = 1e-6,
+        .tie_word_embeddings = true,
+    };
+    const tgt_img = try buildSyntheticTargetBf16ForTest(allocator, tgt_cfg, 91015);
+    defer allocator.free(tgt_img);
+
+    var target = try qwen3.Qwen3Model.loadFromBytes(allocator, tgt_img, tgt_cfg, .{
+        .max_seq_len = 64,
+        .max_tree_nodes = 16,
+        .enable_feature_taps = true,
+    });
+    defer target.deinit(allocator);
+
+    const mtp3_cfg: DraftConfig = .{
+        .format = .mtp,
+        .mtp_chained = true,
+        .vocab_size = 128,
+        .draft_vocab_size = 128,
+        .hidden_size = 128,
+        .target_hidden_size = 128,
+        .num_hidden_layers = 3,
+        .num_attention_heads = 2,
+        .num_key_value_heads = 1,
+        .head_dim = 192,
+        .v_head_dim = 128,
+        .rope_dim = 64,
+        .sliding_window = 8,
+        .attention_value_scale = 0.70710678,
+        .add_swa_attention_sink_bias = true,
+        .intermediate_size = 256,
+        .rope_theta = 10_000.0,
+        .share_embed_tokens = true,
+        .share_lm_head = true,
+    };
+    const mtp3_img = try buildSyntheticDraftAmfImage(allocator, mtp3_cfg, 91016);
+    defer allocator.free(mtp3_img);
+
+    var dh_gpu = try DraftHead.loadFromBytes(allocator, &target, mtp3_img, mtp3_cfg, .{
+        .placement = .gpu,
+        .max_seq_len = 64,
+        .max_tree_slots = 16,
+    });
+    defer dh_gpu.deinit(allocator, &target);
+
+    var dh_sme = try DraftHead.loadFromBytes(allocator, &target, mtp3_img, mtp3_cfg, .{
+        .placement = .cpu_sme2,
+        .max_seq_len = 64,
+        .max_tree_slots = 16,
+    });
+    defer dh_sme.deinit(allocator, &target);
+
+    try std.testing.expect(dh_gpu.isChainedMtp());
+    try std.testing.expectEqual(@as(usize, 3), dh_gpu.numMtpStages());
+    try std.testing.expect(dh_gpu.use_custom_attn);
+    try std.testing.expectEqual(Placement.cpu_sme2, dh_sme.effective_placement);
+    try std.testing.expect(dh_sme.sme2_proj_bytes <= sme.MAX_L2_DRAFT_PROJ_BYTES);
+    try std.testing.expect(dh_sme.extra_stage_sme_projs[1] != null);
+
+    // 3. Prefill 10 tokens (exceeding sliding_window=8 to test SWA ring wraparound), sync all 3 stages!
+    const prompt = [_]u32{ 3, 11, 27, 45, 62, 7, 19, 33, 51, 88 };
+    _ = try target.prefillChunk(&prompt, 0, true);
+    try dh_gpu.syncAccepted(&target, &prompt, target.accepted_top_bind, 0, 4);
+    try dh_sme.syncAccepted(&target, &prompt, target.accepted_top_bind, 0, 4);
+
+    try std.testing.expectEqual(@as(u32, prompt.len), dh_gpu.seq_len);
+    try std.testing.expectEqual(@as(u32, 4), dh_gpu.root_top_k_count);
+    try std.testing.expectEqual(dh_gpu.rootCandidates()[0].token_id, dh_sme.rootCandidates()[0].token_id);
+    try std.testing.expect(std.math.isFinite(dh_gpu.rootCandidates()[0].prob) and dh_gpu.rootCandidates()[0].prob > 0.0);
+
+    // 4. Chain Stage 1 (depth 1 -> depth 2) and Stage 2 (depth 2 -> depth 3) on both GPU & SME2!
+    const d1_toks = [_]u32{ dh_gpu.rootCandidates()[0].token_id, dh_gpu.rootCandidates()[1].token_id };
+    const d1_parents = [_]u32{ 0, 0 };
+    const d1_pos = [_]u32{ prompt.len, prompt.len };
+    var masks = [_]u64{ 0b0001, 0b0010, 0b0101, 0b1010 };
+    var cands_gpu_s1: [2 * 4]moe.TopKCandidate = undefined;
+    var cands_sme_s1: [2 * 4]moe.TopKCandidate = undefined;
+    try dh_gpu.stepTreeBatchForStage(&target, 1, &d1_toks, &d1_parents, &d1_pos, masks[0..2], 0, 4, &cands_gpu_s1);
+    try dh_sme.stepTreeBatchForStage(&target, 1, &d1_toks, &d1_parents, &d1_pos, masks[0..2], 0, 4, &cands_sme_s1);
+    try std.testing.expectEqual(cands_gpu_s1[0].token_id, cands_sme_s1[0].token_id);
+    try std.testing.expectEqual(cands_gpu_s1[4].token_id, cands_sme_s1[4].token_id);
+    try std.testing.expect(std.math.isFinite(cands_gpu_s1[0].prob) and cands_gpu_s1[0].prob > 0.0);
+
+    const d2_toks = [_]u32{ cands_gpu_s1[0].token_id, cands_gpu_s1[4].token_id };
+    const d2_parents = [_]u32{ 1, 2 }; // hidden_pool[1 + slot_idx] from Stage 1
+    const d2_pos = [_]u32{ prompt.len + 1, prompt.len + 1 };
+    var cands_gpu_s2: [2 * 4]moe.TopKCandidate = undefined;
+    var cands_sme_s2: [2 * 4]moe.TopKCandidate = undefined;
+    try dh_gpu.stepTreeBatchForStage(&target, 2, &d2_toks, &d2_parents, &d2_pos, masks[0..4], 2, 4, &cands_gpu_s2);
+    try dh_sme.stepTreeBatchForStage(&target, 2, &d2_toks, &d2_parents, &d2_pos, masks[0..4], 2, 4, &cands_sme_s2);
+    try std.testing.expectEqual(cands_gpu_s2[0].token_id, cands_sme_s2[0].token_id);
+    try std.testing.expectEqual(cands_gpu_s2[4].token_id, cands_sme_s2[4].token_id);
+    try std.testing.expect(dh_sme.sme2_eval_count >= 3);
+
+    // 5. Commit a 1-token accepted follow-up (exercises stage_h_prev_bind across rounds!) and reset.
+    const next_tok = [_]u32{d1_toks[0]};
+    _ = try target.stepDecode(next_tok[0], prompt.len);
+    try dh_gpu.syncAccepted(&target, &next_tok, target.accepted_top_bind, prompt.len, 4);
+    try dh_sme.syncAccepted(&target, &next_tok, target.accepted_top_bind, prompt.len, 4);
+    try std.testing.expectEqual(@as(u32, prompt.len + 1), dh_gpu.seq_len);
+    try std.testing.expectEqual(dh_gpu.rootCandidates()[0].token_id, dh_sme.rootCandidates()[0].token_id);
+
+    dh_gpu.reset();
+    try std.testing.expectEqual(@as(u32, 0), dh_gpu.seq_len);
 }

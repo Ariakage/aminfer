@@ -56,7 +56,7 @@ struct DFlareQkNormRopeParams {
     uint anchor_pos;
     uint has_q_norm;
     uint has_k_norm;
-    uint _pad0;
+    uint rope_dim; // 0 => full head_dim; >0 => partial NeoX RoPE over [0..rope_dim)
     float rms_eps;
     float rope_theta;
     uint _pad1;
@@ -74,7 +74,7 @@ struct DFlareCtxKvStoreParams {
     uint rope_zero_pos;
     float rms_eps;
     float rope_theta;
-    uint _pad0;
+    uint rope_dim; // 0 => full head_dim; >0 => partial NeoX RoPE over [0..rope_dim)
     uint _pad1;
 };
 
@@ -85,6 +85,66 @@ struct DFlareBlockGqaParams {
     uint num_kv_heads;
     uint head_dim;
     uint layer_elem_off;
+    float scale;
+    float v_scale;
+    uint max_ctx;
+    uint anchor_pos;
+    uint sliding_window;
+    uint has_sink_bias;
+};
+
+struct DFlarePackCtxTapsParams {
+    uint num_pos;
+    uint num_taps;
+    uint hidden_size;
+    uint taps_dtype; // 0 = f32, 1 = f16, 2 = bf16
+    uint ring_cap;
+    uint ring_start;
+    uint _pad0;
+    uint _pad1;
+};
+
+struct MtpTreeQkNormRopeParams {
+    uint num_nodes;
+    uint num_q_heads;
+    uint num_kv_heads;
+    uint head_dim;
+    uint v_head_dim;
+    uint rope_dim; // 0 => full head_dim
+    uint has_q_norm;
+    uint has_k_norm;
+    uint norm_dtype; // 0 = f16, 1 = bf16, 2 = f32
+    float rms_eps;
+    float rope_theta;
+    float v_scale;
+};
+
+struct MtpKvCommitParams {
+    uint num_nodes;
+    uint num_kv_heads;
+    uint head_dim;
+    uint v_head_dim;
+    uint base_pos;
+    uint kv_cap;
+    uint layer_k_elem_off;
+    uint layer_v_elem_off;
+};
+
+struct MtpGqaTreeAttnParams {
+    uint num_nodes;
+    uint slot_start;
+    uint q_count;
+    uint base_pos;
+    uint kv_cap;
+    uint sliding_window;
+    uint num_q_heads;
+    uint num_kv_heads;
+    uint head_dim;
+    uint v_head_dim;
+    uint layer_k_elem_off;
+    uint layer_v_elem_off;
+    uint has_sink_bias;
+    uint sink_dtype; // 0 = f16, 1 = bf16, 2 = f32
     float scale;
     uint _pad0;
 };
@@ -212,7 +272,11 @@ static_assert(sizeof(DFlareSeedBlockParams) == 32, "DFlareSeedBlockParams size")
 static_assert(sizeof(DFlareRmsNormParams) == 32, "DFlareRmsNormParams size");
 static_assert(sizeof(DFlareQkNormRopeParams) == 48, "DFlareQkNormRopeParams size");
 static_assert(sizeof(DFlareCtxKvStoreParams) == 48, "DFlareCtxKvStoreParams size");
-static_assert(sizeof(DFlareBlockGqaParams) == 32, "DFlareBlockGqaParams size");
+static_assert(sizeof(DFlareBlockGqaParams) == 48, "DFlareBlockGqaParams size");
+static_assert(sizeof(DFlarePackCtxTapsParams) == 32, "DFlarePackCtxTapsParams size");
+static_assert(sizeof(MtpTreeQkNormRopeParams) == 48, "MtpTreeQkNormRopeParams size");
+static_assert(sizeof(MtpKvCommitParams) == 32, "MtpKvCommitParams size");
+static_assert(sizeof(MtpGqaTreeAttnParams) == 64, "MtpGqaTreeAttnParams size");
 static_assert(sizeof(DFlareElemParams) == 16, "DFlareElemParams size");
 static_assert(sizeof(DFlareGemvF32Params) == 32, "DFlareGemvF32Params size");
 static_assert(sizeof(DFlareMarkovAssembleParams) == 48, "DFlareMarkovAssembleParams size");
@@ -480,11 +544,12 @@ kernel void dflare_rmsnorm_rows(const device uchar *x_raw [[buffer(0)]],
     }
 }
 
-// Helper for shared-memory per-head RMSNorm + NeoX RoPE (head_dim <= 256).
+// Helper for shared-memory per-head RMSNorm + optional partial NeoX RoPE (head_dim <= 256).
 static inline void dflare_head_norm_rope_tg(threadgroup float *tg_h,
                                             device half *head_ptr,
                                             const device float *norm_w,
                                             uint head_dim,
+                                            uint rope_dim,
                                             uint apply_norm,
                                             uint tok_pos,
                                             float rms_eps,
@@ -521,19 +586,23 @@ static inline void dflare_head_norm_rope_tg(threadgroup float *tg_h,
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    if (rope_theta > 0.0f) {
-        const uint half_hd = head_dim >> 1;
-        const float inv_hd = 2.0f / float(head_dim);
+    const uint eff_rope = (rope_dim > 0u && rope_dim <= head_dim) ? rope_dim : head_dim;
+    if (rope_theta > 0.0f && eff_rope >= 2u) {
+        const uint half_rot = eff_rope >> 1;
+        const float inv_rot = 2.0f / float(eff_rope);
         const float pos_f = float(tok_pos);
-        for (uint i = tid; i < half_hd; i += 128u) {
-            const float freq = 1.0f / pow(rope_theta, float(i) * inv_hd);
+        for (uint i = tid; i < half_rot; i += 128u) {
+            const float freq = 1.0f / pow(rope_theta, float(i) * inv_rot);
             const float angle = pos_f * freq;
             float c_val;
             const float s_val = sincos(angle, c_val);
             const float x0 = tg_h[i];
-            const float x1 = tg_h[i + half_hd];
+            const float x1 = tg_h[i + half_rot];
             head_ptr[i] = half(x0 * c_val - x1 * s_val);
-            head_ptr[i + half_hd] = half(x0 * s_val + x1 * c_val);
+            head_ptr[i + half_rot] = half(x0 * s_val + x1 * c_val);
+        }
+        for (uint d = eff_rope + tid; d < head_dim; d += 128u) {
+            head_ptr[d] = half(tg_h[d]);
         }
     } else {
         for (uint d = tid; d < head_dim; d += 128u) {
@@ -543,7 +612,7 @@ static inline void dflare_head_norm_rope_tg(threadgroup float *tg_h,
 }
 
 // ---------------------------------------------------------------------------
-// Kernel 5: Fused Q/K Per-Head RMSNorm + NeoX RoPE (`head_dim <= 256`)
+// Kernel 5: Fused Q/K Per-Head RMSNorm + Partial NeoX RoPE (`head_dim <= 256`)
 // Grid: (num_q_heads + num_kv_heads, seq_len, 1), TG: (128, 1, 1)
 // ---------------------------------------------------------------------------
 kernel void dflare_qk_norm_rope(device half *q_f16 [[buffer(0)]],
@@ -577,6 +646,7 @@ kernel void dflare_qk_norm_rope(device half *q_f16 [[buffer(0)]],
         head_ptr,
         norm_w,
         p.head_dim,
+        p.rope_dim,
         apply_norm,
         p.anchor_pos + seq_idx,
         p.rms_eps,
@@ -588,7 +658,7 @@ kernel void dflare_qk_norm_rope(device half *q_f16 [[buffer(0)]],
 }
 
 // ---------------------------------------------------------------------------
-// Kernel 6: Context K/V Per-Head Norm + NeoX RoPE + Circular Cache Store
+// Kernel 6: Context K/V Per-Head Norm + Partial NeoX RoPE + Circular Cache Store
 // Grid: (num_kv_heads, num_pos, 1), TG: (128, 1, 1)
 // ---------------------------------------------------------------------------
 kernel void dflare_ctx_kv_norm_rope_store(const device half *k_in [[buffer(0)]],
@@ -648,20 +718,24 @@ kernel void dflare_ctx_kv_norm_rope_store(const device half *k_in [[buffer(0)]],
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    if (p.rope_theta > 0.0f) {
-        const uint half_hd = p.head_dim >> 1;
-        const float inv_hd = 2.0f / float(p.head_dim);
+    const uint eff_rope = (p.rope_dim > 0u && p.rope_dim <= p.head_dim) ? p.rope_dim : p.head_dim;
+    if (p.rope_theta > 0.0f && eff_rope >= 2u) {
+        const uint half_rot = eff_rope >> 1;
+        const float inv_rot = 2.0f / float(eff_rope);
         const uint rope_pos = (p.rope_zero_pos != 0u) ? 0u : (p.start_pos + pos_idx);
         const float pos_f = float(rope_pos);
-        for (uint i = tid; i < half_hd; i += 128u) {
-            const float freq = 1.0f / pow(p.rope_theta, float(i) * inv_hd);
+        for (uint i = tid; i < half_rot; i += 128u) {
+            const float freq = 1.0f / pow(p.rope_theta, float(i) * inv_rot);
             const float angle = pos_f * freq;
             float c_val;
             const float s_val = sincos(angle, c_val);
             const float x0 = tg_h[i];
-            const float x1 = tg_h[i + half_hd];
+            const float x1 = tg_h[i + half_rot];
             ctx_k_cache[dst_off + i] = half(x0 * c_val - x1 * s_val);
-            ctx_k_cache[dst_off + i + half_hd] = half(x0 * s_val + x1 * c_val);
+            ctx_k_cache[dst_off + i + half_rot] = half(x0 * s_val + x1 * c_val);
+        }
+        for (uint d = eff_rope + tid; d < p.head_dim; d += 128u) {
+            ctx_k_cache[dst_off + d] = half(tg_h[d]);
         }
     } else {
         for (uint d = tid; d < p.head_dim; d += 128u) {
@@ -672,6 +746,8 @@ kernel void dflare_ctx_kv_norm_rope_store(const device half *k_in [[buffer(0)]],
 
 // ---------------------------------------------------------------------------
 // Kernel 7: Bidirectional Block GQA Attention over `[ctx_kv, block_kv]` (`f16`)
+// with optional causal SWA over circular context ring, `attention_sink_bias`,
+// and `attention_value_scale` (`D15` DFlash + `D16` Inkling 2).
 // Grid: (num_q_heads, seq_len, 1), TG: (128, 1, 1) (4 simdgroups splitting KV)
 // ---------------------------------------------------------------------------
 kernel void dflare_block_gqa_attn(const device half *q_f16 [[buffer(0)]],
@@ -680,7 +756,8 @@ kernel void dflare_block_gqa_attn(const device half *q_f16 [[buffer(0)]],
                                   const device half *blk_k_f16 [[buffer(3)]],
                                   const device half *blk_v_f16 [[buffer(4)]],
                                   device half *out_f16 [[buffer(5)]],
-                                  constant DFlareBlockGqaParams &p [[buffer(6)]],
+                                  const device float *sink_bias_f32 [[buffer(6)]],
+                                  constant DFlareBlockGqaParams &p [[buffer(7)]],
                                   uint2 tg_pos [[threadgroup_position_in_grid]],
                                   uint tid [[thread_index_in_threadgroup]],
                                   uint sg_id [[simdgroup_index_in_threadgroup]],
@@ -715,15 +792,27 @@ kernel void dflare_block_gqa_attn(const device half *q_f16 [[buffer(0)]],
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
+    // Causal SWA window over circular context ring + non-causal bidirectional block `[0..seq_len-1]`.
+    const uint ctx_base = (p.anchor_pos >= p.active_ctx_len) ? (p.anchor_pos - p.active_ctx_len) : 0u;
+    uint eff_ctx_start = ctx_base;
+    uint eff_ctx_len = p.active_ctx_len;
+    if (p.sliding_window > 0u && p.anchor_pos >= p.active_ctx_len) {
+        const uint q_log_pos = p.anchor_pos + q_pos;
+        const uint min_k_pos = (q_log_pos + 1u > p.sliding_window) ? (q_log_pos + 1u - p.sliding_window) : 0u;
+        eff_ctx_start = max(ctx_base, min_k_pos);
+        eff_ctx_len = (p.anchor_pos > eff_ctx_start) ? (p.anchor_pos - eff_ctx_start) : 0u;
+    }
+
     float m_sg = -INFINITY;
     float l_sg = 0.0f;
-    const uint total_kv = p.active_ctx_len + p.seq_len;
+    const uint total_kv = eff_ctx_len + p.seq_len;
 
     for (uint kv_idx = sg_id; kv_idx < total_kv; kv_idx += 4u) {
-        const bool is_ctx = (kv_idx < p.active_ctx_len);
+        const bool is_ctx = (kv_idx < eff_ctx_len);
+        const uint ctx_slot = (p.max_ctx > 0u) ? ((eff_ctx_start + kv_idx) % p.max_ctx) : (eff_ctx_start + kv_idx);
         const ulong kv_off = is_ctx
-            ? (ulong(p.layer_elem_off) + ulong(kv_idx) * kv_dim + ulong(kvh) * p.head_dim)
-            : (ulong(kv_idx - p.active_ctx_len) * kv_dim + ulong(kvh) * p.head_dim);
+            ? (ulong(p.layer_elem_off) + ulong(ctx_slot) * kv_dim + ulong(kvh) * p.head_dim)
+            : (ulong(kv_idx - eff_ctx_len) * kv_dim + ulong(kvh) * p.head_dim);
         const device half *k_head = (is_ctx ? ctx_k_f16 : blk_k_f16) + kv_off;
         const device half *v_head = (is_ctx ? ctx_v_f16 : blk_v_f16) + kv_off;
 
@@ -756,11 +845,17 @@ kernel void dflare_block_gqa_attn(const device half *q_f16 [[buffer(0)]],
                 gm = max(gm, tg_m[s]);
             }
         }
+        if (p.has_sink_bias != 0u) {
+            gm = max(gm, sink_bias_f32[qh]);
+        }
         float gl = 0.0f;
         for (uint s = 0u; s < 4u; s++) {
             if (tg_l[s] > 0.0f) {
                 gl += tg_l[s] * exp(tg_m[s] - gm);
             }
+        }
+        if (p.has_sink_bias != 0u) {
+            gl += exp(sink_bias_f32[qh] - gm);
         }
         tg_m[4] = gm;
         tg_l[4] = (gl > 0.0f) ? (1.0f / gl) : 0.0f;
@@ -768,7 +863,7 @@ kernel void dflare_block_gqa_attn(const device half *q_f16 [[buffer(0)]],
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     const float gm = tg_m[4];
-    const float inv_gl = tg_l[4];
+    const float out_scale = tg_l[4] * p.v_scale;
     for (uint d = tid; d < p.head_dim; d += 128u) {
         float acc = 0.0f;
         for (uint s = 0u; s < 4u; s++) {
@@ -776,7 +871,7 @@ kernel void dflare_block_gqa_attn(const device half *q_f16 [[buffer(0)]],
                 acc = fma(tg_acc[s][d], exp(tg_m[s] - gm), acc);
             }
         }
-        out_f16[q_off + d] = half(acc * inv_gl);
+        out_f16[q_off + d] = half(acc * out_scale);
     }
 }
 
@@ -1600,5 +1695,346 @@ kernel void dflare_topk_logits(const device uchar *logits_raw [[buffer(0)]],
             cur++;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Kernel 18: Pack Context Tap Ring (`f32`/`f16`/`bf16`) -> Contiguous `f16`
+// `[num_pos, num_taps * hidden_size]` for `DFlash` `fc.weight [H, taps*H]`.
+// Grid: (num_taps * hidden_size, num_pos, 1), TG: (256, 1, 1)
+// ---------------------------------------------------------------------------
+kernel void dflare_pack_ctx_taps_f16(const device uchar *taps_raw [[buffer(0)]],
+                                     device half *out_f16 [[buffer(1)]],
+                                     constant DFlarePackCtxTapsParams &p [[buffer(2)]],
+                                     uint2 gid [[thread_position_in_grid]]) {
+    const uint col = gid.x;
+    const uint pos = gid.y;
+    const uint row_cols = p.num_taps * p.hidden_size;
+    if (col >= row_cols || pos >= p.num_pos) {
+        return;
+    }
+    const uint src_slot = (p.ring_cap > 0u) ? ((p.ring_start + pos) % p.ring_cap) : pos;
+    const ulong src_idx = ulong(src_slot) * row_cols + col;
+    const float v = dflare_load_tap_elem(taps_raw, src_idx, p.taps_dtype);
+    out_f16[ulong(pos) * row_cols + col] = half(v);
+}
+
+// Helper for loading f16 (0), bf16 (1), or f32 (2) 1D norm/sink weights.
+static inline float mtp_load_weight_elem(const device uchar *base, ulong idx, uint dtype) {
+    if (dtype == 0u) {
+        return float(((const device half *)base)[idx]);
+    }
+    if (dtype == 1u) {
+        return float(((const device bfloat *)base)[idx]);
+    }
+    return ((const device float *)base)[idx];
+}
+
+// ---------------------------------------------------------------------------
+// Kernel 19 (`D15` Native 3L MTP): Per-Head Optional Q/K RMSNorm + Partial
+// NeoX RoPE (`rope_dim <= head_dim`) + `v_scale` + Tree K/V Store.
+// Grid: (num_q_heads + num_kv_heads, num_nodes, 1), TG: (128, 1, 1)
+// ---------------------------------------------------------------------------
+kernel void mtp_tree_qk_norm_rope_vscale(device half *q_f16 [[buffer(0)]],
+                                         const device half *k_f16 [[buffer(1)]],
+                                         const device half *v_f16 [[buffer(2)]],
+                                         const device uchar *qn_raw [[buffer(3)]],
+                                         const device uchar *kn_raw [[buffer(4)]],
+                                         const device uint *positions_u32 [[buffer(5)]],
+                                         device half *k_tree_out [[buffer(6)]],
+                                         device half *v_tree_out [[buffer(7)]],
+                                         constant MtpTreeQkNormRopeParams &p [[buffer(8)]],
+                                         uint2 tg_pos [[threadgroup_position_in_grid]],
+                                         uint tid [[thread_index_in_threadgroup]],
+                                         uint sg_id [[simdgroup_index_in_threadgroup]],
+                                         uint lane [[thread_index_in_simdgroup]]) {
+    const uint head_global = tg_pos.x;
+    const uint node_idx = tg_pos.y;
+    const uint total_heads = p.num_q_heads + p.num_kv_heads;
+    if (head_global >= total_heads || node_idx >= p.num_nodes || p.head_dim > 256u || p.v_head_dim > 256u) {
+        return;
+    }
+
+    threadgroup float tg_h[256];
+    threadgroup float sg_sums[4];
+
+    const bool is_q = (head_global < p.num_q_heads);
+    const uint h_idx = is_q ? head_global : (head_global - p.num_q_heads);
+    const uint tok_pos = positions_u32[node_idx];
+
+    if (!is_q) {
+        const uint kv_v_dim = p.num_kv_heads * p.v_head_dim;
+        const ulong v_off = ulong(node_idx) * kv_v_dim + ulong(h_idx) * p.v_head_dim;
+        for (uint d = tid; d < p.v_head_dim; d += 128u) {
+            v_tree_out[v_off + d] = half(float(v_f16[v_off + d]) * p.v_scale);
+        }
+    }
+
+    const uint kq_stride = (is_q ? p.num_q_heads : p.num_kv_heads) * p.head_dim;
+    const ulong off = ulong(node_idx) * kq_stride + ulong(h_idx) * p.head_dim;
+    const device half *src_ptr = (is_q ? (const device half *)q_f16 : k_f16) + off;
+    device half *dst_ptr = (is_q ? q_f16 : k_tree_out) + off;
+    const device uchar *norm_raw = is_q ? qn_raw : kn_raw;
+    const uint apply_norm = is_q ? p.has_q_norm : p.has_k_norm;
+
+    float sum_sq = 0.0f;
+    for (uint d = tid; d < p.head_dim; d += 128u) {
+        const float v = float(src_ptr[d]);
+        tg_h[d] = v;
+        sum_sq = fma(v, v, sum_sq);
+    }
+
+    if (apply_norm != 0u) {
+        const float sg_tot = simd_sum(sum_sq);
+        if (lane == 0u) {
+            sg_sums[sg_id] = sg_tot;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tid == 0u) {
+            float tot = 0.0f;
+            for (uint s = 0u; s < 4u; s++) {
+                tot += sg_sums[s];
+            }
+            sg_sums[0] = rsqrt(tot / float(p.head_dim) + p.rms_eps);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        const float inv_rms = sg_sums[0];
+        for (uint d = tid; d < p.head_dim; d += 128u) {
+            tg_h[d] = tg_h[d] * inv_rms * mtp_load_weight_elem(norm_raw, d, p.norm_dtype);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const uint eff_rope = (p.rope_dim > 0u && p.rope_dim <= p.head_dim) ? p.rope_dim : p.head_dim;
+    if (p.rope_theta > 0.0f && eff_rope >= 2u) {
+        const uint half_rot = eff_rope >> 1;
+        const float inv_rot = 2.0f / float(eff_rope);
+        const float pos_f = float(tok_pos);
+        for (uint i = tid; i < half_rot; i += 128u) {
+            const float freq = 1.0f / pow(p.rope_theta, float(i) * inv_rot);
+            const float angle = pos_f * freq;
+            float c_val;
+            const float s_val = sincos(angle, c_val);
+            const float x0 = tg_h[i];
+            const float x1 = tg_h[i + half_rot];
+            dst_ptr[i] = half(x0 * c_val - x1 * s_val);
+            dst_ptr[i + half_rot] = half(x0 * s_val + x1 * c_val);
+        }
+        for (uint d = eff_rope + tid; d < p.head_dim; d += 128u) {
+            dst_ptr[d] = half(tg_h[d]);
+        }
+    } else {
+        for (uint d = tid; d < p.head_dim; d += 128u) {
+            dst_ptr[d] = half(tg_h[d]);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Kernel 20 (`D15` Native 3L MTP): Commit Accepted K/V Rows into Circular Ring
+// Grid: (num_kv_heads, num_nodes, 1), TG: (128, 1, 1)
+// ---------------------------------------------------------------------------
+kernel void mtp_kv_ring_commit(const device half *k_tree [[buffer(0)]],
+                               const device half *v_tree [[buffer(1)]],
+                               device half *kv_ring_k [[buffer(2)]],
+                               device half *kv_ring_v [[buffer(3)]],
+                               constant MtpKvCommitParams &p [[buffer(4)]],
+                               uint2 tg_pos [[threadgroup_position_in_grid]],
+                               uint tid [[thread_index_in_threadgroup]]) {
+    const uint kvh = tg_pos.x;
+    const uint idx = tg_pos.y;
+    if (kvh >= p.num_kv_heads || idx >= p.num_nodes || p.kv_cap == 0u) {
+        return;
+    }
+    const uint slot = (p.base_pos + idx) % p.kv_cap;
+    const uint kv_k_dim = p.num_kv_heads * p.head_dim;
+    const uint kv_v_dim = p.num_kv_heads * p.v_head_dim;
+
+    const ulong src_k = ulong(idx) * kv_k_dim + ulong(kvh) * p.head_dim;
+    const ulong dst_k = ulong(p.layer_k_elem_off) + ulong(slot) * kv_k_dim + ulong(kvh) * p.head_dim;
+    for (uint d = tid; d < p.head_dim; d += 128u) {
+        kv_ring_k[dst_k + d] = k_tree[src_k + d];
+    }
+
+    const ulong src_v = ulong(idx) * kv_v_dim + ulong(kvh) * p.v_head_dim;
+    const ulong dst_v = ulong(p.layer_v_elem_off) + ulong(slot) * kv_v_dim + ulong(kvh) * p.v_head_dim;
+    for (uint d = tid; d < p.v_head_dim; d += 128u) {
+        kv_ring_v[dst_v + d] = v_tree[src_v + d];
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Kernel 21 (`D15` Native 3L MTP): Asymmetric `head_dim/v_head_dim` GQA Tree
+// Attention over Circular SWA/Causal KV Ring + Tree-Local KV + `sink_bias`.
+// Grid: (num_q_heads, q_count, 1), TG: (128, 1, 1)
+// ---------------------------------------------------------------------------
+kernel void mtp_gqa_tree_verify_attn(const device half *q_f16 [[buffer(0)]],
+                                     const device half *kv_ring_k [[buffer(1)]],
+                                     const device half *kv_ring_v [[buffer(2)]],
+                                     const device half *k_tree [[buffer(3)]],
+                                     const device half *v_tree [[buffer(4)]],
+                                     const device uint *positions_u32 [[buffer(5)]],
+                                     const device ulong *ancestor_masks_u64 [[buffer(6)]],
+                                     const device uchar *sink_bias_raw [[buffer(7)]],
+                                     device half *out_f16 [[buffer(8)]],
+                                     constant MtpGqaTreeAttnParams &p [[buffer(9)]],
+                                     uint2 tg_pos [[threadgroup_position_in_grid]],
+                                     uint tid [[thread_index_in_threadgroup]],
+                                     uint sg_id [[simdgroup_index_in_threadgroup]],
+                                     uint lane [[thread_index_in_simdgroup]]) {
+    const uint qh = tg_pos.x;
+    const uint q_idx = tg_pos.y;
+    if (qh >= p.num_q_heads || q_idx >= p.q_count || p.head_dim > 256u || p.v_head_dim > 256u) {
+        return;
+    }
+
+    const uint q_node = p.slot_start + q_idx;
+    if (q_node >= p.num_nodes) {
+        return;
+    }
+
+    const uint gqa_group = p.num_q_heads / p.num_kv_heads;
+    const uint kvh = qh / gqa_group;
+    const uint q_dim = p.num_q_heads * p.head_dim;
+    const uint o_dim = p.num_q_heads * p.v_head_dim;
+    const uint kv_k_dim = p.num_kv_heads * p.head_dim;
+    const uint kv_v_dim = p.num_kv_heads * p.v_head_dim;
+    const ulong q_off = ulong(q_idx) * q_dim + ulong(qh) * p.head_dim;
+    const ulong out_off = ulong(q_idx) * o_dim + ulong(qh) * p.v_head_dim;
+
+    const uint q_pos = positions_u32[q_node];
+    const ulong q_mask = ancestor_masks_u64[q_node];
+
+    threadgroup float tg_q[256];
+    threadgroup float tg_acc[4][256];
+    threadgroup float tg_m[5];
+    threadgroup float tg_l[5];
+
+    for (uint d = tid; d < p.head_dim; d += 128u) {
+        tg_q[d] = float(q_f16[q_off + d]);
+    }
+    for (uint d = tid; d < p.v_head_dim; d += 128u) {
+        tg_acc[0][d] = 0.0f;
+        tg_acc[1][d] = 0.0f;
+        tg_acc[2][d] = 0.0f;
+        tg_acc[3][d] = 0.0f;
+    }
+    if (tid < 5u) {
+        tg_m[tid] = -INFINITY;
+        tg_l[tid] = 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float m_sg = -INFINITY;
+    float l_sg = 0.0f;
+
+    // 1. Committed circular KV ring (`[eff_start .. base_pos)` under causal SWA window).
+    if (p.base_pos > 0u && p.kv_cap > 0u) {
+        const uint ctx_base = (p.base_pos > p.kv_cap) ? (p.base_pos - p.kv_cap) : 0u;
+        uint eff_start = ctx_base;
+        if (p.sliding_window > 0u) {
+            const uint min_k = (q_pos + 1u > p.sliding_window) ? (q_pos + 1u - p.sliding_window) : 0u;
+            eff_start = max(ctx_base, min_k);
+        }
+        const uint eff_ctx = (p.base_pos > eff_start) ? (p.base_pos - eff_start) : 0u;
+        for (uint ci = sg_id; ci < eff_ctx; ci += 4u) {
+            const uint k_pos = eff_start + ci;
+            if (k_pos > q_pos) {
+                continue;
+            }
+            const uint ring_slot = k_pos % p.kv_cap;
+            const device half *k_head = kv_ring_k + ulong(p.layer_k_elem_off) + ulong(ring_slot) * kv_k_dim + ulong(kvh) * p.head_dim;
+            const device half *v_head = kv_ring_v + ulong(p.layer_v_elem_off) + ulong(ring_slot) * kv_v_dim + ulong(kvh) * p.v_head_dim;
+
+            float dot_partial = 0.0f;
+            for (uint d = lane; d < p.head_dim; d += 32u) {
+                dot_partial = fma(tg_q[d], float(k_head[d]), dot_partial);
+            }
+            const float score = simd_sum(dot_partial) * p.scale;
+            const float m_new = max(m_sg, score);
+            const float alpha = (l_sg > 0.0f) ? exp(m_sg - m_new) : 0.0f;
+            const float prob = exp(score - m_new);
+            l_sg = fma(l_sg, alpha, prob);
+            m_sg = m_new;
+
+            for (uint d = lane; d < p.v_head_dim; d += 32u) {
+                tg_acc[sg_id][d] = fma(prob, float(v_head[d]), tg_acc[sg_id][d] * alpha);
+            }
+        }
+    }
+
+    // 2. Tree-local KV slots masked by `ancestor_masks_u64[q_node]` and SWA window.
+    for (uint ti = sg_id; ti < p.num_nodes; ti += 4u) {
+        if (((q_mask >> ti) & 1ull) == 0ull) {
+            continue;
+        }
+        const uint tk_pos = positions_u32[ti];
+        if (tk_pos > q_pos) {
+            continue;
+        }
+        if (p.sliding_window > 0u && (q_pos - tk_pos) >= p.sliding_window) {
+            continue;
+        }
+        const device half *k_head = k_tree + ulong(ti) * kv_k_dim + ulong(kvh) * p.head_dim;
+        const device half *v_head = v_tree + ulong(ti) * kv_v_dim + ulong(kvh) * p.v_head_dim;
+
+        float dot_partial = 0.0f;
+        for (uint d = lane; d < p.head_dim; d += 32u) {
+            dot_partial = fma(tg_q[d], float(k_head[d]), dot_partial);
+        }
+        const float score = simd_sum(dot_partial) * p.scale;
+        const float m_new = max(m_sg, score);
+        const float alpha = (l_sg > 0.0f) ? exp(m_sg - m_new) : 0.0f;
+        const float prob = exp(score - m_new);
+        l_sg = fma(l_sg, alpha, prob);
+        m_sg = m_new;
+
+        for (uint d = lane; d < p.v_head_dim; d += 32u) {
+            tg_acc[sg_id][d] = fma(prob, float(v_head[d]), tg_acc[sg_id][d] * alpha);
+        }
+    }
+
+    if (lane == 0u) {
+        tg_m[sg_id] = m_sg;
+        tg_l[sg_id] = l_sg;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tid == 0u) {
+        float gm = -INFINITY;
+        for (uint s = 0u; s < 4u; s++) {
+            if (tg_l[s] > 0.0f) {
+                gm = max(gm, tg_m[s]);
+            }
+        }
+        float sink_val = -INFINITY;
+        if (p.has_sink_bias != 0u) {
+            sink_val = mtp_load_weight_elem(sink_bias_raw, qh, p.sink_dtype);
+            gm = max(gm, sink_val);
+        }
+        float gl = 0.0f;
+        for (uint s = 0u; s < 4u; s++) {
+            if (tg_l[s] > 0.0f) {
+                gl += tg_l[s] * exp(tg_m[s] - gm);
+            }
+        }
+        if (p.has_sink_bias != 0u) {
+            gl += exp(sink_val - gm);
+        }
+        tg_m[4] = gm;
+        tg_l[4] = (gl > 0.0f) ? (1.0f / gl) : 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const float gm = tg_m[4];
+    const float inv_gl = tg_l[4];
+    for (uint d = tid; d < p.v_head_dim; d += 128u) {
+        float acc = 0.0f;
+        for (uint s = 0u; s < 4u; s++) {
+            if (isfinite(tg_m[s])) {
+                acc = fma(tg_acc[s][d], exp(tg_m[s] - gm), acc);
+            }
+        }
+        out_f16[out_off + d] = half(acc * inv_gl);
     }
 }

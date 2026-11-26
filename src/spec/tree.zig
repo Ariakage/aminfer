@@ -60,14 +60,24 @@ pub const InsertL1Result = struct {
     is_seed: bool,
 };
 
-/// Fixed 256-bit expert activation set per `(node, layer)` (ADR-0009).
+/// Fixed 512-bit expert activation set per `(node, layer)` (ADR-0009, D15:
+/// covers both `256`-expert Flash and `384`-expert Pro MoE architectures in one 64 B cache line).
 pub const ExpertBitset = extern struct {
-    words: [4]u64 = .{ 0, 0, 0, 0 },
+    pub const NUM_WORDS: usize = 8;
+    pub const MAX_EXPERTS: u32 = NUM_WORDS * 64;
 
-    pub const MAX_EXPERTS: u32 = 256;
+    words: [NUM_WORDS]u64 = @splat(0),
 
     pub inline fn empty() ExpertBitset {
         return .{};
+    }
+
+    pub inline fn isEmpty(self: ExpertBitset) bool {
+        var acc: u64 = 0;
+        inline for (0..NUM_WORDS) |w| {
+            acc |= self.words[w];
+        }
+        return acc == 0;
     }
 
     pub inline fn set(self: *ExpertBitset, expert_id: u32) void {
@@ -86,58 +96,151 @@ pub const ExpertBitset = extern struct {
     }
 
     pub inline fn unionWith(self: ExpertBitset, other: ExpertBitset) ExpertBitset {
-        return .{ .words = .{
-            self.words[0] | other.words[0],
-            self.words[1] | other.words[1],
-            self.words[2] | other.words[2],
-            self.words[3] | other.words[3],
-        } };
+        var out: ExpertBitset = undefined;
+        inline for (0..NUM_WORDS) |w| {
+            out.words[w] = self.words[w] | other.words[w];
+        }
+        return out;
     }
 
     pub inline fn unionInPlace(self: *ExpertBitset, other: ExpertBitset) void {
-        inline for (0..4) |w| {
+        inline for (0..NUM_WORDS) |w| {
             self.words[w] |= other.words[w];
         }
     }
 
     pub inline fn intersectWith(self: ExpertBitset, other: ExpertBitset) ExpertBitset {
-        return .{ .words = .{
-            self.words[0] & other.words[0],
-            self.words[1] & other.words[1],
-            self.words[2] & other.words[2],
-            self.words[3] & other.words[3],
-        } };
+        var out: ExpertBitset = undefined;
+        inline for (0..NUM_WORDS) |w| {
+            out.words[w] = self.words[w] & other.words[w];
+        }
+        return out;
     }
 
     /// Bits set in `self` that are absent from `other` (`self \ other`).
     pub inline fn difference(self: ExpertBitset, other: ExpertBitset) ExpertBitset {
-        return .{ .words = .{
-            self.words[0] & ~other.words[0],
-            self.words[1] & ~other.words[1],
-            self.words[2] & ~other.words[2],
-            self.words[3] & ~other.words[3],
-        } };
+        var out: ExpertBitset = undefined;
+        inline for (0..NUM_WORDS) |w| {
+            out.words[w] = self.words[w] & ~other.words[w];
+        }
+        return out;
     }
 
     /// Total number of active experts in this bitset.
     pub inline fn count(self: ExpertBitset) u32 {
-        return @as(u32, @popCount(self.words[0])) +
-            @as(u32, @popCount(self.words[1])) +
-            @as(u32, @popCount(self.words[2])) +
-            @as(u32, @popCount(self.words[3]));
+        var tot: u32 = 0;
+        inline for (0..NUM_WORDS) |w| {
+            tot += @as(u32, @popCount(self.words[w]));
+        }
+        return tot;
     }
 
     /// Number of newly introduced experts in `self \ other`.
     pub inline fn differenceCount(self: ExpertBitset, other: ExpertBitset) u32 {
-        return @as(u32, @popCount(self.words[0] & ~other.words[0])) +
-            @as(u32, @popCount(self.words[1] & ~other.words[1])) +
-            @as(u32, @popCount(self.words[2] & ~other.words[2])) +
-            @as(u32, @popCount(self.words[3] & ~other.words[3]));
+        var tot: u32 = 0;
+        inline for (0..NUM_WORDS) |w| {
+            tot += @as(u32, @popCount(self.words[w] & ~other.words[w]));
+        }
+        return tot;
     }
 };
 
 comptime {
-    if (@sizeOf(ExpertBitset) != 32) @compileError("ExpertBitset must be 32 bytes");
+    if (@sizeOf(ExpertBitset) != 64) @compileError("ExpertBitset must be 64 bytes");
+}
+
+pub const RouterWeightFormat = enum(u8) {
+    f32,
+    f16,
+    bf16,
+};
+
+inline fn decodeBf16Bits(bits: u16) f32 {
+    return @bitCast(@as(u32, bits) << 16);
+}
+
+inline fn sigmoidF32(x: f32) f32 {
+    const cx = std.math.clamp(x, -80.0, 80.0);
+    return 1.0 / (1.0 + @exp(-cx));
+}
+
+/// Estimates routed top-`top_k` MoE experts for one candidate hidden/embedding vector
+/// against a `[num_experts, hidden_size]` router matrix (`f32`/`f16`/`bf16`) with optional
+/// `e_score_correction_bias` and sigmoid scoring (`D7` / `D15`, zero heap allocation).
+pub fn predictRouterTopK(
+    router_bytes: []const u8,
+    format: RouterWeightFormat,
+    hidden_f32: []const f32,
+    num_experts: u32,
+    top_k: u32,
+    score_bias_f32: ?[]const f32,
+    use_sigmoid: bool,
+    logits_scratch: []f32,
+) ExpertBitset {
+    var bs = ExpertBitset.empty();
+    const h: usize = hidden_f32.len;
+    const n_exp: usize = @min(@as(usize, num_experts), @min(logits_scratch.len, ExpertBitset.MAX_EXPERTS));
+    const eff_k: usize = @min(@as(usize, top_k), n_exp);
+    if (h == 0 or n_exp == 0 or eff_k == 0) return bs;
+
+    const elem_bytes: usize = switch (format) {
+        .f32 => 4,
+        .f16, .bf16 => 2,
+    };
+    const row_bytes = h * elem_bytes;
+    if (router_bytes.len < n_exp * row_bytes) return bs;
+
+    for (0..n_exp) |e| {
+        const row_off = e * row_bytes;
+        var dot: f32 = 0.0;
+        switch (format) {
+            .f32 => {
+                for (0..h) |d| {
+                    const bits = std.mem.readInt(u32, router_bytes[row_off + d * 4 ..][0..4], .little);
+                    const w: f32 = @bitCast(bits);
+                    dot = @mulAdd(f32, w, hidden_f32[d], dot);
+                }
+            },
+            .f16 => {
+                for (0..h) |d| {
+                    const bits = std.mem.readInt(u16, router_bytes[row_off + d * 2 ..][0..2], .little);
+                    const w: f32 = @floatCast(@as(f16, @bitCast(bits)));
+                    dot = @mulAdd(f32, w, hidden_f32[d], dot);
+                }
+            },
+            .bf16 => {
+                for (0..h) |d| {
+                    const bits = std.mem.readInt(u16, router_bytes[row_off + d * 2 ..][0..2], .little);
+                    const w: f32 = decodeBf16Bits(bits);
+                    dot = @mulAdd(f32, w, hidden_f32[d], dot);
+                }
+            },
+        }
+        var score = if (use_sigmoid) sigmoidF32(dot) else dot;
+        if (score_bias_f32) |sb| {
+            if (e < sb.len) score += sb[e];
+        }
+        logits_scratch[e] = score;
+    }
+
+    // Deterministic top-`eff_k` selection (tie-break by lower expert ID).
+    for (0..eff_k) |_| {
+        var best_e: usize = 0;
+        var best_v: f32 = -std.math.inf(f32);
+        var found = false;
+        for (0..n_exp) |e| {
+            if (bs.contains(@intCast(e))) continue;
+            const sc = logits_scratch[e];
+            if (!found or sc > best_v) {
+                best_v = sc;
+                best_e = e;
+                found = true;
+            }
+        }
+        if (!found) break;
+        bs.set(@intCast(best_e));
+    }
+    return bs;
 }
 
 /// Calibrated hardware verification cost model for D7 submodular pruning
@@ -678,7 +781,7 @@ pub fn DraftTree(comptime max_nodes: u16) type {
                         if (use_table) {
                             for (0..n_layers) |l| {
                                 const added = experts[base + l].difference(union_by_layer[l]);
-                                if (added.words[0] == 0 and added.words[1] == 0 and added.words[2] == 0 and added.words[3] == 0) {
+                                if (added.isEmpty()) {
                                     continue;
                                 }
                                 const cold_mask: ?ExpertBitset = if (cold_experts_by_layer) |cm| cm[l] else null;
@@ -856,7 +959,7 @@ fn accumulateLayerExperts(
     const cpb: f64 = @as(f64, cost.cold_penalty_bytes);
     const has_cold = cold_mask != null and cost.cold_penalty_bytes > 0.0;
 
-    inline for (0..4) |w_idx| {
+    inline for (0..ExpertBitset.NUM_WORDS) |w_idx| {
         var w = added.words[w_idx];
         while (w != 0) {
             const bit: usize = @ctz(w);
@@ -1308,4 +1411,81 @@ test "M5 D8 DraftTree highestProbPath and copyTruncatedFrom preserve topology an
     // Root (0) + a1 (depth 1) + a2 (depth 2) + b1 (depth 1) = 4 nodes; b3 (depth 3) excluded.
     try std.testing.expect(trunc.findChild(0, 10) != null);
     try std.testing.expect(trunc.findChild(0, 20) != null);
+}
+
+test "M9.1 D15 ExpertBitset 512-expert capacity (384 Pro experts) and zero-alloc predictRouterTopK" {
+    // 1. Verify 512-expert bitset operations across all 8 u64 words (MiMo-V2.6-Pro has 384 experts).
+    var a = ExpertBitset.empty();
+    try std.testing.expect(a.isEmpty());
+    a.set(0);
+    a.set(255);
+    a.set(256);
+    a.set(383);
+    a.set(511);
+    try std.testing.expect(!a.isEmpty());
+    try std.testing.expectEqual(@as(u32, 5), a.count());
+    try std.testing.expect(a.contains(0) and a.contains(256) and a.contains(383) and a.contains(511));
+    try std.testing.expect(!a.contains(300));
+
+    var b = ExpertBitset.empty();
+    for (300..384) |e| b.set(@intCast(e)); // experts 300..383
+    try std.testing.expectEqual(@as(u32, 84), b.count());
+    try std.testing.expectEqual(@as(u32, 1), a.intersectWith(b).count());
+    try std.testing.expectEqual(@as(u32, 88), a.unionWith(b).count());
+
+    // 2. Verify D7 cold-expert pruning works cleanly for 384-expert models (experts >= 256).
+    const num_layers: u32 = 2;
+    const num_experts: u32 = 384;
+    var t = SmallTree.init(1);
+    const hot_node = t.insertChild(0, 10, 0.55, .l2) orelse unreachable;
+    const cold_node = t.insertChild(0, 20, 0.55, .l2) orelse unreachable;
+
+    var exps: [3 * num_layers]ExpertBitset = @splat(ExpertBitset.empty());
+    var cold_masks: [num_layers]ExpertBitset = @splat(ExpertBitset.empty());
+    for (0..num_layers) |l| {
+        exps[0 * num_layers + l].set(12);
+        exps[hot_node * num_layers + l].set(12); // shares hot expert 12
+        exps[cold_node * num_layers + l].set(370); // cold NVMe expert > 255
+        exps[cold_node * num_layers + l].set(383);
+        for (300..384) |e| cold_masks[l].set(@intCast(e));
+    }
+
+    const cost = PruneCostModel.uniformBeta(80.0, 2.0, 400_000.0, 4_000_000.0, 68.0, num_layers, num_experts);
+    const summary = try t.pruneToOptimalSubtree(cost, &exps, &cold_masks, 16);
+    try std.testing.expectEqual(@as(u16, 2), summary.kept_nodes);
+    try std.testing.expect(t.findChild(0, 10) != null);
+    try std.testing.expectEqual(@as(?u16, null), t.findChild(0, 20));
+
+    // 3. Verify predictRouterTopK across f32, f16, bf16, and sigmoid + e_score_correction_bias.
+    const h: usize = 4;
+    const n_exp: usize = 6;
+    const hidden = [_]f32{ 1.0, 0.5, -0.5, 0.25 };
+    var w_f32: [n_exp * h]f32 = @splat(0.0);
+    // Expert 2 dot = 2.0, Expert 4 dot = 1.5, Expert 1 dot = 1.0, others <= 0.
+    w_f32[2 * h + 0] = 2.0;
+    w_f32[4 * h + 0] = 1.5;
+    w_f32[1 * h + 0] = 1.0;
+
+    var w_f16: [n_exp * h]f16 = undefined;
+    var w_bf16: [n_exp * h]u16 = undefined;
+    for (0..n_exp * h) |i| {
+        w_f16[i] = @floatCast(w_f32[i]);
+        const bits: u32 = @bitCast(w_f32[i]);
+        w_bf16[i] = @intCast(bits >> 16);
+    }
+    var scratch: [ExpertBitset.MAX_EXPERTS]f32 = undefined;
+
+    const bs_f32 = predictRouterTopK(std.mem.sliceAsBytes(&w_f32), .f32, &hidden, n_exp, 2, null, false, &scratch);
+    const bs_f16 = predictRouterTopK(std.mem.sliceAsBytes(&w_f16), .f16, &hidden, n_exp, 2, null, false, &scratch);
+    const bs_bf16 = predictRouterTopK(std.mem.sliceAsBytes(&w_bf16), .bf16, &hidden, n_exp, 2, null, false, &scratch);
+    for ([_]ExpertBitset{ bs_f32, bs_f16, bs_bf16 }) |bs| {
+        try std.testing.expectEqual(@as(u32, 2), bs.count());
+        try std.testing.expect(bs.contains(2) and bs.contains(4));
+    }
+
+    // With sigmoid + e_score_correction_bias boosting expert 5 (+2.0), top-2 becomes {5, 2}.
+    const bias = [_]f32{ 0.0, 0.0, 0.0, 0.0, 0.0, 2.0 };
+    const bs_sig = predictRouterTopK(std.mem.sliceAsBytes(&w_f32), .f32, &hidden, n_exp, 2, &bias, true, &scratch);
+    try std.testing.expectEqual(@as(u32, 2), bs_sig.count());
+    try std.testing.expect(bs_sig.contains(5) and bs_sig.contains(2));
 }
