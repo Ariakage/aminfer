@@ -237,20 +237,24 @@ operator axes without sacrificing runtime alignment or conversion fidelity:
   desktop-headroom profile running at `0` swapouts) in
   [../benchmarks/results.md](../benchmarks/results.md#m82--inkling-2--hy4-fused-operators-dflaredfly2-block-drafting-sme2-loop-controllers-and-real-m4-execution).
 
-## Staged `M9.1`–`M9.4` frontier deep-optimization and real-HF parity roadmap (`ADR-0025`, `ADR-0015`)
+## Staged `M9.1`–`M9.5` frontier deep-optimization, real-HF parity, and universal multi-LoRA roadmap (`ADR-0025`, `ADR-0015`, `ADR-0022`)
 
 Following `M8.2` and the HTTP/SSE serving milestone `M8.3` (`C28`,
-[../process.md](../process.md#milestones)), four sequential milestones
+[../process.md](../process.md#milestones)), five sequential milestones
 ([ADR-0025](../decisions/0025-staged-frontier-deep-optimization-inkling2-mimo-glm5-ling3.md),
-[ADR-0015](../decisions/0015-tiered-frontier-model-roadmap.md); capabilities
-`W25`–`W28`, `G26`–`G28`, `D15`, `C27` in [../status.md](../status.md)) extend
-model-specific co-design across `MiMo-V2.6`, `GLM-5`, `Ling-3.1`, and real-HF
-`Qwen3.8-Flash-Next` / `DeepSeek-V4.1-Flash-1017` checkpoints with zero
-primitive rework. Across all four stages (`M9.1`–`M9.4`), a mandatory
-safetensors JSON header pre-flight gate (`W28`) validates `config.json`,
-`model.safetensors.index.json`, and HTTP Range safetensors headers in
-`tools/tests/test_hf_metadata_validation.py` (`long_backbone_names == 0` plus
-exact tensor shapes and scale/broadcast ranks) before converter implementation:
+[ADR-0015](../decisions/0015-tiered-frontier-model-roadmap.md),
+[ADR-0022](../decisions/0022-native-c-python-sdk-and-full-protocol-parity.md);
+capabilities `W25`–`W28`, `W30`, `G26`–`G28`, `D15`, `C27` in
+[../status.md](../status.md)) extend model-specific co-design across
+`MiMo-V2.6`, `GLM-5`, `Ling-3.1`, and real-HF `Qwen3.8-Flash-Next` /
+`DeepSeek-V4.1-Flash-1017` checkpoints with zero primitive rework, and then
+extend runtime multi-LoRA / DoRA hot-loading across all `GraphModel` and
+`M82Runtime` architectures. Across the four model-family stages (`M9.1`–`M9.4`),
+a mandatory safetensors JSON header pre-flight gate (`W28`) validates
+`config.json`, `model.safetensors.index.json`, and HTTP Range safetensors
+headers in `tools/tests/test_hf_metadata_validation.py`
+(`long_backbone_names == 0` plus exact tensor shapes and scale/broadcast ranks)
+before converter implementation:
 
 - **`M9.1` — `MiMo-V2.6` (`Flash` `309B`, `Pro` `1.02T`, `Distill-Qwen-9B` `9.4B`):**
   Exploits `40/48` (`Flash`) and `60/70` (`Pro`) `128`-token `HybridKvRing` SWA
@@ -286,3 +290,16 @@ exact tensor shapes and scale/broadcast ranks) before converter implementation:
   and `layers.N.{hc_*,attn.{wkv,wo_a,wo_b},ffn.*}` mapping, `graph.zig`
   `wo_a`/`wo_b`/`compressor`/`sqrtsoftplus` + cold-tiered / `GSQ-RCO` `3L DSpark`)
   with published Hugging Face shard headers.
+- **`M9.5` — Universal `GraphModel` & `M82Runtime` runtime multi-LoRA and PEFT DoRA hot-loading (`W30`, `W19`, `G29`, `C28`; [ADR-0022](../decisions/0022-native-c-python-sdk-and-full-protocol-parity.md#11-universal-graphmodel-and-m82runtime-multi-lora-and-dora-hot-loading-w30-m95), [ADR-0026](../decisions/0026-m825-inkling2-single-frame-hot-path-and-full-wired-quant-parity.md)):**
+  Extends `W19` `.amlora` and `LoraRegistry` from `Qwen3Model` to `GraphModel`
+  and `M82Runtime` across `inkling2`/`inkling2_loop` (`wq_du`, `wk_dv`, `wv_dv`,
+  `wo_ud`, and `gate_attn` shared and per-loop-pass projections, including
+  `Inkling-2-Mini-Unbound` `peft-r16`/`peft-r64` and DoRA adapters), `hy_v4`,
+  `mimo_v2`, `glm_moe_dsa`/`glm5_next`, `bailing_hybrid`, and `deepseek41`; adds
+  a single-frame Metal 4 GPU low-rank delta path preserving `G29` `0` mid-pass
+  `flushFrame()` alongside `C24` `SME2` `sme2_panel64` offload and an
+  `R9`-bounded configurable wired pool cap for `r = 16..64` adapters; and adds
+  offline PEFT `r <= 64` + DoRA (`lora_magnitude_vector`) `.amlora` import in
+  `tools/src/aminfer_tools/lora.py` with unified `-L`/`--lora` and
+  `"<base>:<adapter>"` routing across `aminfer chat`, `aminfer serve`, `C28`
+  `/v1/models/{id}`, and `C17` SDK.

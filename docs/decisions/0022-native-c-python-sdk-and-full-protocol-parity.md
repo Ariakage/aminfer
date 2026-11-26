@@ -261,10 +261,13 @@ and usage-accounting layer:
 
 - Generalize `W16` `sme2_panel64` `Step-LoRA` adapters to standard Hugging Face
   PEFT LoRA checkpoints (`.amlora` / safetensors offline import and runtime hot
-  loading within the startup wired-budget pool).
+  loading within a `<= 4 MiB` wired L2 pool on `Qwen3Model` / `BatchRuntime`).
 - Route `"model": "<base>:<adapter>"` per request across concurrent `C14`
   continuous-batching slots over a single shared wired base `.amf`, eliminating
-  base-weight duplication across adapters.
+  base-weight duplication across adapters. Extension to non-`Qwen3` `GraphModel`
+  and `M82Runtime` architectures and DoRA checkpoints is specified in
+  [section 11](#11-universal-graphmodel-and-m82runtime-multi-lora-and-dora-hot-loading-w30-m95)
+  (`W30`, M9.5).
 
 ### 9. Opt-in NVMe persistent prefix KV and GDN cache (`R10`, M7.5)
 
@@ -286,14 +289,39 @@ and usage-accounting layer:
   - A `Network.framework` `nw_listener` configured for TLS 1.2 and TLS 1.3 hands each accepted client to a pure-C refcounted `socketpair(AF_UNIX, SOCK_STREAM)` pump (`ami_tls_pump`) on a `DISPATCH_AUTORELEASE_FREQUENCY_WORK_ITEM` serial queue and signals the `kqueue` event loop through a non-blocking `notify_fd` (`UDATA_LISTEN`).
   - `http_sse.zig` reuses the existing preallocated connection slots, HTTP/1.1 `keep-alive`, SSE streaming across `/v1/chat/completions`, `/v1/responses`, and `/v1/messages`, `503` saturation responses drained cleanly with TLS `close_notify`, constant-time `--api-key` auth, and concurrent plaintext `AF_UNIX` `--unix-socket` serving with `0` hot-path heap allocations.
 
+### 11. Universal `GraphModel` and `M82Runtime` multi-LoRA and DoRA hot-loading (`W30`, M9.5)
+
+- **Extending `W19` `.amlora` and `LoraRegistry` beyond `Qwen3Model`:** Extend
+  runtime multi-LoRA hot-loading (`-L`/`--lora <name>=<path.amlora>` and
+  `"<base>:<adapter>"` routing across `aminfer chat`, `aminfer serve`, `C28`
+  `GET /v1/models/{id}`, and the `C17` C/Python SDK) from `Qwen3Model` /
+  `BatchRuntime` to `GraphModel` and `M82Runtime`, covering `inkling2` /
+  `inkling2_loop` (`wq_du`, `wk_dv`, `wv_dv`, `wo_ud`, and `gate_attn` shared
+  and per-loop-pass projections, including `Inkling-2-Mini-Unbound`
+  `peft-r16`/`peft-r64` and DoRA adapters), `hy_v4`, `mimo_v2`,
+  `glm_moe_dsa`/`glm5_next`, `bailing_hybrid`, and `deepseek41`.
+- **Zero-flush GPU low-rank fusion and `SME2` coexistence:** Add a single-frame
+  Metal 4 GPU low-rank delta path (`B(A x)` plus optional DoRA row-wise
+  `lora_magnitude_vector` rescaling) that preserves `G29` `0` mid-pass
+  `flushFrame()`
+  ([ADR-0026](0026-m825-inkling2-single-frame-hot-path-and-full-wired-quant-parity.md))
+  alongside `C24` `SME2` `sme2_panel64` offload for small L2-resident adapters,
+  raising an optional configurable wired pool cap inside the `R9` wired budget
+  for `r = 16..64` adapters without unpinning base weights.
+- **Offline PEFT `r <= 64` and DoRA `.amlora` import:** Extend
+  `tools/src/aminfer_tools/lora.py` to import Hugging Face PEFT `r <= 64` and
+  DoRA (`lora_magnitude_vector`) adapters into 16 KiB-aligned `.amlora`
+  containers while preserving zero-overhead fast-path bypass when
+  `active_adapters == 0`.
+
 ### Scope boundary and zero-overhead non-regression guardrails
 
 - Audio and speech ingress are explicitly excluded from Milestone M7.5.
-- **Strict zero-overhead fast paths when optional M7.5 / M8.3 features are inactive:**
+- **Strict zero-overhead fast paths when optional M7.5 / M8.3 / M9.5 features are inactive:**
   1. `aminfer monitor` (`C19`) and `aminfer chat` (`C20`) are standalone CLI subcommands; `aminfer serve` and `decode` run zero `IOReport` polling when `monitor` is not running, and attaching `monitor --server` polls `/health` + rootless `IOReport` on `QOS_CLASS_UTILITY` E-cores at `>= 500 ms` intervals (`< 0.1%` E-core CPU, `0 B` GPU/wired bandwidth).
   2. Single-file `.amf` metadata (`W18`), `--api-key`, `--unix-socket` (`C18`), `ModelDetailMeta`/`LoraAdapterMeta` discovery, and opt-in native TLS 1.2/1.3 HTTPS (`C28`) execute only at startup or at the HTTP/TLS connection boundary (`0` instructions added to per-token decode, and `0` TLS listener overhead when `--tls-cert` is omitted); `libaminfer.dylib` (`C17`) is a separate build target that leaves the static `aminfer` CLI binary unchanged.
-  3. Unconstrained requests (`response_format` unset, penalties `0`, `logit_bias` empty, `active_adapters == 0`) bypass `C22` grammar state machines and `W19` LoRA adapter dispatches outside the layer loop. When `C22` / penalties are active on large-vocabulary models (`151K–248K` tokens), `C22` pairs with the fused GPU radix/bucket sampler (`G21` in [ADR-0023](0023-native-kernel-barrier-fusion-mma-flashattn-and-simd-accelerators.md)) and propagates masks into speculative draft proposals so neither CPU logit scans nor draft rejections degrade throughput.
-  4. `W19` L2-resident SME2 LoRA adapters cap their P-core L2 footprint at `<= 4 MiB` (`25%` of M4's `16 MiB` P-core L2) inside the `R9` wired budget (never unpinning base weights). Stateful `/v1/responses` slots obey `R9` `evict_first` governance, and opt-in `--disk-prefix-cache` (`R10`, off by default) schedules `F_NOCACHE` writes on background utility I/O queues that yield strictly to `C3`–`C5` decode-critical cold-expert `pread`s.
+  3. Unconstrained requests (`response_format` unset, penalties `0`, `logit_bias` empty, `active_adapters == 0`) bypass `C22` grammar state machines and `W19`/`W30` LoRA adapter dispatches outside the layer loop. When `C22` / penalties are active on large-vocabulary models (`151K–248K` tokens), `C22` pairs with the fused GPU radix/bucket sampler (`G21` in [ADR-0023](0023-native-kernel-barrier-fusion-mma-flashattn-and-simd-accelerators.md)) and propagates masks into speculative draft proposals so neither CPU logit scans nor draft rejections degrade throughput.
+  4. `W19` L2-resident SME2 LoRA adapters cap their P-core L2 footprint at `<= 4 MiB` (`25%` of M4's `16 MiB` P-core L2) inside the `R9` wired budget (never unpinning base weights), while `W30` adds an explicit configurable wired pool cap inside `R9` for `r = 16..64` `GraphModel` / `M82Runtime` GPU/SME2 and DoRA adapters without unpinning base weights. Stateful `/v1/responses` slots obey `R9` `evict_first` governance, and opt-in `--disk-prefix-cache` (`R10`, off by default) schedules `F_NOCACHE` writes on background utility I/O queues that yield strictly to `C3`–`C5` decode-critical cold-expert `pread`s.
 
 ## Consequences
 
