@@ -72,6 +72,14 @@ pub const DEFAULT_STATEFUL_RESPONSE_SLOTS: usize = 64;
 pub const DEFAULT_STATEFUL_RESPONSE_PROMPT_BYTES: usize = 64 * 1024;
 pub const DEFAULT_STATEFUL_RESPONSE_CONTENT_BYTES: usize = 64 * 1024;
 pub const DEFAULT_STATEFUL_RESPONSE_REASONING_BYTES: usize = 32 * 1024;
+pub const DEFAULT_STATEFUL_RESPONSE_INPUT_ITEMS_BYTES: usize = 16 * 1024;
+pub const MAX_STATEFUL_INPUT_ITEMS: usize = 16;
+pub const MAX_DISPLAY_NAME_BYTES: usize = 96;
+pub const MAX_CORS_ORIGIN_BYTES: usize = 256;
+pub const MAX_FIM_TOKEN_BYTES: usize = 64;
+pub const MAX_COMPLETION_TOKEN_IDS: usize = 1024;
+pub const MAX_MEDIA_ITEMS_PER_REQUEST: usize = 4;
+pub const DEFAULT_MAX_MEDIA_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_EMBEDDING_INPUTS: usize = 32;
 pub const MAX_RERANK_DOCS: usize = 64;
 pub const MAX_EMBEDDING_DIM: usize = 8192;
@@ -125,12 +133,17 @@ pub const ParseError = error{
     UnsupportedFeature,
     BufferTooSmall,
     DepthExceeded,
+    RemoteMediaNotSupported,
+    InvalidMediaBase64,
+    TooManyMediaItems,
+    MediaTooLarge,
 };
 
 pub const Endpoint = enum(u8) {
     chat_completions = 0,
     responses = 1,
     messages = 2,
+    completions = 3,
 };
 
 pub const EffectiveSeedSource = enum(u8) {
@@ -481,7 +494,9 @@ pub const ModelCapabilities = struct {
 
 pub const ModelDetailMeta = struct {
     architecture: []const u8 = "unknown",
+    display_name: []const u8 = "",
     max_model_len: u32 = 0,
+    max_output_tokens: u32 = 0,
     vocab_size: u32 = 0,
     effective_bits_per_weight: f64 = 0.0,
     wired_mib: u64 = 0,
@@ -511,6 +526,7 @@ pub const ModelDetailMeta = struct {
 
 pub const LoraAdapterMeta = struct {
     name: []const u8,
+    display_name: []const u8 = "",
     rank: u32,
     lora_alpha: f32,
     scale: f32,
@@ -535,6 +551,60 @@ pub const LoraAdapterMeta = struct {
         return count;
     }
 };
+
+pub const MediaKind = enum(u8) {
+    image = 0,
+    video = 1,
+};
+
+pub const MediaAttachment = struct {
+    kind: MediaKind,
+    mime_buf: [32]u8 = @splat(0),
+    mime_len: u8 = 0,
+    data: []const u8,
+
+    pub fn mimeSlice(self: *const MediaAttachment) []const u8 {
+        return self.mime_buf[0..self.mime_len];
+    }
+};
+
+pub const FimTokens = struct {
+    prefix: []const u8 = "<|fim_prefix|>",
+    suffix: []const u8 = "<|fim_suffix|>",
+    middle: []const u8 = "<|fim_middle|>",
+};
+
+/// Formats a Unix epoch timestamp (seconds) as RFC 3339 UTC (`YYYY-MM-DDTHH:MM:SSZ`)
+/// using Howard Hinnant's civil-from-days integer math with zero heap allocations.
+pub fn formatRfc3339Utc(unix_sec: i64, out: *[32]u8) []const u8 {
+    const clamped: i64 = if (unix_sec < 0) 0 else unix_sec;
+    const days: i64 = @divFloor(clamped, 86400);
+    const rem_sec: u64 = @intCast(@mod(clamped, 86400));
+    const hour: u64 = rem_sec / 3600;
+    const minute: u64 = (rem_sec % 3600) / 60;
+    const second: u64 = rem_sec % 60;
+
+    const z: i64 = days + 719468;
+    const era: i64 = @divFloor(z, 146097);
+    const doe: u64 = @intCast(z - era * 146097);
+    const yoe: u64 = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    const y: i64 = @as(i64, @intCast(yoe)) + era * 400;
+    const doy: u64 = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    const mp: u64 = (5 * doy + 2) / 153;
+    const day: u64 = doy - (153 * mp + 2) / 5 + 1;
+    const month: u64 = if (mp < 10) mp + 3 else mp - 9;
+    const year_i: i64 = y + @as(i64, if (month <= 2) 1 else 0);
+    const year: u64 = @intCast(@max(@as(i64, 0), @min(year_i, 9999)));
+
+    return std.fmt.bufPrint(out, "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}Z", .{
+        year,
+        month,
+        day,
+        hour,
+        minute,
+        second,
+    }) catch "1970-01-01T00:00:00Z";
+}
 
 fn hexNibble(c: u8) ?u8 {
     return switch (c) {
@@ -651,6 +721,12 @@ pub const ServerConfig = struct {
     lora_adapters: []const LoraAdapterMeta = &.{},
     /// Optional native macOS `Network.framework` TLS 1.2/1.3 listener configuration (`C18`).
     tls: ?ServerTlsConfig = null,
+    /// Optional CORS `Access-Control-Allow-Origin` header value (`null` or `""` disables CORS, `C29`).
+    cors_allow_origin: ?[]const u8 = "*",
+    /// Configurable Fill-in-the-Middle delimiters for `POST /v1/completions` when `suffix` is non-empty (`C29`).
+    fim_tokens: FimTokens = .{},
+    /// Per-connection preallocated decoded media buffer capacity carved from `arena_slab` at `Server.init` (`C29`).
+    max_media_bytes: usize = DEFAULT_MAX_MEDIA_BYTES,
 };
 
 /// Parses a dotted-quad IPv4 address string (e.g. `"127.0.0.1"`, `"0.0.0.0"`).
@@ -733,6 +809,15 @@ pub const InferenceJob = struct {
     template_dialect: chat_template.Dialect = .chatml,
     starts_in_think: bool = false,
     stream_include_usage: bool = false,
+    /// Optional pre-tokenized completion prompt token IDs (`POST /v1/completions` with `[u32, ...]`, `C29`).
+    prompt_token_ids: ?[]const u32 = null,
+    /// Preallocated decoded multimodal attachments pointing into `slot.media_buf` (`C29`).
+    media_items: [MAX_MEDIA_ITEMS_PER_REQUEST]MediaAttachment = undefined,
+    media_count: u8 = 0,
+
+    pub fn mediaSlice(self: *const InferenceJob) []const MediaAttachment {
+        return self.media_items[0..self.media_count];
+    }
 };
 
 const EMPTY_STOP_CONFIG: sampling_mod.StopConfig = .{};
@@ -2058,6 +2143,23 @@ pub const ParsedRequest = struct {
     /// Slice referencing the caller's request body for `json_schema` / `gbnf` compilation.
     response_format_schema_json: []const u8 = "",
 
+    /// Optional legacy integer `logprobs` (`0..5`) on `POST /v1/completions` (`C29`).
+    legacy_logprobs: ?u8 = null,
+    /// Pre-tokenized prompt IDs on `POST /v1/completions` when `prompt` is `[u32, ...]` (`C29`).
+    prompt_token_ids_buf: [MAX_COMPLETION_TOKEN_IDS]u32 = undefined,
+    prompt_token_ids_len: u16 = 0,
+    /// Decoded multimodal attachments extracted into `media_buf` (`C29`).
+    media_items: [MAX_MEDIA_ITEMS_PER_REQUEST]MediaAttachment = undefined,
+    media_count: u8 = 0,
+
+    pub fn promptTokenIdsSlice(self: *const ParsedRequest) []const u32 {
+        return self.prompt_token_ids_buf[0..self.prompt_token_ids_len];
+    }
+
+    pub fn mediaSlice(self: *const ParsedRequest) []const MediaAttachment {
+        return self.media_items[0..self.media_count];
+    }
+
     pub fn ngramDomainSlice(self: *const ParsedRequest) []const u8 {
         return self.ngram_domain_buf[0..self.ngram_domain_len];
     }
@@ -3120,6 +3222,347 @@ fn parseOpenAiToolCallsToViews(
     }
 }
 
+const MediaContext = struct {
+    buf: ?[]u8,
+    pos: usize = 0,
+    items: *[MAX_MEDIA_ITEMS_PER_REQUEST]MediaAttachment,
+    count: *u8,
+};
+
+const JsonStringIter = struct {
+    src: []const u8,
+    pos: usize = 1,
+    done: bool = false,
+    pending: [4]u8 = undefined,
+    pending_idx: u8 = 0,
+    pending_len: u8 = 0,
+
+    fn init(raw_quoted: []const u8) ParseError!JsonStringIter {
+        if (raw_quoted.len < 2 or raw_quoted[0] != '"') return error.InvalidFieldValue;
+        return .{ .src = raw_quoted };
+    }
+
+    fn readHex4(self: *JsonStringIter) ParseError!u16 {
+        if (self.pos + 4 > self.src.len) return error.InvalidJson;
+        var val: u16 = 0;
+        for (0..4) |_| {
+            const c = self.src[self.pos];
+            self.pos += 1;
+            const nib = hexNibble(c) orelse return error.InvalidJson;
+            val = (val << 4) | @as(u16, nib);
+        }
+        return val;
+    }
+
+    fn nextByte(self: *JsonStringIter) ParseError!?u8 {
+        if (self.pending_idx < self.pending_len) {
+            const b = self.pending[self.pending_idx];
+            self.pending_idx += 1;
+            return b;
+        }
+        if (self.done) return null;
+        if (self.pos >= self.src.len) return error.InvalidJson;
+        const b = self.src[self.pos];
+        self.pos += 1;
+        if (b == '"') {
+            self.done = true;
+            return null;
+        }
+        if (b < 0x20) return error.InvalidJson;
+        if (b != '\\') return b;
+        if (self.pos >= self.src.len) return error.InvalidJson;
+        const esc = self.src[self.pos];
+        self.pos += 1;
+        switch (esc) {
+            '"' => return '"',
+            '\\' => return '\\',
+            '/' => return '/',
+            'b' => return 0x08,
+            'f' => return 0x0c,
+            'n' => return '\n',
+            'r' => return '\r',
+            't' => return '\t',
+            'u' => {
+                const hi = try self.readHex4();
+                var cp: u21 = hi;
+                if (hi >= 0xD800 and hi <= 0xDBFF) {
+                    if (self.pos + 2 > self.src.len or self.src[self.pos] != '\\' or self.src[self.pos + 1] != 'u') {
+                        return error.InvalidJson;
+                    }
+                    self.pos += 2;
+                    const lo = try self.readHex4();
+                    if (lo < 0xDC00 or lo > 0xDFFF) return error.InvalidJson;
+                    cp = 0x10000 + (@as(u21, hi - 0xD800) << 10) + @as(u21, lo - 0xDC00);
+                } else if (hi >= 0xDC00 and hi <= 0xDFFF) {
+                    return error.InvalidJson;
+                }
+                const n = std.unicode.utf8Encode(cp, &self.pending) catch return error.InvalidJson;
+                self.pending_len = @intCast(n);
+                self.pending_idx = 1;
+                return self.pending[0];
+            },
+            else => return error.InvalidJson,
+        }
+    }
+};
+
+inline fn decodeBase64Char(c: u8) ?u6 {
+    return switch (c) {
+        'A'...'Z' => @intCast(c - 'A'),
+        'a'...'z' => @intCast(c - 'a' + 26),
+        '0'...'9' => @intCast(c - '0' + 52),
+        '+', '-' => 62,
+        '/', '_' => 63,
+        else => null,
+    };
+}
+
+fn decodeBase64MediaStream(
+    prefix_tail: []const u8,
+    it: *JsonStringIter,
+    media_ctx: *MediaContext,
+) ParseError!usize {
+    const start_pos = media_ctx.pos;
+    var q: [4]u6 = undefined;
+    var q_len: usize = 0;
+    var eq_count: usize = 0;
+    var saw_padding = false;
+    var decoded_total: usize = 0;
+    var tail_idx: usize = 0;
+
+    const emitByte = struct {
+        inline fn call(ctx: *MediaContext, total: *usize, byte: u8) ParseError!void {
+            if (ctx.buf) |mbuf| {
+                if (ctx.pos >= mbuf.len) return error.MediaTooLarge;
+                mbuf[ctx.pos] = byte;
+                ctx.pos += 1;
+            }
+            total.* += 1;
+        }
+    }.call;
+
+    while (true) {
+        const ch: u8 = if (tail_idx < prefix_tail.len) blk: {
+            const b = prefix_tail[tail_idx];
+            tail_idx += 1;
+            break :blk b;
+        } else (try it.nextByte()) orelse break;
+
+        if (ch == ' ' or ch == '\t' or ch == '\r' or ch == '\n') continue;
+        if (ch == '=') {
+            if (saw_padding or q_len < 2 or q_len + eq_count >= 4) return error.InvalidMediaBase64;
+            eq_count += 1;
+            if (q_len + eq_count == 4) {
+                if (eq_count == 2) {
+                    try emitByte(media_ctx, &decoded_total, (@as(u8, q[0]) << 2) | (@as(u8, q[1]) >> 4));
+                } else {
+                    try emitByte(media_ctx, &decoded_total, (@as(u8, q[0]) << 2) | (@as(u8, q[1]) >> 4));
+                    try emitByte(media_ctx, &decoded_total, ((@as(u8, q[1]) & 0x0F) << 4) | (@as(u8, q[2]) >> 2));
+                }
+                q_len = 0;
+                eq_count = 0;
+                saw_padding = true;
+            }
+            continue;
+        }
+        if (saw_padding or eq_count > 0) return error.InvalidMediaBase64;
+        const val = decodeBase64Char(ch) orelse return error.InvalidMediaBase64;
+        q[q_len] = val;
+        q_len += 1;
+        if (q_len == 4) {
+            try emitByte(media_ctx, &decoded_total, (@as(u8, q[0]) << 2) | (@as(u8, q[1]) >> 4));
+            try emitByte(media_ctx, &decoded_total, ((@as(u8, q[1]) & 0x0F) << 4) | (@as(u8, q[2]) >> 2));
+            try emitByte(media_ctx, &decoded_total, ((@as(u8, q[2]) & 0x03) << 6) | @as(u8, q[3]));
+            q_len = 0;
+        }
+    }
+
+    if (eq_count > 0 or q_len == 1) return error.InvalidMediaBase64;
+    if (q_len == 2) {
+        try emitByte(media_ctx, &decoded_total, (@as(u8, q[0]) << 2) | (@as(u8, q[1]) >> 4));
+    } else if (q_len == 3) {
+        try emitByte(media_ctx, &decoded_total, (@as(u8, q[0]) << 2) | (@as(u8, q[1]) >> 4));
+        try emitByte(media_ctx, &decoded_total, ((@as(u8, q[1]) & 0x0F) << 4) | (@as(u8, q[2]) >> 2));
+    }
+    if (decoded_total == 0) return error.InvalidMediaBase64;
+    return start_pos;
+}
+
+fn parseMediaUrlField(r: *JsonReader) ParseError!?[]const u8 {
+    const pch = r.peek() orelse return error.InvalidJson;
+    if (pch == '"') {
+        return try r.captureValueSlice(4);
+    }
+    if (pch == '{') {
+        r.pos += 1;
+        var url_raw: ?[]const u8 = null;
+        if (r.peek() != '}') {
+            while (true) {
+                var kb: [64]u8 = undefined;
+                const mk = try r.readKeyOrSkip(&kb);
+                try r.expectByte(':');
+                if (mk != null and std.mem.eql(u8, mk.?, "url")) {
+                    if (!r.consumeKeyword("null")) {
+                        url_raw = try r.captureValueSlice(5);
+                    }
+                } else {
+                    try r.skipValue(5);
+                }
+                const sep = r.peek() orelse return error.InvalidJson;
+                if (sep == ',') {
+                    r.pos += 1;
+                } else if (sep == '}') {
+                    r.pos += 1;
+                    break;
+                } else return error.InvalidJson;
+            }
+        } else r.pos += 1;
+        return url_raw;
+    }
+    return error.InvalidFieldValue;
+}
+
+fn parseAnthropicMediaSource(
+    r: *JsonReader,
+    src_type_buf: *[24]u8,
+    src_type: *[]const u8,
+    src_media_type_buf: *[32]u8,
+    src_media_type: *[]const u8,
+    src_data_raw: *?[]const u8,
+    media_url_raw: *?[]const u8,
+) ParseError!void {
+    try r.expectByte('{');
+    if (r.peek() == '}') {
+        r.pos += 1;
+        return;
+    }
+    while (true) {
+        var kb: [64]u8 = undefined;
+        const mk = try r.readKeyOrSkip(&kb);
+        try r.expectByte(':');
+        if (mk) |key| {
+            if (std.mem.eql(u8, key, "type")) {
+                src_type.* = r.readSmallString(src_type_buf) catch |err| switch (err) {
+                    error.BufferTooSmall => return error.InvalidFieldValue,
+                    else => return err,
+                };
+            } else if (std.mem.eql(u8, key, "media_type")) {
+                src_media_type.* = r.readSmallString(src_media_type_buf) catch |err| switch (err) {
+                    error.BufferTooSmall => return error.InvalidFieldValue,
+                    else => return err,
+                };
+            } else if (std.mem.eql(u8, key, "data")) {
+                if (!r.consumeKeyword("null")) {
+                    src_data_raw.* = try r.captureValueSlice(5);
+                }
+            } else if (std.mem.eql(u8, key, "url")) {
+                if (!r.consumeKeyword("null")) {
+                    media_url_raw.* = try r.captureValueSlice(5);
+                }
+            } else {
+                try r.skipValue(5);
+            }
+        } else {
+            try r.skipValue(5);
+        }
+        const sep = r.peek() orelse return error.InvalidJson;
+        if (sep == ',') {
+            r.pos += 1;
+        } else if (sep == '}') {
+            r.pos += 1;
+            return;
+        } else return error.InvalidJson;
+    }
+}
+
+fn extractAndDecodeMediaBlock(
+    kind: MediaKind,
+    media_url_raw: ?[]const u8,
+    src_type: []const u8,
+    src_media_type: []const u8,
+    src_data_raw: ?[]const u8,
+    media_ctx: *MediaContext,
+) ParseError!void {
+    if (media_ctx.count.* >= MAX_MEDIA_ITEMS_PER_REQUEST) return error.TooManyMediaItems;
+
+    var mime_buf: [32]u8 = @splat(0);
+    var mime_len: u8 = 0;
+    var start_pos: usize = media_ctx.pos;
+
+    if (src_data_raw != null or std.mem.eql(u8, src_type, "base64")) {
+        if (src_type.len > 0 and !std.mem.eql(u8, src_type, "base64")) {
+            return error.InvalidFieldValue;
+        }
+        const data_raw = src_data_raw orelse return error.InvalidMediaBase64;
+        if (src_media_type.len > mime_buf.len) return error.InvalidFieldValue;
+        if (src_media_type.len > 0) {
+            @memcpy(mime_buf[0..src_media_type.len], src_media_type);
+            mime_len = @intCast(src_media_type.len);
+        }
+        var it = try JsonStringIter.init(data_raw);
+        start_pos = try decodeBase64MediaStream(&.{}, &it, media_ctx);
+    } else if (media_url_raw) |url_raw| {
+        if (src_type.len > 0 and !std.mem.eql(u8, src_type, "url")) {
+            return error.InvalidFieldValue;
+        }
+        var it = try JsonStringIter.init(url_raw);
+        var hdr_buf: [128]u8 = undefined;
+        var hdr_len: usize = 0;
+        var comma_idx: ?usize = null;
+        while (hdr_len < hdr_buf.len) {
+            const b = (try it.nextByte()) orelse break;
+            hdr_buf[hdr_len] = b;
+            if (b == ',') {
+                comma_idx = hdr_len;
+                hdr_len += 1;
+                break;
+            }
+            hdr_len += 1;
+            if (hdr_len == 7 and std.ascii.eqlIgnoreCase(hdr_buf[0..7], "http://")) {
+                return error.RemoteMediaNotSupported;
+            }
+            if (hdr_len == 8 and std.ascii.eqlIgnoreCase(hdr_buf[0..8], "https://")) {
+                return error.RemoteMediaNotSupported;
+            }
+        }
+        const prefix = hdr_buf[0..hdr_len];
+        if (std.ascii.startsWithIgnoreCase(prefix, "http://") or std.ascii.startsWithIgnoreCase(prefix, "https://")) {
+            return error.RemoteMediaNotSupported;
+        }
+        if (!std.ascii.startsWithIgnoreCase(prefix, "data:")) {
+            return error.InvalidFieldValue;
+        }
+        const cidx = comma_idx orelse return error.InvalidMediaBase64;
+        const meta = hdr_buf[5..cidx];
+        var parts = std.mem.splitScalar(u8, meta, ';');
+        const raw_mime = parts.next() orelse "";
+        const eff_mime = if (raw_mime.len > 0) raw_mime else "application/octet-stream";
+        if (eff_mime.len > mime_buf.len) return error.InvalidFieldValue;
+        @memcpy(mime_buf[0..eff_mime.len], eff_mime);
+        mime_len = @intCast(eff_mime.len);
+
+        var has_base64 = false;
+        while (parts.next()) |seg| {
+            if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, seg, " \t"), "base64")) {
+                has_base64 = true;
+            }
+        }
+        if (!has_base64) return error.InvalidMediaBase64;
+        start_pos = try decodeBase64MediaStream(hdr_buf[cidx + 1 .. hdr_len], &it, media_ctx);
+    } else {
+        return error.InvalidFieldValue;
+    }
+
+    const data_slice: []const u8 = if (media_ctx.buf) |mbuf| mbuf[start_pos..media_ctx.pos] else &.{};
+    media_ctx.items[media_ctx.count.*] = .{
+        .kind = kind,
+        .mime_buf = mime_buf,
+        .mime_len = mime_len,
+        .data = data_slice,
+    };
+    media_ctx.count.* += 1;
+}
+
 fn parseMessageContentForTemplate(
     dialect: chat_template.Dialect,
     content_json: []const u8,
@@ -3135,6 +3578,7 @@ fn parseMessageContentForTemplate(
     signature_key: ?*const [32]u8,
     signature_model_id: []const u8,
     out_cache_control: *bool,
+    media_ctx: *MediaContext,
 ) ParseError!void {
     var r = JsonReader{ .src = content_json };
     const ch = r.peek() orelse return error.InvalidJson;
@@ -3168,6 +3612,12 @@ fn parseMessageContentForTemplate(
         var tr_id: []const u8 = "";
         var tr_is_error = false;
         var tr_content_raw: ?[]const u8 = null;
+        var media_url_raw: ?[]const u8 = null;
+        var src_type_buf: [24]u8 = undefined;
+        var src_type: []const u8 = "";
+        var src_media_type_buf: [32]u8 = undefined;
+        var src_media_type: []const u8 = "";
+        var src_data_raw: ?[]const u8 = null;
 
         if (r.peek() != '}') {
             while (true) {
@@ -3197,6 +3647,26 @@ fn parseMessageContentForTemplate(
                         if (!r.consumeKeyword("null")) tr_is_error = try r.readBool();
                     } else if (std.mem.eql(u8, key, "content")) {
                         tr_content_raw = try r.captureValueSlice(3);
+                    } else if (std.mem.eql(u8, key, "image_url") or std.mem.eql(u8, key, "video_url")) {
+                        if (!r.consumeKeyword("null")) {
+                            media_url_raw = try parseMediaUrlField(&r);
+                        }
+                    } else if (std.mem.eql(u8, key, "url")) {
+                        if (!r.consumeKeyword("null")) {
+                            media_url_raw = try r.captureValueSlice(3);
+                        }
+                    } else if (std.mem.eql(u8, key, "source")) {
+                        if (!r.consumeKeyword("null")) {
+                            try parseAnthropicMediaSource(
+                                &r,
+                                &src_type_buf,
+                                &src_type,
+                                &src_media_type_buf,
+                                &src_media_type,
+                                &src_data_raw,
+                                &media_url_raw,
+                            );
+                        }
                     } else if (std.mem.eql(u8, key, "cache_control")) {
                         try readerSkipCacheControl(&r, out_cache_control);
                     } else {
@@ -3225,10 +3695,12 @@ fn parseMessageContentForTemplate(
                 }
             }
         } else if (std.mem.eql(u8, btype, "image_url") or std.mem.eql(u8, btype, "image") or std.mem.eql(u8, btype, "input_image")) {
+            try extractAndDecodeMediaBlock(.image, media_url_raw, src_type, src_media_type, src_data_raw, media_ctx);
             if (parts_len.* >= parts_buf.len) return error.BufferTooSmall;
             parts_buf[parts_len.*] = .image;
             parts_len.* += 1;
         } else if (std.mem.eql(u8, btype, "video_url") or std.mem.eql(u8, btype, "video") or std.mem.eql(u8, btype, "input_video")) {
+            try extractAndDecodeMediaBlock(.video, media_url_raw, src_type, src_media_type, src_data_raw, media_ctx);
             if (parts_len.* >= parts_buf.len) return error.BufferTooSmall;
             parts_buf[parts_len.*] = .video;
             parts_len.* += 1;
@@ -3396,6 +3868,7 @@ fn renderProtocolToTemplate(
     signature_key: ?*const [32]u8,
     signature_model_id: []const u8,
     out_cache_control: *bool,
+    media_ctx: *MediaContext,
 ) ParseError!struct { prompt_len: usize, last_user_msg_byte_offset: ?usize, starts_in_think: bool } {
     var stack_scratch: [32 * 1024]u8 = undefined;
     const scratch: []u8 = unescape_scratch orelse &stack_scratch;
@@ -3443,6 +3916,7 @@ fn renderProtocolToTemplate(
                 return error.InvalidFieldValue;
             }
         },
+        .completions => unreachable,
     }
 
     const mapped_tool_choice: chat_template.ToolChoiceKind = switch (tool_choice) {
@@ -3500,6 +3974,7 @@ fn renderProtocolToTemplate(
             signature_key,
             signature_model_id,
             out_cache_control,
+            media_ctx,
         );
         renderer.pushMessage(.{
             .role = .system,
@@ -3658,6 +4133,7 @@ fn renderProtocolToTemplate(
                             signature_key,
                             signature_model_id,
                             out_cache_control,
+                            media_ctx,
                         );
                     }
                     if (tool_calls_raw) |tc_raw| {
@@ -3867,6 +4343,147 @@ pub fn parseInferenceRequestWithTemplate(
     prompt_buf: []u8,
     model_buf: []u8,
 ) ParseError!ParsedRequest {
+    return parseInferenceRequestFull(
+        endpoint,
+        body,
+        default_model,
+        tpl,
+        prior_chatml,
+        unescape_scratch,
+        signature_key,
+        .{},
+        null,
+        null,
+        prompt_buf,
+        model_buf,
+    );
+}
+
+fn renderCompletionsPrompt(
+    prompt_slice: ?[]const u8,
+    suffix_slice: ?[]const u8,
+    fim_tokens: FimTokens,
+    tok: ?*const tokenizer_mod.Tokenizer,
+    unescape_scratch: ?[]u8,
+    prompt_buf: []u8,
+    out_token_ids: *[MAX_COMPLETION_TOKEN_IDS]u32,
+    out_token_ids_len: *u16,
+) ParseError!usize {
+    const p_raw = prompt_slice orelse return error.MissingRequiredField;
+    var stack_scratch: [16 * 1024]u8 = undefined;
+    const scratch: []u8 = unescape_scratch orelse &stack_scratch;
+    var scratch_pos: usize = 0;
+
+    var suffix_txt: []const u8 = "";
+    if (suffix_slice) |sr| {
+        var sr_r = JsonReader{ .src = sr };
+        if (sr_r.peek() != '"') return error.InvalidFieldValue;
+        suffix_txt = try unescapeQuotedJson(sr[sr_r.pos..], scratch, &scratch_pos);
+    }
+
+    var pr = JsonReader{ .src = p_raw };
+    const pch = pr.peek() orelse return error.InvalidJson;
+    if (pch == '"') {
+        const p_txt = try unescapeQuotedJson(p_raw[pr.pos..], scratch, &scratch_pos);
+        var fw = FixedWriter.init(prompt_buf);
+        if (suffix_txt.len > 0) {
+            try fw.writeAll(fim_tokens.prefix);
+            try fw.writeAll(p_txt);
+            try fw.writeAll(fim_tokens.suffix);
+            try fw.writeAll(suffix_txt);
+            try fw.writeAll(fim_tokens.middle);
+        } else {
+            try fw.writeAll(p_txt);
+        }
+        return fw.pos;
+    }
+
+    if (pch == '[') {
+        pr.pos += 1;
+        const first_ch = pr.peek() orelse return error.InvalidJson;
+        if (first_ch == ']') return error.InvalidFieldValue;
+        if (first_ch == '"') {
+            const elem_raw = try pr.captureValueSlice(2);
+            const sep = pr.peek() orelse return error.InvalidJson;
+            if (sep == ',') return error.UnsupportedFeature;
+            if (sep != ']') return error.InvalidJson;
+            pr.pos += 1;
+            const p_txt = try unescapeQuotedJson(elem_raw, scratch, &scratch_pos);
+            var fw = FixedWriter.init(prompt_buf);
+            if (suffix_txt.len > 0) {
+                try fw.writeAll(fim_tokens.prefix);
+                try fw.writeAll(p_txt);
+                try fw.writeAll(fim_tokens.suffix);
+                try fw.writeAll(suffix_txt);
+                try fw.writeAll(fim_tokens.middle);
+            } else {
+                try fw.writeAll(p_txt);
+            }
+            return fw.pos;
+        }
+
+        var count: usize = 0;
+        while (true) {
+            const tid = try pr.readU32();
+            if (count >= MAX_COMPLETION_TOKEN_IDS) return error.BufferTooSmall;
+            out_token_ids[count] = tid;
+            count += 1;
+            const sep = pr.peek() orelse return error.InvalidJson;
+            if (sep == ',') {
+                pr.pos += 1;
+            } else if (sep == ']') {
+                pr.pos += 1;
+                break;
+            } else return error.InvalidJson;
+        }
+        out_token_ids_len.* = @intCast(count);
+
+        if (tok) |t| {
+            const dec_dst = if (suffix_txt.len > 0) scratch[scratch_pos..] else prompt_buf;
+            const decoded = t.decode(out_token_ids[0..count], dec_dst) catch |err| switch (err) {
+                error.BufferTooSmall => return error.BufferTooSmall,
+                else => return error.InvalidFieldValue,
+            };
+            if (suffix_txt.len > 0) {
+                var fw = FixedWriter.init(prompt_buf);
+                try fw.writeAll(fim_tokens.prefix);
+                try fw.writeAll(decoded);
+                try fw.writeAll(fim_tokens.suffix);
+                try fw.writeAll(suffix_txt);
+                try fw.writeAll(fim_tokens.middle);
+                return fw.pos;
+            }
+            return decoded.len;
+        }
+
+        if (suffix_txt.len > 0) {
+            var fw = FixedWriter.init(prompt_buf);
+            try fw.writeAll(fim_tokens.prefix);
+            try fw.writeAll(fim_tokens.suffix);
+            try fw.writeAll(suffix_txt);
+            try fw.writeAll(fim_tokens.middle);
+            return fw.pos;
+        }
+        return 0;
+    }
+
+    return error.InvalidFieldValue;
+}
+
+pub fn parseInferenceRequestFull(
+    endpoint: Endpoint,
+    body: []const u8,
+    default_model: []const u8,
+    tpl: *const chat_template.ChatTemplate,
+    prior_chatml: ?[]const u8,
+    unescape_scratch: ?[]u8,
+    signature_key: ?*const [32]u8,
+    fim_tokens: FimTokens,
+    tok: ?*const tokenizer_mod.Tokenizer,
+    media_buf: ?[]u8,
+    prompt_buf: []u8,
+    model_buf: []u8,
+) ParseError!ParsedRequest {
     var r = JsonReader{ .src = body };
     try r.expectByte('{');
 
@@ -3897,6 +4514,7 @@ pub fn parseInferenceRequestWithTemplate(
     var logit_bias_entries: [sampling_mod.MAX_LOGIT_BIAS_ENTRIES]sampling_mod.LogitBiasEntry = undefined;
     var logit_bias_len: u8 = 0;
     var logprobs: bool = false;
+    var legacy_logprobs: ?u8 = null;
     var top_logprobs: u8 = 0;
     var stop_config = sampling_mod.StopConfig.init();
     var stream_include_usage: bool = false;
@@ -3922,6 +4540,8 @@ pub fn parseInferenceRequestWithTemplate(
     var system_slice: ?[]const u8 = null;
     var messages_slice: ?[]const u8 = null;
     var input_slice: ?[]const u8 = null;
+    var prompt_slice: ?[]const u8 = null;
+    var suffix_slice: ?[]const u8 = null;
 
     if (r.peek() != '}') {
         while (true) {
@@ -3942,6 +4562,14 @@ pub fn parseInferenceRequestWithTemplate(
                 messages_slice = try r.captureValueSlice(1);
             } else if (std.mem.eql(u8, maybe_key.?, "input")) {
                 input_slice = try r.captureValueSlice(1);
+            } else if (std.mem.eql(u8, maybe_key.?, "prompt")) {
+                if (!r.consumeKeyword("null")) {
+                    prompt_slice = try r.captureValueSlice(1);
+                }
+            } else if (std.mem.eql(u8, maybe_key.?, "suffix")) {
+                if (!r.consumeKeyword("null")) {
+                    suffix_slice = try r.captureValueSlice(1);
+                }
             } else if (std.mem.eql(u8, maybe_key.?, "system") or std.mem.eql(u8, maybe_key.?, "instructions")) {
                 if (!r.consumeKeyword("null")) {
                     system_slice = try r.captureValueSlice(1);
@@ -4023,7 +4651,21 @@ pub fn parseInferenceRequestWithTemplate(
                 }
             } else if (std.mem.eql(u8, maybe_key.?, "logprobs")) {
                 if (!r.consumeKeyword("null")) {
-                    logprobs = try r.readBool();
+                    if (endpoint == .completions) {
+                        const pch = r.peek() orelse return error.InvalidJson;
+                        if (pch == 't' or pch == 'f') {
+                            logprobs = try r.readBool();
+                            legacy_logprobs = if (logprobs) 1 else null;
+                        } else {
+                            const lv = try r.readU32();
+                            if (lv > 5) return error.InvalidFieldValue;
+                            legacy_logprobs = @intCast(lv);
+                            logprobs = true;
+                            top_logprobs = @intCast(lv);
+                        }
+                    } else {
+                        logprobs = try r.readBool();
+                    }
                 }
             } else if (std.mem.eql(u8, maybe_key.?, "top_logprobs")) {
                 if (!r.consumeKeyword("null")) {
@@ -4386,7 +5028,9 @@ pub fn parseInferenceRequestWithTemplate(
             return error.InvalidFieldValue;
         }
     }
-    const enable_thinking: bool = if (resolved_enable_opt) |b|
+    const enable_thinking: bool = if (endpoint == .completions)
+        false
+    else if (resolved_enable_opt) |b|
         b
     else if (resolved_effort_opt) |e|
         e.isThinkingEnabled()
@@ -4400,34 +5044,59 @@ pub fn parseInferenceRequestWithTemplate(
         null;
     const resolved_budget_tokens: ?u32 = if (enable_thinking) thinking_budget_tokens else null;
 
-    const rendered = try renderProtocolToTemplate(
-        endpoint,
-        tpl,
-        prompt_buf,
-        prior_chatml,
-        system_slice,
-        messages_slice,
-        input_slice,
-        tools[0..tool_count],
-        tools_raw_slice,
-        tool_choice,
-        tool_choice_name_buf[0..tool_choice_name_len],
-        parallel_tool_calls,
-        resolved_effort,
-        enable_thinking,
-        kw_preserved_thinking,
-        unescape_scratch,
-        signature_key,
-        model_buf[0..model_len],
-        &cache_control_pin,
-    );
-    const starts_in_think = rendered.starts_in_think;
+    var prompt_token_ids_buf: [MAX_COMPLETION_TOKEN_IDS]u32 = undefined;
+    var prompt_token_ids_len: u16 = 0;
+    var media_items: [MAX_MEDIA_ITEMS_PER_REQUEST]MediaAttachment = undefined;
+    var media_count: u8 = 0;
+
+    const rendered_prompt_len: usize, const rendered_boundary: ?usize, const starts_in_think: bool = if (endpoint == .completions) blk: {
+        const plen = try renderCompletionsPrompt(
+            prompt_slice,
+            suffix_slice,
+            fim_tokens,
+            tok,
+            unescape_scratch,
+            prompt_buf,
+            &prompt_token_ids_buf,
+            &prompt_token_ids_len,
+        );
+        break :blk .{ plen, null, false };
+    } else blk: {
+        var media_ctx = MediaContext{
+            .buf = media_buf,
+            .items = &media_items,
+            .count = &media_count,
+        };
+        const rendered = try renderProtocolToTemplate(
+            endpoint,
+            tpl,
+            prompt_buf,
+            prior_chatml,
+            system_slice,
+            messages_slice,
+            input_slice,
+            tools[0..tool_count],
+            tools_raw_slice,
+            tool_choice,
+            tool_choice_name_buf[0..tool_choice_name_len],
+            parallel_tool_calls,
+            resolved_effort,
+            enable_thinking,
+            kw_preserved_thinking,
+            unescape_scratch,
+            signature_key,
+            model_buf[0..model_len],
+            &cache_control_pin,
+            &media_ctx,
+        );
+        break :blk .{ rendered.prompt_len, rendered.last_user_msg_byte_offset, rendered.starts_in_think };
+    };
 
     return .{
         .endpoint = endpoint,
         .model_len = @intCast(model_len),
-        .prompt_len = rendered.prompt_len,
-        .last_user_msg_byte_offset = rendered.last_user_msg_byte_offset,
+        .prompt_len = rendered_prompt_len,
+        .last_user_msg_byte_offset = rendered_boundary,
         .max_tokens = max_tokens,
         .temperature = temperature,
         .seed = seed,
@@ -4467,6 +5136,11 @@ pub fn parseInferenceRequestWithTemplate(
         .response_format = response_format,
         .response_format_strict = response_format_strict,
         .response_format_schema_json = response_format_schema_json,
+        .legacy_logprobs = legacy_logprobs,
+        .prompt_token_ids_buf = prompt_token_ids_buf,
+        .prompt_token_ids_len = prompt_token_ids_len,
+        .media_items = media_items,
+        .media_count = media_count,
     };
 }
 
@@ -4818,12 +5492,14 @@ const HttpMethod = enum(u8) {
     get,
     post,
     delete,
+    options,
     other,
 };
 
 const HttpHeadersResult = struct {
     method: HttpMethod,
     path: []const u8,
+    query: []const u8 = "",
     header_end: usize,
     content_length: ?usize,
     chunked: bool,
@@ -4863,10 +5539,14 @@ fn parseHttpHeaders(buf: []const u8) HttpParseError!HttpHeadersResult {
         .post
     else if (std.mem.eql(u8, method_str, "DELETE"))
         .delete
+    else if (std.mem.eql(u8, method_str, "OPTIONS"))
+        .options
     else
         .other;
 
-    const path = if (std.mem.indexOfScalar(u8, target_str, '?')) |q| target_str[0..q] else target_str;
+    const q_idx = std.mem.indexOfScalar(u8, target_str, '?');
+    const path = if (q_idx) |q| target_str[0..q] else target_str;
+    const query = if (q_idx) |q| target_str[q + 1 ..] else "";
 
     var content_length: ?usize = null;
     var chunked = false;
@@ -4921,6 +5601,7 @@ fn parseHttpHeaders(buf: []const u8) HttpParseError!HttpHeadersResult {
     return .{
         .method = method,
         .path = path,
+        .query = query,
         .header_end = header_end,
         .content_length = content_length,
         .chunked = chunked,
@@ -5165,6 +5846,32 @@ const IncompleteReason = enum(u8) {
     }
 };
 
+const InputItemRole = enum(u8) {
+    user = 0,
+    system = 1,
+    developer = 2,
+    assistant = 3,
+    tool = 4,
+
+    fn name(self: InputItemRole) []const u8 {
+        return switch (self) {
+            .user => "user",
+            .system => "system",
+            .developer => "developer",
+            .assistant => "assistant",
+            .tool => "tool",
+        };
+    }
+};
+
+const StatefulInputItem = struct {
+    origin_request_id: u64 = 0,
+    origin_item_idx: u16 = 0,
+    offset: u32 = 0,
+    len: u32 = 0,
+    role: InputItemRole = .user,
+};
+
 /// Preallocated fixed-slot stateful `/v1/responses` record (`evict_first` LRU,
 /// zero steady-state heap allocation, `C18`).
 const StatefulResponseSlot = struct {
@@ -5198,6 +5905,10 @@ const StatefulResponseSlot = struct {
     reasoning_len: usize = 0,
     content_buf: []u8 = &.{},
     content_len: usize = 0,
+    input_items_buf: []u8 = &.{},
+    input_items_len: usize = 0,
+    input_items: [MAX_STATEFUL_INPUT_ITEMS]StatefulInputItem = undefined,
+    input_item_count: u8 = 0,
     tool_calls: [MAX_STORED_TOOL_CALLS]StoredToolCall = undefined,
     tool_call_count: u8 = 0,
 
@@ -5236,6 +5947,10 @@ const ConnectionSlot = struct {
     nonstream_reasoning_len: usize,
     nonstream_content_buf: []u8,
     nonstream_content_len: usize,
+    media_buf: []u8,
+    prompt_token_ids_buf: [MAX_COMPLETION_TOKEN_IDS]u32,
+    prompt_token_ids_len: u16,
+    legacy_logprobs: ?u8,
 
     // Lock-free worker->server token ring backed by `Server.token_ring_storage`.
     token_ring: ring.SpscRing(TokenEvent),
@@ -5391,6 +6106,8 @@ const ConnectionSlot = struct {
 
     fn resetPerRequestState(self: *ConnectionSlot) void {
         self.prompt_len = 0;
+        self.prompt_token_ids_len = 0;
+        self.legacy_logprobs = null;
         self.tx_read_pos = 0;
         self.tx_write_pos = 0;
         self.nonstream_reasoning_len = 0;
@@ -5690,6 +6407,8 @@ fn utf8ChunkLen(slice: []const u8, max_len: usize) usize {
 const StoredLoraAdapter = struct {
     name_buf: [lora_mod.MAX_ADAPTER_NAME_LEN]u8 = @splat(0),
     name_len: u8 = 0,
+    display_name_buf: [MAX_DISPLAY_NAME_BYTES]u8 = @splat(0),
+    display_name_len: u8 = 0,
     rank: u32 = 0,
     lora_alpha: f32 = 0.0,
     scale: f32 = 0.0,
@@ -5697,6 +6416,27 @@ const StoredLoraAdapter = struct {
 
     fn nameSlice(self: *const StoredLoraAdapter) []const u8 {
         return self.name_buf[0..self.name_len];
+    }
+
+    fn displayNameSlice(self: *const StoredLoraAdapter) []const u8 {
+        return self.display_name_buf[0..self.display_name_len];
+    }
+};
+
+const StoredFimTokens = struct {
+    prefix_buf: [MAX_FIM_TOKEN_BYTES]u8 = @splat(0),
+    prefix_len: u8 = 0,
+    suffix_buf: [MAX_FIM_TOKEN_BYTES]u8 = @splat(0),
+    suffix_len: u8 = 0,
+    middle_buf: [MAX_FIM_TOKEN_BYTES]u8 = @splat(0),
+    middle_len: u8 = 0,
+
+    fn asFimTokens(self: *const StoredFimTokens) FimTokens {
+        return .{
+            .prefix = self.prefix_buf[0..self.prefix_len],
+            .suffix = self.suffix_buf[0..self.suffix_len],
+            .middle = self.middle_buf[0..self.middle_len],
+        };
     }
 };
 
@@ -5707,11 +6447,16 @@ pub const Server = struct {
     created_unix_sec: i64,
     model_arch_buf: [64]u8,
     model_arch_len: u8,
+    model_display_name_buf: [MAX_DISPLAY_NAME_BYTES]u8,
+    model_display_name_len: u8,
     model_detail: ModelDetailMeta,
     lora_adapters_storage: [lora_mod.MAX_ADAPTERS]StoredLoraAdapter,
     lora_adapter_count: u8,
     api_key_buf: [MAX_API_KEY_BYTES]u8,
     api_key_len: u16,
+    cors_allow_origin_buf: [MAX_CORS_ORIGIN_BYTES]u8,
+    cors_allow_origin_len: u16,
+    fim_tokens: StoredFimTokens,
     signature_key: [32]u8,
     unix_socket_path_buf: [MAX_UNIX_SOCKET_PATH_BYTES + 1]u8,
     unix_socket_path_len: u16,
@@ -5800,6 +6545,7 @@ pub const Server = struct {
         if (config.lora_adapters.len > lora_mod.MAX_ADAPTERS) return error.InvalidConfig;
         for (config.lora_adapters, 0..) |adp, i| {
             if (adp.name.len == 0 or adp.name.len > lora_mod.MAX_ADAPTER_NAME_LEN) return error.InvalidConfig;
+            if (adp.display_name.len > MAX_DISPLAY_NAME_BYTES) return error.InvalidConfig;
             if (adp.rank == 0) return error.InvalidConfig;
             if (!std.math.isFinite(adp.lora_alpha) or !std.math.isFinite(adp.scale)) return error.InvalidConfig;
             if (config.model_id.len + 1 + adp.name.len > MAX_MODEL_ID_BYTES) return error.InvalidConfig;
@@ -5808,7 +6554,18 @@ pub const Server = struct {
             }
         }
         var init_meta = config.model_detail orelse ModelDetailMeta{};
+        if (init_meta.display_name.len > MAX_DISPLAY_NAME_BYTES) return error.InvalidConfig;
         if (!std.math.isFinite(init_meta.effective_bits_per_weight)) return error.InvalidConfig;
+        if (config.cors_allow_origin) |origin| {
+            if (origin.len > MAX_CORS_ORIGIN_BYTES) return error.InvalidConfig;
+            if (std.mem.indexOfAny(u8, origin, "\r\n") != null) return error.InvalidConfig;
+        }
+        if (config.fim_tokens.prefix.len > MAX_FIM_TOKEN_BYTES or
+            config.fim_tokens.suffix.len > MAX_FIM_TOKEN_BYTES or
+            config.fim_tokens.middle.len > MAX_FIM_TOKEN_BYTES)
+        {
+            return error.InvalidConfig;
+        }
         if (config.api_key) |ak| {
             if (ak.len > MAX_API_KEY_BYTES) return error.InvalidConfig;
         }
@@ -5844,6 +6601,7 @@ pub const Server = struct {
             sum = std.math.add(usize, sum, config.tx_buf_bytes) catch return error.InvalidConfig;
             sum = std.math.add(usize, sum, config.nonstream_reasoning_bytes) catch return error.InvalidConfig;
             sum = std.math.add(usize, sum, config.nonstream_content_bytes) catch return error.InvalidConfig;
+            sum = std.math.add(usize, sum, config.max_media_bytes) catch return error.InvalidConfig;
             break :blk sum;
         };
         const raw_slab_bytes = std.math.mul(usize, per_slot_bytes, config.max_conns) catch return error.InvalidConfig;
@@ -5867,7 +6625,8 @@ pub const Server = struct {
             config.stateful_response_slots;
         const per_resp_bytes = DEFAULT_STATEFUL_RESPONSE_PROMPT_BYTES +
             DEFAULT_STATEFUL_RESPONSE_REASONING_BYTES +
-            DEFAULT_STATEFUL_RESPONSE_CONTENT_BYTES;
+            DEFAULT_STATEFUL_RESPONSE_CONTENT_BYTES +
+            DEFAULT_STATEFUL_RESPONSE_INPUT_ITEMS_BYTES;
         const raw_resp_bytes = std.math.mul(usize, per_resp_bytes, resp_slot_count) catch return error.InvalidConfig;
         const aligned_resp_bytes = if (raw_resp_bytes == 0)
             APPLE_PAGE_SIZE
@@ -5889,10 +6648,13 @@ pub const Server = struct {
                 r_off += DEFAULT_STATEFUL_RESPONSE_REASONING_BYTES;
                 const o_buf = response_store_slab[r_off .. r_off + DEFAULT_STATEFUL_RESPONSE_CONTENT_BYTES];
                 r_off += DEFAULT_STATEFUL_RESPONSE_CONTENT_BYTES;
+                const ii_buf = response_store_slab[r_off .. r_off + DEFAULT_STATEFUL_RESPONSE_INPUT_ITEMS_BYTES];
+                r_off += DEFAULT_STATEFUL_RESPONSE_INPUT_ITEMS_BYTES;
                 rs.* = .{
                     .chatml_buf = c_buf,
                     .reasoning_buf = r_buf,
                     .content_buf = o_buf,
+                    .input_items_buf = ii_buf,
                 };
             }
         }
@@ -5945,6 +6707,8 @@ pub const Server = struct {
             slab_off += config.nonstream_reasoning_bytes;
             const ns_content = arena_slab[slab_off .. slab_off + config.nonstream_content_bytes];
             slab_off += config.nonstream_content_bytes;
+            const media = arena_slab[slab_off .. slab_off + config.max_media_bytes];
+            slab_off += config.max_media_bytes;
 
             const tok_start = i * config.token_ring_cap;
             const tok_ring = ring.SpscRing(TokenEvent).init(
@@ -5971,6 +6735,10 @@ pub const Server = struct {
                 .nonstream_reasoning_len = 0,
                 .nonstream_content_buf = ns_content,
                 .nonstream_content_len = 0,
+                .media_buf = media,
+                .prompt_token_ids_buf = undefined,
+                .prompt_token_ids_len = 0,
+                .legacy_logprobs = null,
                 .token_ring = tok_ring,
                 .cancelled = .init(false),
                 .worker_active = .init(false),
@@ -6207,7 +6975,37 @@ pub const Server = struct {
         const model_arch_len: u8 = @intCast(@min(raw_arch.len, model_arch_buf.len));
         @memcpy(model_arch_buf[0..model_arch_len], raw_arch[0..model_arch_len]);
 
+        var model_display_name_buf: [MAX_DISPLAY_NAME_BYTES]u8 = @splat(0);
+        const model_display_name_len: u8 = @intCast(init_meta.display_name.len);
+        if (model_display_name_len > 0) {
+            @memcpy(model_display_name_buf[0..model_display_name_len], init_meta.display_name);
+        }
+
+        var cors_allow_origin_buf: [MAX_CORS_ORIGIN_BYTES]u8 = @splat(0);
+        var cors_allow_origin_len: u16 = 0;
+        if (config.cors_allow_origin) |origin| {
+            if (origin.len > 0) {
+                @memcpy(cors_allow_origin_buf[0..origin.len], origin);
+                cors_allow_origin_len = @intCast(origin.len);
+            }
+        }
+
+        var fim_tokens_stored: StoredFimTokens = .{};
+        if (config.fim_tokens.prefix.len > 0) {
+            @memcpy(fim_tokens_stored.prefix_buf[0..config.fim_tokens.prefix.len], config.fim_tokens.prefix);
+            fim_tokens_stored.prefix_len = @intCast(config.fim_tokens.prefix.len);
+        }
+        if (config.fim_tokens.suffix.len > 0) {
+            @memcpy(fim_tokens_stored.suffix_buf[0..config.fim_tokens.suffix.len], config.fim_tokens.suffix);
+            fim_tokens_stored.suffix_len = @intCast(config.fim_tokens.suffix.len);
+        }
+        if (config.fim_tokens.middle.len > 0) {
+            @memcpy(fim_tokens_stored.middle_buf[0..config.fim_tokens.middle.len], config.fim_tokens.middle);
+            fim_tokens_stored.middle_len = @intCast(config.fim_tokens.middle.len);
+        }
+
         init_meta.architecture = &.{};
+        init_meta.display_name = &.{};
         if (init_meta.max_model_len == 0) {
             init_meta.max_model_len = @intCast(@min(config.max_prompt_tokens, std.math.maxInt(u32)));
         }
@@ -6224,6 +7022,10 @@ pub const Server = struct {
         for (config.lora_adapters, 0..) |adp, i| {
             @memcpy(lora_adapters_storage[i].name_buf[0..adp.name.len], adp.name);
             lora_adapters_storage[i].name_len = @intCast(adp.name.len);
+            if (adp.display_name.len > 0) {
+                @memcpy(lora_adapters_storage[i].display_name_buf[0..adp.display_name.len], adp.display_name);
+                lora_adapters_storage[i].display_name_len = @intCast(adp.display_name.len);
+            }
             lora_adapters_storage[i].rank = adp.rank;
             lora_adapters_storage[i].lora_alpha = adp.lora_alpha;
             lora_adapters_storage[i].scale = adp.scale;
@@ -6235,6 +7037,8 @@ pub const Server = struct {
         stored_config.model_detail = null;
         stored_config.lora_adapters = &.{};
         stored_config.tls = null;
+        stored_config.cors_allow_origin = null;
+        stored_config.fim_tokens = .{};
 
         self.* = .{
             .config = stored_config,
@@ -6243,11 +7047,16 @@ pub const Server = struct {
             .created_unix_sec = created_unix_sec,
             .model_arch_buf = model_arch_buf,
             .model_arch_len = model_arch_len,
+            .model_display_name_buf = model_display_name_buf,
+            .model_display_name_len = model_display_name_len,
             .model_detail = init_meta,
             .lora_adapters_storage = lora_adapters_storage,
             .lora_adapter_count = @intCast(config.lora_adapters.len),
             .api_key_buf = api_key_buf,
             .api_key_len = api_key_len,
+            .cors_allow_origin_buf = cors_allow_origin_buf,
+            .cors_allow_origin_len = cors_allow_origin_len,
+            .fim_tokens = fim_tokens_stored,
             .signature_key = signature_key,
             .unix_socket_path_buf = unix_path_buf,
             .unix_socket_path_len = unix_path_len,
@@ -7295,8 +8104,17 @@ pub const Server = struct {
             slot.rx_consumed_len = total_needed;
         }
 
+        const route_path = hdr.path;
+        const norm_path = normalizeApiPath(route_path);
+
+        // Handle CORS preflight (`OPTIONS`) BEFORE `--api-key` authentication on known routes (`C29`).
+        if (hdr.method == .options and isKnownRoute(route_path, norm_path)) {
+            self.handleOptionsPreflight(slot);
+            return;
+        }
+
         // Route dispatch.
-        if (std.mem.eql(u8, hdr.path, "/health")) {
+        if (std.mem.eql(u8, route_path, "/health")) {
             if (hdr.method != .get) {
                 self.sendErrorResponse(slot, 405, "Method Not Allowed", "GET", "method not allowed", "invalid_request_error", "method_not_allowed");
                 return;
@@ -7305,7 +8123,7 @@ pub const Server = struct {
             return;
         }
 
-        // Constant-time `--api-key` validation (`C18`) across all `/v1/*` routes:
+        // Constant-time `--api-key` validation (`C18`) across all `/v1/*` and prefix-free routes:
         // accepts either `Authorization: Bearer <key>` or `x-api-key: <key>`.
         if (self.api_key_len > 0) {
             const expected = self.api_key_buf[0..self.api_key_len];
@@ -7332,18 +8150,16 @@ pub const Server = struct {
             }
         }
 
-        const route_path = if (std.mem.indexOfScalar(u8, hdr.path, '?')) |q| hdr.path[0..q] else hdr.path;
-
-        if (std.mem.eql(u8, route_path, "/v1/models")) {
+        if (std.mem.eql(u8, norm_path, "/models")) {
             if (hdr.method != .get) {
                 self.sendErrorResponse(slot, 405, "Method Not Allowed", "GET", "method not allowed", "invalid_request_error", "method_not_allowed");
                 return;
             }
-            self.handleModels(slot);
+            self.handleModels(slot, hdr.query);
             return;
         }
-        if (std.mem.startsWith(u8, route_path, "/v1/models/")) {
-            const raw_id = route_path["/v1/models/".len..];
+        if (std.mem.startsWith(u8, norm_path, "/models/")) {
+            const raw_id = norm_path["/models/".len..];
             if (raw_id.len == 0) {
                 self.sendErrorResponse(slot, 404, "Not Found", null, "model not found", "invalid_request_error", "model_not_found");
                 return;
@@ -7355,7 +8171,7 @@ pub const Server = struct {
             self.handleModelById(slot, raw_id);
             return;
         }
-        if (std.mem.eql(u8, hdr.path, "/v1/ngram-packs")) {
+        if (std.mem.eql(u8, norm_path, "/ngram-packs")) {
             if (hdr.method != .get) {
                 self.sendErrorResponse(slot, 405, "Method Not Allowed", "GET", "method not allowed", "invalid_request_error", "method_not_allowed");
                 return;
@@ -7363,7 +8179,7 @@ pub const Server = struct {
             self.handleNgramPacks(slot);
             return;
         }
-        if (std.mem.eql(u8, hdr.path, "/v1/ngram-packs/select")) {
+        if (std.mem.eql(u8, norm_path, "/ngram-packs/select")) {
             if (hdr.method != .post) {
                 self.sendErrorResponse(slot, 405, "Method Not Allowed", "POST", "method not allowed", "invalid_request_error", "method_not_allowed");
                 return;
@@ -7371,7 +8187,7 @@ pub const Server = struct {
             self.handleNgramPacksSelect(slot, body);
             return;
         }
-        if (std.mem.eql(u8, hdr.path, "/v1/embeddings")) {
+        if (std.mem.eql(u8, norm_path, "/embeddings")) {
             if (hdr.method != .post) {
                 self.sendErrorResponse(slot, 405, "Method Not Allowed", "POST", "method not allowed", "invalid_request_error", "method_not_allowed");
                 return;
@@ -7379,7 +8195,7 @@ pub const Server = struct {
             self.handleEmbeddings(slot, body);
             return;
         }
-        if (std.mem.eql(u8, hdr.path, "/v1/rerank")) {
+        if (std.mem.eql(u8, norm_path, "/rerank")) {
             if (hdr.method != .post) {
                 self.sendErrorResponse(slot, 405, "Method Not Allowed", "POST", "method not allowed", "invalid_request_error", "method_not_allowed");
                 return;
@@ -7387,7 +8203,7 @@ pub const Server = struct {
             self.handleRerank(slot, body);
             return;
         }
-        if (std.mem.eql(u8, hdr.path, "/v1/messages/count_tokens")) {
+        if (std.mem.eql(u8, norm_path, "/messages/count_tokens")) {
             if (hdr.method != .post) {
                 self.sendErrorResponse(slot, 405, "Method Not Allowed", "POST", "method not allowed", "invalid_request_error", "method_not_allowed");
                 return;
@@ -7396,10 +8212,18 @@ pub const Server = struct {
             self.handleMessagesCountTokens(slot, body);
             return;
         }
+        if (std.mem.eql(u8, norm_path, "/responses/input_tokens")) {
+            if (hdr.method != .post) {
+                self.sendErrorResponse(slot, 405, "Method Not Allowed", "POST", "method not allowed", "invalid_request_error", "method_not_allowed");
+                return;
+            }
+            self.handleResponsesInputTokens(slot, body);
+            return;
+        }
 
-        // Stateful `/v1/responses/{id}` and `/v1/responses/{id}/cancel` routes (`C18`).
-        if (std.mem.startsWith(u8, hdr.path, "/v1/responses/")) {
-            const rest = hdr.path["/v1/responses/".len..];
+        // Stateful `/v1/responses/{id}`, `/v1/responses/{id}/cancel`, and `/v1/responses/{id}/input_items` (`C18`/`C29`).
+        if (std.mem.startsWith(u8, norm_path, "/responses/")) {
+            const rest = norm_path["/responses/".len..];
             if (std.mem.endsWith(u8, rest, "/cancel")) {
                 const resp_id = rest[0 .. rest.len - "/cancel".len];
                 if (resp_id.len == 0 or std.mem.indexOfScalar(u8, resp_id, '/') != null) {
@@ -7413,6 +8237,19 @@ pub const Server = struct {
                 self.handleResponseCancel(slot, resp_id);
                 return;
             }
+            if (std.mem.endsWith(u8, rest, "/input_items")) {
+                const resp_id = rest[0 .. rest.len - "/input_items".len];
+                if (resp_id.len == 0 or std.mem.indexOfScalar(u8, resp_id, '/') != null) {
+                    self.sendErrorResponse(slot, 404, "Not Found", null, "endpoint not found", "invalid_request_error", "not_found");
+                    return;
+                }
+                if (hdr.method != .get) {
+                    self.sendErrorResponse(slot, 405, "Method Not Allowed", "GET", "method not allowed", "invalid_request_error", "method_not_allowed");
+                    return;
+                }
+                self.handleResponseInputItems(slot, resp_id, hdr.query);
+                return;
+            }
             if (rest.len > 0 and std.mem.indexOfScalar(u8, rest, '/') == null) {
                 switch (hdr.method) {
                     .get => self.handleResponseGet(slot, rest),
@@ -7423,11 +8260,13 @@ pub const Server = struct {
             }
         }
 
-        const endpoint: Endpoint = if (std.mem.eql(u8, hdr.path, "/v1/chat/completions"))
+        const endpoint: Endpoint = if (std.mem.eql(u8, norm_path, "/chat/completions"))
             .chat_completions
-        else if (std.mem.eql(u8, hdr.path, "/v1/responses"))
+        else if (std.mem.eql(u8, norm_path, "/completions"))
+            .completions
+        else if (std.mem.eql(u8, norm_path, "/responses"))
             .responses
-        else if (std.mem.eql(u8, hdr.path, "/v1/messages"))
+        else if (std.mem.eql(u8, norm_path, "/messages"))
             .messages
         else {
             self.sendErrorResponse(slot, 404, "Not Found", null, "endpoint not found", "invalid_request_error", "not_found");
@@ -7441,6 +8280,136 @@ pub const Server = struct {
         if (endpoint == .messages and !self.validateAnthropicHeaders(slot, &hdr)) return;
 
         self.admitInferenceRequest(slot, endpoint, body);
+    }
+
+    fn normalizeApiPath(path: []const u8) []const u8 {
+        if (std.mem.startsWith(u8, path, "/v1/")) {
+            return path["/v1".len..];
+        }
+        return path;
+    }
+
+    fn isKnownRoute(raw_path: []const u8, norm_path: []const u8) bool {
+        if (std.mem.eql(u8, raw_path, "/health")) return true;
+        if (std.mem.eql(u8, norm_path, "/models")) return true;
+        if (std.mem.startsWith(u8, norm_path, "/models/") and norm_path.len > "/models/".len) return true;
+        if (std.mem.eql(u8, norm_path, "/ngram-packs") or std.mem.eql(u8, norm_path, "/ngram-packs/select")) return true;
+        if (std.mem.eql(u8, norm_path, "/embeddings") or std.mem.eql(u8, norm_path, "/rerank")) return true;
+        if (std.mem.eql(u8, norm_path, "/messages") or std.mem.eql(u8, norm_path, "/messages/count_tokens")) return true;
+        if (std.mem.eql(u8, norm_path, "/chat/completions") or std.mem.eql(u8, norm_path, "/completions")) return true;
+        if (std.mem.eql(u8, norm_path, "/responses") or std.mem.eql(u8, norm_path, "/responses/input_tokens")) return true;
+        if (std.mem.startsWith(u8, norm_path, "/responses/")) {
+            const rest = norm_path["/responses/".len..];
+            if (std.mem.endsWith(u8, rest, "/cancel")) {
+                const rid = rest[0 .. rest.len - "/cancel".len];
+                return rid.len > 0 and std.mem.indexOfScalar(u8, rid, '/') == null;
+            }
+            if (std.mem.endsWith(u8, rest, "/input_items")) {
+                const rid = rest[0 .. rest.len - "/input_items".len];
+                return rid.len > 0 and std.mem.indexOfScalar(u8, rid, '/') == null;
+            }
+            return rest.len > 0 and std.mem.indexOfScalar(u8, rest, '/') == null;
+        }
+        return false;
+    }
+
+    fn corsOriginSlice(self: *const Server) ?[]const u8 {
+        if (self.cors_allow_origin_len == 0) return null;
+        return self.cors_allow_origin_buf[0..self.cors_allow_origin_len];
+    }
+
+    fn appendCorsResponseHeaders(self: *const Server, w: *FixedWriter, is_preflight: bool) error{BufferTooSmall}!void {
+        const origin = self.corsOriginSlice() orelse return;
+        try w.writeAll("Access-Control-Allow-Origin: ");
+        try w.writeAll(origin);
+        try w.writeAll("\r\n");
+        if (is_preflight) {
+            try w.writeAll(
+                "Access-Control-Allow-Methods: GET, POST, DELETE, OPTIONS\r\n" ++
+                    "Access-Control-Allow-Headers: Authorization, Content-Type, x-api-key, anthropic-version, anthropic-beta, OpenAI-Beta\r\n" ++
+                    "Access-Control-Max-Age: 86400\r\n",
+            );
+        } else {
+            try w.writeAll("Access-Control-Expose-Headers: x-request-id, Content-Type\r\n");
+        }
+    }
+
+    fn handleOptionsPreflight(self: *Server, slot: *ConnectionSlot) void {
+        var hdr_buf: [1024]u8 = undefined;
+        var w = FixedWriter.init(&hdr_buf);
+        w.print("HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: {s}\r\n", .{
+            if (slot.keep_alive) "keep-alive" else "close",
+        }) catch {
+            self.closeSlotSocketAndRelease(slot, false);
+            return;
+        };
+        self.appendCorsResponseHeaders(&w, true) catch {
+            self.closeSlotSocketAndRelease(slot, false);
+            return;
+        };
+        w.writeAll("\r\n") catch {
+            self.closeSlotSocketAndRelease(slot, false);
+            return;
+        };
+        slot.appendTx(w.written()) catch {
+            self.closeSlotSocketAndRelease(slot, false);
+            return;
+        };
+        slot.state = .draining_response;
+        if (self.flushTx(slot) and slot.pendingTxLen() == 0) {
+            self.finishHttpExchange(slot);
+        }
+    }
+
+    fn writeHttpJsonOkHeadersAndSend(
+        self: *Server,
+        slot: *ConnectionSlot,
+        body_len: usize,
+        header_reserve: usize,
+        seed_used: ?u64,
+        seed_source: ?EffectiveSeedSource,
+    ) void {
+        var hdr_buf: [1024]u8 = undefined;
+        var hw = FixedWriter.init(&hdr_buf);
+        hw.print(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: {s}\r\n",
+            .{ body_len, if (slot.keep_alive) "keep-alive" else "close" },
+        ) catch {
+            self.closeSlotSocketAndRelease(slot, false);
+            return;
+        };
+        if (seed_used) |su| {
+            hw.print("X-Aminfer-Seed-Used: {d}\r\n", .{su}) catch {
+                self.closeSlotSocketAndRelease(slot, false);
+                return;
+            };
+        }
+        if (seed_source) |ss| {
+            hw.print("X-Aminfer-Seed-Source: {s}\r\n", .{ss.name()}) catch {
+                self.closeSlotSocketAndRelease(slot, false);
+                return;
+            };
+        }
+        self.appendCorsResponseHeaders(&hw, false) catch {
+            self.closeSlotSocketAndRelease(slot, false);
+            return;
+        };
+        hw.writeAll("\r\n") catch {
+            self.closeSlotSocketAndRelease(slot, false);
+            return;
+        };
+        if (hw.pos > header_reserve) {
+            self.closeSlotSocketAndRelease(slot, false);
+            return;
+        }
+        const hdr_start = header_reserve - hw.pos;
+        @memcpy(slot.tx_buf[hdr_start..header_reserve], hw.written());
+        slot.tx_read_pos = hdr_start;
+        slot.tx_write_pos = header_reserve + body_len;
+        slot.state = .draining_response;
+        if (self.flushTx(slot) and slot.pendingTxLen() == 0) {
+            self.finishHttpExchange(slot);
+        }
     }
 
     fn validateAnthropicHeaders(self: *Server, slot: *ConnectionSlot, hdr: *const HttpHeadersResult) bool {
@@ -7482,7 +8451,7 @@ pub const Server = struct {
         seed_source: ?EffectiveSeedSource,
         json_body: []const u8,
     ) void {
-        var hdr_buf: [512]u8 = undefined;
+        var hdr_buf: [1024]u8 = undefined;
         var w = FixedWriter.init(&hdr_buf);
         w.print("HTTP/1.1 {d} {s}\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: {s}\r\n", .{
             status_code,
@@ -7511,6 +8480,10 @@ pub const Server = struct {
                 return;
             };
         }
+        self.appendCorsResponseHeaders(&w, false) catch {
+            self.closeSlotSocketAndRelease(slot, false);
+            return;
+        };
         w.writeAll("\r\n") catch {
             self.closeSlotSocketAndRelease(slot, false);
             return;
@@ -7741,6 +8714,7 @@ pub const Server = struct {
                 error.BufferTooSmall => "domain identifier too long",
                 error.DepthExceeded => "JSON nesting depth exceeded",
                 error.UnsupportedFeature => "unsupported request feature",
+                error.RemoteMediaNotSupported, error.InvalidMediaBase64, error.TooManyMediaItems, error.MediaTooLarge => "invalid 'domain' value",
             };
             self.sendErrorResponse(slot, 400, "Bad Request", null, msg, "invalid_request_error", "bad_request");
             return;
@@ -7820,19 +8794,31 @@ pub const Server = struct {
         const live_wired = self.wired_mib.load(.monotonic);
         const effective_wired_mib = if (live_wired > 0) live_wired else meta.wired_mib;
         const safe_bpw = sanitizeFiniteF64(meta.effective_bits_per_weight);
+        var ts_buf: [32]u8 = undefined;
+        const created_at = formatRfc3339Utc(self.created_unix_sec, &ts_buf);
+        const display_name = if (self.model_display_name_len > 0)
+            self.model_display_name_buf[0..self.model_display_name_len]
+        else
+            base_id;
+        const max_output: u32 = if (meta.max_output_tokens > 0) meta.max_output_tokens else meta.max_model_len;
 
         try w.writeAll("{\"id\":\"");
         try w.writeJsonEscaped(base_id);
-        try w.print("\",\"object\":\"model\",\"created\":{d},\"owned_by\":\"aminfer\",\"root\":\"", .{
+        try w.writeAll("\",\"object\":\"model\",\"type\":\"model\",\"display_name\":\"");
+        try w.writeJsonEscaped(display_name);
+        try w.print("\",\"created\":{d},\"created_at\":\"{s}\",\"owned_by\":\"aminfer\",\"root\":\"", .{
             self.created_unix_sec,
+            created_at,
         });
         try w.writeJsonEscaped(base_id);
         try w.writeAll("\",\"parent\":null,\"architecture\":\"");
         try w.writeJsonEscaped(arch);
         try w.print(
-            "\",\"max_model_len\":{d},\"vocab_size\":{d},\"effective_bits_per_weight\":{d:.6},\"wired_mib\":{d},\"cold_bytes\":{d},\"capabilities\":",
+            "\",\"max_model_len\":{d},\"max_input_tokens\":{d},\"max_tokens\":{d},\"vocab_size\":{d},\"effective_bits_per_weight\":{d:.6},\"wired_mib\":{d},\"cold_bytes\":{d},\"capabilities\":",
             .{
                 meta.max_model_len,
+                meta.max_model_len,
+                max_output,
                 meta.vocab_size,
                 safe_bpw,
                 effective_wired_mib,
@@ -7853,13 +8839,25 @@ pub const Server = struct {
         const meta = self.model_detail;
         const safe_alpha = sanitizeFiniteF32(adp.lora_alpha);
         const safe_scale = sanitizeFiniteF32(adp.scale);
+        var ts_buf: [32]u8 = undefined;
+        const created_at = formatRfc3339Utc(self.created_unix_sec, &ts_buf);
+        const max_output: u32 = if (meta.max_output_tokens > 0) meta.max_output_tokens else meta.max_model_len;
 
         try w.writeAll("{\"id\":\"");
         try w.writeJsonEscaped(base_id);
         try w.writeByte(':');
         try w.writeJsonEscaped(adp.nameSlice());
-        try w.print("\",\"object\":\"model\",\"created\":{d},\"owned_by\":\"aminfer\",\"root\":\"", .{
+        try w.writeAll("\",\"object\":\"model\",\"type\":\"model\",\"display_name\":\"");
+        if (adp.display_name_len > 0) {
+            try w.writeJsonEscaped(adp.displayNameSlice());
+        } else {
+            try w.writeJsonEscaped(base_id);
+            try w.writeByte(':');
+            try w.writeJsonEscaped(adp.nameSlice());
+        }
+        try w.print("\",\"created\":{d},\"created_at\":\"{s}\",\"owned_by\":\"aminfer\",\"root\":\"", .{
             self.created_unix_sec,
+            created_at,
         });
         try w.writeJsonEscaped(base_id);
         try w.writeAll("\",\"parent\":\"");
@@ -7867,9 +8865,11 @@ pub const Server = struct {
         try w.writeAll("\",\"architecture\":\"");
         try w.writeJsonEscaped(arch);
         try w.print(
-            "\",\"max_model_len\":{d},\"vocab_size\":{d},\"rank\":{d},\"lora_alpha\":{d:.6},\"scale\":{d:.6},\"wired_bytes\":{d},\"capabilities\":",
+            "\",\"max_model_len\":{d},\"max_input_tokens\":{d},\"max_tokens\":{d},\"vocab_size\":{d},\"rank\":{d},\"lora_alpha\":{d:.6},\"scale\":{d:.6},\"wired_bytes\":{d},\"capabilities\":",
             .{
                 meta.max_model_len,
+                meta.max_model_len,
+                max_output,
                 meta.vocab_size,
                 adp.rank,
                 safe_alpha,
@@ -7881,32 +8881,155 @@ pub const Server = struct {
         try w.writeByte('}');
     }
 
-    fn writeModelsListJson(self: *const Server, w: *FixedWriter) error{BufferTooSmall}!void {
-        try w.writeAll("{\"object\":\"list\",\"data\":[");
-        try self.writeBaseModelJson(w);
-        for (self.lora_adapters_storage[0..self.lora_adapter_count]) |*adp| {
-            try w.writeByte(',');
-            try self.writeLoraModelJson(w, adp);
+    fn modelItemIdAt(self: *const Server, idx: usize, buf: *[MAX_MODEL_ID_BYTES]u8) []const u8 {
+        if (idx == 0) return self.modelId();
+        const adp = &self.lora_adapters_storage[idx - 1];
+        return std.fmt.bufPrint(buf, "{s}:{s}", .{ self.modelId(), adp.nameSlice() }) catch self.modelId();
+    }
+
+    fn writeModelItemAt(self: *const Server, w: *FixedWriter, idx: usize) error{BufferTooSmall}!void {
+        if (idx == 0) {
+            try self.writeBaseModelJson(w);
+        } else {
+            try self.writeLoraModelJson(w, &self.lora_adapters_storage[idx - 1]);
         }
-        try w.writeAll("]}");
+    }
+
+    fn writeModelsListJson(
+        self: *const Server,
+        w: *FixedWriter,
+        limit: usize,
+        after_id: ?[]const u8,
+        before_id: ?[]const u8,
+    ) error{BufferTooSmall}!void {
+        const total: usize = 1 + @as(usize, self.lora_adapter_count);
+        var id_tmp: [MAX_MODEL_ID_BYTES]u8 = undefined;
+
+        var range_start: usize = 0;
+        var range_end: usize = total;
+        if (after_id) |aid| {
+            var matched: ?usize = null;
+            for (0..total) |i| {
+                if (std.mem.eql(u8, self.modelItemIdAt(i, &id_tmp), aid)) {
+                    matched = i;
+                    break;
+                }
+            }
+            range_start = if (matched) |m| m + 1 else total;
+        }
+        if (before_id) |bid| {
+            var matched: ?usize = null;
+            for (0..total) |i| {
+                if (std.mem.eql(u8, self.modelItemIdAt(i, &id_tmp), bid)) {
+                    matched = i;
+                    break;
+                }
+            }
+            range_end = if (matched) |m| @max(range_start, m) else range_start;
+        }
+
+        const slice_start: usize, const slice_end: usize, const has_more: bool = if (before_id != null and after_id == null) blk: {
+            const se = range_end;
+            const ss = if (range_end - range_start > limit) range_end - limit else range_start;
+            break :blk .{ ss, se, ss > range_start };
+        } else blk: {
+            const ss = range_start;
+            const se = @min(range_end, range_start + limit);
+            break :blk .{ ss, se, se < range_end };
+        };
+
+        try w.writeAll("{\"object\":\"list\",\"data\":[");
+        var idx = slice_start;
+        while (idx < slice_end) : (idx += 1) {
+            if (idx > slice_start) try w.writeByte(',');
+            try self.writeModelItemAt(w, idx);
+        }
+        try w.writeAll("],\"first_id\":");
+        if (slice_start < slice_end) {
+            try w.writeByte('"');
+            try w.writeJsonEscaped(self.modelItemIdAt(slice_start, &id_tmp));
+            try w.writeByte('"');
+        } else {
+            try w.writeAll("null");
+        }
+        try w.writeAll(",\"last_id\":");
+        if (slice_start < slice_end) {
+            try w.writeByte('"');
+            try w.writeJsonEscaped(self.modelItemIdAt(slice_end - 1, &id_tmp));
+            try w.writeByte('"');
+        } else {
+            try w.writeAll("null");
+        }
+        try w.print(",\"has_more\":{s}}}", .{jsonBoolStr(has_more)});
     }
 
     fn sendModelJsonOrError(self: *Server, slot: *ConnectionSlot, json_body: []const u8) void {
-        if (json_body.len + 256 > slot.tx_buf.len) {
+        if (json_body.len + 768 > slot.tx_buf.len) {
             self.sendErrorResponse(slot, 500, "Internal Server Error", null, "model response exceeds slot tx buffer", "server_error", "response_too_large");
             return;
         }
         self.sendJsonResponse(slot, 200, "OK", null, null, null, json_body);
     }
 
-    fn handleModels(self: *Server, slot: *ConnectionSlot) void {
-        var body_buf: [16384]u8 = undefined;
-        var w = FixedWriter.init(&body_buf);
-        self.writeModelsListJson(&w) catch {
+    fn handleModels(self: *Server, slot: *ConnectionSlot, query: []const u8) void {
+        var limit: usize = 20;
+        var after_buf: [MAX_MODEL_ID_BYTES]u8 = undefined;
+        var after_id: ?[]const u8 = null;
+        var before_buf: [MAX_MODEL_ID_BYTES]u8 = undefined;
+        var before_id: ?[]const u8 = null;
+
+        if (query.len > 0) {
+            var pairs = std.mem.splitScalar(u8, query, '&');
+            while (pairs.next()) |pair| {
+                if (pair.len == 0) continue;
+                const eq = std.mem.indexOfScalar(u8, pair, '=');
+                const k = if (eq) |e| pair[0..e] else pair;
+                const v = if (eq) |e| pair[e + 1 ..] else "";
+                if (std.mem.eql(u8, k, "limit")) {
+                    const parsed = std.fmt.parseInt(i64, v, 10) catch {
+                        self.sendErrorResponse(slot, 400, "Bad Request", null, "invalid limit query parameter", "invalid_request_error", "invalid_limit");
+                        return;
+                    };
+                    if (parsed <= 0 or parsed > 1000) {
+                        self.sendErrorResponse(slot, 400, "Bad Request", null, "limit must be between 1 and 1000", "invalid_request_error", "invalid_limit");
+                        return;
+                    }
+                    limit = @intCast(parsed);
+                } else if (std.mem.eql(u8, k, "after_id")) {
+                    if (v.len > 0) {
+                        after_id = percentDecodeUrlPath(v, &after_buf) catch |err| switch (err) {
+                            error.InvalidPercentEncoding => {
+                                self.sendErrorResponse(slot, 400, "Bad Request", null, "invalid percent-encoded after_id", "invalid_request_error", "invalid_cursor");
+                                return;
+                            },
+                            error.BufferTooSmall => "__nonmatching__",
+                        };
+                    }
+                } else if (std.mem.eql(u8, k, "before_id")) {
+                    if (v.len > 0) {
+                        before_id = percentDecodeUrlPath(v, &before_buf) catch |err| switch (err) {
+                            error.InvalidPercentEncoding => {
+                                self.sendErrorResponse(slot, 400, "Bad Request", null, "invalid percent-encoded before_id", "invalid_request_error", "invalid_cursor");
+                                return;
+                            },
+                            error.BufferTooSmall => "__nonmatching__",
+                        };
+                    }
+                }
+            }
+        }
+
+        const HEADER_RESERVE: usize = 768;
+        if (slot.tx_buf.len <= HEADER_RESERVE) {
+            self.closeSlotSocketAndRelease(slot, false);
+            return;
+        }
+        var bw = FixedWriter.init(slot.tx_buf[HEADER_RESERVE..]);
+        self.writeModelsListJson(&bw, limit, after_id, before_id) catch {
             self.sendErrorResponse(slot, 500, "Internal Server Error", null, "models list exceeds response buffer", "server_error", "response_too_large");
             return;
         };
-        self.sendModelJsonOrError(slot, w.written());
+        self.writeHttpJsonOkHeadersAndSend(slot, bw.pos, HEADER_RESERVE, null, null);
     }
 
     fn handleModelById(self: *Server, slot: *ConnectionSlot, raw_id: []const u8) void {
@@ -7960,8 +9083,33 @@ pub const Server = struct {
     // stateful /v1/responses/{id} GET / DELETE / cancel
     // -----------------------------------------------------------------------
 
+    fn sendParseErrorResponse(self: *Server, slot: *ConnectionSlot, err: ParseError) void {
+        const msg = switch (err) {
+            error.InvalidJson => "invalid JSON request body",
+            error.MissingRequiredField => "missing required field in request body",
+            error.InvalidFieldValue => "invalid parameter value in request body",
+            error.UnsupportedFeature => "unsupported request feature",
+            error.BufferTooSmall => "prompt exceeds preallocated slot buffer",
+            error.DepthExceeded => "JSON nesting depth exceeded",
+            error.RemoteMediaNotSupported => "remote media URLs are not supported; provide base64 data",
+            error.InvalidMediaBase64 => "invalid base64 media data",
+            error.TooManyMediaItems => "too many media items in request",
+            error.MediaTooLarge => "decoded media exceeds preallocated max_media_bytes",
+        };
+        const err_code = switch (err) {
+            error.BufferTooSmall, error.MediaTooLarge => "payload_too_large",
+            error.RemoteMediaNotSupported => "unsupported_media_url",
+            error.InvalidMediaBase64 => "invalid_media",
+            error.TooManyMediaItems => "too_many_media_items",
+            else => "bad_request",
+        };
+        const code: u16 = if (err == error.BufferTooSmall or err == error.MediaTooLarge) 413 else 400;
+        const reason = if (code == 413) "Payload Too Large" else "Bad Request";
+        self.sendErrorResponse(slot, code, reason, null, msg, "invalid_request_error", err_code);
+    }
+
     fn handleMessagesCountTokens(self: *Server, slot: *ConnectionSlot, body: []const u8) void {
-        const parsed = parseInferenceRequestWithTemplate(
+        const parsed = parseInferenceRequestFull(
             .messages,
             body,
             self.modelId(),
@@ -7969,20 +9117,13 @@ pub const Server = struct {
             null,
             slot.nonstream_content_buf,
             &self.signature_key,
+            self.fim_tokens.asFimTokens(),
+            self.tokenizer(),
+            slot.media_buf,
             slot.prompt_buf,
             &slot.model_buf,
         ) catch |err| {
-            const msg = switch (err) {
-                error.InvalidJson => "invalid JSON request body",
-                error.MissingRequiredField => "missing required field in request body",
-                error.InvalidFieldValue => "invalid parameter value in request body",
-                error.UnsupportedFeature => "unsupported request feature",
-                error.BufferTooSmall => "prompt exceeds preallocated slot buffer",
-                error.DepthExceeded => "JSON nesting depth exceeded",
-            };
-            const code: u16 = if (err == error.BufferTooSmall) 413 else 400;
-            const reason = if (err == error.BufferTooSmall) "Payload Too Large" else "Bad Request";
-            self.sendErrorResponse(slot, code, reason, null, msg, "invalid_request_error", "bad_request");
+            self.sendParseErrorResponse(slot, err);
             return;
         };
 
@@ -8022,6 +9163,93 @@ pub const Server = struct {
         self.sendJsonResponse(slot, 200, "OK", null, null, null, w.written());
     }
 
+    fn handleResponsesInputTokens(self: *Server, slot: *ConnectionSlot, body: []const u8) void {
+        var prior_chatml: ?[]const u8 = null;
+        var prev_probe_buf: [MAX_RESPONSE_ID_BYTES]u8 = undefined;
+        if (findJsonStringField(body, "previous_response_id", &prev_probe_buf)) |prev_id| {
+            if (prev_id.len > 0) {
+                const prev_rec = self.findStatefulResponseById(prev_id) orelse {
+                    self.sendErrorResponse(
+                        slot,
+                        404,
+                        "Not Found",
+                        null,
+                        "previous_response_id not found or evicted",
+                        "invalid_request_error",
+                        "response_not_found",
+                    );
+                    return;
+                };
+                if (prev_rec.transcript_corrupt or prev_rec.status != .completed or prev_rec.chatml_len == 0) {
+                    self.sendErrorResponse(
+                        slot,
+                        409,
+                        "Conflict",
+                        null,
+                        "previous_response_id transcript is incomplete or truncated",
+                        "invalid_request_error",
+                        "incomplete_previous_response",
+                    );
+                    return;
+                }
+                prior_chatml = prev_rec.chatml_buf[0..prev_rec.chatml_len];
+            }
+        }
+
+        const parsed = parseInferenceRequestFull(
+            .responses,
+            body,
+            self.modelId(),
+            &self.config.chat_template,
+            prior_chatml,
+            slot.nonstream_content_buf,
+            &self.signature_key,
+            self.fim_tokens.asFimTokens(),
+            self.tokenizer(),
+            slot.media_buf,
+            slot.prompt_buf,
+            &slot.model_buf,
+        ) catch |err| {
+            self.sendParseErrorResponse(slot, err);
+            return;
+        };
+
+        const tok = self.tokenizer() orelse {
+            self.sendErrorResponse(
+                slot,
+                501,
+                "Not Implemented",
+                null,
+                "native tokenizer not attached for /v1/responses/input_tokens",
+                "api_error",
+                "tokenizer_unavailable",
+            );
+            return;
+        };
+
+        const prompt_bytes = slot.prompt_buf[0..parsed.prompt_len];
+        const ids = tok.encodeWithScratch(&self.aux_encode_scratch, prompt_bytes, self.aux_token_ids) catch {
+            self.sendErrorResponse(
+                slot,
+                413,
+                "Payload Too Large",
+                null,
+                "prompt exceeds preallocated token counting capacity",
+                "invalid_request_error",
+                "token_limit_exceeded",
+            );
+            return;
+        };
+
+        var resp_buf: [128]u8 = undefined;
+        var w = FixedWriter.init(&resp_buf);
+        w.print("{{\"object\":\"response.input_tokens\",\"input_tokens\":{d}}}", .{ids.len}) catch {
+            self.closeSlotSocketAndRelease(slot, false);
+            return;
+        };
+        self.sendJsonResponse(slot, 200, "OK", null, null, null, w.written());
+    }
+
     fn handleEmbeddings(self: *Server, slot: *ConnectionSlot, body: []const u8) void {
         const req = parseEmbeddingsRequest(
             body,
@@ -8036,9 +9264,10 @@ pub const Server = struct {
                 error.BufferTooSmall => "embeddings request exceeds preallocated scratch capacity",
                 error.DepthExceeded => "JSON nesting depth exceeded",
                 error.UnsupportedFeature => "unsupported embeddings feature",
+                error.RemoteMediaNotSupported, error.InvalidMediaBase64, error.TooManyMediaItems, error.MediaTooLarge => "invalid embeddings media field",
             };
-            const code: u16 = if (err == error.BufferTooSmall) 413 else 400;
-            const reason = if (err == error.BufferTooSmall) "Payload Too Large" else "Bad Request";
+            const code: u16 = if (err == error.BufferTooSmall or err == error.MediaTooLarge) 413 else 400;
+            const reason = if (code == 413) "Payload Too Large" else "Bad Request";
             self.sendErrorResponse(slot, code, reason, null, msg, "invalid_request_error", "bad_request");
             return;
         };
@@ -8081,7 +9310,7 @@ pub const Server = struct {
             return;
         }
 
-        const HEADER_RESERVE: usize = 256;
+        const HEADER_RESERVE: usize = 768;
         if (slot.tx_buf.len <= HEADER_RESERVE) {
             self.closeSlotSocketAndRelease(slot, false);
             return;
@@ -8096,23 +9325,7 @@ pub const Server = struct {
             return;
         };
 
-        var hdr_buf: [HEADER_RESERVE]u8 = undefined;
-        var hw = FixedWriter.init(&hdr_buf);
-        hw.print(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: {s}\r\n\r\n",
-            .{ json_body.len, if (slot.keep_alive) "keep-alive" else "close" },
-        ) catch {
-            self.closeSlotSocketAndRelease(slot, false);
-            return;
-        };
-        const hdr_start = HEADER_RESERVE - hw.pos;
-        @memcpy(slot.tx_buf[hdr_start..HEADER_RESERVE], hw.written());
-        slot.tx_read_pos = hdr_start;
-        slot.tx_write_pos = HEADER_RESERVE + json_body.len;
-        slot.state = .draining_response;
-        if (self.flushTx(slot) and slot.pendingTxLen() == 0) {
-            self.finishHttpExchange(slot);
-        }
+        self.writeHttpJsonOkHeadersAndSend(slot, json_body.len, HEADER_RESERVE, null, null);
     }
 
     fn handleRerank(self: *Server, slot: *ConnectionSlot, body: []const u8) void {
@@ -8129,9 +9342,10 @@ pub const Server = struct {
                 error.BufferTooSmall => "rerank request exceeds preallocated scratch capacity",
                 error.DepthExceeded => "JSON nesting depth exceeded",
                 error.UnsupportedFeature => "unsupported rerank feature",
+                error.RemoteMediaNotSupported, error.InvalidMediaBase64, error.TooManyMediaItems, error.MediaTooLarge => "invalid rerank media field",
             };
-            const code: u16 = if (err == error.BufferTooSmall) 413 else 400;
-            const reason = if (err == error.BufferTooSmall) "Payload Too Large" else "Bad Request";
+            const code: u16 = if (err == error.BufferTooSmall or err == error.MediaTooLarge) 413 else 400;
+            const reason = if (code == 413) "Payload Too Large" else "Bad Request";
             self.sendErrorResponse(slot, code, reason, null, msg, "invalid_request_error", "bad_request");
             return;
         };
@@ -8164,7 +9378,7 @@ pub const Server = struct {
         };
         const n = @min(res.count, MAX_RERANK_DOCS);
 
-        const HEADER_RESERVE: usize = 256;
+        const HEADER_RESERVE: usize = 768;
         if (slot.tx_buf.len <= HEADER_RESERVE) {
             self.closeSlotSocketAndRelease(slot, false);
             return;
@@ -8179,23 +9393,7 @@ pub const Server = struct {
             return;
         };
 
-        var hdr_buf: [HEADER_RESERVE]u8 = undefined;
-        var hw = FixedWriter.init(&hdr_buf);
-        hw.print(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: {s}\r\n\r\n",
-            .{ json_body.len, if (slot.keep_alive) "keep-alive" else "close" },
-        ) catch {
-            self.closeSlotSocketAndRelease(slot, false);
-            return;
-        };
-        const hdr_start = HEADER_RESERVE - hw.pos;
-        @memcpy(slot.tx_buf[hdr_start..HEADER_RESERVE], hw.written());
-        slot.tx_read_pos = hdr_start;
-        slot.tx_write_pos = HEADER_RESERVE + json_body.len;
-        slot.state = .draining_response;
-        if (self.flushTx(slot) and slot.pendingTxLen() == 0) {
-            self.finishHttpExchange(slot);
-        }
+        self.writeHttpJsonOkHeadersAndSend(slot, json_body.len, HEADER_RESERVE, null, null);
     }
 
     fn findStatefulResponseById(self: *Server, resp_id: []const u8) ?*StatefulResponseSlot {
@@ -8346,7 +9544,7 @@ pub const Server = struct {
             self.sendErrorResponse(slot, 404, "Not Found", null, "response not found", "invalid_request_error", "response_not_found");
             return;
         };
-        const HEADER_RESERVE: usize = 256;
+        const HEADER_RESERVE: usize = 768;
         if (slot.tx_buf.len <= HEADER_RESERVE) {
             self.closeSlotSocketAndRelease(slot, false);
             return;
@@ -8356,23 +9554,137 @@ pub const Server = struct {
             self.sendErrorResponse(slot, 500, "Internal Server Error", null, "response exceeds tx buffer", "server_error", "tx_overflow");
             return;
         };
-        var hdr_buf: [HEADER_RESERVE]u8 = undefined;
-        var hw = FixedWriter.init(&hdr_buf);
-        hw.print(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: {s}\r\n\r\n",
-            .{ bw.pos, if (slot.keep_alive) "keep-alive" else "close" },
-        ) catch {
-            self.closeSlotSocketAndRelease(slot, false);
+        self.writeHttpJsonOkHeadersAndSend(slot, bw.pos, HEADER_RESERVE, null, null);
+    }
+
+    const InputItemsOrder = enum { asc, desc };
+
+    fn formatInputItemId(item: *const StatefulInputItem, buf: *[48]u8) []const u8 {
+        return std.fmt.bufPrint(buf, "msg_{d}_{d}", .{ item.origin_request_id, item.origin_item_idx }) catch "msg_0_0";
+    }
+
+    fn handleResponseInputItems(
+        self: *Server,
+        slot: *ConnectionSlot,
+        resp_id: []const u8,
+        query: []const u8,
+    ) void {
+        var limit: usize = 20;
+        var order: InputItemsOrder = .desc;
+        var after_buf: [64]u8 = undefined;
+        var after_id: ?[]const u8 = null;
+
+        if (query.len > 0) {
+            var pairs = std.mem.splitScalar(u8, query, '&');
+            while (pairs.next()) |pair| {
+                if (pair.len == 0) continue;
+                const eq = std.mem.indexOfScalar(u8, pair, '=');
+                const k = if (eq) |e| pair[0..e] else pair;
+                const v = if (eq) |e| pair[e + 1 ..] else "";
+                if (std.mem.eql(u8, k, "limit")) {
+                    const parsed = std.fmt.parseInt(i64, v, 10) catch {
+                        self.sendErrorResponse(slot, 400, "Bad Request", null, "invalid limit query parameter", "invalid_request_error", "invalid_limit");
+                        return;
+                    };
+                    if (parsed <= 0 or parsed > 100) {
+                        self.sendErrorResponse(slot, 400, "Bad Request", null, "limit must be between 1 and 100", "invalid_request_error", "invalid_limit");
+                        return;
+                    }
+                    limit = @intCast(parsed);
+                } else if (std.mem.eql(u8, k, "order")) {
+                    if (std.mem.eql(u8, v, "asc")) {
+                        order = .asc;
+                    } else if (std.mem.eql(u8, v, "desc")) {
+                        order = .desc;
+                    } else {
+                        self.sendErrorResponse(slot, 400, "Bad Request", null, "order must be 'asc' or 'desc'", "invalid_request_error", "invalid_order");
+                        return;
+                    }
+                } else if (std.mem.eql(u8, k, "after")) {
+                    if (v.len > 0) {
+                        after_id = percentDecodeUrlPath(v, &after_buf) catch |err| switch (err) {
+                            error.InvalidPercentEncoding => {
+                                self.sendErrorResponse(slot, 400, "Bad Request", null, "invalid percent-encoded after cursor", "invalid_request_error", "invalid_cursor");
+                                return;
+                            },
+                            error.BufferTooSmall => "__nonmatching__",
+                        };
+                    }
+                }
+            }
+        }
+
+        const rec = self.findStatefulResponseById(resp_id) orelse {
+            self.sendErrorResponse(slot, 404, "Not Found", null, "response not found", "invalid_request_error", "response_not_found");
             return;
         };
-        const hdr_start = HEADER_RESERVE - hw.pos;
-        @memcpy(slot.tx_buf[hdr_start..HEADER_RESERVE], hw.written());
-        slot.tx_read_pos = hdr_start;
-        slot.tx_write_pos = HEADER_RESERVE + bw.pos;
-        slot.state = .draining_response;
-        if (self.flushTx(slot) and slot.pendingTxLen() == 0) {
-            self.finishHttpExchange(slot);
+
+        const total: usize = rec.input_item_count;
+        var id_tmp: [48]u8 = undefined;
+        var start_pos: usize = 0;
+        if (after_id) |aid| {
+            var matched: ?usize = null;
+            for (0..total) |pos| {
+                const idx = if (order == .asc) pos else (total - 1 - pos);
+                if (std.mem.eql(u8, formatInputItemId(&rec.input_items[idx], &id_tmp), aid)) {
+                    matched = pos;
+                    break;
+                }
+            }
+            start_pos = if (matched) |m| m + 1 else total;
         }
+        const end_pos = @min(total, start_pos + limit);
+        const has_more = end_pos < total;
+
+        const HEADER_RESERVE: usize = 768;
+        if (slot.tx_buf.len <= HEADER_RESERVE) {
+            self.closeSlotSocketAndRelease(slot, false);
+            return;
+        }
+        var bw = FixedWriter.init(slot.tx_buf[HEADER_RESERVE..]);
+        const write_ok: bool = blk: {
+            bw.writeAll("{\"object\":\"list\",\"data\":[") catch break :blk false;
+            var pos = start_pos;
+            while (pos < end_pos) : (pos += 1) {
+                if (pos > start_pos) bw.writeByte(',') catch break :blk false;
+                const idx = if (order == .asc) pos else (total - 1 - pos);
+                const item = &rec.input_items[idx];
+                const item_id = formatInputItemId(item, &id_tmp);
+                const off: usize = item.offset;
+                const len: usize = item.len;
+                const text = if (off + len <= rec.input_items_buf.len)
+                    rec.input_items_buf[off .. off + len]
+                else
+                    "";
+                bw.print(
+                    "{{\"id\":\"{s}\",\"type\":\"message\",\"status\":\"completed\",\"role\":\"{s}\",\"content\":[{{\"type\":\"input_text\",\"text\":\"",
+                    .{ item_id, item.role.name() },
+                ) catch break :blk false;
+                bw.writeJsonEscaped(text) catch break :blk false;
+                bw.writeAll("\"}]}") catch break :blk false;
+            }
+            bw.writeAll("],\"first_id\":") catch break :blk false;
+            if (start_pos < end_pos) {
+                const f_idx = if (order == .asc) start_pos else (total - 1 - start_pos);
+                bw.print("\"{s}\"", .{formatInputItemId(&rec.input_items[f_idx], &id_tmp)}) catch break :blk false;
+            } else {
+                bw.writeAll("null") catch break :blk false;
+            }
+            bw.writeAll(",\"last_id\":") catch break :blk false;
+            if (start_pos < end_pos) {
+                const l_idx = if (order == .asc) (end_pos - 1) else (total - end_pos);
+                bw.print("\"{s}\"", .{formatInputItemId(&rec.input_items[l_idx], &id_tmp)}) catch break :blk false;
+            } else {
+                bw.writeAll("null") catch break :blk false;
+            }
+            bw.print(",\"has_more\":{s}}}", .{jsonBoolStr(has_more)}) catch break :blk false;
+            break :blk true;
+        };
+        if (!write_ok) {
+            self.sendErrorResponse(slot, 500, "Internal Server Error", null, "input items exceed tx buffer", "server_error", "tx_overflow");
+            return;
+        }
+        self.writeHttpJsonOkHeadersAndSend(slot, bw.pos, HEADER_RESERVE, null, null);
     }
 
     fn handleResponseDelete(self: *Server, slot: *ConnectionSlot, resp_id: []const u8) void {
@@ -8424,7 +9736,7 @@ pub const Server = struct {
             }
             rec.active_conn_slot = null;
         }
-        const HEADER_RESERVE: usize = 256;
+        const HEADER_RESERVE: usize = 768;
         if (slot.tx_buf.len <= HEADER_RESERVE) {
             self.closeSlotSocketAndRelease(slot, false);
             return;
@@ -8434,23 +9746,7 @@ pub const Server = struct {
             self.sendErrorResponse(slot, 500, "Internal Server Error", null, "response exceeds tx buffer", "server_error", "tx_overflow");
             return;
         };
-        var hdr_buf: [HEADER_RESERVE]u8 = undefined;
-        var hw = FixedWriter.init(&hdr_buf);
-        hw.print(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: {s}\r\n\r\n",
-            .{ bw.pos, if (slot.keep_alive) "keep-alive" else "close" },
-        ) catch {
-            self.closeSlotSocketAndRelease(slot, false);
-            return;
-        };
-        const hdr_start = HEADER_RESERVE - hw.pos;
-        @memcpy(slot.tx_buf[hdr_start..HEADER_RESERVE], hw.written());
-        slot.tx_read_pos = hdr_start;
-        slot.tx_write_pos = HEADER_RESERVE + bw.pos;
-        slot.state = .draining_response;
-        if (self.flushTx(slot) and slot.pendingTxLen() == 0) {
-            self.finishHttpExchange(slot);
-        }
+        self.writeHttpJsonOkHeadersAndSend(slot, bw.pos, HEADER_RESERVE, null, null);
     }
 
     fn appendCompletedTranscriptTurn(
@@ -8592,10 +9888,260 @@ pub const Server = struct {
         rec.chatml_len = cw.pos;
     }
 
+    const TempInputItem = struct {
+        role: InputItemRole,
+        text: []const u8,
+    };
+
+    fn appendContentTextToScratch(content_raw: []const u8, scratch: []u8, scratch_pos: *usize) []const u8 {
+        var r = JsonReader{ .src = content_raw };
+        const ch = r.peek() orelse return "";
+        const text_start = scratch_pos.*;
+        if (ch == '"') {
+            var fw = FixedWriter.init(scratch[text_start..]);
+            r.readStringInto(&fw) catch return "";
+            scratch_pos.* += fw.pos;
+            return fw.written();
+        }
+        if (ch != '[') return "";
+        r.pos += 1;
+        if (r.peek() == ']') return "";
+        var fw = FixedWriter.init(scratch[text_start..]);
+        while (true) {
+            r.expectByte('{') catch break;
+            var btype_buf: [32]u8 = undefined;
+            var btype: []const u8 = "";
+            var text_raw: ?[]const u8 = null;
+            if (r.peek() != '}') {
+                while (true) {
+                    var kb: [64]u8 = undefined;
+                    const mk = r.readKeyOrSkip(&kb) catch break;
+                    r.expectByte(':') catch break;
+                    if (mk) |key| {
+                        if (std.mem.eql(u8, key, "type")) {
+                            btype = r.readSmallString(&btype_buf) catch "";
+                        } else if (std.mem.eql(u8, key, "text")) {
+                            text_raw = r.captureValueSlice(4) catch null;
+                        } else {
+                            r.skipValue(4) catch break;
+                        }
+                    } else {
+                        r.skipValue(4) catch break;
+                    }
+                    const sep = r.peek() orelse break;
+                    if (sep == ',') {
+                        r.pos += 1;
+                    } else if (sep == '}') {
+                        r.pos += 1;
+                        break;
+                    } else break;
+                }
+            } else r.pos += 1;
+            if (btype.len == 0 or std.mem.eql(u8, btype, "text") or std.mem.eql(u8, btype, "input_text") or std.mem.eql(u8, btype, "output_text")) {
+                if (text_raw) |tr| {
+                    var sr = JsonReader{ .src = tr };
+                    if (sr.peek() == '"') {
+                        sr.readStringInto(&fw) catch break;
+                    }
+                }
+            }
+            const sep2 = r.peek() orelse break;
+            if (sep2 == ',') {
+                r.pos += 1;
+            } else break;
+        }
+        scratch_pos.* += fw.pos;
+        return fw.written();
+    }
+
+    fn collectResponsesInputItemsFromBody(
+        body: []const u8,
+        scratch: []u8,
+        out_items: *[MAX_STATEFUL_INPUT_ITEMS]TempInputItem,
+    ) usize {
+        var r = JsonReader{ .src = body };
+        r.expectByte('{') catch return 0;
+        var instr_raw: ?[]const u8 = null;
+        var input_raw: ?[]const u8 = null;
+        if (r.peek() != '}') {
+            while (true) {
+                var kb: [64]u8 = undefined;
+                const mk = r.readKeyOrSkip(&kb) catch return 0;
+                r.expectByte(':') catch return 0;
+                if (mk) |key| {
+                    if (std.mem.eql(u8, key, "instructions") or std.mem.eql(u8, key, "system")) {
+                        if (!r.consumeKeyword("null")) {
+                            instr_raw = r.captureValueSlice(2) catch null;
+                        }
+                    } else if (std.mem.eql(u8, key, "input")) {
+                        input_raw = r.captureValueSlice(2) catch null;
+                    } else {
+                        r.skipValue(2) catch return 0;
+                    }
+                } else {
+                    r.skipValue(2) catch return 0;
+                }
+                const sep = r.peek() orelse return 0;
+                if (sep == ',') {
+                    r.pos += 1;
+                } else if (sep == '}') {
+                    break;
+                } else return 0;
+            }
+        }
+
+        var count: usize = 0;
+        var scratch_pos: usize = 0;
+        if (instr_raw) |ir| {
+            const txt = appendContentTextToScratch(ir, scratch, &scratch_pos);
+            if (txt.len > 0 and count < MAX_STATEFUL_INPUT_ITEMS) {
+                out_items[count] = .{ .role = .system, .text = txt };
+                count += 1;
+            }
+        }
+        const inp = input_raw orelse return count;
+        var ir = JsonReader{ .src = inp };
+        const ch = ir.peek() orelse return count;
+        if (ch == '"') {
+            if (count < MAX_STATEFUL_INPUT_ITEMS) {
+                const txt = appendContentTextToScratch(inp[ir.pos..], scratch, &scratch_pos);
+                out_items[count] = .{ .role = .user, .text = txt };
+                count += 1;
+            }
+            return count;
+        }
+        if (ch != '[') return count;
+        ir.pos += 1;
+        if (ir.peek() == ']') return count;
+        while (count < MAX_STATEFUL_INPUT_ITEMS) {
+            ir.expectByte('{') catch break;
+            var role_buf: [32]u8 = undefined;
+            var role_str: []const u8 = "";
+            var itype_buf: [32]u8 = undefined;
+            var itype: []const u8 = "";
+            var content_raw: ?[]const u8 = null;
+            var output_raw: ?[]const u8 = null;
+            if (ir.peek() != '}') {
+                while (true) {
+                    var kb: [64]u8 = undefined;
+                    const mk = ir.readKeyOrSkip(&kb) catch break;
+                    ir.expectByte(':') catch break;
+                    if (mk) |key| {
+                        if (std.mem.eql(u8, key, "role")) {
+                            role_str = ir.readSmallString(&role_buf) catch "";
+                        } else if (std.mem.eql(u8, key, "type")) {
+                            itype = ir.readSmallString(&itype_buf) catch "";
+                        } else if (std.mem.eql(u8, key, "content")) {
+                            content_raw = ir.captureValueSlice(3) catch null;
+                        } else if (std.mem.eql(u8, key, "output")) {
+                            output_raw = ir.captureValueSlice(3) catch null;
+                        } else {
+                            ir.skipValue(3) catch break;
+                        }
+                    } else {
+                        ir.skipValue(3) catch break;
+                    }
+                    const sep = ir.peek() orelse break;
+                    if (sep == ',') {
+                        ir.pos += 1;
+                    } else if (sep == '}') {
+                        ir.pos += 1;
+                        break;
+                    } else break;
+                }
+            } else ir.pos += 1;
+
+            if (std.mem.eql(u8, itype, "function_call_output")) {
+                if (output_raw) |oraw| {
+                    const txt = appendContentTextToScratch(oraw, scratch, &scratch_pos);
+                    out_items[count] = .{ .role = .tool, .text = txt };
+                    count += 1;
+                }
+            } else if (!std.mem.eql(u8, itype, "function_call")) {
+                const mapped_role: InputItemRole = if (std.mem.eql(u8, role_str, "system"))
+                    .system
+                else if (std.mem.eql(u8, role_str, "developer"))
+                    .developer
+                else if (std.mem.eql(u8, role_str, "assistant"))
+                    .assistant
+                else if (std.mem.eql(u8, role_str, "tool"))
+                    .tool
+                else
+                    .user;
+                const txt = if (content_raw) |cr| appendContentTextToScratch(cr, scratch, &scratch_pos) else "";
+                out_items[count] = .{ .role = mapped_role, .text = txt };
+                count += 1;
+            }
+            const sep2 = ir.peek() orelse break;
+            if (sep2 == ',') {
+                ir.pos += 1;
+            } else break;
+        }
+        return count;
+    }
+
+    fn populateStatefulResponseInputItems(
+        rec: *StatefulResponseSlot,
+        prev_rec_opt: ?*const StatefulResponseSlot,
+        new_items: []const TempInputItem,
+    ) void {
+        rec.input_item_count = 0;
+        rec.input_items_len = 0;
+
+        const prev_count: usize = if (prev_rec_opt) |pr| if (pr != rec) pr.input_item_count else 0 else 0;
+        const cap_new = @min(new_items.len, MAX_STATEFUL_INPUT_ITEMS);
+        const keep_prev = @min(prev_count, MAX_STATEFUL_INPUT_ITEMS - cap_new);
+        const skip_prev = prev_count - keep_prev;
+
+        var buf_off: usize = 0;
+        if (prev_rec_opt) |pr| {
+            if (pr != rec) {
+                var pi: usize = skip_prev;
+                while (pi < prev_count) : (pi += 1) {
+                    const src_item = &pr.input_items[pi];
+                    const avail = rec.input_items_buf.len -| buf_off;
+                    const take = @min(avail, @as(usize, src_item.len));
+                    const s_off: usize = src_item.offset;
+                    if (take > 0 and s_off + take <= pr.input_items_buf.len) {
+                        @memcpy(rec.input_items_buf[buf_off .. buf_off + take], pr.input_items_buf[s_off .. s_off + take]);
+                    }
+                    rec.input_items[rec.input_item_count] = .{
+                        .origin_request_id = src_item.origin_request_id,
+                        .origin_item_idx = src_item.origin_item_idx,
+                        .offset = @intCast(buf_off),
+                        .len = @intCast(take),
+                        .role = src_item.role,
+                    };
+                    rec.input_item_count += 1;
+                    buf_off += take;
+                }
+            }
+        }
+
+        for (new_items[0..cap_new], 0..) |item, idx| {
+            const avail = rec.input_items_buf.len -| buf_off;
+            const take = @min(avail, item.text.len);
+            if (take > 0) {
+                @memcpy(rec.input_items_buf[buf_off .. buf_off + take], item.text[0..take]);
+            }
+            rec.input_items[rec.input_item_count] = .{
+                .origin_request_id = rec.request_id,
+                .origin_item_idx = @intCast(idx),
+                .offset = @intCast(buf_off),
+                .len = @intCast(take),
+                .role = item.role,
+            };
+            rec.input_item_count += 1;
+            buf_off += take;
+        }
+        rec.input_items_len = buf_off;
+    }
+
     fn admitInferenceRequest(self: *Server, slot: *ConnectionSlot, endpoint: Endpoint, body: []const u8) void {
         // Resolve optional `previous_response_id` on `/v1/responses` before building ChatML prompt
         // so the full chained transcript is prepended directly into `slot.prompt_buf` (`0` heap alloc).
         var prior_chatml: ?[]const u8 = null;
+        var prev_rec_ptr: ?*const StatefulResponseSlot = null;
         if (endpoint == .responses) {
             var prev_probe_buf: [MAX_RESPONSE_ID_BYTES]u8 = undefined;
             if (findJsonStringField(body, "previous_response_id", &prev_probe_buf)) |prev_id| {
@@ -8625,11 +10171,12 @@ pub const Server = struct {
                         return;
                     }
                     prior_chatml = prev_rec.chatml_buf[0..prev_rec.chatml_len];
+                    prev_rec_ptr = prev_rec;
                 }
             }
         }
 
-        const parsed = parseInferenceRequestWithTemplate(
+        const parsed = parseInferenceRequestFull(
             endpoint,
             body,
             self.modelId(),
@@ -8637,20 +10184,13 @@ pub const Server = struct {
             prior_chatml,
             slot.nonstream_content_buf,
             &self.signature_key,
+            self.fim_tokens.asFimTokens(),
+            self.tokenizer(),
+            slot.media_buf,
             slot.prompt_buf,
             &slot.model_buf,
         ) catch |err| {
-            const msg = switch (err) {
-                error.InvalidJson => "invalid JSON request body",
-                error.MissingRequiredField => "missing required field in request body",
-                error.InvalidFieldValue => "invalid parameter value in request body",
-                error.UnsupportedFeature => "unsupported request feature",
-                error.BufferTooSmall => "prompt exceeds preallocated slot buffer",
-                error.DepthExceeded => "JSON nesting depth exceeded",
-            };
-            const code: u16 = if (err == error.BufferTooSmall) 413 else 400;
-            const reason = if (err == error.BufferTooSmall) "Payload Too Large" else "Bad Request";
-            self.sendErrorResponse(slot, code, reason, null, msg, "invalid_request_error", "bad_request");
+            self.sendParseErrorResponse(slot, err);
             return;
         };
 
@@ -8787,6 +10327,14 @@ pub const Server = struct {
         slot.stream = parsed.stream;
         slot.model_len = parsed.model_len;
         slot.prompt_len = parsed.prompt_len;
+        slot.prompt_token_ids_len = parsed.prompt_token_ids_len;
+        if (parsed.prompt_token_ids_len > 0) {
+            @memcpy(
+                slot.prompt_token_ids_buf[0..parsed.prompt_token_ids_len],
+                parsed.prompt_token_ids_buf[0..parsed.prompt_token_ids_len],
+            );
+        }
+        slot.legacy_logprobs = parsed.legacy_logprobs;
         slot.ngram_domain_buf = parsed.ngram_domain_buf;
         slot.ngram_domain_len = parsed.ngram_domain_len;
         slot.logit_bias_entries = parsed.logit_bias_entries;
@@ -8841,9 +10389,12 @@ pub const Server = struct {
         slot.cancelled.store(false, .release);
         while (slot.token_ring.tryPop() != null) {}
 
-        // Reserve stateful `/v1/responses` slot (`in_progress`) so GET & POST /cancel work live!
+        // Reserve stateful `/v1/responses` slot (`in_progress`) so GET, input_items & POST /cancel work live!
         // Never evict active `.in_progress` slots (`503 server_overloaded` when all slots active).
         if (endpoint == .responses and parsed.store_response) {
+            var new_items: [MAX_STATEFUL_INPUT_ITEMS]TempInputItem = undefined;
+            const new_item_count = collectResponsesInputItemsFromBody(body, slot.nonstream_content_buf, &new_items);
+
             const r_idx = self.allocStatefulResponseSlot() orelse {
                 _ = self.rejected_503_count.fetchAdd(1, .monotonic);
                 self.sendErrorResponse(
@@ -8890,6 +10441,7 @@ pub const Server = struct {
             rec.reasoning_len = 0;
             rec.content_len = 0;
             rec.tool_call_count = 0;
+            populateStatefulResponseInputItems(rec, prev_rec_ptr, new_items[0..new_item_count]);
             slot.stateful_resp_slot_idx = r_idx;
         }
 
@@ -8897,9 +10449,9 @@ pub const Server = struct {
             slot.keep_alive = false;
         }
 
-        // For SSE streams, send HTTP 200 headers (with X-Aminfer-Seed-Used) immediately.
+        // For SSE streams, send HTTP 200 headers (with X-Aminfer-Seed-Used + CORS) immediately.
         if (parsed.stream) {
-            var hdr_buf: [512]u8 = undefined;
+            var hdr_buf: [1024]u8 = undefined;
             var w = FixedWriter.init(&hdr_buf);
             w.print(
                 "HTTP/1.1 200 OK\r\n" ++
@@ -8907,10 +10459,19 @@ pub const Server = struct {
                     "Cache-Control: no-cache\r\n" ++
                     "Connection: close\r\n" ++
                     "X-Aminfer-Seed-Used: {d}\r\n" ++
-                    "X-Aminfer-Seed-Source: {s}\r\n" ++
-                    "\r\n",
+                    "X-Aminfer-Seed-Source: {s}\r\n",
                 .{ slot.seed_used, slot.seed_source.name() },
             ) catch {
+                self.rollbackStatefulResponseSlot(slot);
+                self.closeSlotSocketAndRelease(slot, false);
+                return;
+            };
+            self.appendCorsResponseHeaders(&w, false) catch {
+                self.rollbackStatefulResponseSlot(slot);
+                self.closeSlotSocketAndRelease(slot, false);
+                return;
+            };
+            w.writeAll("\r\n") catch {
                 self.rollbackStatefulResponseSlot(slot);
                 self.closeSlotSocketAndRelease(slot, false);
                 return;
@@ -8963,6 +10524,12 @@ pub const Server = struct {
             .template_dialect = parsed.template_dialect,
             .starts_in_think = parsed.starts_in_think,
             .stream_include_usage = parsed.stream_include_usage,
+            .prompt_token_ids = if (slot.prompt_token_ids_len > 0)
+                slot.prompt_token_ids_buf[0..slot.prompt_token_ids_len]
+            else
+                null,
+            .media_items = parsed.media_items,
+            .media_count = parsed.media_count,
         };
 
         if (!self.job_ring.tryPush(job)) {
@@ -9107,6 +10674,30 @@ pub const Server = struct {
     }
 
     fn feedSlotText(self: *Server, slot: *ConnectionSlot, text: []const u8, token_count: u32) void {
+        if (slot.endpoint == .completions) {
+            const RawHoldCtx = struct {
+                server: *Server,
+                slot: *ConnectionSlot,
+                fn onSafe(ctx: *@This(), safe_bytes: []const u8) error{BufferTooSmall}!void {
+                    if (safe_bytes.len == 0) return;
+                    if (ctx.slot.first_emitted_ns == 0) {
+                        const now = monotonicNowNs();
+                        ctx.slot.first_emitted_ns = now;
+                        if (ctx.slot.first_token_ns == 0) ctx.slot.first_token_ns = now;
+                    }
+                    ctx.server.appendNonStreamSpan(ctx.slot, .content, safe_bytes);
+                    if (ctx.slot.stream) {
+                        try ctx.server.appendStreamDelta(ctx.slot, .content, safe_bytes);
+                    }
+                }
+            };
+            var rctx = RawHoldCtx{ .server = self, .slot = slot };
+            _ = slot.stop_holdback.feed(&slot.stop_config, text, &rctx, RawHoldCtx.onSafe) catch {
+                self.closeSlotSocketAndRelease(slot, true);
+                return;
+            };
+            return;
+        }
         const ThinkCtx = struct {
             server: *Server,
             slot: *ConnectionSlot,
@@ -9181,7 +10772,7 @@ pub const Server = struct {
                     try self.flushAndCloseResponsesOpenItems(slot);
                 }
             },
-            .chat_completions => {},
+            .chat_completions, .completions => {},
         }
     }
 
@@ -9346,6 +10937,7 @@ pub const Server = struct {
                 try w.writeAll("\",\"input\":{}}}\n\n");
                 try slot.appendTx(w.written());
             },
+            .completions => return,
         }
     }
 
@@ -9395,6 +10987,7 @@ pub const Server = struct {
                 try w.writeAll("\"}}\n\n");
                 try slot.appendTx(w.written());
             },
+            .completions => return,
         }
     }
 
@@ -9408,7 +11001,7 @@ pub const Server = struct {
         var buf: [STREAM_TX_HEADROOM_BYTES]u8 = undefined;
         var w = FixedWriter.init(&buf);
         switch (slot.endpoint) {
-            .chat_completions => return,
+            .chat_completions, .completions => return,
             .responses => {
                 const args = if (index < slot.stored_tool_call_count)
                     slot.stored_tool_calls[index].argsSlice()
@@ -9630,7 +11223,7 @@ pub const Server = struct {
         var buf: [1536]u8 = undefined;
         var w = FixedWriter.init(&buf);
         switch (slot.endpoint) {
-            .chat_completions => return,
+            .chat_completions, .completions => return,
             .responses => {
                 const s0 = slot.responses_seq_num;
                 slot.responses_seq_num += 1;
@@ -9700,6 +11293,20 @@ pub const Server = struct {
                 }
                 try w.writeJsonEscaped(span);
                 try w.writeAll("\"},\"finish_reason\":null}]}\n\n");
+                try slot.appendTx(w.written());
+            },
+            .completions => {
+                try w.print(
+                    "data: {{\"id\":\"cmpl-{d}\",\"object\":\"text_completion\",\"created\":{d},\"model\":\"",
+                    .{ slot.request_id, slot.created_unix },
+                );
+                try w.writeJsonEscaped(slot.modelSlice());
+                try w.print(
+                    "\",\"seed_used\":{d},\"seed_source\":\"{s}\",\"choices\":[{{\"text\":\"",
+                    .{ slot.seed_used, slot.seed_source.name() },
+                );
+                try w.writeJsonEscaped(span);
+                try w.writeAll("\",\"index\":0,\"logprobs\":null,\"finish_reason\":null}]}\n\n");
                 try slot.appendTx(w.written());
             },
             .responses => {
@@ -9884,69 +11491,93 @@ pub const Server = struct {
     }
 
     fn finishSlotResponse(self: *Server, slot: *ConnectionSlot, raw_reason: FinishReason) void {
-        // 1. Flush any un-matched partial stop-sequence prefix bytes (only when NOT stopped by a match!).
-        {
-            const HoldFlushCtx = struct {
+        if (slot.endpoint == .completions) {
+            const RawHoldFlushCtx = struct {
                 server: *Server,
                 slot: *ConnectionSlot,
                 fn onSafe(ctx: *@This(), safe_bytes: []const u8) error{BufferTooSmall}!void {
                     if (safe_bytes.len == 0) return;
-                    const ThinkCtx = struct {
-                        server: *Server,
-                        slot: *ConnectionSlot,
-                        fn onSpan(tctx: *@This(), channel: StreamChannel, span: []const u8) error{BufferTooSmall}!void {
-                            if (span.len == 0) return;
-                            if (channel == .reasoning and tctx.slot.thinking_budget_exhausted) return;
-                            try tctx.server.dispatchChannelSpan(tctx.slot, channel, span);
-                        }
-                    };
-                    var tctx = ThinkCtx{ .server = ctx.server, .slot = ctx.slot };
-                    try ctx.slot.think_splitter.feed(safe_bytes, &tctx, ThinkCtx.onSpan);
+                    if (ctx.slot.first_emitted_ns == 0) {
+                        const now = monotonicNowNs();
+                        ctx.slot.first_emitted_ns = now;
+                        if (ctx.slot.first_token_ns == 0) ctx.slot.first_token_ns = now;
+                    }
+                    ctx.server.appendNonStreamSpan(ctx.slot, .content, safe_bytes);
+                    if (ctx.slot.stream) {
+                        try ctx.server.appendStreamDelta(ctx.slot, .content, safe_bytes);
+                    }
                 }
             };
-            var hfctx = HoldFlushCtx{ .server = self, .slot = slot };
-            slot.stop_holdback.flush(&hfctx, HoldFlushCtx.onSafe) catch {
+            var rhfctx = RawHoldFlushCtx{ .server = self, .slot = slot };
+            slot.stop_holdback.flush(&rhfctx, RawHoldFlushCtx.onSafe) catch {
                 self.closeSlotSocketAndRelease(slot, true);
                 return;
             };
-        }
+        } else {
+            // 1. Flush any un-matched partial stop-sequence prefix bytes (only when NOT stopped by a match!).
+            {
+                const HoldFlushCtx = struct {
+                    server: *Server,
+                    slot: *ConnectionSlot,
+                    fn onSafe(ctx: *@This(), safe_bytes: []const u8) error{BufferTooSmall}!void {
+                        if (safe_bytes.len == 0) return;
+                        const ThinkCtx = struct {
+                            server: *Server,
+                            slot: *ConnectionSlot,
+                            fn onSpan(tctx: *@This(), channel: StreamChannel, span: []const u8) error{BufferTooSmall}!void {
+                                if (span.len == 0) return;
+                                if (channel == .reasoning and tctx.slot.thinking_budget_exhausted) return;
+                                try tctx.server.dispatchChannelSpan(tctx.slot, channel, span);
+                            }
+                        };
+                        var tctx = ThinkCtx{ .server = ctx.server, .slot = ctx.slot };
+                        try ctx.slot.think_splitter.feed(safe_bytes, &tctx, ThinkCtx.onSpan);
+                    }
+                };
+                var hfctx = HoldFlushCtx{ .server = self, .slot = slot };
+                slot.stop_holdback.flush(&hfctx, HoldFlushCtx.onSafe) catch {
+                    self.closeSlotSocketAndRelease(slot, true);
+                    return;
+                };
+            }
 
-        // 2. Flush any buffered partial `<think>` / `</think>` bytes.
-        {
-            const FlushCtx = struct {
-                server: *Server,
-                slot: *ConnectionSlot,
-                fn onSpan(ctx: *@This(), channel: StreamChannel, span: []const u8) error{BufferTooSmall}!void {
-                    if (span.len == 0) return;
-                    if (channel == .reasoning and ctx.slot.thinking_budget_exhausted) return;
-                    try ctx.server.dispatchChannelSpan(ctx.slot, channel, span);
-                }
-            };
-            var fctx = FlushCtx{ .server = self, .slot = slot };
-            slot.think_splitter.flush(&fctx, FlushCtx.onSpan) catch {
-                self.closeSlotSocketAndRelease(slot, true);
-                return;
-            };
-        }
+            // 2. Flush any buffered partial `<think>` / `</think>` bytes.
+            {
+                const FlushCtx = struct {
+                    server: *Server,
+                    slot: *ConnectionSlot,
+                    fn onSpan(ctx: *@This(), channel: StreamChannel, span: []const u8) error{BufferTooSmall}!void {
+                        if (span.len == 0) return;
+                        if (channel == .reasoning and ctx.slot.thinking_budget_exhausted) return;
+                        try ctx.server.dispatchChannelSpan(ctx.slot, channel, span);
+                    }
+                };
+                var fctx = FlushCtx{ .server = self, .slot = slot };
+                slot.think_splitter.flush(&fctx, FlushCtx.onSpan) catch {
+                    self.closeSlotSocketAndRelease(slot, true);
+                    return;
+                };
+            }
 
-        // 3. Flush any buffered partial `<tool_call>` bytes.
-        {
-            const ToolFlushCtx = struct {
-                server: *Server,
-                slot: *ConnectionSlot,
-                fn onToolEvent(ctx: *@This(), tev: ToolCallStreamEvent) error{BufferTooSmall}!void {
-                    try ctx.server.handleToolCallEvent(ctx.slot, tev);
-                }
-            };
-            var tfctx = ToolFlushCtx{ .server = self, .slot = slot };
-            slot.tool_parser.flush(&tfctx, ToolFlushCtx.onToolEvent) catch {
-                self.closeSlotSocketAndRelease(slot, true);
-                return;
-            };
+            // 3. Flush any buffered partial `<tool_call>` bytes.
+            {
+                const ToolFlushCtx = struct {
+                    server: *Server,
+                    slot: *ConnectionSlot,
+                    fn onToolEvent(ctx: *@This(), tev: ToolCallStreamEvent) error{BufferTooSmall}!void {
+                        try ctx.server.handleToolCallEvent(ctx.slot, tev);
+                    }
+                };
+                var tfctx = ToolFlushCtx{ .server = self, .slot = slot };
+                slot.tool_parser.flush(&tfctx, ToolFlushCtx.onToolEvent) catch {
+                    self.closeSlotSocketAndRelease(slot, true);
+                    return;
+                };
+            }
         }
 
         // Upgrade finish_reason to `.tool_calls` (`"tool_calls"` / `"tool_use"`) when tool calls were emitted!
-        const reason: FinishReason = if (slot.tool_parser.hasToolCalls() and (raw_reason == .stop or raw_reason == .stop_sequence))
+        const reason: FinishReason = if (slot.endpoint != .completions and slot.tool_parser.hasToolCalls() and (raw_reason == .stop or raw_reason == .stop_sequence))
             .tool_calls
         else if (slot.stop_holdback.stopped)
             .stop_sequence
@@ -10118,6 +11749,70 @@ pub const Server = struct {
                         return;
                     };
                 },
+                .completions => {
+                    w.print(
+                        "data: {{\"id\":\"cmpl-{d}\",\"object\":\"text_completion\",\"created\":{d},\"model\":\"",
+                        .{ slot.request_id, slot.created_unix },
+                    ) catch {
+                        self.closeSlotSocketAndRelease(slot, true);
+                        return;
+                    };
+                    w.writeJsonEscaped(slot.modelSlice()) catch {
+                        self.closeSlotSocketAndRelease(slot, true);
+                        return;
+                    };
+                    w.print(
+                        "\",\"seed_used\":{d},\"seed_source\":\"{s}\",\"choices\":[{{\"text\":\"\",\"index\":0,\"logprobs\":null,\"finish_reason\":\"{s}\"}}]," ++
+                            "\"usage\":{{\"prompt_tokens\":{d},\"completion_tokens\":{d},\"total_tokens\":{d},\"prompt_tokens_details\":{{\"cached_tokens\":{d}}},\"completion_tokens_details\":{{\"reasoning_tokens\":{d}}}}}," ++
+                            "\"aminfer_timings\":{{\"ttft_ms\":{d:.3},\"tpot_ms\":{d:.3},\"tok_per_s\":{d:.2}}}}}\n\n",
+                        .{
+                            slot.seed_used,
+                            slot.seed_source.name(),
+                            reason.openAiName(),
+                            slot.prompt_tokens,
+                            slot.completion_tokens,
+                            total_tokens,
+                            slot.cached_tokens,
+                            slot.reasoning_tokens,
+                            timings.ttft_ms,
+                            timings.tpot_ms,
+                            timings.tok_per_s,
+                        },
+                    ) catch {
+                        self.closeSlotSocketAndRelease(slot, true);
+                        return;
+                    };
+                    if (slot.stream_include_usage) {
+                        w.print(
+                            "data: {{\"id\":\"cmpl-{d}\",\"object\":\"text_completion\",\"created\":{d},\"model\":\"",
+                            .{ slot.request_id, slot.created_unix },
+                        ) catch {
+                            self.closeSlotSocketAndRelease(slot, true);
+                            return;
+                        };
+                        w.writeJsonEscaped(slot.modelSlice()) catch {
+                            self.closeSlotSocketAndRelease(slot, true);
+                            return;
+                        };
+                        w.print(
+                            "\",\"choices\":[],\"usage\":{{\"prompt_tokens\":{d},\"completion_tokens\":{d},\"total_tokens\":{d},\"prompt_tokens_details\":{{\"cached_tokens\":{d}}},\"completion_tokens_details\":{{\"reasoning_tokens\":{d}}}}}}}\n\n",
+                            .{
+                                slot.prompt_tokens,
+                                slot.completion_tokens,
+                                total_tokens,
+                                slot.cached_tokens,
+                                slot.reasoning_tokens,
+                            },
+                        ) catch {
+                            self.closeSlotSocketAndRelease(slot, true);
+                            return;
+                        };
+                    }
+                    w.writeAll("data: [DONE]\n\n") catch {
+                        self.closeSlotSocketAndRelease(slot, true);
+                        return;
+                    };
+                },
                 .responses => unreachable,
                 .messages => {
                     if (slot.anthropic_block != .none) {
@@ -10200,7 +11895,7 @@ pub const Server = struct {
         timings: Timings,
         total_tokens: u32,
     ) void {
-        const HEADER_RESERVE: usize = 512;
+        const HEADER_RESERVE: usize = 768;
         if (slot.tx_buf.len <= HEADER_RESERVE) {
             self.closeSlotSocketAndRelease(slot, false);
             return;
@@ -10212,6 +11907,33 @@ pub const Server = struct {
 
         const ok: bool = blk: {
             switch (slot.endpoint) {
+                .completions => {
+                    bw.print(
+                        "{{\"id\":\"cmpl-{d}\",\"object\":\"text_completion\",\"created\":{d},\"model\":\"",
+                        .{ slot.request_id, slot.created_unix },
+                    ) catch break :blk false;
+                    bw.writeJsonEscaped(slot.modelSlice()) catch break :blk false;
+                    bw.print(
+                        "\",\"seed_used\":{d},\"seed_source\":\"{s}\",\"choices\":[{{\"text\":\"",
+                        .{ slot.seed_used, slot.seed_source.name() },
+                    ) catch break :blk false;
+                    bw.writeJsonEscaped(content) catch break :blk false;
+                    bw.print(
+                        "\",\"index\":0,\"logprobs\":null,\"finish_reason\":\"{s}\"}}],\"usage\":{{\"prompt_tokens\":{d},\"completion_tokens\":{d},\"total_tokens\":{d},\"prompt_tokens_details\":{{\"cached_tokens\":{d}}},\"completion_tokens_details\":{{\"reasoning_tokens\":{d}}}}}," ++
+                            "\"aminfer_timings\":{{\"ttft_ms\":{d:.3},\"tpot_ms\":{d:.3},\"tok_per_s\":{d:.2}}}}}",
+                        .{
+                            reason.openAiName(),
+                            slot.prompt_tokens,
+                            slot.completion_tokens,
+                            total_tokens,
+                            slot.cached_tokens,
+                            slot.reasoning_tokens,
+                            timings.ttft_ms,
+                            timings.tpot_ms,
+                            timings.tok_per_s,
+                        },
+                    ) catch break :blk false;
+                },
                 .chat_completions => {
                     bw.print(
                         "{{\"id\":\"chatcmpl-{d}\",\"object\":\"chat.completion\",\"created\":{d},\"model\":\"",
@@ -10385,30 +12107,7 @@ pub const Server = struct {
         }
 
         const body_len = bw.pos;
-        var hdr_buf: [HEADER_RESERVE]u8 = undefined;
-        var hw = FixedWriter.init(&hdr_buf);
-        hw.print(
-            "HTTP/1.1 200 OK\r\n" ++
-                "Content-Type: application/json\r\n" ++
-                "Content-Length: {d}\r\n" ++
-                "Connection: {s}\r\n" ++
-                "X-Aminfer-Seed-Used: {d}\r\n" ++
-                "X-Aminfer-Seed-Source: {s}\r\n" ++
-                "\r\n",
-            .{ body_len, if (slot.keep_alive) "keep-alive" else "close", slot.seed_used, slot.seed_source.name() },
-        ) catch {
-            self.closeSlotSocketAndRelease(slot, false);
-            return;
-        };
-
-        const hdr_start = HEADER_RESERVE - hw.pos;
-        @memcpy(slot.tx_buf[hdr_start..HEADER_RESERVE], hw.written());
-        slot.tx_read_pos = hdr_start;
-        slot.tx_write_pos = HEADER_RESERVE + body_len;
-        slot.state = .draining_response;
-        if (self.flushTx(slot) and slot.pendingTxLen() == 0) {
-            self.finishHttpExchange(slot);
-        }
+        self.writeHttpJsonOkHeadersAndSend(slot, body_len, HEADER_RESERVE, slot.seed_used, slot.seed_source);
     }
 
     fn failSlotResponse(self: *Server, slot: *ConnectionSlot, message: []const u8) void {
@@ -14234,12 +15933,17 @@ test "C28 GET /v1/models (>4096 B) and GET /v1/models/{id} with LoRA adapters, p
     const ModelEntryJson = struct {
         id: []const u8,
         object: []const u8,
+        type: []const u8,
+        display_name: []const u8,
         created: i64,
+        created_at: []const u8,
         owned_by: []const u8,
         root: []const u8,
         parent: ?[]const u8 = null,
         architecture: []const u8,
         max_model_len: u32,
+        max_input_tokens: u32,
+        max_tokens: u32,
         vocab_size: u32,
         effective_bits_per_weight: ?f64 = null,
         wired_mib: ?u64 = null,
@@ -14253,6 +15957,9 @@ test "C28 GET /v1/models (>4096 B) and GET /v1/models/{id} with LoRA adapters, p
     const ModelsListJson = struct {
         object: []const u8,
         data: []const ModelEntryJson,
+        first_id: ?[]const u8 = null,
+        last_id: ?[]const u8 = null,
+        has_more: bool,
     };
 
     // 3a. GET /v1/models (> 4096 B payload parsed via std.json.parseFromSlice).
@@ -15020,5 +16727,923 @@ test "M8.3 HTTPS Server: TLS 1.3/1.2, encrypted PEM & .p12, C28 /v1/models/{id},
         try testNbSendAll(holder.fd, "GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: keep-alive\r\n\r\n");
         const h_resp2 = try testNbRecvOneHttpResponse(holder.fd, &resp_buf);
         try std.testing.expect(std.mem.startsWith(u8, h_resp2, "HTTP/1.1 200 OK\r\n"));
+    }
+}
+
+test "C29 Anthropic /v1/models parity, RFC3339 civil-from-days, pagination cursors, and prefix-free route aliases with --api-key" {
+    // 1. Verify integer-math civil-from-days UTC RFC 3339 formatter (zero heap allocs).
+    {
+        var ts_buf: [32]u8 = undefined;
+        try std.testing.expectEqualStrings("1970-01-01T00:00:00Z", formatRfc3339Utc(0, &ts_buf));
+        try std.testing.expectEqualStrings("2024-02-29T12:00:00Z", formatRfc3339Utc(1709208000, &ts_buf));
+        try std.testing.expectEqualStrings("2026-11-26T14:00:00Z", formatRfc3339Utc(1795701600, &ts_buf));
+    }
+
+    const gpa = std.testing.allocator;
+    const mini_tok_json =
+        \\{"model":{"type":"BPE","vocab":{"<|im_start|>":0,"<|im_end|>":1,"a":2,"b":3,"c":4,"d":5,"e":6,"f":7,"g":8,"h":9,"i":10,"j":11,"k":12,"l":13,"m":14,"n":15,"o":16,"p":17,"q":18,"r":19,"s":20,"t":21,"u":22,"v":23,"w":24,"x":25,"y":26,"z":27," ":28,"\n":29,"hello":30},"merges":[]},"added_tokens":[{"id":0,"content":"<|im_start|>","special":true},{"id":1,"content":"<|im_end|>","special":true}]}
+    ;
+    var tok = try tokenizer_mod.Tokenizer.fromHuggingFaceJson(gpa, mini_tok_json);
+    defer tok.deinit(gpa);
+
+    const Handlers = struct {
+        fn generate(_: *anyopaque, job: *const InferenceJob, stream: *TokenStream) void {
+            _ = stream.setPromptTokens(3);
+            if (!stream.emitText("ok:", 1)) return;
+            if (!stream.emitText(job.model_base, 1)) return;
+            stream.finish(.stop, 3);
+        }
+
+        fn embed(_: *anyopaque, req: *const EmbedRequest, out_vectors: []f32) anyerror!EmbedResult {
+            for (0..req.input_count) |i| {
+                out_vectors[i * 2] = 1.0;
+                out_vectors[i * 2 + 1] = 0.0;
+            }
+            return .{ .dim = 2, .prompt_tokens = 2 };
+        }
+
+        fn rerank(_: *anyopaque, req: *const RerankRequest, out_items: []RerankItem) anyerror!RerankResult {
+            for (0..req.document_count) |i| {
+                out_items[i] = .{ .index = @intCast(i), .relevance_score = 0.9 };
+            }
+            return .{ .count = req.document_count, .prompt_tokens = 2 };
+        }
+    };
+
+    const adps = [_]LoraAdapterMeta{
+        .{ .name = "coder", .display_name = "Coder Adapter", .rank = 8, .lora_alpha = 16.0, .scale = 2.0, .wired_bytes = 1024 },
+        .{ .name = "sql", .rank = 16, .lora_alpha = 32.0, .scale = 2.0, .wired_bytes = 2048 },
+        .{ .name = "math", .display_name = "Math Adapter", .rank = 4, .lora_alpha = 8.0, .scale = 2.0, .wired_bytes = 512 },
+    };
+
+    var dummy: u8 = 0;
+    const srv = try Server.init(gpa, .{
+        .port = 0,
+        .model_id = "org/base-model",
+        .api_key = "sk-c29-auth",
+        .tokenizer = &tok,
+        .embedding_handler = .{ .ctx = &dummy, .embedFn = Handlers.embed },
+        .rerank_handler = .{ .ctx = &dummy, .rerankFn = Handlers.rerank },
+        .model_detail = .{
+            .architecture = "qwen3",
+            .display_name = "Base Display",
+            .max_model_len = 32768,
+            .max_output_tokens = 8192,
+            .vocab_size = 6,
+            .effective_bits_per_weight = 4.5,
+        },
+        .lora_adapters = &adps,
+        .max_conns = 6,
+        .max_active_requests = 4,
+        .apply_qos = false,
+    });
+    defer srv.deinit(gpa);
+    try srv.start(.{ .ctx = &dummy, .generateFn = Handlers.generate });
+    defer srv.stop();
+
+    const port = srv.boundPort();
+    var req_buf: [2048]u8 = undefined;
+    var resp_buf: [32768]u8 = undefined;
+
+    const ModelItem = struct {
+        id: []const u8,
+        object: []const u8,
+        type: []const u8,
+        display_name: []const u8,
+        created: i64,
+        created_at: []const u8,
+        owned_by: []const u8,
+        root: []const u8,
+        parent: ?[]const u8 = null,
+        architecture: []const u8,
+        max_model_len: u32,
+        max_input_tokens: u32,
+        max_tokens: u32,
+        vocab_size: u32,
+        effective_bits_per_weight: ?f64 = null,
+        wired_mib: ?u64 = null,
+        cold_bytes: ?u64 = null,
+        rank: ?u32 = null,
+        lora_alpha: ?f64 = null,
+        scale: ?f64 = null,
+        wired_bytes: ?u64 = null,
+        capabilities: std.json.Value,
+    };
+    const ModelsList = struct {
+        object: []const u8,
+        data: []const ModelItem,
+        first_id: ?[]const u8 = null,
+        last_id: ?[]const u8 = null,
+        has_more: bool,
+    };
+
+    // 2. Verify Anthropic fields + OpenAI/C28 fields + pagination on both /v1/models and /models.
+    {
+        const r_p1 = try testHttpExchange(
+            port,
+            "GET /models?limit=2 HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer sk-c29-auth\r\n\r\n",
+            &resp_buf,
+        );
+        try std.testing.expect(std.mem.startsWith(u8, r_p1, "HTTP/1.1 200 OK\r\n"));
+        const p1 = try std.json.parseFromSlice(ModelsList, gpa, extractHttpBody(r_p1).?, .{});
+        defer p1.deinit();
+        try std.testing.expectEqual(@as(usize, 2), p1.value.data.len);
+        try std.testing.expectEqualStrings("org/base-model", p1.value.first_id.?);
+        try std.testing.expectEqualStrings("org/base-model:coder", p1.value.last_id.?);
+        try std.testing.expect(p1.value.has_more);
+        try std.testing.expectEqualStrings("model", p1.value.data[0].type);
+        try std.testing.expectEqualStrings("Base Display", p1.value.data[0].display_name);
+        try std.testing.expectEqual(@as(u32, 32768), p1.value.data[0].max_input_tokens);
+        try std.testing.expectEqual(@as(u32, 8192), p1.value.data[0].max_tokens);
+        try std.testing.expectEqual(@as(usize, 20), p1.value.data[0].created_at.len);
+        try std.testing.expectEqualStrings("Coder Adapter", p1.value.data[1].display_name);
+
+        // Next page with percent-encoded after_id.
+        const r_p2 = try testHttpExchange(
+            port,
+            "GET /v1/models?after_id=org%2Fbase-model%3Acoder&limit=2 HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer sk-c29-auth\r\n\r\n",
+            &resp_buf,
+        );
+        try std.testing.expect(std.mem.startsWith(u8, r_p2, "HTTP/1.1 200 OK\r\n"));
+        const p2 = try std.json.parseFromSlice(ModelsList, gpa, extractHttpBody(r_p2).?, .{});
+        defer p2.deinit();
+        try std.testing.expectEqual(@as(usize, 2), p2.value.data.len);
+        try std.testing.expectEqualStrings("org/base-model:sql", p2.value.data[0].id);
+        // Empty LoRA display_name falls back to the item's full id.
+        try std.testing.expectEqualStrings("org/base-model:sql", p2.value.data[0].display_name);
+        try std.testing.expectEqualStrings("org/base-model:math", p2.value.data[1].id);
+        try std.testing.expect(!p2.value.has_more);
+
+        // Past-end cursor produces empty list with null first_id/last_id.
+        const r_empty = try testHttpExchange(
+            port,
+            "GET /models?after_id=org%2Fbase-model%3Amath HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer sk-c29-auth\r\n\r\n",
+            &resp_buf,
+        );
+        const pe = try std.json.parseFromSlice(ModelsList, gpa, extractHttpBody(r_empty).?, .{});
+        defer pe.deinit();
+        try std.testing.expectEqual(@as(usize, 0), pe.value.data.len);
+        try std.testing.expectEqual(@as(?[]const u8, null), pe.value.first_id);
+        try std.testing.expectEqual(@as(?[]const u8, null), pe.value.last_id);
+        try std.testing.expect(!pe.value.has_more);
+
+        // before_id cursor returns preceding items.
+        const r_bef = try testHttpExchange(
+            port,
+            "GET /v1/models?before_id=org%2Fbase-model%3Amath&limit=2 HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer sk-c29-auth\r\n\r\n",
+            &resp_buf,
+        );
+        const pb = try std.json.parseFromSlice(ModelsList, gpa, extractHttpBody(r_bef).?, .{});
+        defer pb.deinit();
+        try std.testing.expectEqual(@as(usize, 2), pb.value.data.len);
+        try std.testing.expectEqualStrings("org/base-model:coder", pb.value.data[0].id);
+        try std.testing.expectEqualStrings("org/base-model:sql", pb.value.data[1].id);
+        try std.testing.expect(pb.value.has_more);
+
+        // Invalid limit and cursor percent-encoding -> 400 invalid_request_error.
+        const bad_qs = [_][]const u8{
+            "GET /models?limit=0 HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer sk-c29-auth\r\n\r\n",
+            "GET /models?limit=abc HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer sk-c29-auth\r\n\r\n",
+            "GET /models?limit=1001 HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer sk-c29-auth\r\n\r\n",
+            "GET /models?after_id=bad%ZZ HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer sk-c29-auth\r\n\r\n",
+        };
+        for (bad_qs) |qreq| {
+            const br = try testHttpExchange(port, qreq, &resp_buf);
+            try std.testing.expect(std.mem.startsWith(u8, br, "HTTP/1.1 400 Bad Request\r\n"));
+            try std.testing.expect(std.mem.indexOf(u8, br, "\"invalid_request_error\"") != null);
+        }
+
+        // Prefix-free detail route GET /models/{id}.
+        const r_det = try testHttpExchange(
+            port,
+            "GET /models/org%2Fbase-model%3Acoder HTTP/1.1\r\nHost: localhost\r\nx-api-key: sk-c29-auth\r\n\r\n",
+            &resp_buf,
+        );
+        try std.testing.expect(std.mem.startsWith(u8, r_det, "HTTP/1.1 200 OK\r\n"));
+        const pd = try std.json.parseFromSlice(ModelItem, gpa, extractHttpBody(r_det).?, .{});
+        defer pd.deinit();
+        try std.testing.expectEqualStrings("model", pd.value.type);
+        try std.testing.expectEqualStrings("Coder Adapter", pd.value.display_name);
+    }
+
+    // 3. Prefix-free routes enforce --api-key identically and serve identical responses; /health remains open.
+    {
+        const r_health = try testHttpExchange(port, "GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n", &resp_buf);
+        try std.testing.expect(std.mem.startsWith(u8, r_health, "HTTP/1.1 200 OK\r\n"));
+
+        const unauth_reqs = [_][]const u8{
+            "GET /models HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            "POST /chat/completions HTTP/1.1\r\nHost: localhost\r\nContent-Length: 2\r\n\r\n{}",
+            "POST /completions HTTP/1.1\r\nHost: localhost\r\nContent-Length: 2\r\n\r\n{}",
+            "POST /messages HTTP/1.1\r\nHost: localhost\r\nContent-Length: 2\r\n\r\n{}",
+            "POST /responses HTTP/1.1\r\nHost: localhost\r\nContent-Length: 2\r\n\r\n{}",
+            "POST /responses/input_tokens HTTP/1.1\r\nHost: localhost\r\nContent-Length: 2\r\n\r\n{}",
+            "GET /responses/resp_1/input_items HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        };
+        for (unauth_reqs) |ureq| {
+            const ur = try testHttpExchange(port, ureq, &resp_buf);
+            try std.testing.expect(std.mem.startsWith(u8, ur, "HTTP/1.1 401 Unauthorized\r\n"));
+        }
+
+        const r_unk = try testHttpExchange(
+            port,
+            "GET /unknown-route HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer sk-c29-auth\r\n\r\n",
+            &resp_buf,
+        );
+        try std.testing.expect(std.mem.startsWith(u8, r_unk, "HTTP/1.1 404 Not Found\r\n"));
+
+        const auth_hdr = "Authorization: Bearer sk-c29-auth\r\n";
+        const r_chat = try testHttpPostJsonWithHeaders(port, "/chat/completions", auth_hdr, "{\"messages\":[{\"role\":\"user\",\"content\":\"a\"}]}", &req_buf, &resp_buf);
+        try std.testing.expect(std.mem.startsWith(u8, r_chat, "HTTP/1.1 200 OK\r\n"));
+
+        const r_msg = try testHttpPostJsonWithHeaders(port, "/messages", auth_hdr, "{\"max_tokens\":8,\"messages\":[{\"role\":\"user\",\"content\":\"a\"}]}", &req_buf, &resp_buf);
+        try std.testing.expect(std.mem.startsWith(u8, r_msg, "HTTP/1.1 200 OK\r\n"));
+
+        const r_mc = try testHttpPostJsonWithHeaders(port, "/messages/count_tokens", auth_hdr, "{\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}]}", &req_buf, &resp_buf);
+        try std.testing.expect(std.mem.startsWith(u8, r_mc, "HTTP/1.1 200 OK\r\n"));
+
+        const r_emb = try testHttpPostJsonWithHeaders(port, "/embeddings", auth_hdr, "{\"input\":\"a\"}", &req_buf, &resp_buf);
+        try std.testing.expect(std.mem.startsWith(u8, r_emb, "HTTP/1.1 200 OK\r\n"));
+
+        const r_rer = try testHttpPostJsonWithHeaders(port, "/rerank", auth_hdr, "{\"query\":\"a\",\"documents\":[\"b\"]}", &req_buf, &resp_buf);
+        try std.testing.expect(std.mem.startsWith(u8, r_rer, "HTTP/1.1 200 OK\r\n"));
+    }
+}
+
+test "C29 /v1/responses/input_tokens and /v1/responses/{id}/input_items across previous_response_id chains" {
+    const gpa = std.testing.allocator;
+    const mini_tok_json =
+        \\{"model":{"type":"BPE","vocab":{"<|im_start|>":0,"<|im_end|>":1,"a":2,"b":3,"c":4,"d":5,"e":6,"f":7,"g":8,"h":9,"i":10,"j":11,"k":12,"l":13,"m":14,"n":15,"o":16,"p":17,"q":18,"r":19,"s":20,"t":21,"u":22,"v":23,"w":24,"x":25,"y":26,"z":27," ":28,"\n":29,"<":30,">":31,"/":32,"_":33,".":34,"!":35},"merges":[]},"added_tokens":[{"id":0,"content":"<|im_start|>","special":true},{"id":1,"content":"<|im_end|>","special":true}]}
+    ;
+    var tok = try tokenizer_mod.Tokenizer.fromHuggingFaceJson(gpa, mini_tok_json);
+    defer tok.deinit(gpa);
+
+    const Mock = struct {
+        fn generate(_: *anyopaque, _: *const InferenceJob, stream: *TokenStream) void {
+            _ = stream.setPromptTokens(4);
+            if (!stream.emitText("done", 1)) return;
+            stream.finish(.stop, 4);
+        }
+    };
+    var dummy: u8 = 0;
+
+    // Without tokenizer -> 501 Not Implemented on /v1/responses/input_tokens.
+    {
+        const srv_notok = try Server.init(gpa, .{
+            .port = 0,
+            .max_conns = 4,
+            .max_active_requests = 2,
+            .max_media_bytes = 4096,
+            .apply_qos = false,
+        });
+        defer srv_notok.deinit(gpa);
+        try srv_notok.start(.{ .ctx = &dummy, .generateFn = Mock.generate });
+        defer srv_notok.stop();
+
+        var req_buf: [2048]u8 = undefined;
+        var resp_buf: [8192]u8 = undefined;
+        const r_501 = try testHttpPostJson(srv_notok.boundPort(), "/v1/responses/input_tokens", "{\"input\":\"hello\"}", &req_buf, &resp_buf);
+        try std.testing.expect(std.mem.startsWith(u8, r_501, "HTTP/1.1 501 Not Implemented\r\n"));
+    }
+
+    const srv = try Server.init(gpa, .{
+        .port = 0,
+        .model_id = "qwen3-resp",
+        .tokenizer = &tok,
+        .max_conns = 6,
+        .max_active_requests = 4,
+        .max_media_bytes = 4096,
+        .apply_qos = false,
+    });
+    defer srv.deinit(gpa);
+    try srv.start(.{ .ctx = &dummy, .generateFn = Mock.generate });
+    defer srv.stop();
+
+    const port = srv.boundPort();
+    var req_buf: [4096]u8 = undefined;
+    var resp_buf: [16384]u8 = undefined;
+
+    // 405 on GET /v1/responses/input_tokens.
+    {
+        const r_405 = try testHttpExchange(port, "GET /v1/responses/input_tokens HTTP/1.1\r\nHost: localhost\r\n\r\n", &resp_buf);
+        try std.testing.expect(std.mem.startsWith(u8, r_405, "HTTP/1.1 405 Method Not Allowed\r\n"));
+        try std.testing.expectEqualStrings("POST", extractHeaderValue(r_405, "Allow") orelse "");
+    }
+
+    // 404 on unknown previous_response_id.
+    {
+        const r_404 = try testHttpPostJson(port, "/responses/input_tokens", "{\"input\":\"hi\",\"previous_response_id\":\"resp_missing\"}", &req_buf, &resp_buf);
+        try std.testing.expect(std.mem.startsWith(u8, r_404, "HTTP/1.1 404 Not Found\r\n"));
+    }
+
+    // Turn 1 stateful response with instructions + developer + user input items.
+    const r1 = try testHttpPostJson(
+        port,
+        "/responses",
+        "{\"instructions\":\"be brief\",\"input\":[{\"role\":\"developer\",\"content\":\"use json\"},{\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"first turn\"}]}]}",
+        &req_buf,
+        &resp_buf,
+    );
+    try std.testing.expect(std.mem.startsWith(u8, r1, "HTTP/1.1 200 OK\r\n"));
+    const RespObj = struct { id: []const u8 };
+    const p_r1 = try std.json.parseFromSlice(RespObj, gpa, extractHttpBody(r1).?, .{ .ignore_unknown_fields = true });
+    defer p_r1.deinit();
+    var r1_id_buf: [MAX_RESPONSE_ID_BYTES]u8 = undefined;
+    @memcpy(r1_id_buf[0..p_r1.value.id.len], p_r1.value.id);
+    const r1_id = r1_id_buf[0..p_r1.value.id.len];
+
+    // Count tokens for turn 1 alone vs turn 2 chained to resp_1.
+    const TokCountObj = struct { object: []const u8, input_tokens: u32 };
+    const r_cnt1 = try testHttpPostJson(port, "/v1/responses/input_tokens", "{\"input\":\"follow up\"}", &req_buf, &resp_buf);
+    try std.testing.expect(std.mem.startsWith(u8, r_cnt1, "HTTP/1.1 200 OK\r\n"));
+    const pc1 = try std.json.parseFromSlice(TokCountObj, gpa, extractHttpBody(r_cnt1).?, .{});
+    defer pc1.deinit();
+    try std.testing.expectEqualStrings("response.input_tokens", pc1.value.object);
+    try std.testing.expect(pc1.value.input_tokens > 0);
+
+    var chain_body_buf: [512]u8 = undefined;
+    const chain_body = try std.fmt.bufPrint(
+        &chain_body_buf,
+        "{{\"previous_response_id\":\"{s}\",\"input\":\"follow up\"}}",
+        .{r1_id},
+    );
+    const r_cnt2 = try testHttpPostJson(port, "/responses/input_tokens", chain_body, &req_buf, &resp_buf);
+    try std.testing.expect(std.mem.startsWith(u8, r_cnt2, "HTTP/1.1 200 OK\r\n"));
+    const pc2 = try std.json.parseFromSlice(TokCountObj, gpa, extractHttpBody(r_cnt2).?, .{});
+    defer pc2.deinit();
+    try std.testing.expect(pc2.value.input_tokens > pc1.value.input_tokens);
+
+    // Turn 2 stateful response chained to turn 1.
+    const r2 = try testHttpPostJson(port, "/v1/responses", chain_body, &req_buf, &resp_buf);
+    try std.testing.expect(std.mem.startsWith(u8, r2, "HTTP/1.1 200 OK\r\n"));
+    const p_r2 = try std.json.parseFromSlice(RespObj, gpa, extractHttpBody(r2).?, .{ .ignore_unknown_fields = true });
+    defer p_r2.deinit();
+    var r2_id_buf: [MAX_RESPONSE_ID_BYTES]u8 = undefined;
+    @memcpy(r2_id_buf[0..p_r2.value.id.len], p_r2.value.id);
+    const r2_id = r2_id_buf[0..p_r2.value.id.len];
+
+    // input_items validation: 405 on POST, 404 on missing id, 400 on bad order/limit.
+    {
+        var path_buf: [128]u8 = undefined;
+        const p_post = try std.fmt.bufPrint(&path_buf, "/v1/responses/{s}/input_items", .{r2_id});
+        const r_405 = try testHttpPostJson(port, p_post, "{}", &req_buf, &resp_buf);
+        try std.testing.expect(std.mem.startsWith(u8, r_405, "HTTP/1.1 405 Method Not Allowed\r\n"));
+        try std.testing.expectEqualStrings("GET", extractHeaderValue(r_405, "Allow") orelse "");
+
+        const r_404 = try testHttpExchange(port, "GET /v1/responses/resp_unknown/input_items HTTP/1.1\r\nHost: localhost\r\n\r\n", &resp_buf);
+        try std.testing.expect(std.mem.startsWith(u8, r_404, "HTTP/1.1 404 Not Found\r\n"));
+
+        var bad_req_buf: [256]u8 = undefined;
+        const bad_ord = try std.fmt.bufPrint(&bad_req_buf, "GET /responses/{s}/input_items?order=bad HTTP/1.1\r\nHost: localhost\r\n\r\n", .{r2_id});
+        const r_bad_ord = try testHttpExchange(port, bad_ord, &resp_buf);
+        try std.testing.expect(std.mem.startsWith(u8, r_bad_ord, "HTTP/1.1 400 Bad Request\r\n"));
+    }
+
+    // Verify input_items preserves all 4 items across chain (system, developer, first turn, follow up), asc/desc + limit/after!
+    const InputContent = struct { type: []const u8, text: []const u8 };
+    const InputItem = struct {
+        id: []const u8,
+        type: []const u8,
+        status: []const u8,
+        role: []const u8,
+        content: []const InputContent,
+    };
+    const InputItemsList = struct {
+        object: []const u8,
+        data: []const InputItem,
+        first_id: ?[]const u8 = null,
+        last_id: ?[]const u8 = null,
+        has_more: bool,
+    };
+
+    var get_buf: [256]u8 = undefined;
+    const req_asc = try std.fmt.bufPrint(&get_buf, "GET /v1/responses/{s}/input_items?order=asc HTTP/1.1\r\nHost: localhost\r\n\r\n", .{r2_id});
+    const r_asc = try testHttpExchange(port, req_asc, &resp_buf);
+    try std.testing.expect(std.mem.startsWith(u8, r_asc, "HTTP/1.1 200 OK\r\n"));
+    const p_asc = try std.json.parseFromSlice(InputItemsList, gpa, extractHttpBody(r_asc).?, .{});
+    defer p_asc.deinit();
+    try std.testing.expectEqualStrings("list", p_asc.value.object);
+    try std.testing.expectEqual(@as(usize, 4), p_asc.value.data.len);
+    try std.testing.expectEqualStrings("system", p_asc.value.data[0].role);
+    try std.testing.expectEqualStrings("be brief", p_asc.value.data[0].content[0].text);
+    try std.testing.expectEqualStrings("developer", p_asc.value.data[1].role);
+    try std.testing.expectEqualStrings("use json", p_asc.value.data[1].content[0].text);
+    try std.testing.expectEqualStrings("user", p_asc.value.data[2].role);
+    try std.testing.expectEqualStrings("first turn", p_asc.value.data[2].content[0].text);
+    try std.testing.expectEqualStrings("user", p_asc.value.data[3].role);
+    try std.testing.expectEqualStrings("follow up", p_asc.value.data[3].content[0].text);
+    try std.testing.expect(!p_asc.value.has_more);
+
+    // Default desc order + limit=2 + after cursor pagination.
+    const req_desc = try std.fmt.bufPrint(&get_buf, "GET /responses/{s}/input_items?limit=2 HTTP/1.1\r\nHost: localhost\r\n\r\n", .{r2_id});
+    const r_desc = try testHttpExchange(port, req_desc, &resp_buf);
+    const p_desc = try std.json.parseFromSlice(InputItemsList, gpa, extractHttpBody(r_desc).?, .{});
+    defer p_desc.deinit();
+    try std.testing.expectEqual(@as(usize, 2), p_desc.value.data.len);
+    try std.testing.expectEqualStrings("follow up", p_desc.value.data[0].content[0].text);
+    try std.testing.expectEqualStrings("first turn", p_desc.value.data[1].content[0].text);
+    try std.testing.expect(p_desc.value.has_more);
+    var last_item_id_buf: [48]u8 = undefined;
+    @memcpy(last_item_id_buf[0..p_desc.value.last_id.?.len], p_desc.value.last_id.?);
+    const last_item_id = last_item_id_buf[0..p_desc.value.last_id.?.len];
+
+    const req_p2 = try std.fmt.bufPrint(&get_buf, "GET /v1/responses/{s}/input_items?order=desc&limit=2&after={s} HTTP/1.1\r\nHost: localhost\r\n\r\n", .{ r2_id, last_item_id });
+    const r_p2 = try testHttpExchange(port, req_p2, &resp_buf);
+    const p_p2 = try std.json.parseFromSlice(InputItemsList, gpa, extractHttpBody(r_p2).?, .{});
+    defer p_p2.deinit();
+    try std.testing.expectEqual(@as(usize, 2), p_p2.value.data.len);
+    try std.testing.expectEqualStrings("use json", p_p2.value.data[0].content[0].text);
+    try std.testing.expectEqualStrings("be brief", p_p2.value.data[1].content[0].text);
+    try std.testing.expect(!p_p2.value.has_more);
+}
+
+test "C29 /v1/completions streaming SSE, non-streaming JSON, FIM suffix, token-ID array prompt, and batch_slot_streams" {
+    const gpa = std.testing.allocator;
+    const mini_tok_json =
+        \\{"model":{"type":"BPE","vocab":{"<|im_start|>":0,"<|im_end|>":1,"a":2,"b":3,"c":4,"d":5},"merges":[]},"added_tokens":[{"id":0,"content":"<|im_start|>","special":true},{"id":1,"content":"<|im_end|>","special":true}]}
+    ;
+    var tok = try tokenizer_mod.Tokenizer.fromHuggingFaceJson(gpa, mini_tok_json);
+    defer tok.deinit(gpa);
+
+    const MockState = struct {
+        last_prompt_buf: [2048]u8 = undefined,
+        last_prompt_len: usize = 0,
+        last_ids_buf: [64]u32 = undefined,
+        last_ids_len: usize = 0,
+
+        fn generate(ctx_ptr: *anyopaque, job: *const InferenceJob, stream: *TokenStream) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx_ptr));
+            self.last_prompt_len = @min(job.prompt.len, self.last_prompt_buf.len);
+            @memcpy(self.last_prompt_buf[0..self.last_prompt_len], job.prompt[0..self.last_prompt_len]);
+            if (job.prompt_token_ids) |ids| {
+                self.last_ids_len = @min(ids.len, self.last_ids_buf.len);
+                @memcpy(self.last_ids_buf[0..self.last_ids_len], ids[0..self.last_ids_len]);
+            } else {
+                self.last_ids_len = 0;
+            }
+            _ = stream.setPromptTokens(5);
+            if (!stream.emitText("<think>keep</think>", 1)) return;
+            if (!stream.emitText("world!", 1)) return;
+            stream.finish(.stop, 5);
+        }
+    };
+
+    // 1. Single-slot Server with custom FimTokens + Tokenizer.
+    var mock = MockState{};
+    const srv = try Server.init(gpa, .{
+        .port = 0,
+        .model_id = "qwen3-coder",
+        .tokenizer = &tok,
+        .fim_tokens = .{
+            .prefix = "<PRE>",
+            .suffix = "<SUF>",
+            .middle = "<MID>",
+        },
+        .max_conns = 6,
+        .max_active_requests = 4,
+        .max_media_bytes = 4096,
+        .apply_qos = false,
+    });
+    defer srv.deinit(gpa);
+    try srv.start(.{ .ctx = &mock, .generateFn = MockState.generate });
+    defer srv.stop();
+
+    const port = srv.boundPort();
+    var req_buf: [4096]u8 = undefined;
+    var resp_buf: [16384]u8 = undefined;
+
+    // 405 on GET /v1/completions.
+    {
+        const r_405 = try testHttpExchange(port, "GET /v1/completions HTTP/1.1\r\nHost: localhost\r\n\r\n", &resp_buf);
+        try std.testing.expect(std.mem.startsWith(u8, r_405, "HTTP/1.1 405 Method Not Allowed\r\n"));
+        try std.testing.expectEqualStrings("POST", extractHeaderValue(r_405, "Allow") orelse "");
+    }
+
+    // Non-streaming raw prompt (no ChatML wrapping, and literal <think> preserved in text!).
+    {
+        const r = try testHttpPostJson(
+            port,
+            "/v1/completions",
+            "{\"model\":\"qwen3-coder\",\"prompt\":\"def hi():\",\"logprobs\":3,\"max_tokens\":16,\"stream\":false}",
+            &req_buf,
+            &resp_buf,
+        );
+        try std.testing.expect(std.mem.startsWith(u8, r, "HTTP/1.1 200 OK\r\n"));
+        try std.testing.expectEqualStrings("def hi():", mock.last_prompt_buf[0..mock.last_prompt_len]);
+        try std.testing.expect(std.mem.indexOf(u8, mock.last_prompt_buf[0..mock.last_prompt_len], "<|im_start|>") == null);
+        const body = extractHttpBody(r).?;
+        try expectValidJson(body);
+        try std.testing.expect(std.mem.indexOf(u8, body, "\"object\":\"text_completion\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, body, "\"id\":\"cmpl-") != null);
+        try std.testing.expect(std.mem.indexOf(u8, body, "\"text\":\"<think>keep</think>world!\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, body, "\"finish_reason\":\"stop\"") != null);
+    }
+
+    // Invalid logprobs > 5 -> 400.
+    {
+        const r_bad = try testHttpPostJson(port, "/completions", "{\"prompt\":\"hi\",\"logprobs\":6}", &req_buf, &resp_buf);
+        try std.testing.expect(std.mem.startsWith(u8, r_bad, "HTTP/1.1 400 Bad Request\r\n"));
+    }
+
+    // FIM suffix wrapping + streaming SSE with stream_options.include_usage.
+    {
+        const r_sse = try testHttpPostJson(
+            port,
+            "/completions",
+            "{\"prompt\":\"fn add(a: i32, \",\"suffix\":\") -> i32 { a + b }\",\"stream\":true,\"stream_options\":{\"include_usage\":true}}",
+            &req_buf,
+            &resp_buf,
+        );
+        try std.testing.expect(std.mem.startsWith(u8, r_sse, "HTTP/1.1 200 OK\r\n"));
+        try std.testing.expectEqualStrings("<PRE>fn add(a: i32, <SUF>) -> i32 { a + b }<MID>", mock.last_prompt_buf[0..mock.last_prompt_len]);
+        const sse = extractHttpBody(r_sse).?;
+        _ = try expectValidSseJsonFrames(sse);
+        try std.testing.expect(std.mem.indexOf(u8, sse, "\"object\":\"text_completion\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, sse, "\"choices\":[],\"usage\":") != null);
+        try std.testing.expect(std.mem.indexOf(u8, sse, "data: [DONE]\n\n") != null);
+    }
+
+    // Token-ID array prompt [2, 3, 4] decoded via Tokenizer AND forwarded on InferenceJob.prompt_token_ids.
+    {
+        const r_ids = try testHttpPostJson(
+            port,
+            "/v1/completions",
+            "{\"prompt\":[2,3,4],\"stream\":false}",
+            &req_buf,
+            &resp_buf,
+        );
+        try std.testing.expect(std.mem.startsWith(u8, r_ids, "HTTP/1.1 200 OK\r\n"));
+        try std.testing.expectEqualSlices(u32, &.{ 2, 3, 4 }, mock.last_ids_buf[0..mock.last_ids_len]);
+        try std.testing.expectEqualStrings("abc", mock.last_prompt_buf[0..mock.last_prompt_len]);
+    }
+
+    // 2. Continuous-batching `batch_slot_streams` path for .completions (default FimTokens + token_ids without tokenizer)!
+    {
+        const BatchMock = struct {
+            saw_fim: bool = false,
+            saw_ids: bool = false,
+
+            fn tokenize(ctx_ptr: *anyopaque, job: *const InferenceJob, out_tokens: []u32) batch_sched.BackendError!usize {
+                const self: *@This() = @ptrCast(@alignCast(ctx_ptr));
+                if (job.prompt_token_ids) |ids| {
+                    self.saw_ids = std.mem.eql(u32, ids, &.{ 7, 8, 9 });
+                    @memcpy(out_tokens[0..ids.len], ids);
+                    return ids.len;
+                }
+                if (std.mem.eql(u8, job.prompt, "<|fim_prefix|>x<|fim_suffix|>z<|fim_middle|>")) {
+                    self.saw_fim = true;
+                }
+                out_tokens[0] = 1;
+                out_tokens[1] = 2;
+                return 2;
+            }
+            fn detokenize(_: *anyopaque, tok_id: u32, out_bytes: []u8) []const u8 {
+                if (tok_id == 10) return out_bytes[0..0];
+                @memcpy(out_bytes[0..1], "y");
+                return out_bytes[0..1];
+            }
+            fn lookupPrefix(_: *anyopaque, _: u16, _: []const u32) batch_sched.PrefixLookupResult {
+                return .{};
+            }
+            fn prefillSlot(_: *anyopaque, chunk: *const batch_sched.PrefillChunkView) batch_sched.BackendError!batch_sched.PrefillResult {
+                if (!chunk.is_final_chunk) return .{};
+                return .{ .first_token = 11 };
+            }
+            fn stepDecodeBatch(_: *anyopaque, view: *const batch_sched.BatchStepView, out: []u32) batch_sched.BackendError!void {
+                for (0..view.batchSize()) |i| {
+                    out[i] = 10;
+                }
+            }
+            fn releaseSlot(_: *anyopaque, _: u16, _: u64) void {}
+        };
+        var bmock = BatchMock{};
+        const srv_b = try Server.init(gpa, .{
+            .port = 0,
+            .max_conns = 4,
+            .max_active_requests = 4,
+            .max_media_bytes = 4096,
+            .apply_qos = false,
+        });
+        defer srv_b.deinit(gpa);
+        try srv_b.startBatched(.{
+            .ctx = &bmock,
+            .tokenizeFn = BatchMock.tokenize,
+            .detokenizeFn = BatchMock.detokenize,
+            .backend = .{
+                .ctx = &bmock,
+                .lookupPrefixFn = BatchMock.lookupPrefix,
+                .prefillSlotFn = BatchMock.prefillSlot,
+                .stepDecodeBatchFn = BatchMock.stepDecodeBatch,
+                .releaseSlotFn = BatchMock.releaseSlot,
+            },
+            .eos_token_ids = .{ 10, 0, 0, 0 },
+            .eos_token_count = 1,
+        });
+        defer srv_b.stop();
+
+        const r_b1 = try testHttpPostJson(srv_b.boundPort(), "/v1/completions", "{\"prompt\":\"x\",\"suffix\":\"z\",\"stream\":true}", &req_buf, &resp_buf);
+        try std.testing.expect(std.mem.startsWith(u8, r_b1, "HTTP/1.1 200 OK\r\n"));
+        try std.testing.expect(bmock.saw_fim);
+        try std.testing.expect(std.mem.indexOf(u8, r_b1, "\"object\":\"text_completion\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, r_b1, "\"text\":\"y\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, r_b1, "data: [DONE]\n\n") != null);
+
+        const r_b2 = try testHttpPostJson(srv_b.boundPort(), "/completions", "{\"prompt\":[7,8,9],\"stream\":false}", &req_buf, &resp_buf);
+        try std.testing.expect(std.mem.startsWith(u8, r_b2, "HTTP/1.1 200 OK\r\n"));
+        try std.testing.expect(bmock.saw_ids);
+    }
+}
+
+test "C29 unauthenticated OPTIONS CORS preflight, CORS headers across JSON/SSE/HTTPS, base64 multimodal media ingress, and zero hot-path mallocs" {
+    const gpa = std.testing.allocator;
+    const mini_tok_json =
+        \\{"model":{"type":"BPE","vocab":{"<|im_start|>":0,"<|im_end|>":1,"a":2,"b":3,"c":4,"d":5,"e":6,"f":7,"g":8,"h":9,"i":10,"j":11,"k":12,"l":13,"m":14,"n":15,"o":16,"p":17,"q":18,"r":19,"s":20,"t":21,"u":22,"v":23,"w":24,"x":25,"y":26,"z":27," ":28,"\n":29},"merges":[]},"added_tokens":[{"id":0,"content":"<|im_start|>","special":true},{"id":1,"content":"<|im_end|>","special":true}]}
+    ;
+    var tok = try tokenizer_mod.Tokenizer.fromHuggingFaceJson(gpa, mini_tok_json);
+    defer tok.deinit(gpa);
+
+    const MediaMock = struct {
+        count: u8 = 0,
+        kinds: [MAX_MEDIA_ITEMS_PER_REQUEST]MediaKind = undefined,
+        mimes: [MAX_MEDIA_ITEMS_PER_REQUEST][32]u8 = undefined,
+        mime_lens: [MAX_MEDIA_ITEMS_PER_REQUEST]u8 = @splat(0),
+        data_buf: [MAX_MEDIA_ITEMS_PER_REQUEST][64]u8 = undefined,
+        data_lens: [MAX_MEDIA_ITEMS_PER_REQUEST]usize = @splat(0),
+        saw_image_tag: bool = false,
+        saw_video_tag: bool = false,
+
+        fn generate(ctx_ptr: *anyopaque, job: *const InferenceJob, stream: *TokenStream) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx_ptr));
+            const items = job.mediaSlice();
+            self.count = @intCast(items.len);
+            for (items, 0..) |m, idx| {
+                self.kinds[idx] = m.kind;
+                const ms = m.mimeSlice();
+                self.mime_lens[idx] = @intCast(ms.len);
+                @memcpy(self.mimes[idx][0..ms.len], ms);
+                const take = @min(m.data.len, self.data_buf[idx].len);
+                self.data_lens[idx] = take;
+                @memcpy(self.data_buf[idx][0..take], m.data[0..take]);
+            }
+            self.saw_image_tag = std.mem.indexOf(u8, job.prompt, "<|image_pad|>") != null;
+            self.saw_video_tag = std.mem.indexOf(u8, job.prompt, "<|video_pad|>") != null;
+            _ = stream.setPromptTokens(4);
+            if (!stream.emitText("mm-ok", 1)) return;
+            stream.finish(.stop, 4);
+        }
+    };
+
+    var mm = MediaMock{};
+    const srv = try Server.init(gpa, .{
+        .port = 0,
+        .model_id = "qwen3-vl",
+        .api_key = "sk-cors-test",
+        .cors_allow_origin = "https://ui.local",
+        .tokenizer = &tok,
+        .max_conns = 6,
+        .max_active_requests = 4,
+        .max_media_bytes = 64,
+        .apply_qos = false,
+    });
+    defer srv.deinit(gpa);
+    try srv.start(.{ .ctx = &mm, .generateFn = MediaMock.generate });
+    defer srv.stop();
+
+    const port = srv.boundPort();
+    var req_buf: [8192]u8 = undefined;
+    var resp_buf: [16384]u8 = undefined;
+
+    // 1. Unauthenticated OPTIONS preflight on known routes -> 204 No Content with full CORS headers.
+    {
+        const r_opt = try testHttpExchange(port, "OPTIONS /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\n\r\n", &resp_buf);
+        try std.testing.expect(std.mem.startsWith(u8, r_opt, "HTTP/1.1 204 No Content\r\n"));
+        try std.testing.expectEqualStrings("0", extractHeaderValue(r_opt, "Content-Length") orelse "");
+        try std.testing.expectEqualStrings("https://ui.local", extractHeaderValue(r_opt, "Access-Control-Allow-Origin") orelse "");
+        try std.testing.expectEqualStrings("GET, POST, DELETE, OPTIONS", extractHeaderValue(r_opt, "Access-Control-Allow-Methods") orelse "");
+        try std.testing.expect(std.mem.indexOf(u8, extractHeaderValue(r_opt, "Access-Control-Allow-Headers") orelse "", "anthropic-version") != null);
+        try std.testing.expectEqualStrings("86400", extractHeaderValue(r_opt, "Access-Control-Max-Age") orelse "");
+
+        const r_opt_pf = try testHttpExchange(port, "OPTIONS /completions HTTP/1.1\r\nHost: localhost\r\n\r\n", &resp_buf);
+        try std.testing.expect(std.mem.startsWith(u8, r_opt_pf, "HTTP/1.1 204 No Content\r\n"));
+    }
+
+    // 2. CORS headers injected on 401 error, 200 JSON, and SSE 200 OK headers.
+    {
+        const r_401 = try testHttpExchange(port, "GET /models HTTP/1.1\r\nHost: localhost\r\n\r\n", &resp_buf);
+        try std.testing.expect(std.mem.startsWith(u8, r_401, "HTTP/1.1 401 Unauthorized\r\n"));
+        try std.testing.expectEqualStrings("https://ui.local", extractHeaderValue(r_401, "Access-Control-Allow-Origin") orelse "");
+        try std.testing.expectEqualStrings("x-request-id, Content-Type", extractHeaderValue(r_401, "Access-Control-Expose-Headers") orelse "");
+
+        const r_200 = try testHttpExchange(port, "GET /models HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer sk-cors-test\r\n\r\n", &resp_buf);
+        try std.testing.expect(std.mem.startsWith(u8, r_200, "HTTP/1.1 200 OK\r\n"));
+        try std.testing.expectEqualStrings("https://ui.local", extractHeaderValue(r_200, "Access-Control-Allow-Origin") orelse "");
+
+        const r_sse = try testHttpPostJsonWithHeaders(
+            port,
+            "/v1/completions",
+            "Authorization: Bearer sk-cors-test\r\n",
+            "{\"prompt\":\"a\",\"stream\":true}",
+            &req_buf,
+            &resp_buf,
+        );
+        try std.testing.expect(std.mem.startsWith(u8, r_sse, "HTTP/1.1 200 OK\r\n"));
+        try std.testing.expectEqualStrings("https://ui.local", extractHeaderValue(r_sse, "Access-Control-Allow-Origin") orelse "");
+    }
+
+    // 3. Base64 media extraction across Chat Completions (image_url + video_url), Responses (input_image), Messages (source.base64).
+    const auth_hdr = "Authorization: Bearer sk-cors-test\r\n";
+    {
+        // Standard base64 "PNG!" -> UExH is "PLG", "iVBORw0K" = \x89PNG\r\n ; use exact bytes "PNG_OK" = "UE5HX09L", "MP4_OK" = "TVA0X09L" (URL-safe + whitespace!).
+        const chat_mm =
+            \\{"messages":[{"role":"user","content":[{"type":"text","text":"look"},{"type":"image_url","image_url":{"url":"data:image/png;base64,UE5H\nX09L"}},{"type":"video_url","video_url":{"url":"data:video/mp4;base64,TVA0X09L"}}]}]}
+        ;
+        const r_cmm = try testHttpPostJsonWithHeaders(port, "/v1/chat/completions", auth_hdr, chat_mm, &req_buf, &resp_buf);
+        try std.testing.expect(std.mem.startsWith(u8, r_cmm, "HTTP/1.1 200 OK\r\n"));
+        try std.testing.expectEqual(@as(u8, 2), mm.count);
+        try std.testing.expectEqual(MediaKind.image, mm.kinds[0]);
+        try std.testing.expectEqualStrings("image/png", mm.mimes[0][0..mm.mime_lens[0]]);
+        try std.testing.expectEqualStrings("PNG_OK", mm.data_buf[0][0..mm.data_lens[0]]);
+        try std.testing.expectEqual(MediaKind.video, mm.kinds[1]);
+        try std.testing.expectEqualStrings("video/mp4", mm.mimes[1][0..mm.mime_lens[1]]);
+        try std.testing.expectEqualStrings("MP4_OK", mm.data_buf[1][0..mm.data_lens[1]]);
+        try std.testing.expect(mm.saw_image_tag);
+        try std.testing.expect(mm.saw_video_tag);
+
+        // OpenAI /v1/responses input_image with URL-safe base64 ("-_8=" -> 0xfb 0xff).
+        const resp_mm =
+            \\{"input":[{"role":"user","content":[{"type":"input_image","image_url":"data:image/webp;base64,-_8"}]}]}
+        ;
+        const r_rmm = try testHttpPostJsonWithHeaders(port, "/v1/responses", auth_hdr, resp_mm, &req_buf, &resp_buf);
+        try std.testing.expect(std.mem.startsWith(u8, r_rmm, "HTTP/1.1 200 OK\r\n"));
+        try std.testing.expectEqual(@as(u8, 1), mm.count);
+        try std.testing.expectEqual(MediaKind.image, mm.kinds[0]);
+        try std.testing.expectEqualStrings("image/webp", mm.mimes[0][0..mm.mime_lens[0]]);
+        try std.testing.expectEqualSlices(u8, &.{ 0xfb, 0xff }, mm.data_buf[0][0..mm.data_lens[0]]);
+
+        // Anthropic /v1/messages source.type=base64.
+        const msg_mm =
+            \\{"max_tokens":8,"messages":[{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/jpeg","data":"SlBFRw=="}},{"type":"text","text":"hi"}]}]}
+        ;
+        const r_mmm = try testHttpPostJsonWithHeaders(port, "/v1/messages", auth_hdr, msg_mm, &req_buf, &resp_buf);
+        try std.testing.expect(std.mem.startsWith(u8, r_mmm, "HTTP/1.1 200 OK\r\n"));
+        try std.testing.expectEqual(@as(u8, 1), mm.count);
+        try std.testing.expectEqualStrings("image/jpeg", mm.mimes[0][0..mm.mime_lens[0]]);
+        try std.testing.expectEqualStrings("JPEG", mm.data_buf[0][0..mm.data_lens[0]]);
+    }
+
+    // 4. Reject remote URLs (400), invalid base64 (400), >4 items (400), and >max_media_bytes (413).
+    {
+        const remote_body =
+            \\{"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"https://example.com/a.png"}}]}]}
+        ;
+        const r_rem = try testHttpPostJsonWithHeaders(port, "/v1/chat/completions", auth_hdr, remote_body, &req_buf, &resp_buf);
+        try std.testing.expect(std.mem.startsWith(u8, r_rem, "HTTP/1.1 400 Bad Request\r\n"));
+        try std.testing.expect(std.mem.indexOf(u8, r_rem, "remote media URLs are not supported; provide base64 data") != null);
+
+        const bad_b64_body =
+            \\{"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,@@@!"}}]}]}
+        ;
+        const r_b64 = try testHttpPostJsonWithHeaders(port, "/v1/chat/completions", auth_hdr, bad_b64_body, &req_buf, &resp_buf);
+        try std.testing.expect(std.mem.startsWith(u8, r_b64, "HTTP/1.1 400 Bad Request\r\n"));
+
+        const five_items =
+            \\{"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,QQ=="}},{"type":"image_url","image_url":{"url":"data:image/png;base64,QQ=="}},{"type":"image_url","image_url":{"url":"data:image/png;base64,QQ=="}},{"type":"image_url","image_url":{"url":"data:image/png;base64,QQ=="}},{"type":"image_url","image_url":{"url":"data:image/png;base64,QQ=="}}]}]}
+        ;
+        const r_5 = try testHttpPostJsonWithHeaders(port, "/v1/chat/completions", auth_hdr, five_items, &req_buf, &resp_buf);
+        try std.testing.expect(std.mem.startsWith(u8, r_5, "HTTP/1.1 400 Bad Request\r\n"));
+
+        // 72 decoded bytes (`QUFB...` 96 chars) > max_media_bytes (64) -> 413 Payload Too Large!
+        const big_b64 = "QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFB";
+        var big_body_buf: [512]u8 = undefined;
+        const big_body = try std.fmt.bufPrint(
+            &big_body_buf,
+            "{{\"messages\":[{{\"role\":\"user\",\"content\":[{{\"type\":\"image_url\",\"image_url\":{{\"url\":\"data:image/png;base64,{s}\"}}}}]}}]}}",
+            .{big_b64},
+        );
+        const r_413 = try testHttpPostJsonWithHeaders(port, "/v1/chat/completions", auth_hdr, big_body, &req_buf, &resp_buf);
+        try std.testing.expect(std.mem.startsWith(u8, r_413, "HTTP/1.1 413 Payload Too Large\r\n"));
+    }
+
+    // 5. Zero hot-path heap allocations (`malloc_zone_statistics`) across all new C29 routes!
+    {
+        const warm_chat_mm =
+            \\{"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,UE5HX09L"}}]}]}
+        ;
+        const r_resp_seed = try testHttpPostJsonWithHeaders(port, "/responses", auth_hdr, "{\"input\":\"seed item\"}", &req_buf, &resp_buf);
+        try std.testing.expect(std.mem.startsWith(u8, r_resp_seed, "HTTP/1.1 200 OK\r\n"));
+        const RespId = struct { id: []const u8 };
+        const rid = try std.json.parseFromSlice(RespId, gpa, extractHttpBody(r_resp_seed).?, .{ .ignore_unknown_fields = true });
+        defer rid.deinit();
+        var rid_buf: [MAX_RESPONSE_ID_BYTES]u8 = undefined;
+        @memcpy(rid_buf[0..rid.value.id.len], rid.value.id);
+        const rid_slice = rid_buf[0..rid.value.id.len];
+
+        var items_req_buf: [256]u8 = undefined;
+        const items_req = try std.fmt.bufPrint(&items_req_buf, "GET /responses/{s}/input_items HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer sk-cors-test\r\n\r\n", .{rid_slice});
+
+        // Warm up every C29 route first.
+        _ = try testHttpExchange(port, "OPTIONS /completions HTTP/1.1\r\nHost: localhost\r\n\r\n", &resp_buf);
+        _ = try testHttpExchange(port, "GET /models?limit=1 HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer sk-cors-test\r\n\r\n", &resp_buf);
+        _ = try testHttpPostJsonWithHeaders(port, "/responses/input_tokens", auth_hdr, "{\"input\":\"abc\"}", &req_buf, &resp_buf);
+        _ = try testHttpExchange(port, items_req, &resp_buf);
+        _ = try testHttpPostJsonWithHeaders(port, "/completions", auth_hdr, "{\"prompt\":\"a\",\"suffix\":\"b\",\"stream\":false}", &req_buf, &resp_buf);
+        _ = try testHttpPostJsonWithHeaders(port, "/v1/chat/completions", auth_hdr, warm_chat_mm, &req_buf, &resp_buf);
+
+        while (srv.stats().active_conns > 0 or srv.stats().active_requests > 0) {
+            sleepNs(500_000);
+        }
+
+        var m_before: MallocStatistics = std.mem.zeroes(MallocStatistics);
+        malloc_zone_statistics(null, &m_before);
+
+        for (0..4) |_| {
+            const ro = try testHttpExchange(port, "OPTIONS /completions HTTP/1.1\r\nHost: localhost\r\n\r\n", &resp_buf);
+            try std.testing.expect(std.mem.startsWith(u8, ro, "HTTP/1.1 204 No Content\r\n"));
+            const rm = try testHttpExchange(port, "GET /models?limit=1 HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer sk-cors-test\r\n\r\n", &resp_buf);
+            try std.testing.expect(std.mem.startsWith(u8, rm, "HTTP/1.1 200 OK\r\n"));
+            const rit = try testHttpPostJsonWithHeaders(port, "/responses/input_tokens", auth_hdr, "{\"input\":\"abc\"}", &req_buf, &resp_buf);
+            try std.testing.expect(std.mem.startsWith(u8, rit, "HTTP/1.1 200 OK\r\n"));
+            const rii = try testHttpExchange(port, items_req, &resp_buf);
+            try std.testing.expect(std.mem.startsWith(u8, rii, "HTTP/1.1 200 OK\r\n"));
+            const rcm = try testHttpPostJsonWithHeaders(port, "/completions", auth_hdr, "{\"prompt\":\"a\",\"suffix\":\"b\",\"stream\":false}", &req_buf, &resp_buf);
+            try std.testing.expect(std.mem.startsWith(u8, rcm, "HTTP/1.1 200 OK\r\n"));
+            const rmm = try testHttpPostJsonWithHeaders(port, "/v1/chat/completions", auth_hdr, warm_chat_mm, &req_buf, &resp_buf);
+            try std.testing.expect(std.mem.startsWith(u8, rmm, "HTTP/1.1 200 OK\r\n"));
+        }
+
+        while (srv.stats().active_conns > 0 or srv.stats().active_requests > 0) {
+            sleepNs(500_000);
+        }
+
+        var m_after: MallocStatistics = std.mem.zeroes(MallocStatistics);
+        malloc_zone_statistics(null, &m_after);
+        try std.testing.expect(m_after.blocks_in_use <= m_before.blocks_in_use);
+        try std.testing.expect(m_after.size_in_use <= m_before.size_in_use);
+    }
+
+    // 6. CORS disabled (`cors_allow_origin: null`) + HTTPS TLS 1.3 CORS verification.
+    {
+        const srv_nocors = try Server.init(gpa, .{
+            .port = 0,
+            .cors_allow_origin = null,
+            .max_conns = 2,
+            .max_active_requests = 1,
+            .max_media_bytes = 1024,
+            .apply_qos = false,
+        });
+        defer srv_nocors.deinit(gpa);
+        try srv_nocors.start(.{ .ctx = &mm, .generateFn = MediaMock.generate });
+        defer srv_nocors.stop();
+
+        const r_nc = try testHttpExchange(srv_nocors.boundPort(), "GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n", &resp_buf);
+        try std.testing.expect(std.mem.startsWith(u8, r_nc, "HTTP/1.1 200 OK\r\n"));
+        try std.testing.expectEqual(@as(?[]const u8, null), extractHeaderValue(r_nc, "Access-Control-Allow-Origin"));
+
+        // HTTPS TLS 1.3 OPTIONS preflight + CORS header check.
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var threaded_io: std.Io.Threaded = .init(gpa, .{});
+        defer threaded_io.deinit();
+        const io = threaded_io.io();
+        const dir = try std.fmt.allocPrint(gpa, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+        defer gpa.free(dir);
+        const ec_key = try std.fmt.allocPrint(gpa, "{s}/c29.key.pem", .{dir});
+        defer gpa.free(ec_key);
+        const ec_cert = try std.fmt.allocPrint(gpa, "{s}/c29.cert.pem", .{dir});
+        defer gpa.free(ec_cert);
+        try testRunCmdChecked(gpa, io, &.{
+            "/usr/bin/openssl", "ecparam", "-name", "prime256v1", "-genkey", "-noout", "-out", ec_key,
+        });
+        try testRunCmdChecked(gpa, io, &.{
+            "/usr/bin/openssl", "req", "-x509", "-new", "-key", ec_key, "-subj", "/CN=127.0.0.1", "-days", "1", "-out", ec_cert,
+        });
+        const cert_bytes = try std.Io.Dir.cwd().readFileAlloc(io, ec_cert, gpa, .limited(64 * 1024));
+        defer gpa.free(cert_bytes);
+        const key_bytes = try std.Io.Dir.cwd().readFileAlloc(io, ec_key, gpa, .limited(64 * 1024));
+        defer gpa.free(key_bytes);
+
+        const srv_tls = try Server.init(gpa, .{
+            .port = 0,
+            .api_key = "sk-tls-c29",
+            .cors_allow_origin = "*",
+            .tls = .{ .cert_bytes = cert_bytes, .key_bytes = key_bytes },
+            .max_conns = 4,
+            .max_active_requests = 2,
+            .max_media_bytes = 1024,
+            .apply_qos = false,
+        });
+        defer srv_tls.deinit(gpa);
+        try srv_tls.start(.{ .ctx = &mm, .generateFn = MediaMock.generate });
+        defer srv_tls.stop();
+
+        const r_tls_opt = try testTlsHttpExchange(
+            srv_tls.boundPort(),
+            tls_mod.TLS_VERSION_1_3,
+            tls_mod.TLS_VERSION_1_3,
+            "OPTIONS /v1/models HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+            &resp_buf,
+        );
+        try std.testing.expect(std.mem.startsWith(u8, r_tls_opt.resp, "HTTP/1.1 204 No Content\r\n"));
+        try std.testing.expectEqualStrings("*", extractHeaderValue(r_tls_opt.resp, "Access-Control-Allow-Origin") orelse "");
     }
 }
