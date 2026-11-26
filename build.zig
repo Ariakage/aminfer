@@ -43,6 +43,7 @@ const kernel_sources = [_][]const u8{
     "src/kernels/sampling.metal",
     "src/kernels/inkling2_hy4.metal",
     "src/kernels/dflare_gpu.metal",
+    "src/kernels/lora_ops.metal",
 };
 
 pub fn build(b: *std.Build) void {

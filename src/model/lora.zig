@@ -24,8 +24,11 @@ const quant = @import("../quant/spec.zig");
 const sme = @import("../cpu/sme.zig");
 const chip_profile = @import("../platform/chip_profile.zig");
 
-/// Hard cap on P-core L2-resident LoRA wired pool (`4 MiB`, ADR-0022).
-pub const MAX_LORA_POOL_BYTES: usize = 4 * 1024 * 1024;
+/// Default L2-friendly wired pool capacity (`4 MiB`, ADR-0022).
+pub const DEFAULT_LORA_POOL_BYTES: usize = 4 * 1024 * 1024;
+/// Hard wired pool ceiling for universal multi-LoRA + DoRA (`256 MiB`, W30),
+/// strictly bounded further by startup `R9` wired headroom (`wired_budget`).
+pub const MAX_LORA_POOL_BYTES: usize = 256 * 1024 * 1024;
 pub const MAX_POOL_PAGES: usize = MAX_LORA_POOL_BYTES / page.APPLE_PAGE_SIZE;
 
 /// Maximum simultaneously hot-loaded LoRA adapters in `LoraRegistry`.
@@ -45,8 +48,17 @@ pub const TargetProjection = enum(u8) {
     gate_proj = 4,
     up_proj = 5,
     down_proj = 6,
+    gate_attn = 7,
+    wr_du = 8,
+    qkv_proj = 9,
+    gate_up_proj = 10,
+    q_a_proj = 11,
+    q_b_proj = 12,
+    kv_a_proj = 13,
+    kv_b_proj = 14,
+    eh_proj = 15,
 
-    pub const COUNT: usize = 7;
+    pub const COUNT: usize = 16;
 
     pub fn label(self: TargetProjection) []const u8 {
         return switch (self) {
@@ -57,6 +69,15 @@ pub const TargetProjection = enum(u8) {
             .gate_proj => "gate_proj",
             .up_proj => "up_proj",
             .down_proj => "down_proj",
+            .gate_attn => "gate_attn",
+            .wr_du => "wr_du",
+            .qkv_proj => "qkv_proj",
+            .gate_up_proj => "gate_up_proj",
+            .q_a_proj => "q_a_proj",
+            .q_b_proj => "q_b_proj",
+            .kv_a_proj => "kv_a_proj",
+            .kv_b_proj => "kv_b_proj",
+            .eh_proj => "eh_proj",
         };
     }
 
@@ -69,21 +90,99 @@ pub const TargetProjection = enum(u8) {
             .gate_proj => "mlp.gate_proj",
             .up_proj => "mlp.up_proj",
             .down_proj => "mlp.down_proj",
+            .gate_attn => "self_attn.gate_attn",
+            .wr_du => "self_attn.wr_du",
+            .qkv_proj => "self_attn.qkv_proj",
+            .gate_up_proj => "mlp.gate_up_proj",
+            .q_a_proj => "self_attn.q_a_proj",
+            .q_b_proj => "self_attn.q_b_proj",
+            .kv_a_proj => "self_attn.kv_a_proj",
+            .kv_b_proj => "self_attn.kv_b_proj",
+            .eh_proj => "self_attn.eh_proj",
         };
     }
 
-    pub fn bit(self: TargetProjection) u8 {
-        return @as(u8, 1) << @intCast(@backingInt(self));
+    pub fn bit(self: TargetProjection) u16 {
+        return @as(u16, 1) << @intCast(@backingInt(self));
     }
 
     pub fn parseModuleName(name: []const u8) ?TargetProjection {
-        if (std.mem.eql(u8, name, "q_proj")) return .q_proj;
-        if (std.mem.eql(u8, name, "k_proj")) return .k_proj;
-        if (std.mem.eql(u8, name, "v_proj")) return .v_proj;
-        if (std.mem.eql(u8, name, "o_proj")) return .o_proj;
-        if (std.mem.eql(u8, name, "gate_proj")) return .gate_proj;
-        if (std.mem.eql(u8, name, "up_proj")) return .up_proj;
-        if (std.mem.eql(u8, name, "down_proj")) return .down_proj;
+        if (std.mem.eql(u8, name, "q_proj") or
+            std.mem.eql(u8, name, "self_attn.q_proj") or
+            std.mem.eql(u8, name, "self_attn.q_proj.linear") or
+            std.mem.eql(u8, name, "attn.wq") or
+            std.mem.eql(u8, name, "attn.wq_du") or
+            std.mem.eql(u8, name, "wq") or
+            std.mem.eql(u8, name, "wq_du")) return .q_proj;
+        if (std.mem.eql(u8, name, "k_proj") or
+            std.mem.eql(u8, name, "self_attn.k_proj") or
+            std.mem.eql(u8, name, "self_attn.k_proj.linear") or
+            std.mem.eql(u8, name, "attn.wk") or
+            std.mem.eql(u8, name, "attn.wk_dv") or
+            std.mem.eql(u8, name, "wk") or
+            std.mem.eql(u8, name, "wk_dv")) return .k_proj;
+        if (std.mem.eql(u8, name, "v_proj") or
+            std.mem.eql(u8, name, "self_attn.v_proj") or
+            std.mem.eql(u8, name, "self_attn.v_proj.linear") or
+            std.mem.eql(u8, name, "attn.wv") or
+            std.mem.eql(u8, name, "attn.wv_dv") or
+            std.mem.eql(u8, name, "wv") or
+            std.mem.eql(u8, name, "wv_dv")) return .v_proj;
+        if (std.mem.eql(u8, name, "o_proj") or
+            std.mem.eql(u8, name, "self_attn.o_proj") or
+            std.mem.eql(u8, name, "self_attn.o_proj.linear") or
+            std.mem.eql(u8, name, "attn.wo") or
+            std.mem.eql(u8, name, "attn.wo_ud") or
+            std.mem.eql(u8, name, "wo") or
+            std.mem.eql(u8, name, "wo_ud")) return .o_proj;
+        if (std.mem.eql(u8, name, "gate_proj") or
+            std.mem.eql(u8, name, "mlp.gate_proj") or
+            std.mem.eql(u8, name, "ffn.w1") or
+            std.mem.eql(u8, name, "w1")) return .gate_proj;
+        if (std.mem.eql(u8, name, "up_proj") or
+            std.mem.eql(u8, name, "mlp.up_proj") or
+            std.mem.eql(u8, name, "ffn.w3") or
+            std.mem.eql(u8, name, "w3")) return .up_proj;
+        if (std.mem.eql(u8, name, "down_proj") or
+            std.mem.eql(u8, name, "mlp.down_proj") or
+            std.mem.eql(u8, name, "ffn.w2") or
+            std.mem.eql(u8, name, "w2")) return .down_proj;
+        if (std.mem.eql(u8, name, "gate_attn") or
+            std.mem.eql(u8, name, "self_attn.gate_attn") or
+            std.mem.eql(u8, name, "attn.gate_attn") or
+            std.mem.eql(u8, name, "self_attn.o_proj.gate_proj") or
+            std.mem.eql(u8, name, "o_proj.gate_proj")) return .gate_attn;
+        if (std.mem.eql(u8, name, "wr_du") or
+            std.mem.eql(u8, name, "self_attn.wr_du") or
+            std.mem.eql(u8, name, "attn.wr") or
+            std.mem.eql(u8, name, "attn.wr_du") or
+            std.mem.eql(u8, name, "wr")) return .wr_du;
+        if (std.mem.eql(u8, name, "qkv_proj") or
+            std.mem.eql(u8, name, "self_attn.qkv_proj") or
+            std.mem.eql(u8, name, "attn.wqkv") or
+            std.mem.eql(u8, name, "wqkv")) return .qkv_proj;
+        if (std.mem.eql(u8, name, "gate_up_proj") or
+            std.mem.eql(u8, name, "mlp.gate_up_proj") or
+            std.mem.eql(u8, name, "ffn.w13") or
+            std.mem.eql(u8, name, "w13")) return .gate_up_proj;
+        if (std.mem.eql(u8, name, "q_a_proj") or
+            std.mem.eql(u8, name, "self_attn.q_a_proj") or
+            std.mem.eql(u8, name, "attn.q_a_proj")) return .q_a_proj;
+        if (std.mem.eql(u8, name, "q_b_proj") or
+            std.mem.eql(u8, name, "self_attn.q_b_proj") or
+            std.mem.eql(u8, name, "attn.q_b_proj")) return .q_b_proj;
+        if (std.mem.eql(u8, name, "kv_a_proj") or
+            std.mem.eql(u8, name, "self_attn.kv_a_proj") or
+            std.mem.eql(u8, name, "self_attn.kv_a_proj_with_mqa") or
+            std.mem.eql(u8, name, "kv_a_proj_with_mqa") or
+            std.mem.eql(u8, name, "attn.kv_a_proj")) return .kv_a_proj;
+        if (std.mem.eql(u8, name, "kv_b_proj") or
+            std.mem.eql(u8, name, "self_attn.kv_b_proj") or
+            std.mem.eql(u8, name, "attn.kv_b_proj")) return .kv_b_proj;
+        if (std.mem.eql(u8, name, "eh_proj") or
+            std.mem.eql(u8, name, "self_attn.eh_proj") or
+            std.mem.eql(u8, name, "attn.eh_proj") or
+            std.mem.eql(u8, name, "mlp.eh_proj")) return .eh_proj;
         return null;
     }
 };
@@ -137,12 +236,14 @@ pub const AdapterConfigMeta = struct {
     rank: u32,
     lora_alpha: f32,
     scale: f32,
-    target_mask: u8,
+    target_mask: u16,
+    use_dora: bool = false,
 };
+pub const AdapterMeta = AdapterConfigMeta;
 
 /// Parses PEFT `adapter_config.json` (either embedded in `__meta.adapter_config_json`
 /// or sidecar) extracting `r`, `lora_alpha`, derived `scale = lora_alpha / r`,
-/// and `target_modules` bitmask.
+/// `use_dora`, and `target_modules` bitmask.
 pub fn parseAdapterConfigJson(allocator: std.mem.Allocator, json_bytes: []const u8) LoraError!AdapterConfigMeta {
     var parsed = std.json.parseFromSlice(std.json.Value, allocator, json_bytes, .{
         .ignore_unknown_fields = true,
@@ -168,7 +269,13 @@ pub fn parseAdapterConfigJson(allocator: std.mem.Allocator, json_bytes: []const 
     } else @floatFromInt(rank);
     if (!std.math.isFinite(lora_alpha)) return error.InvalidAdapterConfig;
 
-    var target_mask: u8 = 0;
+    const use_dora: bool = if (obj.get("use_dora")) |dv| switch (dv) {
+        .bool => |b| b,
+        .null => false,
+        else => return error.InvalidAdapterConfig,
+    } else false;
+
+    var target_mask: u16 = 0;
     if (obj.get("target_modules")) |tm_val| {
         switch (tm_val) {
             .array => |arr| {
@@ -195,6 +302,7 @@ pub fn parseAdapterConfigJson(allocator: std.mem.Allocator, json_bytes: []const 
         .lora_alpha = lora_alpha,
         .scale = scale,
         .target_mask = target_mask,
+        .use_dora = use_dora,
     };
 }
 
@@ -202,9 +310,13 @@ pub fn parseAdapterConfigJson(allocator: std.mem.Allocator, json_bytes: []const 
 pub const BaseModelShape = struct {
     num_layers: u32,
     hidden_size: u32,
-    q_dim: u32,
-    kv_dim: u32,
-    intermediate_size: u32,
+    q_dim: u32 = 0,
+    kv_dim: u32 = 0,
+    intermediate_size: u32 = 0,
+    /// When `true` (`W30`), validates `lora_a [rank, K]` and `lora_b [N, rank|64]`
+    /// with `K > 0`, `N > 0`, and `layer < num_layers` without requiring Qwen3-only
+    /// fixed `q_dim`/`kv_dim`/`intermediate_size` (for heterogeneous hybrid/graph models).
+    flexible_dims: bool = false,
 
     pub fn expectedDims(self: BaseModelShape, target: TargetProjection) struct { n: u32, k: u32 } {
         return switch (target) {
@@ -213,6 +325,10 @@ pub const BaseModelShape = struct {
             .o_proj => .{ .n = self.hidden_size, .k = self.q_dim },
             .gate_proj, .up_proj => .{ .n = self.intermediate_size, .k = self.hidden_size },
             .down_proj => .{ .n = self.hidden_size, .k = self.intermediate_size },
+            .gate_attn, .wr_du => .{ .n = self.q_dim, .k = self.hidden_size },
+            .qkv_proj => .{ .n = self.q_dim + 2 * self.kv_dim, .k = self.hidden_size },
+            .gate_up_proj => .{ .n = 2 * self.intermediate_size, .k = self.hidden_size },
+            .q_a_proj, .q_b_proj, .kv_a_proj, .kv_b_proj, .eh_proj => .{ .n = 0, .k = 0 },
         };
     }
 };
@@ -230,8 +346,180 @@ pub const LoraLinearPair = struct {
     b_blob: []const u8,
     /// Present when `layout == .sme2_panel64` (fast L2-resident SME2 `ld1b` / `luti2` path).
     sme_adapter: ?sme.SmeStepLoraAdapter = null,
+    /// `true` when this projection carries a PEFT DoRA magnitude vector (`W30`).
+    use_dora: bool = false,
+    /// Wired `[n]f32` DoRA magnitude vector `m` (owned by adapter pages in `LoraRegistry.pool`).
+    dora_mag_f32: ?[]f32 = null,
+    /// Wired `[n]f32` precomputed exact PEFT DoRA row scale
+    /// `gamma_i = m_i / sqrt(||W_0[i] + scale * (B @ A)[i]||_2^2 + 1e-12)`,
+    /// initialized to `1.0` until calibrated against base weights.
+    dora_row_scale_f32: ?[]f32 = null,
 
-    /// Evaluates `y_f16[row, 0..n] += scale * ((x_f16[row, 0..k] @ A^T) @ B^T)` for
+    pub fn readAValue(self: *const LoraLinearPair, j: usize, t: usize) f32 {
+        const r: usize = self.rank;
+        const k: usize = self.k;
+        std.debug.assert(j < r and t < k);
+        switch (self.layout) {
+            .row_major => {
+                const a_u16: []const u16 = @alignCast(std.mem.bytesAsSlice(u16, self.a_blob[0 .. r * k * 2]));
+                return quant.floatBitsToF32(self.dtype, a_u16[j * k + t]);
+            },
+            .sme2_panel64 => {
+                const k_groups = k / sme.GROUP_SIZE;
+                const g_bytes: usize = @intCast(amf.SME2_F16_GROUP_BYTES);
+                const p = j / sme.PANEL_COLS;
+                const pc = j % sme.PANEL_COLS;
+                const g = t / sme.GROUP_SIZE;
+                const cg = t % sme.GROUP_SIZE;
+                const kp = cg / 2;
+                const sub = cg % 2;
+                const off = (p * k_groups + g) * g_bytes + kp * 64 + pc * 4 + sub * 2;
+                const bits = std.mem.readInt(u16, self.a_blob[off..][0..2], .little);
+                return quant.floatBitsToF32(self.dtype, bits);
+            },
+        }
+    }
+
+    pub fn readBValue(self: *const LoraLinearPair, o: usize, j: usize) f32 {
+        const r: usize = self.rank;
+        const n: usize = self.n;
+        std.debug.assert(o < n and j < r);
+        switch (self.layout) {
+            .row_major => {
+                const b_u16: []const u16 = @alignCast(std.mem.bytesAsSlice(u16, self.b_blob[0 .. n * r * 2]));
+                return quant.floatBitsToF32(self.dtype, b_u16[o * r + j]);
+            },
+            .sme2_panel64 => {
+                const g_bytes: usize = @intCast(amf.SME2_F16_GROUP_BYTES);
+                const p = o / sme.PANEL_COLS;
+                const pc = o % sme.PANEL_COLS;
+                const kp = j / 2;
+                const sub = j % 2;
+                const off = p * g_bytes + kp * 64 + pc * 4 + sub * 2;
+                const bits = std.mem.readInt(u16, self.b_blob[off..][0..2], .little);
+                return quant.floatBitsToF32(self.dtype, bits);
+            },
+        }
+    }
+
+    /// Calibrates a single output row `row_idx` of `dora_row_scale_f32` directly from
+    /// dequantized base weight row `w0_row_f32[0..k]`:
+    /// `gamma[row] = m[row] / sqrt(||W_0[row] + scale * (B @ A)[row]||_2^2 + 1e-12)`.
+    pub fn calibrateDoraRowFromBaseRow(
+        self: *LoraLinearPair,
+        row_idx: usize,
+        w0_row_f32: []const f32,
+    ) LoraError!void {
+        const mag = self.dora_mag_f32 orelse return;
+        const out_scale = self.dora_row_scale_f32 orelse return;
+        if (!self.use_dora) return;
+        if (self.weight_dtype == .q2_affine) return error.UnsupportedDType;
+        if (row_idx >= self.n) return error.DimensionMismatch;
+        if (w0_row_f32.len < self.k) return error.BufferTooSmall;
+
+        const r: usize = self.rank;
+        const k: usize = self.k;
+        var b_row: [MAX_LORA_RANK]f32 = undefined;
+        for (0..r) |j| b_row[j] = self.readBValue(row_idx, j);
+
+        const s64: f64 = @floatCast(self.scale);
+        var norm_sq: f64 = 0.0;
+        for (0..k) |t| {
+            var ba_t: f64 = 0.0;
+            for (0..r) |j| {
+                ba_t += @as(f64, b_row[j]) * @as(f64, self.readAValue(j, t));
+            }
+            const eff: f64 = @as(f64, w0_row_f32[t]) + s64 * ba_t;
+            norm_sq += eff * eff;
+        }
+        const denom: f64 = @sqrt(norm_sq + 1.0e-12);
+        out_scale[row_idx] = @floatCast(@as(f64, mag[row_idx]) / denom);
+    }
+
+    /// Calibrates all `N` rows of `dora_row_scale_f32` once at adapter load/bind time
+    /// from row-major base weight matrix `base_w_f32` (`[n, k]`).
+    pub fn calibrateDoraPairFromBaseRows(
+        self: *LoraLinearPair,
+        base_w_f32: []const f32,
+    ) LoraError!void {
+        if (!self.use_dora or self.dora_mag_f32 == null or self.dora_row_scale_f32 == null) return;
+        const n: usize = self.n;
+        const k: usize = self.k;
+        const nk = std.math.mul(usize, n, k) catch return error.DimensionMismatch;
+        if (base_w_f32.len < nk) return error.BufferTooSmall;
+        for (0..n) |i| {
+            try self.calibrateDoraRowFromBaseRow(i, base_w_f32[i * k ..][0..k]);
+        }
+    }
+
+    /// Calibrates all `N` rows of `dora_row_scale_f32` from precomputed base row L2 norms
+    /// `||W_0[i]||_2` and optional exact cross inner products `dot(W_0[i], scale * (B @ A)[i])`.
+    /// When `cross_dots_f32` is provided, matches `calibrateDoraPairFromBaseRows` exactly via
+    /// `||W_0[i] + s(BA)[i]||^2 = ||W_0[i]||^2 + s^2 * b_i^T (A A^T) b_i + 2 * cross_dots[i]`.
+    pub fn calibrateDoraPairFromBaseRowNorms(
+        self: *LoraLinearPair,
+        base_row_norms_f32: []const f32,
+        cross_dots_f32: ?[]const f32,
+    ) LoraError!void {
+        const mag = self.dora_mag_f32 orelse return;
+        const out_scale = self.dora_row_scale_f32 orelse return;
+        if (!self.use_dora) return;
+        if (self.weight_dtype == .q2_affine) return error.UnsupportedDType;
+
+        const n: usize = self.n;
+        const k: usize = self.k;
+        const r: usize = self.rank;
+        if (base_row_norms_f32.len < n) return error.BufferTooSmall;
+        if (cross_dots_f32) |cd| {
+            if (cd.len < n) return error.BufferTooSmall;
+        }
+
+        // Compute Gram matrix G_A = A @ A^T in f64 (`r <= 64`).
+        var gram_a: [MAX_LORA_RANK][MAX_LORA_RANK]f64 = undefined;
+        for (0..r) |j1| {
+            for (j1..r) |j2| {
+                var acc: f64 = 0.0;
+                for (0..k) |t| {
+                    acc += @as(f64, self.readAValue(j1, t)) * @as(f64, self.readAValue(j2, t));
+                }
+                gram_a[j1][j2] = acc;
+                gram_a[j2][j1] = acc;
+            }
+        }
+
+        const s64: f64 = @floatCast(self.scale);
+        const s_sq: f64 = s64 * s64;
+        var b_row: [MAX_LORA_RANK]f64 = undefined;
+        for (0..n) |i| {
+            for (0..r) |j| b_row[j] = @as(f64, self.readBValue(i, j));
+            var quad: f64 = 0.0;
+            for (0..r) |j1| {
+                var inner: f64 = 0.0;
+                for (0..r) |j2| inner += gram_a[j1][j2] * b_row[j2];
+                quad += b_row[j1] * inner;
+            }
+            const w0_norm: f64 = @as(f64, base_row_norms_f32[i]);
+            const cross_term: f64 = if (cross_dots_f32) |cd| 2.0 * @as(f64, cd[i]) else 0.0;
+            const eff_sq: f64 = @max(0.0, w0_norm * w0_norm + s_sq * quad + cross_term);
+            const denom: f64 = @sqrt(eff_sq + 1.0e-12);
+            out_scale[i] = @floatCast(@as(f64, mag[i]) / denom);
+        }
+    }
+
+    /// Alias for `applySingleRowF16`.
+    pub inline fn evalRowF16(
+        self: *const LoraLinearPair,
+        x_row: []const f16,
+        y_row: []f16,
+        z_scratch: []f32,
+        z_u16_scratch: []u16,
+        dispatcher: ?*sme.SmeDispatcher,
+    ) sme.Error!void {
+        return self.applySingleRowF16(x_row, y_row, z_scratch, z_u16_scratch, dispatcher);
+    }
+
+    /// Evaluates `y_f16[row, 0..n] = gamma * (y_f16[row, 0..n] + scale * ((x_f16[row, 0..k] @ A^T) @ B^T))`
+    /// (with `gamma = dora_row_scale_f32` when `use_dora == true`, else `1.0`) for
     /// a single row in-place with ZERO heap allocations using caller scratch `z_f32[0..rank]`.
     pub fn applySingleRowF16(
         self: *const LoraLinearPair,
@@ -241,10 +529,19 @@ pub const LoraLinearPair = struct {
         z_u16_scratch: []u16,
         dispatcher: ?*sme.SmeDispatcher,
     ) sme.Error!void {
-        if (self.scale == 0.0) return;
+        const dora_scale: ?[]const f32 = if (self.use_dora) self.dora_row_scale_f32 else null;
         const r: usize = self.rank;
         const n: usize = self.n;
         const k: usize = self.k;
+        if (self.scale == 0.0) {
+            if (dora_scale) |ds| {
+                std.debug.assert(y_row.len >= n and ds.len >= n);
+                for (0..n) |o| {
+                    y_row[o] = @floatCast(@as(f32, @floatCast(y_row[o])) * ds[o]);
+                }
+            }
+            return;
+        }
         std.debug.assert(x_row.len >= k and y_row.len >= n and z_scratch.len >= r);
 
         switch (self.layout) {
@@ -264,7 +561,7 @@ pub const LoraLinearPair = struct {
                     z_scratch[j] = acc * self.scale;
                 }
 
-                // 2. y[o] += dot(z[0..r], B[o, 0..r])
+                // 2. y[o] = (y[o] + dot(z[0..r], B[o, 0..r])) * (has_dora ? dora_scale[o] : 1.0)
                 for (0..n) |o| {
                     const b_row = b_u16[o * r ..][0..r];
                     var acc: f32 = @floatCast(y_row[o]);
@@ -272,6 +569,7 @@ pub const LoraLinearPair = struct {
                         const bv: f32 = quant.floatBitsToF32(self.dtype, b_row[j]);
                         acc += z_scratch[j] * bv;
                     }
+                    if (dora_scale) |ds| acc *= ds[o];
                     y_row[o] = @floatCast(acc);
                 }
             },
@@ -307,7 +605,9 @@ pub const LoraLinearPair = struct {
                                 .{ .cache_hint = .temporal, .epilogue = .none, .out_dtype = .f32 },
                             );
                             for (0..n) |o| {
-                                y_row[o] = @floatCast(@as(f32, @floatCast(y_row[o])) + y_f32_tmp[o]);
+                                var val = @as(f32, @floatCast(y_row[o])) + y_f32_tmp[o];
+                                if (dora_scale) |ds| val *= ds[o];
+                                y_row[o] = @floatCast(val);
                             }
                             return;
                         }
@@ -357,7 +657,9 @@ pub const LoraLinearPair = struct {
                             sme.GROUP_SIZE,
                         );
                         for (0..n) |o| {
-                            y_row[o] = @floatCast(@as(f32, @floatCast(y_row[o])) + y_f32_tmp[o]);
+                            var val = @as(f32, @floatCast(y_row[o])) + y_f32_tmp[o];
+                            if (dora_scale) |ds| val *= ds[o];
+                            y_row[o] = @floatCast(val);
                         }
                         return;
                     }
@@ -373,6 +675,7 @@ pub const LoraLinearPair = struct {
         y_row: []f16,
         z_scratch: []f32,
     ) void {
+        const dora_scale: ?[]const f32 = if (self.use_dora) self.dora_row_scale_f32 else null;
         const r: usize = self.rank;
         const n: usize = self.n;
         const k: usize = self.k;
@@ -404,7 +707,7 @@ pub const LoraLinearPair = struct {
         }
         for (0..r) |j| z_scratch[j] *= self.scale;
 
-        // 2. y[o] += (z_padded @ B_panel64^T)[o]
+        // 2. y[o] = (y[o] + (z_padded @ B_panel64^T)[o]) * (has_dora ? dora_scale[o] : 1.0)
         const b_panels = (n + sme.PANEL_COLS - 1) / sme.PANEL_COLS;
         for (0..b_panels) |p| {
             const grp_off = p * g_bytes;
@@ -427,12 +730,15 @@ pub const LoraLinearPair = struct {
             for (0..sme.PANEL_COLS) |c| {
                 const col = p * sme.PANEL_COLS + c;
                 if (col >= n) break;
-                y_row[col] = @floatCast(@as(f32, @floatCast(y_row[col])) + acc[c]);
+                var val = @as(f32, @floatCast(y_row[col])) + acc[c];
+                if (dora_scale) |ds| val *= ds[col];
+                y_row[col] = @floatCast(val);
             }
         }
     }
 
     fn addPanel64BToF16Row(self: *const LoraLinearPair, z_u16: []const u16, y_row: []f16) void {
+        const dora_scale: ?[]const f32 = if (self.use_dora) self.dora_row_scale_f32 else null;
         const n: usize = self.n;
         const r: usize = self.rank;
         const g_bytes: usize = @intCast(amf.SME2_F16_GROUP_BYTES);
@@ -457,7 +763,9 @@ pub const LoraLinearPair = struct {
             for (0..sme.PANEL_COLS) |c| {
                 const col = p * sme.PANEL_COLS + c;
                 if (col >= n) break;
-                y_row[col] = @floatCast(@as(f32, @floatCast(y_row[col])) + acc[c]);
+                var val = @as(f32, @floatCast(y_row[col])) + acc[c];
+                if (dora_scale) |ds| val *= ds[col];
+                y_row[col] = @floatCast(val);
             }
         }
     }
@@ -466,7 +774,7 @@ pub const LoraLinearPair = struct {
 pub const LayerAdapters = struct {
     /// Indexed by `@backingInt(TargetProjection)`.
     projections: [TargetProjection.COUNT]?LoraLinearPair = @splat(null),
-    target_mask: u8 = 0,
+    target_mask: u16 = 0,
 
     pub fn hasTarget(self: *const LayerAdapters, target: TargetProjection) bool {
         return (self.target_mask & target.bit()) != 0;
@@ -490,7 +798,8 @@ pub const LoadedAdapter = struct {
     rank: u32 = 0,
     lora_alpha: f32 = 0.0,
     scale: f32 = 0.0,
-    target_mask: u8 = 0,
+    target_mask: u16 = 0,
+    use_dora: bool = false,
     wired_bytes: usize = 0,
     num_layers: u32 = 0,
     layers: []LayerAdapters = &.{},
@@ -503,11 +812,20 @@ pub const LoadedAdapter = struct {
         if (!self.in_use or layer_idx >= self.layers.len) return null;
         return &self.layers[layer_idx];
     }
+
+    pub fn layerAdaptersMut(self: *LoadedAdapter, layer_idx: usize) ?*LayerAdapters {
+        if (!self.in_use or layer_idx >= self.layers.len) return null;
+        return &self.layers[layer_idx];
+    }
 };
 
 pub const LoraRegistryConfig = struct {
-    /// Preallocated wired pool capacity in bytes (`> 0`, 16 KiB aligned, `<= 4 MiB`).
-    pool_bytes: usize = MAX_LORA_POOL_BYTES,
+    /// Preallocated wired pool capacity in bytes (`> 0`, 16 KiB aligned, `<= 256 MiB`).
+    /// Defaults to `DEFAULT_LORA_POOL_BYTES` (`4 MiB`).
+    pool_bytes: usize = DEFAULT_LORA_POOL_BYTES,
+    /// Optional allocator for the startup `page_owner` bitmap (`total_pages` bytes);
+    /// defaults to `std.heap.page_allocator` and is freed automatically in `deinit`.
+    allocator: ?std.mem.Allocator = null,
     /// `R9` wired budget enforcing that this LoRA pool stays inside startup wired headroom
     /// without ever unpinning base model weights.
     wired_budget: ?budget_mod.Budget = null,
@@ -529,12 +847,13 @@ pub const LoraRegistryStats = struct {
     total_unloads: u64,
 };
 
-/// Preallocated wired-RAM multi-LoRA registry (`W19`, `ADR-0022`, `C24`).
+/// Preallocated wired-RAM multi-LoRA + DoRA registry (`W19`, `W30`, `ADR-0022`, `C24`).
 ///
-/// Owns ONE fixed `page.WiredRegion` (`<= 4 MiB`, `mlock`ed once at `init`) and
-/// manages hot-load / hot-unload of up to `MAX_ADAPTERS` `.amlora` bundles via
-/// a 16 KiB page-ownership bitmap. When an SME2 dispatcher is attached, also
-/// maintains wired `StepLoraScratch` + `f32` accumulation buffers to run
+/// Owns ONE fixed `page.WiredRegion` (`<= 256 MiB`, `mlock`ed once at `init`,
+/// bounded by `R9` `wired_budget`) and manages hot-load / hot-unload of up to
+/// `MAX_ADAPTERS` `.amlora` bundles via a dynamically-sized 16 KiB page-ownership
+/// bitmap. When an SME2 dispatcher is attached, also maintains wired
+/// `StepLoraScratch` + `f32` accumulation buffers to run
 /// `sme.SmeStepLoraAdapter.evalMultiAdapterHoisted` (`<= 4 MiB` L2 cap & `C13`
 /// bus gate) with zero hot-path allocations.
 pub const LoraRegistry = struct {
@@ -542,7 +861,8 @@ pub const LoraRegistry = struct {
 
     pool: page.WiredRegion,
     total_pages: usize,
-    page_owner: [MAX_POOL_PAGES]u8,
+    page_owner: []u8,
+    page_owner_allocator: std.mem.Allocator,
     used_pages: usize,
 
     base_shape: BaseModelShape,
@@ -583,6 +903,12 @@ pub const LoraRegistry = struct {
             try b.checkPlan(cfg.pool_bytes);
         }
 
+        const total_pages = cfg.pool_bytes / page.APPLE_PAGE_SIZE;
+        const po_alloc = cfg.allocator orelse std.heap.page_allocator;
+        const page_owner = try po_alloc.alloc(u8, total_pages);
+        errdefer po_alloc.free(page_owner);
+        @memset(page_owner, FREE_PAGE_OWNER);
+
         const region = try page.WiredRegion.init(cfg.pool_bytes);
         errdefer region.deinit();
 
@@ -600,8 +926,9 @@ pub const LoraRegistry = struct {
 
         return .{
             .pool = region,
-            .total_pages = cfg.pool_bytes / page.APPLE_PAGE_SIZE,
-            .page_owner = @splat(FREE_PAGE_OWNER),
+            .total_pages = total_pages,
+            .page_owner = page_owner,
+            .page_owner_allocator = po_alloc,
             .used_pages = 0,
             .base_shape = cfg.base_shape,
             .sme_dispatcher = cfg.sme_dispatcher,
@@ -629,6 +956,10 @@ pub const LoraRegistry = struct {
         }
         self.active_count = 0;
         self.used_pages = 0;
+        if (self.page_owner.len > 0) {
+            self.page_owner_allocator.free(self.page_owner);
+            self.page_owner = &.{};
+        }
         if (self.sme_scratch) |*sc| {
             sc.deinit();
             self.sme_scratch = null;
@@ -638,6 +969,60 @@ pub const LoraRegistry = struct {
             self.delta_f32_region = null;
         }
         self.pool.deinit();
+    }
+
+    /// Returns the 16 KiB-aligned backing wired pool slice for zero-copy Metal wrapping.
+    pub fn poolSlice(self: *const LoraRegistry) []align(page.APPLE_PAGE_SIZE) u8 {
+        return self.pool.bytes;
+    }
+
+    /// Computes byte offset of a pointer living inside `self.pool.bytes`.
+    pub fn poolByteOffset(self: *const LoraRegistry, ptr: [*]const u8) usize {
+        const base = @intFromPtr(self.pool.bytes.ptr);
+        const addr = @intFromPtr(ptr);
+        std.debug.assert(addr >= base and addr < base + self.pool.bytes.len);
+        return addr - base;
+    }
+
+    /// Returns a const pointer to the loaded `LoraLinearPair` at `(slot_id, layer_idx, target)`.
+    pub fn pairAt(self: *const LoraRegistry, slot_id: u32, layer_idx: usize, target: TargetProjection) ?*const LoraLinearPair {
+        const adp = self.adapterAt(slot_id) orelse return null;
+        const la = adp.layerAdapters(layer_idx) orelse return null;
+        if (la.projections[@backingInt(target)]) |*pair| return pair;
+        return null;
+    }
+
+    /// Returns a mutable pointer to the loaded `LoraLinearPair` at `(slot_id, layer_idx, target)`.
+    pub fn pairAtMut(self: *LoraRegistry, slot_id: u32, layer_idx: usize, target: TargetProjection) ?*LoraLinearPair {
+        if (slot_id >= MAX_ADAPTERS or !self.slots[slot_id].in_use) return null;
+        const la = self.slots[slot_id].layerAdaptersMut(layer_idx) orelse return null;
+        if (la.projections[@backingInt(target)]) |*pair| return pair;
+        return null;
+    }
+
+    /// Calibrates a loaded DoRA pair's wired `dora_row_scale_f32` from full base weight rows `[n, k]`.
+    pub fn calibrateDoraPairFromBaseRows(
+        self: *LoraRegistry,
+        slot_id: u32,
+        layer_idx: usize,
+        target: TargetProjection,
+        base_w_f32: []const f32,
+    ) LoraError!void {
+        const pair = self.pairAtMut(slot_id, layer_idx, target) orelse return error.AdapterNotFound;
+        try pair.calibrateDoraPairFromBaseRows(base_w_f32);
+    }
+
+    /// Calibrates a loaded DoRA pair's wired `dora_row_scale_f32` from base row norms and optional cross dots.
+    pub fn calibrateDoraPairFromBaseRowNorms(
+        self: *LoraRegistry,
+        slot_id: u32,
+        layer_idx: usize,
+        target: TargetProjection,
+        base_row_norms_f32: []const f32,
+        cross_dots_f32: ?[]const f32,
+    ) LoraError!void {
+        const pair = self.pairAtMut(slot_id, layer_idx, target) orelse return error.AdapterNotFound;
+        try pair.calibrateDoraPairFromBaseRowNorms(base_row_norms_f32, cross_dots_f32);
     }
 
     /// Updates live `C13` / `C16` unified memory bus pressure telemetry used by `evalMultiAdapterHoisted`.
@@ -748,14 +1133,14 @@ pub const LoraRegistry = struct {
     }
 
     /// Returns `true` if `adapter_slot` targets any projection in `(layer_idx, mask)`.
-    pub fn slotTargetsLayerMask(self: *const LoraRegistry, slot_id: u32, layer_idx: usize, mask: u8) bool {
+    pub fn slotTargetsLayerMask(self: *const LoraRegistry, slot_id: u32, layer_idx: usize, mask: u16) bool {
         const adp = self.adapterAt(slot_id) orelse return false;
         const la = adp.layerAdapters(layer_idx) orelse return false;
         return (la.target_mask & mask) != 0;
     }
 
     /// Returns `true` if ANY slot in `batch_lora_slots` targets `(layer_idx, mask)`.
-    pub fn batchTargetsLayerMask(self: *const LoraRegistry, batch_lora_slots: []const u32, layer_idx: usize, mask: u8) bool {
+    pub fn batchTargetsLayerMask(self: *const LoraRegistry, batch_lora_slots: []const u32, layer_idx: usize, mask: u16) bool {
         for (batch_lora_slots) |sid| {
             if (sid == NO_ADAPTER) continue;
             if (self.slotTargetsLayerMask(sid, layer_idx, mask)) return true;
@@ -763,11 +1148,24 @@ pub const LoraRegistry = struct {
         return false;
     }
 
-    /// Evaluates a single adapter's rank-`r` projection delta across `num_rows`
-    /// (`m`) rows of `[num_rows, k]` -> `[num_rows, n]` in-place (`0` heap allocs),
-    /// routing `.sme2_panel64` adapters (including `q2_affine` / `LUT4`) through
-    /// hoisted `sme.SmeStepLoraAdapter.evalMultiAdapterHoisted` (`<= 4 MiB` L2 cap
-    /// & `C13` bus gate) when SME2 hoisted runtime scratch is attached.
+    /// Alias for `applySingleAdapterProjectionF16`.
+    pub inline fn applyProjectionF16(
+        self: *LoraRegistry,
+        slot_id: u32,
+        layer_idx: usize,
+        target: TargetProjection,
+        x_f16: []const f16,
+        y_f16: []f16,
+        num_rows: usize,
+    ) (sme.Error || error{BusContentionDeferred})!void {
+        return self.applySingleAdapterProjectionF16(slot_id, layer_idx, target, x_f16, y_f16, num_rows);
+    }
+
+    /// Evaluates a single adapter's rank-`r` projection delta (plus optional PEFT DoRA
+    /// row scaling) across `num_rows` (`m`) rows of `[num_rows, k]` -> `[num_rows, n]`
+    /// in-place (`0` heap allocs), routing `.sme2_panel64` adapters (including `q2_affine`
+    /// / `LUT4`) through hoisted `sme.SmeStepLoraAdapter.evalMultiAdapterHoisted`
+    /// (`<= 4 MiB` L2 cap & `C13` bus gate) when SME2 hoisted runtime scratch is attached.
     pub fn applySingleAdapterProjectionF16(
         self: *LoraRegistry,
         slot_id: u32,
@@ -781,11 +1179,12 @@ pub const LoraRegistry = struct {
         const adp = self.adapterAt(slot_id) orelse return;
         const la = adp.layerAdapters(layer_idx) orelse return;
         const pair = la.projections[@backingInt(target)] orelse return;
-        if (pair.scale == 0.0) return;
+        if (pair.scale == 0.0 and !pair.use_dora) return;
 
         const k: usize = pair.k;
         const n: usize = pair.n;
-        if (pair.layout == .sme2_panel64 and pair.sme_adapter != null and
+        const dora_scale: ?[]const f32 = if (pair.use_dora) pair.dora_row_scale_f32 else null;
+        if (pair.scale != 0.0 and pair.layout == .sme2_panel64 and pair.sme_adapter != null and
             self.sme_dispatcher != null and self.sme_scratch != null and self.delta_f32_region != null)
         {
             const sme_adp = pair.sme_adapter.?.withAlpha(pair.scale);
@@ -815,8 +1214,17 @@ pub const LoraRegistry = struct {
                             null,
                         );
                         const y_dst = y_f16[row_off * n ..][0..mn];
-                        for (0..mn) |i| {
-                            y_dst[i] = @floatCast(@as(f32, @floatCast(y_dst[i])) + delta_slice[i]);
+                        if (dora_scale) |ds| {
+                            for (0..chunk_m) |r_i| {
+                                const rb = r_i * n;
+                                for (0..n) |o| {
+                                    y_dst[rb + o] = @floatCast((@as(f32, @floatCast(y_dst[rb + o])) + delta_slice[rb + o]) * ds[o]);
+                                }
+                            }
+                        } else {
+                            for (0..mn) |i| {
+                                y_dst[i] = @floatCast(@as(f32, @floatCast(y_dst[i])) + delta_slice[i]);
+                            }
                         }
                         row_off += chunk_m;
                     }
@@ -850,10 +1258,9 @@ pub const LoraRegistry = struct {
         num_rows: usize,
     ) (sme.Error || error{BusContentionDeferred})!void {
         if (slot_ids.len == 0 or num_rows == 0) return;
-        const dims = self.base_shape.expectedDims(target);
-        const k: usize = dims.k;
-        const n: usize = dims.n;
 
+        var k: usize = 0;
+        var n: usize = 0;
         var hoisted: [MAX_ADAPTERS]sme.SmeStepLoraAdapter = undefined;
         var hoisted_count: usize = 0;
         var fallback_slots: [MAX_ADAPTERS]u32 = undefined;
@@ -864,8 +1271,12 @@ pub const LoraRegistry = struct {
             const adp = self.adapterAt(sid) orelse continue;
             const la = adp.layerAdapters(layer_idx) orelse continue;
             const pair = la.projections[@backingInt(target)] orelse continue;
-            if (pair.scale == 0.0) continue;
-            if (pair.layout == .sme2_panel64 and pair.sme_adapter != null and
+            if (pair.scale == 0.0 and !pair.use_dora) continue;
+            if (k == 0) {
+                k = pair.k;
+                n = pair.n;
+            }
+            if (!pair.use_dora and pair.scale != 0.0 and pair.layout == .sme2_panel64 and pair.sme_adapter != null and
                 self.sme_dispatcher != null and self.sme_scratch != null and self.delta_f32_region != null and
                 !pair.sme_adapter.?.a_weight.dtype.activationIsBf16() and hoisted_count < MAX_ADAPTERS)
             {
@@ -914,7 +1325,7 @@ pub const LoraRegistry = struct {
         }
     }
 
-    /// Applies per-row heterogeneous LoRA deltas across a `C14` continuous-batching
+    /// Applies per-row heterogeneous LoRA / DoRA deltas across a `C14` continuous-batching
     /// step where row `b` uses `batch_lora_slots[b]` (`NO_ADAPTER` for base-only
     /// requests, or distinct loaded adapter slots across concurrent requests!).
     pub fn applyBatchProjectionF16(
@@ -925,14 +1336,13 @@ pub const LoraRegistry = struct {
         x_f16: []const f16,
         y_f16: []f16,
     ) sme.Error!void {
-        const dims = self.base_shape.expectedDims(target);
-        const k: usize = dims.k;
-        const n: usize = dims.n;
         for (batch_lora_slots, 0..) |sid, row| {
             if (sid == NO_ADAPTER) continue;
             const adp = self.adapterAt(sid) orelse continue;
             const la = adp.layerAdapters(layer_idx) orelse continue;
             const pair = la.projections[@backingInt(target)] orelse continue;
+            const k: usize = pair.k;
+            const n: usize = pair.n;
             try pair.applySingleRowF16(
                 x_f16[row * k ..][0..k],
                 y_f16[row * n ..][0..n],
@@ -1030,33 +1440,87 @@ pub const LoraRegistry = struct {
         }
     }
 
-    fn parseLoraTensorName(name: []const u8) ?struct { layer: u32, target: TargetProjection, is_a: bool } {
+    const LoraTensorRole = enum { lora_a, lora_b, dora_mag };
+
+    const ParsedLoraTensorName = struct {
+        layer: u32,
+        target: TargetProjection,
+        mod_path: []const u8,
+        role: LoraTensorRole,
+    };
+
+    fn parseLoraTensorName(name: []const u8) ?ParsedLoraTensorName {
         if (!std.mem.startsWith(u8, name, "layers.")) return null;
         const rest = name["layers.".len..];
         const dot = std.mem.indexOfScalar(u8, rest, '.') orelse return null;
         const layer_idx = std.fmt.parseInt(u32, rest[0..dot], 10) catch return null;
         const tail = rest[dot + 1 ..];
 
-        const is_a = std.mem.endsWith(u8, tail, ".lora_a");
-        const is_b = std.mem.endsWith(u8, tail, ".lora_b");
-        if (!is_a and !is_b) return null;
-        const mod_path = tail[0 .. tail.len - ".lora_a".len];
+        const role_path: struct { role: LoraTensorRole, mod_path: []const u8 } =
+            if (std.mem.endsWith(u8, tail, ".lora_a"))
+                .{ .role = .lora_a, .mod_path = tail[0 .. tail.len - ".lora_a".len] }
+            else if (std.mem.endsWith(u8, tail, ".lora_b"))
+                .{ .role = .lora_b, .mod_path = tail[0 .. tail.len - ".lora_b".len] }
+            else if (std.mem.endsWith(u8, tail, ".dora_mag"))
+                .{ .role = .dora_mag, .mod_path = tail[0 .. tail.len - ".dora_mag".len] }
+            else if (std.mem.endsWith(u8, tail, ".lora_mag"))
+                .{ .role = .dora_mag, .mod_path = tail[0 .. tail.len - ".lora_mag".len] }
+            else if (std.mem.endsWith(u8, tail, ".lora_magnitude_vector"))
+                .{ .role = .dora_mag, .mod_path = tail[0 .. tail.len - ".lora_magnitude_vector".len] }
+            else
+                return null;
 
-        const all_targets = [_]TargetProjection{
-            .q_proj,
-            .k_proj,
-            .v_proj,
-            .o_proj,
-            .gate_proj,
-            .up_proj,
-            .down_proj,
+        const target = TargetProjection.parseModuleName(role_path.mod_path) orelse return null;
+        return .{
+            .layer = layer_idx,
+            .target = target,
+            .mod_path = role_path.mod_path,
+            .role = role_path.role,
         };
-        for (all_targets) |tp| {
-            if (std.mem.eql(u8, mod_path, tp.suffix())) {
-                return .{ .layer = layer_idx, .target = tp, .is_a = is_a };
+    }
+
+    fn findPairedEntry(
+        parsed: *const amf.Parsed,
+        info: ParsedLoraTensorName,
+        role: LoraTensorRole,
+    ) ?*const amf.TensorEntry {
+        var name_buf: [64]u8 = undefined;
+        const suffixes: []const []const u8 = switch (role) {
+            .lora_a => &.{"lora_a"},
+            .lora_b => &.{"lora_b"},
+            .dora_mag => &.{ "dora_mag", "lora_mag", "lora_magnitude_vector" },
+        };
+        // Fast O(1)-ish exact lookup trying source mod_path first, then canonical suffix.
+        for (suffixes) |sfx| {
+            if (std.fmt.bufPrint(&name_buf, "layers.{d}.{s}.{s}", .{ info.layer, info.mod_path, sfx })) |nm| {
+                if (nm.len < 48) {
+                    if (parsed.find(nm)) |e| return e;
+                }
+            } else |_| {}
+            if (!std.mem.eql(u8, info.mod_path, info.target.suffix())) {
+                if (std.fmt.bufPrint(&name_buf, "layers.{d}.{s}.{s}", .{ info.layer, info.target.suffix(), sfx })) |nm| {
+                    if (nm.len < 48) {
+                        if (parsed.find(nm)) |e| return e;
+                    }
+                } else |_| {}
+            }
+        }
+        // Fallback scan matching any alias resolving to the same `(layer, target, role)`.
+        for (parsed.entries) |*e| {
+            if (amf.isMetaEntry(e)) continue;
+            const parsed_e = parseLoraTensorName(e.nameSlice()) orelse continue;
+            if (parsed_e.layer == info.layer and parsed_e.target == info.target and parsed_e.role == role) {
+                return e;
             }
         }
         return null;
+    }
+
+    fn doraWiredBytes(n: usize) LoraError!usize {
+        const vec_bytes = std.math.mul(usize, n, @sizeOf(f32)) catch return error.DimensionMismatch;
+        const scale_off = std.mem.alignForward(usize, vec_bytes, 16);
+        const total = std.math.add(usize, scale_off, vec_bytes) catch return error.DimensionMismatch;
+        return try page.alignUp(total);
     }
 
     fn loadAdapterInternal(
@@ -1091,7 +1555,7 @@ pub const LoraRegistry = struct {
         errdefer allocator.free(layers);
         @memset(layers, .{});
 
-        // Pre-check total wired pages required before mutating pool state.
+        // Pre-check total wired pages required (including DoRA wired vectors) before mutating pool state.
         var needed_pages: usize = 0;
         var found_any_pair = false;
         for (parsed.entries) |*e| {
@@ -1099,7 +1563,18 @@ pub const LoraRegistry = struct {
             if ((try e.tensorKind()) != .loop_adapter) continue;
             const info = parseLoraTensorName(e.nameSlice()) orelse continue;
             if (info.layer >= self.base_shape.num_layers) return error.LayerOutOfRange;
+            if (info.role != .lora_a) continue;
+            const b_entry = findPairedEntry(parsed, info, .lora_b) orelse return error.MissingPairedTensor;
+            if ((try b_entry.tensorKind()) != .loop_adapter) return error.InvalidTensorKind;
+            if (b_entry.rank != 2 or b_entry.shape[0] == 0) return error.DimensionMismatch;
+
             needed_pages += @intCast(e.blob_bytes / page.APPLE_PAGE_SIZE);
+            needed_pages += @intCast(b_entry.blob_bytes / page.APPLE_PAGE_SIZE);
+            if (findPairedEntry(parsed, info, .dora_mag)) |mag_entry| {
+                if ((try mag_entry.tensorKind()) != .loop_adapter) return error.InvalidTensorKind;
+                const d_bytes = try doraWiredBytes(b_entry.shape[0]);
+                needed_pages += d_bytes / page.APPLE_PAGE_SIZE;
+            }
         }
         if (needed_pages == 0) return error.MissingPairedTensor;
         if (self.used_pages + needed_pages > self.total_pages) return error.PoolOutOfSpace;
@@ -1109,21 +1584,17 @@ pub const LoraRegistry = struct {
         var inferred_rank: u32 = if (cfg_meta) |m| m.rank else 0;
         var effective_scale: f32 = if (cfg_meta) |m| m.scale else 1.0;
         var effective_alpha: f32 = if (cfg_meta) |m| m.lora_alpha else 0.0;
-        var combined_target_mask: u8 = 0;
+        var any_dora: bool = if (cfg_meta) |m| m.use_dora else false;
+        var combined_target_mask: u16 = 0;
         var wired_bytes: usize = 0;
 
         for (parsed.entries) |*a_entry| {
             if (amf.isMetaEntry(a_entry)) continue;
             if ((try a_entry.tensorKind()) != .loop_adapter) continue;
             const info = parseLoraTensorName(a_entry.nameSlice()) orelse continue;
-            if (!info.is_a) continue;
+            if (info.role != .lora_a) continue;
 
-            var b_name_buf: [64]u8 = undefined;
-            const b_name = std.fmt.bufPrint(&b_name_buf, "layers.{d}.{s}.lora_b", .{
-                info.layer,
-                info.target.suffix(),
-            }) catch return error.InvalidAdapterName;
-            const b_entry = parsed.find(b_name) orelse return error.MissingPairedTensor;
+            const b_entry = findPairedEntry(parsed, info, .lora_b) orelse return error.MissingPairedTensor;
             if ((try b_entry.tensorKind()) != .loop_adapter) return error.InvalidTensorKind;
 
             const a_dt = try a_entry.dataType();
@@ -1163,10 +1634,13 @@ pub const LoraRegistry = struct {
                 return error.UnsupportedRank;
             }
 
-            const expected = self.base_shape.expectedDims(info.target);
             const k = a_entry.shape[1];
             const n = b_entry.shape[0];
-            if (n != expected.n or k != expected.k) return error.DimensionMismatch;
+            if (k == 0 or n == 0) return error.DimensionMismatch;
+            if (!self.base_shape.flexible_dims) {
+                const expected = self.base_shape.expectedDims(info.target);
+                if (n != expected.n or k != expected.k) return error.DimensionMismatch;
+            }
 
             switch (a_lay) {
                 .row_major => {
@@ -1185,6 +1659,50 @@ pub const LoraRegistry = struct {
             try source.readBlobInto(a_entry, a_dst);
             try source.readBlobInto(b_entry, b_dst);
             wired_bytes += a_dst.len + b_dst.len;
+
+            var pair_use_dora = false;
+            var dora_mag_slice: ?[]f32 = null;
+            var dora_scale_slice: ?[]f32 = null;
+            if (findPairedEntry(parsed, info, .dora_mag)) |mag_entry| {
+                if ((try mag_entry.tensorKind()) != .loop_adapter) return error.InvalidTensorKind;
+                if (mag_entry.rank != 1 or mag_entry.shape[0] != n) return error.DimensionMismatch;
+                if ((try mag_entry.tensorLayout()) != .row_major) return error.InvalidTensorLayout;
+                const mag_dt = try mag_entry.dataType();
+                if (mag_dt != .f32 and mag_dt != .f16 and mag_dt != .bf16) return error.UnsupportedDType;
+
+                const n_us: usize = n;
+                const vec_bytes = n_us * @sizeOf(f32);
+                const scale_off = std.mem.alignForward(usize, vec_bytes, 16);
+                const d_bytes = try doraWiredBytes(n_us);
+                const d_dst = try self.allocPoolPages(owner, d_bytes / page.APPLE_PAGE_SIZE);
+                wired_bytes += d_dst.len;
+
+                const mag_f32: []f32 = @alignCast(std.mem.bytesAsSlice(f32, d_dst[0..vec_bytes]));
+                const scale_f32: []f32 = @alignCast(std.mem.bytesAsSlice(f32, d_dst[scale_off .. scale_off + vec_bytes]));
+
+                if (mag_dt == .f32) {
+                    if (mag_entry.blob_bytes > d_dst.len) return error.BufferTooSmall;
+                    try source.readBlobInto(mag_entry, d_dst);
+                } else {
+                    const tmp_len: usize = @intCast(mag_entry.blob_bytes);
+                    const tmp = try allocator.alignedAlloc(u8, .fromByteUnits(page.APPLE_PAGE_SIZE), tmp_len);
+                    defer allocator.free(tmp);
+                    try source.readBlobInto(mag_entry, tmp);
+                    const src_u16: []const u16 = @alignCast(std.mem.bytesAsSlice(u16, tmp[0 .. n_us * 2]));
+                    const mag_fdt: quant.FloatDType = if (mag_dt == .bf16) .bf16 else .f16;
+                    for (0..n_us) |i| {
+                        mag_f32[i] = quant.floatBitsToF32(mag_fdt, src_u16[i]);
+                    }
+                }
+                for (mag_f32) |mv| {
+                    if (!std.math.isFinite(mv)) return error.InvalidAdapterConfig;
+                }
+                @memset(scale_f32, 1.0);
+                pair_use_dora = true;
+                any_dora = true;
+                dora_mag_slice = mag_f32;
+                dora_scale_slice = scale_f32;
+            }
 
             var sme_adp: ?sme.SmeStepLoraAdapter = null;
             if (a_lay == .sme2_panel64) {
@@ -1210,6 +1728,9 @@ pub const LoraRegistry = struct {
                 .a_blob = a_dst,
                 .b_blob = b_dst,
                 .sme_adapter = sme_adp,
+                .use_dora = pair_use_dora,
+                .dora_mag_f32 = dora_mag_slice,
+                .dora_row_scale_f32 = dora_scale_slice,
             };
             layers[info.layer].target_mask |= info.target.bit();
             combined_target_mask |= info.target.bit();
@@ -1226,6 +1747,7 @@ pub const LoraRegistry = struct {
             .lora_alpha = effective_alpha,
             .scale = effective_scale,
             .target_mask = combined_target_mask,
+            .use_dora = any_dora,
             .wired_bytes = wired_bytes,
             .num_layers = self.base_shape.num_layers,
             .layers = layers,
@@ -1254,11 +1776,18 @@ pub const SyntheticLoraSpec = struct {
     b_lut4: bool = false,
     a_f32: []const f32,
     b_f32: []const f32,
+    /// Optional 1D `[n]` DoRA magnitude vector (`W30`).
+    dora_mag_f32: ?[]const f32 = null,
+    dora_mag_dtype: amf.DType = .f32,
+    /// Tensor suffix for the DoRA magnitude vector (canonical `"dora_mag"`, or alias `"lora_mag"`).
+    dora_mag_suffix: []const u8 = "dora_mag",
+    /// Optional architecture-native module suffix override (e.g. `"attn.wq_du"`, `"attn.gate_attn"`).
+    custom_suffix: ?[]const u8 = null,
 };
 
 /// Builds a valid 16 KiB-aligned `.amlora` (`.amf` v0) byte image embedding
 /// `__meta.adapter_config_json` and `TensorKind.loop_adapter` `lora_a`/`lora_b`
-/// blobs (supports both `row_major` and `sme2_panel64`).
+/// (and optional `dora_mag`) blobs (supports both `row_major` and `sme2_panel64`).
 pub fn buildSyntheticAmloraBytes(
     allocator: std.mem.Allocator,
     adapter_id: []const u8,
@@ -1266,14 +1795,44 @@ pub fn buildSyntheticAmloraBytes(
     lora_alpha: f32,
     specs: []const SyntheticLoraSpec,
 ) ![]u8 {
-    var cfg_buf: [512]u8 = undefined;
+    var any_dora = false;
+    var extra_entries: usize = 0;
+    var tm_mask: u16 = 0;
+    for (specs) |sp| {
+        tm_mask |= sp.target.bit();
+        if (sp.dora_mag_f32 != null) {
+            any_dora = true;
+            extra_entries += 1;
+        }
+    }
+    var tm_buf: [512]u8 = undefined;
+    var tm_pos: usize = 0;
+    const all_targets = [_]TargetProjection{
+        .q_proj,    .k_proj,    .v_proj,       .o_proj,
+        .gate_proj, .up_proj,   .down_proj,    .gate_attn,
+        .wr_du,     .qkv_proj,  .gate_up_proj, .q_a_proj,
+        .q_b_proj,  .kv_a_proj, .kv_b_proj,    .eh_proj,
+    };
+    const emit_mask: u16 = if (tm_mask != 0) tm_mask else (TargetProjection.q_proj.bit() |
+        TargetProjection.k_proj.bit() | TargetProjection.v_proj.bit() | TargetProjection.o_proj.bit() |
+        TargetProjection.gate_proj.bit() | TargetProjection.up_proj.bit() | TargetProjection.down_proj.bit());
+    for (all_targets) |tp| {
+        if ((emit_mask & tp.bit()) == 0) continue;
+        const part = try std.fmt.bufPrint(tm_buf[tm_pos..], "{s}\"{s}\"", .{
+            if (tm_pos == 0) "" else ",",
+            tp.label(),
+        });
+        tm_pos += part.len;
+    }
+
+    var cfg_buf: [1024]u8 = undefined;
     const cfg_json = try std.fmt.bufPrint(
         &cfg_buf,
-        "{{\"peft_type\":\"LORA\",\"r\":{d},\"lora_alpha\":{d:.6},\"target_modules\":[\"q_proj\",\"k_proj\",\"v_proj\",\"o_proj\",\"gate_proj\",\"up_proj\",\"down_proj\"]}}",
-        .{ rank, lora_alpha },
+        "{{\"peft_type\":\"LORA\",\"r\":{d},\"lora_alpha\":{d:.6},\"use_dora\":{s},\"target_modules\":[{s}]}}",
+        .{ rank, lora_alpha, if (any_dora) "true" else "false", tm_buf[0..tm_pos] },
     );
 
-    const total_entries = 1 + specs.len * 2;
+    const total_entries = 1 + specs.len * 2 + extra_entries;
     const entries = try allocator.alloc(amf.TensorEntry, total_entries);
     defer allocator.free(entries);
 
@@ -1301,7 +1860,8 @@ pub fn buildSyntheticAmloraBytes(
     const dir_offset: usize = page.APPLE_PAGE_SIZE;
     const dir_bytes: usize = try page.alignUp(total_entries * @sizeOf(amf.TensorEntry));
 
-    for (specs, 0..) |sp, si| {
+    var entry_idx: usize = 1;
+    for (specs) |sp| {
         const amf_dt: amf.DType = if (sp.dtype == .bf16) .bf16 else .f16;
         const pdt: sme.PanelDType = if (sp.dtype == .bf16) .bf16 else .f16;
         const b_wdt: quant.WeightDType = sp.b_weight_dtype orelse if (sp.dtype == .bf16) .bf16 else .f16;
@@ -1316,10 +1876,11 @@ pub fn buildSyntheticAmloraBytes(
         else
             .affine_scale_bias;
 
+        const mod_suffix = sp.custom_suffix orelse sp.target.suffix();
         var a_name_buf: [48]u8 = undefined;
-        const a_name = try std.fmt.bufPrint(&a_name_buf, "layers.{d}.{s}.lora_a", .{ sp.layer, sp.target.suffix() });
+        const a_name = try std.fmt.bufPrint(&a_name_buf, "layers.{d}.{s}.lora_a", .{ sp.layer, mod_suffix });
         var b_name_buf: [48]u8 = undefined;
-        const b_name = try std.fmt.bufPrint(&b_name_buf, "layers.{d}.{s}.lora_b", .{ sp.layer, sp.target.suffix() });
+        const b_name = try std.fmt.bufPrint(&b_name_buf, "layers.{d}.{s}.lora_b", .{ sp.layer, mod_suffix });
 
         var ae = amf.TensorEntry.zeroed(a_name, .loop_adapter, amf_dt);
         ae.rank = 2;
@@ -1463,12 +2024,55 @@ pub fn buildSyntheticAmloraBytes(
         be.blob_bytes = b_blob_len;
         be.blob_crc32 = std.hash.Crc32.hash(b_blob);
 
-        entries[1 + si * 2] = ae;
-        blobs[1 + si * 2] = a_blob;
+        entries[entry_idx] = ae;
+        blobs[entry_idx] = a_blob;
+        entry_idx += 1;
         built += 1;
-        entries[1 + si * 2 + 1] = be;
-        blobs[1 + si * 2 + 1] = b_blob;
+        entries[entry_idx] = be;
+        blobs[entry_idx] = b_blob;
+        entry_idx += 1;
         built += 1;
+
+        if (sp.dora_mag_f32) |mag_src| {
+            var m_name_buf: [48]u8 = undefined;
+            const m_name = try std.fmt.bufPrint(&m_name_buf, "layers.{d}.{s}.{s}", .{ sp.layer, mod_suffix, sp.dora_mag_suffix });
+            var me = amf.TensorEntry.zeroed(m_name, .loop_adapter, sp.dora_mag_dtype);
+            me.rank = 1;
+            me.layer = @intCast(sp.layer);
+            me.shape = .{ sp.n, 0, 0, 0 };
+            me.setLayoutAndParamKind(.row_major, .affine_scale_bias);
+            const elem_bytes: usize = switch (sp.dora_mag_dtype) {
+                .f32 => 4,
+                .f16, .bf16 => 2,
+                else => return error.UnsupportedDType,
+            };
+            const m_data_bytes: usize = @as(usize, sp.n) * elem_bytes;
+            const m_blob_len = try page.alignUp(m_data_bytes);
+            const m_blob = try allocator.alloc(u8, m_blob_len);
+            @memset(m_blob, 0);
+            switch (sp.dora_mag_dtype) {
+                .f32 => {
+                    const dst_f32: []f32 = @alignCast(std.mem.bytesAsSlice(f32, m_blob[0..m_data_bytes]));
+                    @memcpy(dst_f32, mag_src[0..sp.n]);
+                },
+                .f16 => {
+                    const dst_u16: []u16 = @alignCast(std.mem.bytesAsSlice(u16, m_blob[0..m_data_bytes]));
+                    for (mag_src[0..sp.n], 0..) |v, idx| dst_u16[idx] = quant.f32ToFloatBits(.f16, v);
+                },
+                .bf16 => {
+                    const dst_u16: []u16 = @alignCast(std.mem.bytesAsSlice(u16, m_blob[0..m_data_bytes]));
+                    for (mag_src[0..sp.n], 0..) |v, idx| dst_u16[idx] = quant.f32ToFloatBits(.bf16, v);
+                },
+                else => return error.UnsupportedDType,
+            }
+            me.data_bytes = m_data_bytes;
+            me.blob_bytes = m_blob_len;
+            me.blob_crc32 = std.hash.Crc32.hash(m_blob);
+            entries[entry_idx] = me;
+            blobs[entry_idx] = m_blob;
+            entry_idx += 1;
+            built += 1;
+        }
     }
 
     var cursor: usize = dir_offset + dir_bytes;
@@ -1825,4 +2429,249 @@ test "C24 LoraRegistry supports Q2 affine & LUT4 Step-LoRA, hoisted multi-adapte
     reg_large.setBusContentionState(false, null, 0);
     try reg_large.applyMultiAdapterProjectionF16(&heavy_wave, 0, .q_proj, x_large, y_large, 1);
     reg.setBusContentionState(false, null, 0);
+}
+
+test "W30 universal projections, Inkling-2 aliases, 32 MiB R9 pool, and exact DoRA calibration & CPU equivalence" {
+    const gpa = std.testing.allocator;
+
+    // 1. TargetProjection 16-bit mask and canonical + architecture-native aliases
+    try std.testing.expectEqual(@as(usize, 16), TargetProjection.COUNT);
+    try std.testing.expectEqual(@as(?TargetProjection, .q_proj), TargetProjection.parseModuleName("attn.wq_du"));
+    try std.testing.expectEqual(@as(?TargetProjection, .q_proj), TargetProjection.parseModuleName("self_attn.q_proj.linear"));
+    try std.testing.expectEqual(@as(?TargetProjection, .k_proj), TargetProjection.parseModuleName("attn.wk_dv"));
+    try std.testing.expectEqual(@as(?TargetProjection, .v_proj), TargetProjection.parseModuleName("attn.wv_dv"));
+    try std.testing.expectEqual(@as(?TargetProjection, .o_proj), TargetProjection.parseModuleName("attn.wo_ud"));
+    try std.testing.expectEqual(@as(?TargetProjection, .gate_attn), TargetProjection.parseModuleName("attn.gate_attn"));
+    try std.testing.expectEqual(@as(?TargetProjection, .gate_attn), TargetProjection.parseModuleName("self_attn.o_proj.gate_proj"));
+    try std.testing.expectEqual(@as(?TargetProjection, .wr_du), TargetProjection.parseModuleName("attn.wr_du"));
+    try std.testing.expectEqual(@as(?TargetProjection, .qkv_proj), TargetProjection.parseModuleName("attn.wqkv"));
+    try std.testing.expectEqual(@as(?TargetProjection, .gate_proj), TargetProjection.parseModuleName("ffn.w1"));
+    try std.testing.expectEqual(@as(?TargetProjection, .up_proj), TargetProjection.parseModuleName("ffn.w3"));
+    try std.testing.expectEqual(@as(?TargetProjection, .down_proj), TargetProjection.parseModuleName("ffn.w2"));
+    try std.testing.expectEqual(@as(?TargetProjection, .gate_up_proj), TargetProjection.parseModuleName("ffn.w13"));
+    try std.testing.expectEqual(@as(?TargetProjection, .kv_a_proj), TargetProjection.parseModuleName("self_attn.kv_a_proj_with_mqa"));
+    try std.testing.expectEqual(@as(?TargetProjection, .eh_proj), TargetProjection.parseModuleName("eh_proj"));
+    try std.testing.expectEqual(@as(u16, 1 << 15), TargetProjection.eh_proj.bit());
+
+    // 2. parseAdapterConfigJson parses use_dora and widened u16 target_mask
+    const cfg_meta = try parseAdapterConfigJson(
+        gpa,
+        "{\"r\":64,\"lora_alpha\":128,\"use_dora\":true,\"target_modules\":[\"attn.wq_du\",\"attn.gate_attn\",\"attn.wr_du\",\"ffn.w13\",\"eh_proj\"]}",
+    );
+    try std.testing.expectEqual(@as(u32, 64), cfg_meta.rank);
+    try std.testing.expectApproxEqAbs(@as(f32, 2.0), cfg_meta.scale, 1e-6);
+    try std.testing.expect(cfg_meta.use_dora);
+    const expected_mask: u16 = TargetProjection.q_proj.bit() |
+        TargetProjection.gate_attn.bit() |
+        TargetProjection.wr_du.bit() |
+        TargetProjection.gate_up_proj.bit() |
+        TargetProjection.eh_proj.bit();
+    try std.testing.expectEqual(expected_mask, cfg_meta.target_mask);
+
+    // 3. R9 wired budget enforcement + > 4 MiB (32 MiB) wired pool allocation & reclamation
+    const tight_budget = budget_mod.Budget.compute(.{
+        .memory_bytes = 32 * 1024 * 1024,
+        .user_wire_limit = 8 * 1024 * 1024,
+        .global_user_wire_limit = 8 * 1024 * 1024,
+        .gpu_working_set_bytes = 8 * 1024 * 1024,
+        .configured_cap = null,
+        .headroom_bytes = page.APPLE_PAGE_SIZE,
+    });
+    const flex_shape: BaseModelShape = .{
+        .num_layers = 4,
+        .hidden_size = 64,
+        .flexible_dims = true,
+    };
+    try std.testing.expectError(error.BudgetExceeded, LoraRegistry.init(.{
+        .pool_bytes = 32 * 1024 * 1024,
+        .allocator = gpa,
+        .wired_budget = tight_budget,
+        .base_shape = flex_shape,
+    }));
+
+    const roomy_budget = budget_mod.Budget.compute(.{
+        .memory_bytes = 256 * 1024 * 1024,
+        .user_wire_limit = 128 * 1024 * 1024,
+        .global_user_wire_limit = 128 * 1024 * 1024,
+        .gpu_working_set_bytes = 128 * 1024 * 1024,
+        .configured_cap = null,
+        .headroom_bytes = page.APPLE_PAGE_SIZE,
+    });
+    var reg = try LoraRegistry.init(.{
+        .pool_bytes = 32 * 1024 * 1024,
+        .allocator = gpa,
+        .wired_budget = roomy_budget,
+        .base_shape = flex_shape,
+    });
+    defer reg.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 32 * 1024 * 1024), reg.stats().pool_capacity_bytes);
+
+    // 4. Load Inkling-2 native suffixes + DoRA (.dora_mag f32, .lora_mag bf16, .lora_magnitude_vector f16)
+    //    at r=16 & r=64 across heterogeneous per-layer dims (`flexible_dims = true`).
+    const k: usize = 64;
+    const n_ga: usize = 96;
+    const r: usize = 16;
+
+    const w0 = try gpa.alloc(f32, n_ga * k);
+    defer gpa.free(w0);
+    const a_rm = try gpa.alloc(f32, r * k);
+    defer gpa.free(a_rm);
+    const b_rm = try gpa.alloc(f32, n_ga * r);
+    defer gpa.free(b_rm);
+    const mag = try gpa.alloc(f32, n_ga);
+    defer gpa.free(mag);
+    for (w0, 0..) |*v, i| v.* = @as(f32, @floatFromInt(@as(i32, @intCast((i * 7 + 3) % 13)) - 6)) * 0.125;
+    for (a_rm, 0..) |*v, i| v.* = @as(f32, @floatFromInt(@as(i32, @intCast((i * 5 + 1) % 11)) - 5)) * 0.0625;
+    for (b_rm, 0..) |*v, i| v.* = @as(f32, @floatFromInt(@as(i32, @intCast((i * 3 + 2) % 9)) - 4)) * 0.0625;
+    for (mag, 0..) |*v, i| v.* = 0.8 + @as(f32, @floatFromInt(i % 7)) * 0.15;
+
+    const img_dora = try buildSyntheticAmloraBytes(gpa, "inkling-dora", r, 32.0, &.{
+        .{
+            .layer = 0,
+            .target = .gate_attn,
+            .n = n_ga,
+            .k = k,
+            .rank = r,
+            .layout = .row_major,
+            .dtype = .f16,
+            .a_f32 = a_rm,
+            .b_f32 = b_rm,
+            .dora_mag_f32 = mag,
+            .dora_mag_dtype = .f32,
+            .dora_mag_suffix = "dora_mag",
+            .custom_suffix = "attn.gate_attn",
+        },
+        .{
+            .layer = 1,
+            .target = .q_proj,
+            .n = n_ga,
+            .k = k,
+            .rank = r,
+            .layout = .sme2_panel64,
+            .dtype = .bf16,
+            .a_f32 = a_rm,
+            .b_f32 = b_rm,
+            .dora_mag_f32 = mag,
+            .dora_mag_dtype = .bf16,
+            .dora_mag_suffix = "lora_mag",
+            .custom_suffix = "attn.wq_du",
+        },
+        .{
+            .layer = 2,
+            .target = .o_proj,
+            .n = n_ga,
+            .k = k,
+            .rank = r,
+            .layout = .row_major,
+            .dtype = .f16,
+            .a_f32 = a_rm,
+            .b_f32 = b_rm,
+            .dora_mag_f32 = mag,
+            .dora_mag_dtype = .f16,
+            .dora_mag_suffix = "lora_magnitude_vector",
+            .custom_suffix = "attn.wo_ud",
+        },
+    });
+    defer gpa.free(img_dora);
+
+    const slot = try reg.loadAdapterFromBytes(gpa, "ink-dora", img_dora);
+    const adp = reg.adapterAt(slot).?;
+    try std.testing.expect(adp.use_dora);
+    try std.testing.expect(reg.slotTargetsLayerMask(slot, 0, TargetProjection.gate_attn.bit()));
+    try std.testing.expect(reg.slotTargetsLayerMask(slot, 1, TargetProjection.q_proj.bit()));
+    try std.testing.expect(reg.slotTargetsLayerMask(slot, 2, TargetProjection.o_proj.bit()));
+
+    // Before calibration, dora_row_scale_f32 defaults to 1.0.
+    const pair0 = reg.pairAt(slot, 0, .gate_attn).?;
+    try std.testing.expect(pair0.use_dora);
+    for (pair0.dora_row_scale_f32.?) |s| try std.testing.expectEqual(@as(f32, 1.0), s);
+
+    // Calibrate layer 0 via BaseRows and layer 2 via BaseRowNorms + cross_dots -> must agree closely!
+    try reg.calibrateDoraPairFromBaseRows(slot, 0, .gate_attn, w0);
+    try reg.calibrateDoraPairFromBaseRows(slot, 1, .q_proj, w0);
+
+    var w0_norms: [n_ga]f32 = undefined;
+    var cross_dots: [n_ga]f32 = undefined;
+    const scale: f32 = 32.0 / @as(f32, @floatFromInt(r)); // 2.0
+    for (0..n_ga) |i| {
+        var wn_sq: f64 = 0.0;
+        var cd: f64 = 0.0;
+        for (0..k) |t| {
+            const wt: f64 = w0[i * k + t];
+            wn_sq += wt * wt;
+            var ba: f64 = 0.0;
+            for (0..r) |j| {
+                const av = quant.floatBitsToF32(.f16, quant.f32ToFloatBits(.f16, a_rm[j * k + t]));
+                const bv = quant.floatBitsToF32(.f16, quant.f32ToFloatBits(.f16, b_rm[i * r + j]));
+                ba += @as(f64, bv) * @as(f64, av);
+            }
+            cd += wt * @as(f64, scale) * ba;
+        }
+        w0_norms[i] = @floatCast(@sqrt(wn_sq));
+        cross_dots[i] = @floatCast(cd);
+    }
+    try reg.calibrateDoraPairFromBaseRowNorms(slot, 2, .o_proj, &w0_norms, &cross_dots);
+
+    // Verify CPU applyProjectionF16 matches merged (m / ||W0 + s BA||) * (W0 + s BA) @ x!
+    var x_f16: [k]f16 = undefined;
+    var y0_f16: [n_ga]f16 = undefined;
+    var y1_f16: [n_ga]f16 = undefined;
+    for (0..k) |t| x_f16[t] = @floatCast(@as(f32, @floatFromInt(@as(i32, @intCast((t * 3) % 9)) - 4)) * 0.25);
+    for (0..n_ga) |i| {
+        var base_y: f32 = 0.0;
+        for (0..k) |t| base_y += w0[i * k + t] * @as(f32, @floatCast(x_f16[t]));
+        y0_f16[i] = @floatCast(base_y);
+        y1_f16[i] = @floatCast(base_y);
+    }
+
+    try reg.applyProjectionF16(slot, 0, .gate_attn, &x_f16, &y0_f16, 1);
+    try reg.applyProjectionF16(slot, 1, .q_proj, &x_f16, &y1_f16, 1);
+
+    for (0..n_ga) |i| {
+        // Exact merged DoRA reference for layer 0 (f16 weights, f32 mag)
+        var norm_sq: f64 = 0.0;
+        var dot_val: f64 = 0.0;
+        for (0..k) |t| {
+            var ba: f64 = 0.0;
+            for (0..r) |j| {
+                const av = quant.floatBitsToF32(.f16, quant.f32ToFloatBits(.f16, a_rm[j * k + t]));
+                const bv = quant.floatBitsToF32(.f16, quant.f32ToFloatBits(.f16, b_rm[i * r + j]));
+                ba += @as(f64, bv) * @as(f64, av);
+            }
+            const eff = @as(f64, w0[i * k + t]) + @as(f64, scale) * ba;
+            norm_sq += eff * eff;
+            dot_val += eff * @as(f64, @floatCast(x_f16[t]));
+        }
+        const expected0: f32 = @floatCast((@as(f64, mag[i]) / @sqrt(norm_sq + 1.0e-12)) * dot_val);
+        try std.testing.expectApproxEqAbs(expected0, @as(f32, @floatCast(y0_f16[i])), 0.03);
+
+        // Layer 1 (sme2_panel64 bf16 weights, bf16 mag)
+        var norm_sq1: f64 = 0.0;
+        var dot_val1: f64 = 0.0;
+        for (0..k) |t| {
+            var ba: f64 = 0.0;
+            for (0..r) |j| {
+                const av = quant.floatBitsToF32(.bf16, quant.f32ToFloatBits(.bf16, a_rm[j * k + t]));
+                const bv = quant.floatBitsToF32(.bf16, quant.f32ToFloatBits(.bf16, b_rm[i * r + j]));
+                ba += @as(f64, bv) * @as(f64, av);
+            }
+            const eff = @as(f64, w0[i * k + t]) + @as(f64, scale) * ba;
+            norm_sq1 += eff * eff;
+            dot_val1 += eff * @as(f64, @floatCast(x_f16[t]));
+        }
+        const mag_bf16 = quant.floatBitsToF32(.bf16, quant.f32ToFloatBits(.bf16, mag[i]));
+        const expected1: f32 = @floatCast((@as(f64, mag_bf16) / @sqrt(norm_sq1 + 1.0e-12)) * dot_val1);
+        try std.testing.expectApproxEqAbs(expected1, @as(f32, @floatCast(y1_f16[i])), 0.04);
+
+        // Layer 2 (calibrated via BaseRowNorms + cross_dots) must match layer 0 scale (up to f16 mag rounding)
+        const s0 = pair0.dora_row_scale_f32.?[i];
+        const s2 = reg.pairAt(slot, 2, .o_proj).?.dora_row_scale_f32.?[i];
+        try std.testing.expectApproxEqAbs(s0, s2, 0.01);
+    }
+
+    // 5. Unload reclaims all wired pages including DoRA wired pages!
+    try std.testing.expect(reg.stats().pool_used_bytes > 0);
+    try reg.unloadAdapter(gpa, "ink-dora");
+    try std.testing.expectEqual(@as(usize, 0), reg.stats().pool_used_bytes);
+    try std.testing.expectEqual(@as(u32, 0), reg.activeAdapterCount());
 }
