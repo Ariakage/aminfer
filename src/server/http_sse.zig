@@ -8389,6 +8389,9 @@ pub const Server = struct {
         slot.nonstream_reasoning_len = 0;
         slot.nonstream_content_len = 0;
         slot.think_splitter.resetForDialect(parsed.template_dialect, parsed.starts_in_think);
+        // Downstream `ToolCallParser` consumes Inkling 2 `<|message_model|>` recipient headers
+        // and `<|end_message|>` closers on the `.content` channel and strips envelope tags itself.
+        slot.think_splitter.strip_envelope_tags = false;
         slot.tool_parser.resetForDialect(slot.request_id, parsed.template_dialect);
         slot.stored_tool_call_count = 0;
         slot.cancelled.store(false, .release);

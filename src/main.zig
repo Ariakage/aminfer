@@ -8209,7 +8209,15 @@ const GraphChatEngineRunner = struct {
             }
         } else {
             self.model.resetKvCache();
-            var cur_tok = self.model.prefillChunk(prompt_ids, 0, true) catch return error.BackendFailed;
+            const chunk_cap: usize = @max(@as(usize, 1), @as(usize, self.model.prefillChunkCap()));
+            var p_pos: usize = 0;
+            var cur_tok: u32 = 0;
+            while (p_pos < prompt_ids.len) {
+                const p_end = @min(prompt_ids.len, p_pos + chunk_cap);
+                const is_last = (p_end == prompt_ids.len);
+                cur_tok = self.model.prefillChunk(prompt_ids[p_pos..p_end], @intCast(p_pos), is_last) catch return error.BackendFailed;
+                p_pos = p_end;
+            }
             const v_size: usize = @min(@as(usize, self.model.config.vocab_size), self.p_res.len);
             if (use_constrained) {
                 const raw_lg = self.model.readLastLogitsF16();

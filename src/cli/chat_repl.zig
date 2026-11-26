@@ -406,6 +406,7 @@ pub const TurnStream = struct {
     dim_active: bool = false,
     had_reasoning: bool = false,
     had_content: bool = false,
+    last_reasoning_byte: u8 = 0,
 
     start_ns: u64,
     first_token_ns: ?u64 = null,
@@ -444,21 +445,15 @@ pub const TurnStream = struct {
                             self.dim_active = true;
                         }
                         try self.out_sink.writeAll(span);
+                        self.last_reasoning_byte = span[span.len - 1];
                     },
                     .plain => {
                         try self.out_sink.writeAll(span);
+                        self.last_reasoning_byte = span[span.len - 1];
                     },
                 }
             },
             .content => {
-                if (self.splitter.mode == .inkling2 and
-                    (std.mem.eql(u8, span, "<|message_model|>") or
-                        std.mem.eql(u8, span, "<|content_text|>") or
-                        std.mem.eql(u8, span, "<|end_message|>") or
-                        std.mem.eql(u8, span, "<|content_model_end_sampling|>")))
-                {
-                    return;
-                }
                 if (self.dim_active) {
                     try self.out_sink.writeAll("\x1b[0m");
                     self.dim_active = false;
@@ -469,6 +464,14 @@ pub const TurnStream = struct {
                 else
                     span;
                 if (clean_span.len == 0) return;
+
+                // Visual separation between visible reasoning and answer when neither
+                // ended nor started with a newline (e.g. Inkling 2 thinking blocks).
+                if (!self.had_content and self.had_reasoning and self.think_display != .hidden and
+                    self.last_reasoning_byte != '\n' and clean_span[0] != '\n')
+                {
+                    try self.out_sink.writeAll("\n\n");
+                }
 
                 self.had_content = true;
                 try self.out_sink.writeAll(clean_span);
@@ -1140,6 +1143,328 @@ pub const ChatSession = struct {
 };
 
 // ---------------------------------------------------------------------------
+// Zero-Alloc UTF-8 Display Width & Interactive Line Editor (CJK-Safe Backspace)
+// ---------------------------------------------------------------------------
+
+/// Terminal column width for a Unicode scalar value (`0`, `1`, or `2`).
+/// Zero-alloc replacement for `wcwidth` covering C0/C1 controls, combining marks,
+/// variation selectors, ZWJ, East Asian Wide/Fullwidth/CJK/Hangul/Kana, and Emoji.
+pub fn utf8CodepointWidth(cp: u21) u2 {
+    if (cp < 0x20 or (cp >= 0x7F and cp <= 0x9F)) return 0;
+    if ((cp >= 0x0300 and cp <= 0x036F) or
+        (cp >= 0x1AB0 and cp <= 0x1AFF) or
+        (cp >= 0x1DC0 and cp <= 0x1DFF) or
+        (cp >= 0x200B and cp <= 0x200F) or
+        (cp >= 0x20D0 and cp <= 0x20FF) or
+        (cp >= 0xFE00 and cp <= 0xFE0F) or
+        (cp >= 0xFE20 and cp <= 0xFE2F))
+    {
+        return 0;
+    }
+
+    if ((cp >= 0x1100 and cp <= 0x115F) or
+        (cp >= 0x2329 and cp <= 0x232A) or
+        (cp >= 0x2E80 and cp <= 0x303E) or
+        (cp >= 0x3040 and cp <= 0xA4CF) or
+        (cp >= 0xA960 and cp <= 0xA97C) or
+        (cp >= 0xAC00 and cp <= 0xD7A3) or
+        (cp >= 0xF900 and cp <= 0xFAFF) or
+        (cp >= 0xFE10 and cp <= 0xFE19) or
+        (cp >= 0xFE30 and cp <= 0xFE6F) or
+        (cp >= 0xFF01 and cp <= 0xFF60) or
+        (cp >= 0xFFE0 and cp <= 0xFFE6) or
+        (cp >= 0x1F300 and cp <= 0x1FAFF) or
+        (cp >= 0x20000 and cp <= 0x3FFFD))
+    {
+        return 2;
+    }
+
+    return 1;
+}
+
+pub const PopGraphemeResult = struct {
+    new_len: usize,
+    cols: usize,
+};
+
+fn decodePrevUtf8(buf: []const u8) struct { start: usize, cp: ?u21 } {
+    std.debug.assert(buf.len > 0);
+    var start = buf.len - 1;
+    var back: usize = 0;
+    while (start > 0 and (buf[start] & 0xC0) == 0x80 and back < 3) {
+        start -= 1;
+        back += 1;
+    }
+    const seq = buf[start..];
+    const expected_len = std.unicode.utf8ByteSequenceLength(seq[0]) catch {
+        return .{ .start = buf.len - 1, .cp = null };
+    };
+    if (expected_len != seq.len) {
+        return .{ .start = buf.len - 1, .cp = null };
+    }
+    const cp = std.unicode.utf8Decode(seq) catch {
+        return .{ .start = buf.len - 1, .cp = null };
+    };
+    return .{ .start = start, .cp = cp };
+}
+
+/// Pops the trailing grapheme cluster (trailing width-0 codepoints plus 1 base
+/// codepoint, continuing across any preceding `U+200D` ZWJ joiner) and returns
+/// the new byte length and exact display columns to erase. Falls back safely to
+/// popping 1 byte / 1 column on malformed UTF-8.
+pub fn popLastGrapheme(buf: []const u8) PopGraphemeResult {
+    if (buf.len == 0) return .{ .new_len = 0, .cols = 0 };
+    var pos: usize = buf.len;
+    var cols: usize = 0;
+
+    while (pos > 0) {
+        while (pos > 0) {
+            const prev = decodePrevUtf8(buf[0..pos]);
+            const cp = prev.cp orelse {
+                return .{ .new_len = prev.start, .cols = if (cols == 0) 1 else cols };
+            };
+            const w = utf8CodepointWidth(cp);
+            if (w == 0) {
+                pos = prev.start;
+                continue;
+            }
+            pos = prev.start;
+            cols = @max(cols, @as(usize, w));
+            break;
+        }
+        if (pos == 0) break;
+
+        const maybe_zwj = decodePrevUtf8(buf[0..pos]);
+        if (maybe_zwj.cp) |cp| {
+            if (cp == 0x200D) {
+                pos = maybe_zwj.start;
+                continue;
+            }
+        }
+        break;
+    }
+
+    return .{ .new_len = pos, .cols = cols };
+}
+
+/// Computes total terminal display columns for `buf` consistently with `popLastGrapheme`.
+pub fn displayWidth(buf: []const u8) usize {
+    var pos: usize = buf.len;
+    var total: usize = 0;
+    while (pos > 0) {
+        const res = popLastGrapheme(buf[0..pos]);
+        total += res.cols;
+        if (res.new_len >= pos) break;
+        pos = res.new_len;
+    }
+    return total;
+}
+
+/// Zero-allocation terminal line editor for interactive TTY mode (`!ICANON`, `!ECHO`).
+/// Accumulates UTF-8 multi-byte characters, performs exact column-width erasure for
+/// CJK/wide glyphs and emoji on Backspace/`Ctrl-W`/`Ctrl-U`, handles `Ctrl-D` EOF on
+/// empty lines, and swallows ANSI CSI/SS3 escape sequences (e.g. arrow keys).
+pub const InteractiveLineEditor = struct {
+    pub const EscState = enum { none, esc, csi, ss3 };
+
+    pub const FeedOutcome = union(enum) {
+        pending,
+        line: []const u8,
+        eof,
+    };
+
+    line_buf: []u8,
+    len: usize = 0,
+    utf8_pending: [4]u8 = @splat(0),
+    utf8_need: u3 = 0,
+    utf8_got: u3 = 0,
+    esc_state: EscState = .none,
+    last_was_cr: bool = false,
+
+    pub fn currentLine(self: *const InteractiveLineEditor) []const u8 {
+        return self.line_buf[0..self.len];
+    }
+
+    fn writeRepeatedByte(out_sink: ByteSink, byte: u8, count: usize) Error!void {
+        const bs_block: [64]u8 = @splat(0x08);
+        const sp_block: [64]u8 = @splat(' ');
+        const block: *const [64]u8 = if (byte == 0x08) &bs_block else &sp_block;
+        var rem = count;
+        while (rem > 0) {
+            const n = @min(rem, block.len);
+            try out_sink.writeAll(block[0..n]);
+            rem -= n;
+        }
+    }
+
+    fn emitEraseCols(out_sink: ByteSink, cols: usize) Error!void {
+        if (cols == 0) return;
+        try writeRepeatedByte(out_sink, 0x08, cols);
+        try writeRepeatedByte(out_sink, ' ', cols);
+        try writeRepeatedByte(out_sink, 0x08, cols);
+    }
+
+    pub fn feedByte(self: *InteractiveLineEditor, b: u8, out_sink: ByteSink) Error!FeedOutcome {
+        // Absorb ANSI escape sequences (`\x1b[...` CSI, `\x1bO.` SS3, or 2-byte ESC+ch).
+        switch (self.esc_state) {
+            .none => {},
+            .esc => {
+                self.last_was_cr = false;
+                if (b == '[') {
+                    self.esc_state = .csi;
+                } else if (b == 'O') {
+                    self.esc_state = .ss3;
+                } else if (b == 0x1b) {
+                    self.esc_state = .esc;
+                } else {
+                    self.esc_state = .none;
+                }
+                return .pending;
+            },
+            .csi => {
+                self.last_was_cr = false;
+                if (b >= 0x40 and b <= 0x7E) {
+                    self.esc_state = .none;
+                    return .pending;
+                } else if (b == 0x1b) {
+                    self.esc_state = .esc;
+                    return .pending;
+                } else if (b >= 0x20 and b <= 0x3F) {
+                    return .pending;
+                } else {
+                    // Malformed/aborted CSI (e.g. Enter/Ctrl-D): exit CSI and handle `b`.
+                    self.esc_state = .none;
+                }
+            },
+            .ss3 => {
+                self.last_was_cr = false;
+                self.esc_state = .none;
+                return .pending;
+            },
+        }
+
+        // Collapse `\r\n` into a single line submission.
+        if (b == '\n' and self.last_was_cr) {
+            self.last_was_cr = false;
+            return .pending;
+        }
+        self.last_was_cr = false;
+
+        // Multi-byte UTF-8 continuation / lead bytes (`>= 0x80`).
+        if (b >= 0x80) {
+            if ((b & 0xC0) == 0x80) {
+                if (self.utf8_need > 0 and self.utf8_got < self.utf8_need) {
+                    self.utf8_pending[self.utf8_got] = b;
+                    self.utf8_got += 1;
+                    if (self.utf8_got == self.utf8_need) {
+                        const seq = self.utf8_pending[0..self.utf8_need];
+                        self.utf8_need = 0;
+                        self.utf8_got = 0;
+                        const decoded_cp: ?u21 = std.unicode.utf8Decode(seq) catch null;
+                        if (decoded_cp != null) {
+                            if (self.len + seq.len > self.line_buf.len) return error.PromptTooLarge;
+                            @memcpy(self.line_buf[self.len .. self.len + seq.len], seq);
+                            self.len += seq.len;
+                            try out_sink.writeAll(seq);
+                        }
+                    }
+                } else {
+                    self.utf8_need = 0;
+                    self.utf8_got = 0;
+                }
+            } else {
+                if (std.unicode.utf8ByteSequenceLength(b)) |seq_len| {
+                    if (seq_len >= 2 and seq_len <= 4) {
+                        self.utf8_pending[0] = b;
+                        self.utf8_need = @intCast(seq_len);
+                        self.utf8_got = 1;
+                    } else {
+                        self.utf8_need = 0;
+                        self.utf8_got = 0;
+                    }
+                } else |_| {
+                    self.utf8_need = 0;
+                    self.utf8_got = 0;
+                }
+            }
+            return .pending;
+        }
+
+        // Any ASCII byte terminates an incomplete UTF-8 sequence.
+        self.utf8_need = 0;
+        self.utf8_got = 0;
+
+        switch (b) {
+            0x1b => {
+                self.esc_state = .esc;
+                return .pending;
+            },
+            '\r', '\n' => {
+                self.last_was_cr = (b == '\r');
+                self.esc_state = .none;
+                try out_sink.writeAll("\n");
+                const submitted = self.line_buf[0..self.len];
+                self.len = 0;
+                return .{ .line = submitted };
+            },
+            0x08, 0x7f => {
+                if (self.len > 0) {
+                    const res = popLastGrapheme(self.line_buf[0..self.len]);
+                    self.len = res.new_len;
+                    try emitEraseCols(out_sink, res.cols);
+                }
+                return .pending;
+            },
+            0x15 => {
+                // Ctrl-U: kill entire line with exact display-column erase.
+                const total_cols = displayWidth(self.line_buf[0..self.len]);
+                self.len = 0;
+                try emitEraseCols(out_sink, total_cols);
+                return .pending;
+            },
+            0x17 => {
+                // Ctrl-W: erase trailing spaces, then preceding word / CJK run.
+                var total_cols: usize = 0;
+                while (self.len > 0 and (self.line_buf[self.len - 1] == ' ' or self.line_buf[self.len - 1] == '\t')) {
+                    const res = popLastGrapheme(self.line_buf[0..self.len]);
+                    self.len = res.new_len;
+                    total_cols += res.cols;
+                }
+                while (self.len > 0 and self.line_buf[self.len - 1] != ' ' and self.line_buf[self.len - 1] != '\t') {
+                    const res = popLastGrapheme(self.line_buf[0..self.len]);
+                    self.len = res.new_len;
+                    total_cols += res.cols;
+                }
+                try emitEraseCols(out_sink, total_cols);
+                return .pending;
+            },
+            0x04 => {
+                // Ctrl-D: EOF on empty line.
+                if (self.len == 0) return .eof;
+                return .pending;
+            },
+            '\t' => {
+                // Normalize tab to 1-column space so backspace column math stays exact.
+                if (self.len >= self.line_buf.len) return error.PromptTooLarge;
+                self.line_buf[self.len] = ' ';
+                self.len += 1;
+                try out_sink.writeAll(" ");
+                return .pending;
+            },
+            0x20...0x7E => {
+                if (self.len >= self.line_buf.len) return error.PromptTooLarge;
+                self.line_buf[self.len] = b;
+                self.len += 1;
+                const one = [1]u8{b};
+                try out_sink.writeAll(&one);
+                return .pending;
+            },
+            else => return .pending,
+        }
+    }
+};
+
+// ---------------------------------------------------------------------------
 // Scrolling Terminal REPL & Non-Interactive `stdin` Pipe Entry Point
 // ---------------------------------------------------------------------------
 
@@ -1198,6 +1523,75 @@ pub fn runReplOrPipe(
 
     // Plain scrolling terminal line-REPL (zero alternate screen!).
     const prompt_str = if (effective_cfg.use_color) "\x1b[1;36m>\x1b[0m " else "> ";
+
+    // On a real interactive TTY, disable Darwin canonical echo (`ICANON | ECHO | IEXTEN`)
+    // and drive `InteractiveLineEditor` so wide CJK/Emoji glyphs erase 2 columns cleanly
+    // instead of macOS's 1-column `\b \b` ghosting. Keep `ISIG` enabled for `Ctrl-C`.
+    if (telemetry.isTty(in_fd) and telemetry.isTty(out_fd)) {
+        var orig_termios: std.c.termios = undefined;
+        if (std.c.tcgetattr(in_fd, &orig_termios) == 0) {
+            var edit_termios = orig_termios;
+            edit_termios.lflag.ICANON = false;
+            edit_termios.lflag.ECHO = false;
+            edit_termios.lflag.IEXTEN = false;
+            edit_termios.lflag.ISIG = true;
+            edit_termios.iflag.ICRNL = true;
+            if (@hasField(@TypeOf(edit_termios.iflag), "IUTF8")) {
+                edit_termios.iflag.IUTF8 = true;
+            }
+            edit_termios.cc[@backingInt(std.c.V.MIN)] = 1;
+            edit_termios.cc[@backingInt(std.c.V.TIME)] = 0;
+
+            if (std.c.tcsetattr(in_fd, .NOW, &edit_termios) == 0) {
+                defer _ = std.c.tcsetattr(in_fd, .NOW, &orig_termios);
+                var editor: InteractiveLineEditor = .{ .line_buf = line_buf };
+                var read_buf: [256]u8 = undefined;
+
+                try out_sink.writeAll(prompt_str);
+                while (true) {
+                    const rc = std.c.read(in_fd, read_buf[0..].ptr, read_buf.len);
+                    if (rc < 0) {
+                        if (std.c.errno(rc) == .INTR) continue;
+                        return error.ReadFailed;
+                    }
+                    if (rc == 0) {
+                        try out_sink.writeAll("\n");
+                        if (editor.len > 0) {
+                            _ = try session.handleInteractiveLine(editor.currentLine(), runner, out_sink, out_sink);
+                        }
+                        return;
+                    }
+                    const n: usize = @intCast(rc);
+                    for (read_buf[0..n]) |b| {
+                        switch (try editor.feedByte(b, out_sink)) {
+                            .pending => {},
+                            .eof => {
+                                try out_sink.writeAll("\n");
+                                return;
+                            },
+                            .line => |one_line| {
+                                const outcome = session.handleInteractiveLine(one_line, runner, out_sink, out_sink) catch |err| switch (err) {
+                                    error.UnknownSlashCommand,
+                                    error.EmptyAttachmentPath,
+                                    error.EmptyEditMessage,
+                                    error.NoTurnToRetry,
+                                    error.NoTurnToEdit,
+                                    => blk: {
+                                        try err_sink.print("[error: {s}]\n", .{@errorName(err)});
+                                        break :blk LineOutcome.continued;
+                                    },
+                                    else => return err,
+                                };
+                                if (outcome == .exited) return;
+                                try out_sink.writeAll(prompt_str);
+                            },
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     var pending_len: usize = 0;
 
     try out_sink.writeAll(prompt_str);
@@ -1449,9 +1843,10 @@ test "ChatSession streaming <think> dimming, G14 /image & /video attachments, an
     try std.testing.expect((try cache.entryInfo(turn1_ckpt)).evict_first);
     try std.testing.expect(!(try cache.entryInfo(turn1_full_blk)).evict_first);
 
-    // Verify NO alternate-screen sequence (`\x1b[?1049h`) was emitted, while ANSI dim `\x1b[2m` wrapped `<think>`!
+    // Verify NO alternate-screen sequence (`\x1b[?1049h`) was emitted, while ANSI dim `\x1b[2m` wrapped `<think>`
+    // with clean `\n\n` visual separation before the answer!
     try std.testing.expect(std.mem.indexOf(u8, out_cap.written(), "\x1b[?1049h") == null);
-    try std.testing.expect(std.mem.indexOf(u8, out_cap.written(), "\x1b[2mplan step 1\x1b[0mAnswer: Describe media\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out_cap.written(), "\x1b[2mplan step 1\x1b[0m\n\nAnswer: Describe media\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, info_cap.written(), "tok/s | TTFT 8.5 ms | PrefixCache hit 16/64 tok") != null);
 
     // 2. Run Turn 2 -> must chain from `turn1_ckpt` / `turn1_full_blk` and strip Turn 1's `<think>` from ChatML history!
@@ -1719,4 +2114,177 @@ test "ChatConfig sampling defaults, greedy T=0 parity, and TurnRequest penalty f
     try std.testing.expectApproxEqAbs(@as(f32, 1.12), cap_runner.last_rep, 1e-6);
     try std.testing.expectApproxEqAbs(@as(f32, 0.4), cap_runner.last_pres, 1e-6);
     try std.testing.expectApproxEqAbs(@as(f32, 0.25), cap_runner.last_freq, 1e-6);
+}
+
+test "Inkling 2 TurnStream strips control tags, separates dimmed reasoning, and keeps clean history" {
+    const gpa = std.testing.allocator;
+    const tokens = [_][]const u8{
+        "<|message_model|>",
+        "<|content_thinking|>",
+        "The user asks...",
+        "<|end_message|>",
+        "<|message_model|>",
+        "<|content_text|>",
+        "你好！我是 Inkling。",
+        "<|end_message|>",
+        "<|content_model_end_sampling|>",
+    };
+
+    const InklingRunner = struct {
+        byte_by_byte: bool,
+        fn runTurn(ctx: *anyopaque, _: *const TurnRequest, stream: *TurnStream) Error!TurnStats {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            for (tokens) |tok| {
+                if (self.byte_by_byte) {
+                    for (tok) |b| {
+                        const one = [1]u8{b};
+                        try stream.emitText(&one);
+                    }
+                } else {
+                    try stream.emitText(tok);
+                }
+            }
+            return .{ .prompt_tokens = 12, .generated_tokens = 9 };
+        }
+    };
+
+    for ([_]bool{ false, true }) |byte_mode| {
+        var runner_ctx = InklingRunner{ .byte_by_byte = byte_mode };
+        var cfg = try ChatConfig.parseArgs(&.{"--no-stats"});
+        cfg.chat_template = chat_template.ChatTemplate.preset(.inkling2);
+        cfg.think_display = .dimmed;
+        cfg.use_color = true;
+
+        var sess = try ChatSession.init(gpa, cfg);
+        defer sess.deinit(gpa);
+
+        var out_b = CaptureBuf{};
+        var sum_b = CaptureBuf{};
+        try sess.submitUserTurn(
+            "你好你是什么模型",
+            .{ .ctx = &runner_ctx, .runTurnFn = InklingRunner.runTurn },
+            out_b.sink(),
+            sum_b.sink(),
+        );
+
+        const rendered = out_b.written();
+        try std.testing.expect(std.mem.indexOf(u8, rendered, "<|") == null);
+        try std.testing.expect(std.mem.indexOf(u8, rendered, "|>") == null);
+        try std.testing.expectEqualStrings(
+            "\x1b[2mThe user asks...\x1b[0m\n\n你好！我是 Inkling。\n",
+            rendered,
+        );
+
+        // Session history must contain ONLY the clean assistant answer (no `\n\n`, no tags, no reasoning).
+        try std.testing.expectEqual(@as(usize, 1), sess.turn_count);
+        const turn0 = sess.turns[0];
+        const recorded_assistant = sess.text_pool[turn0.assistant_off .. turn0.assistant_off + turn0.assistant_len];
+        try std.testing.expectEqualStrings("你好！我是 Inkling。", recorded_assistant);
+    }
+}
+
+test "InteractiveLineEditor handles CJK wide-char backspace, emoji, Ctrl-W, Ctrl-U, Ctrl-D, and CSI arrows" {
+    // 1. Display width sanity checks
+    try std.testing.expectEqual(@as(u2, 0), utf8CodepointWidth(0x00));
+    try std.testing.expectEqual(@as(u2, 0), utf8CodepointWidth(0x200D));
+    try std.testing.expectEqual(@as(u2, 0), utf8CodepointWidth(0xFE0F));
+    try std.testing.expectEqual(@as(u2, 0), utf8CodepointWidth(0x0301));
+    try std.testing.expectEqual(@as(u2, 1), utf8CodepointWidth('A'));
+    try std.testing.expectEqual(@as(u2, 1), utf8CodepointWidth(0x303F));
+    try std.testing.expectEqual(@as(u2, 2), utf8CodepointWidth(0x4F60)); // 你
+    try std.testing.expectEqual(@as(u2, 2), utf8CodepointWidth(0x1F680)); // 🚀
+
+    // 2. CJK wide-character Backspace: `"你好"` + `0x7f` -> `"你"` and `\x08\x08  \x08\x08`
+    {
+        var line_buf: [256]u8 = undefined;
+        var editor: InteractiveLineEditor = .{ .line_buf = &line_buf };
+        var out = CaptureBuf{};
+
+        for ("你好") |b| {
+            try std.testing.expectEqual(InteractiveLineEditor.FeedOutcome.pending, try editor.feedByte(b, out.sink()));
+        }
+        try std.testing.expectEqualStrings("你好", editor.currentLine());
+
+        try std.testing.expectEqual(InteractiveLineEditor.FeedOutcome.pending, try editor.feedByte(0x7f, out.sink()));
+        try std.testing.expectEqualStrings("你", editor.currentLine());
+        try std.testing.expect(std.mem.endsWith(u8, out.written(), "\x08\x08  \x08\x08"));
+        try std.testing.expectEqualStrings("你好\x08\x08  \x08\x08", out.written());
+
+        // Backspace again wipes `"你"` and does not underflow on a 3rd Backspace.
+        try std.testing.expectEqual(InteractiveLineEditor.FeedOutcome.pending, try editor.feedByte(0x08, out.sink()));
+        try std.testing.expectEqualStrings("", editor.currentLine());
+        const len_after_second_bs = out.len;
+        try std.testing.expectEqual(InteractiveLineEditor.FeedOutcome.pending, try editor.feedByte(0x7f, out.sink()));
+        try std.testing.expectEqual(len_after_second_bs, out.len);
+    }
+
+    // 3. Mixed ASCII + CJK + Emoji + arrow CSI/SS3 ignore + Ctrl-W + Ctrl-U + CRLF dedup
+    {
+        var line_buf: [256]u8 = undefined;
+        var editor: InteractiveLineEditor = .{ .line_buf = &line_buf };
+        var out = CaptureBuf{};
+
+        // Type `"hi 你好🚀"`, inject arrow keys `\x1b[D`, `\x1b[1;5C`, `\x1bOD`, verify ignored.
+        for ("hi \x1b[D你好\x1b[1;5C🚀\x1bOD") |b| {
+            try std.testing.expectEqual(InteractiveLineEditor.FeedOutcome.pending, try editor.feedByte(b, out.sink()));
+        }
+        try std.testing.expectEqualStrings("hi 你好🚀", editor.currentLine());
+        try std.testing.expectEqualStrings("hi 你好🚀", out.written());
+
+        // Backspace removes 4-byte 🚀 (2 display cols).
+        out.reset();
+        try std.testing.expectEqual(InteractiveLineEditor.FeedOutcome.pending, try editor.feedByte(0x7f, out.sink()));
+        try std.testing.expectEqualStrings("hi 你好", editor.currentLine());
+        try std.testing.expectEqualStrings("\x08\x08  \x08\x08", out.written());
+
+        // Append trailing spaces then Ctrl-W pops `"你好  "` (2 + 4 = 6 cols).
+        for ("  ") |b| {
+            _ = try editor.feedByte(b, out.sink());
+        }
+        out.reset();
+        try std.testing.expectEqual(InteractiveLineEditor.FeedOutcome.pending, try editor.feedByte(0x17, out.sink()));
+        try std.testing.expectEqualStrings("hi ", editor.currentLine());
+        try std.testing.expectEqualStrings("\x08\x08\x08\x08\x08\x08      \x08\x08\x08\x08\x08\x08", out.written());
+
+        // Ctrl-U clears remaining `"hi "` (3 cols).
+        out.reset();
+        try std.testing.expectEqual(InteractiveLineEditor.FeedOutcome.pending, try editor.feedByte(0x15, out.sink()));
+        try std.testing.expectEqualStrings("", editor.currentLine());
+        try std.testing.expectEqualStrings("\x08\x08\x08   \x08\x08\x08", out.written());
+
+        // Type `"测试"`, submit with `\r\n`, ensure single line submission and `\n` is ignored.
+        for ("测试") |b| {
+            _ = try editor.feedByte(b, out.sink());
+        }
+        const cr_outcome = try editor.feedByte('\r', out.sink());
+        switch (cr_outcome) {
+            .line => |s| try std.testing.expectEqualStrings("测试", s),
+            else => return error.TestUnexpectedResult,
+        }
+        try std.testing.expectEqual(InteractiveLineEditor.FeedOutcome.pending, try editor.feedByte('\n', out.sink()));
+
+        // Ctrl-D on empty line returns `.eof`.
+        try std.testing.expectEqual(InteractiveLineEditor.FeedOutcome.eof, try editor.feedByte(0x04, out.sink()));
+    }
+
+    // 4. Combining marks, ZWJ emoji cluster, and malformed UTF-8 fallback in `popLastGrapheme`
+    {
+        // `"e\u{0301}"` (3 bytes, 1 col)
+        const comb = "ae\xcc\x81";
+        const r1 = popLastGrapheme(comb);
+        try std.testing.expectEqual(@as(usize, 1), r1.new_len);
+        try std.testing.expectEqual(@as(usize, 1), r1.cols);
+
+        // `"👨\u{200D}👩"` ZWJ cluster (11 bytes, 2 cols)
+        const zwj = "x\xf0\x9f\x91\xa8\xe2\x80\x8d\xf0\x9f\x91\xa9";
+        const r2 = popLastGrapheme(zwj);
+        try std.testing.expectEqual(@as(usize, 1), r2.new_len);
+        try std.testing.expectEqual(@as(usize, 2), r2.cols);
+
+        // Malformed UTF-8 trailing byte -> 1 byte, 1 col
+        const bad = "a\xff";
+        const r3 = popLastGrapheme(bad);
+        try std.testing.expectEqual(@as(usize, 1), r3.new_len);
+        try std.testing.expectEqual(@as(usize, 1), r3.cols);
+    }
 }

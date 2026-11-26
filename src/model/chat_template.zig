@@ -2246,11 +2246,31 @@ pub const ThinkSplitter = struct {
     const HY4_CLOSE = "</think:opensource>";
     const INKLING_OPEN = "<|content_thinking|>";
     const INKLING_CLOSE = "<|end_message|>";
-    const MAX_TAG_LEN: usize = INKLING_OPEN.len; // 20 bytes
+    const INKLING_MSG_MODEL = "<|message_model|>";
+    const INKLING_CONTENT_TEXT = "<|content_text|>";
+    const INKLING_END_SAMPLING = "<|content_model_end_sampling|>";
+    const INKLING_ENDOFTEXT = "<|endoftext|>";
+    const MAX_TAG_LEN: usize = 32; // >= INKLING_END_SAMPLING.len (30 bytes)
+
+    const TagMatch = enum {
+        none,
+        prefix,
+        open_standard,
+        open_hy4,
+        open_inkling,
+        close_think,
+        swallow_keep_state,
+    };
 
     in_think: bool = false,
     mode: ThinkTagKind = .auto,
     active_kind: ThinkTagKind = .standard,
+    /// When `true` (default), Inkling 2 envelope control tags (`<|message_model|>`,
+    /// `<|content_text|>`, `<|end_message|>`, `<|content_model_end_sampling|>`,
+    /// `<|endoftext|>`) are silently stripped across arbitrary chunk boundaries.
+    /// Set to `false` when a downstream `ToolCallParser` needs `<|message_model|>`
+    /// recipient headers and `<|end_message|>` closers on the `.content` channel.
+    strip_envelope_tags: bool = true,
     pending: [MAX_TAG_LEN]u8 = undefined,
     pending_len: u8 = 0,
 
@@ -2271,6 +2291,7 @@ pub const ThinkSplitter = struct {
         self.mode = mode;
         self.in_think = start_in_think;
         self.active_kind = if (mode == .auto) .standard else mode;
+        self.strip_envelope_tags = true;
         self.pending_len = 0;
     }
 
@@ -2282,22 +2303,72 @@ pub const ThinkSplitter = struct {
         };
     }
 
-    fn matchOpenTagPrefix(self: *const ThinkSplitter, cand: []const u8) enum { none, prefix, exact_standard, exact_hy4, exact_inkling } {
-        const allow_std = (self.mode == .auto or self.mode == .standard);
-        const allow_hy4 = (self.mode == .auto or self.mode == .hy4);
+    inline fn isPrefixOf(tag: []const u8, cand: []const u8) bool {
+        return cand.len < tag.len and std.mem.startsWith(u8, tag, cand);
+    }
+
+    fn matchTag(self: *const ThinkSplitter, cand: []const u8) TagMatch {
         const allow_ink = (self.mode == .auto or self.mode == .inkling2);
+        const strip_ink = allow_ink and self.strip_envelope_tags;
 
-        if (allow_std and std.mem.eql(u8, cand, STANDARD_OPEN)) return .exact_standard;
-        if (allow_hy4 and std.mem.eql(u8, cand, HY4_OPEN)) return .exact_hy4;
-        if (allow_ink and std.mem.eql(u8, cand, INKLING_OPEN)) return .exact_inkling;
+        if (self.in_think) {
+            const ctag = self.activeCloseTag();
+            if (std.mem.eql(u8, cand, ctag)) return .close_think;
 
-        if ((allow_std and cand.len < STANDARD_OPEN.len and std.mem.startsWith(u8, STANDARD_OPEN, cand)) or
-            (allow_hy4 and cand.len < HY4_OPEN.len and std.mem.startsWith(u8, HY4_OPEN, cand)) or
-            (allow_ink and cand.len < INKLING_OPEN.len and std.mem.startsWith(u8, INKLING_OPEN, cand)))
-        {
-            return .prefix;
+            if (strip_ink) {
+                if (std.mem.eql(u8, cand, INKLING_MSG_MODEL)) return .swallow_keep_state;
+                if (std.mem.eql(u8, cand, INKLING_OPEN)) return .open_inkling;
+                if (std.mem.eql(u8, cand, INKLING_CONTENT_TEXT) or
+                    std.mem.eql(u8, cand, INKLING_CLOSE) or
+                    std.mem.eql(u8, cand, INKLING_END_SAMPLING) or
+                    std.mem.eql(u8, cand, INKLING_ENDOFTEXT))
+                {
+                    return .close_think;
+                }
+            }
+
+            if (isPrefixOf(ctag, cand)) return .prefix;
+            if (strip_ink and (isPrefixOf(INKLING_MSG_MODEL, cand) or
+                isPrefixOf(INKLING_OPEN, cand) or
+                isPrefixOf(INKLING_CONTENT_TEXT, cand) or
+                isPrefixOf(INKLING_CLOSE, cand) or
+                isPrefixOf(INKLING_END_SAMPLING, cand) or
+                isPrefixOf(INKLING_ENDOFTEXT, cand)))
+            {
+                return .prefix;
+            }
+            return .none;
+        } else {
+            const allow_std = (self.mode == .auto or self.mode == .standard);
+            const allow_hy4 = (self.mode == .auto or self.mode == .hy4);
+
+            if (allow_std and std.mem.eql(u8, cand, STANDARD_OPEN)) return .open_standard;
+            if (allow_hy4 and std.mem.eql(u8, cand, HY4_OPEN)) return .open_hy4;
+            if (allow_ink and std.mem.eql(u8, cand, INKLING_OPEN)) return .open_inkling;
+            if (strip_ink) {
+                if (std.mem.eql(u8, cand, INKLING_MSG_MODEL)) return .swallow_keep_state;
+                if (std.mem.eql(u8, cand, INKLING_CONTENT_TEXT) or
+                    std.mem.eql(u8, cand, INKLING_CLOSE) or
+                    std.mem.eql(u8, cand, INKLING_END_SAMPLING) or
+                    std.mem.eql(u8, cand, INKLING_ENDOFTEXT))
+                {
+                    return .close_think;
+                }
+            }
+
+            if ((allow_std and isPrefixOf(STANDARD_OPEN, cand)) or
+                (allow_hy4 and isPrefixOf(HY4_OPEN, cand)) or
+                (allow_ink and isPrefixOf(INKLING_OPEN, cand)) or
+                (strip_ink and (isPrefixOf(INKLING_MSG_MODEL, cand) or
+                    isPrefixOf(INKLING_CONTENT_TEXT, cand) or
+                    isPrefixOf(INKLING_CLOSE, cand) or
+                    isPrefixOf(INKLING_END_SAMPLING, cand) or
+                    isPrefixOf(INKLING_ENDOFTEXT, cand))))
+            {
+                return .prefix;
+            }
+            return .none;
         }
-        return .none;
     }
 
     pub fn feed(
@@ -2323,59 +2394,51 @@ pub const ThinkSplitter = struct {
                 }
             } else {
                 const b = chunk[i];
-                if (self.in_think) {
-                    const ctag = self.activeCloseTag();
-                    if (b == ctag[self.pending_len]) {
-                        self.pending[self.pending_len] = b;
-                        self.pending_len += 1;
-                        i += 1;
-                        if (self.pending_len == ctag.len) {
+                if (self.pending_len < MAX_TAG_LEN) {
+                    self.pending[self.pending_len] = b;
+                    const cand = self.pending[0 .. self.pending_len + 1];
+                    switch (self.matchTag(cand)) {
+                        .prefix => {
+                            self.pending_len += 1;
+                            i += 1;
+                        },
+                        .open_standard => {
+                            self.pending_len = 0;
+                            self.in_think = true;
+                            self.active_kind = .standard;
+                            i += 1;
+                        },
+                        .open_hy4 => {
+                            self.pending_len = 0;
+                            self.in_think = true;
+                            self.active_kind = .hy4;
+                            i += 1;
+                        },
+                        .open_inkling => {
+                            self.pending_len = 0;
+                            self.in_think = true;
+                            self.active_kind = .inkling2;
+                            i += 1;
+                        },
+                        .close_think => {
                             self.pending_len = 0;
                             self.in_think = false;
-                        }
-                    } else {
-                        const flushed = self.pending[0..self.pending_len];
-                        self.pending_len = 0;
-                        try emit_fn(ctx, channel, flushed);
+                            i += 1;
+                        },
+                        .swallow_keep_state => {
+                            self.pending_len = 0;
+                            i += 1;
+                        },
+                        .none => {
+                            const flushed = self.pending[0..self.pending_len];
+                            self.pending_len = 0;
+                            try emit_fn(ctx, channel, flushed);
+                        },
                     }
                 } else {
-                    if (self.pending_len < MAX_TAG_LEN) {
-                        self.pending[self.pending_len] = b;
-                        const cand = self.pending[0 .. self.pending_len + 1];
-                        switch (self.matchOpenTagPrefix(cand)) {
-                            .prefix => {
-                                self.pending_len += 1;
-                                i += 1;
-                            },
-                            .exact_standard => {
-                                self.pending_len = 0;
-                                self.in_think = true;
-                                self.active_kind = .standard;
-                                i += 1;
-                            },
-                            .exact_hy4 => {
-                                self.pending_len = 0;
-                                self.in_think = true;
-                                self.active_kind = .hy4;
-                                i += 1;
-                            },
-                            .exact_inkling => {
-                                self.pending_len = 0;
-                                self.in_think = true;
-                                self.active_kind = .inkling2;
-                                i += 1;
-                            },
-                            .none => {
-                                const flushed = self.pending[0..self.pending_len];
-                                self.pending_len = 0;
-                                try emit_fn(ctx, channel, flushed);
-                            },
-                        }
-                    } else {
-                        const flushed = self.pending[0..self.pending_len];
-                        self.pending_len = 0;
-                        try emit_fn(ctx, channel, flushed);
-                    }
+                    const flushed = self.pending[0..self.pending_len];
+                    self.pending_len = 0;
+                    try emit_fn(ctx, channel, flushed);
                 }
             }
         }
@@ -2387,8 +2450,38 @@ pub const ThinkSplitter = struct {
         comptime emit_fn: anytype,
     ) !void {
         if (self.pending_len == 0) return;
-        const channel: StreamChannel = if (self.in_think) .reasoning else .content;
         const flushed = self.pending[0..self.pending_len];
+        switch (self.matchTag(flushed)) {
+            .open_standard => {
+                self.pending_len = 0;
+                self.in_think = true;
+                self.active_kind = .standard;
+                return;
+            },
+            .open_hy4 => {
+                self.pending_len = 0;
+                self.in_think = true;
+                self.active_kind = .hy4;
+                return;
+            },
+            .open_inkling => {
+                self.pending_len = 0;
+                self.in_think = true;
+                self.active_kind = .inkling2;
+                return;
+            },
+            .close_think => {
+                self.pending_len = 0;
+                self.in_think = false;
+                return;
+            },
+            .swallow_keep_state => {
+                self.pending_len = 0;
+                return;
+            },
+            .prefix, .none => {},
+        }
+        const channel: StreamChannel = if (self.in_think) .reasoning else .content;
         self.pending_len = 0;
         try emit_fn(ctx, channel, flushed);
     }
@@ -2596,4 +2689,85 @@ test "ChatTemplate declarative JSON parsing, custom delimiters, and ThinkSplitte
     try sp.flush(&c2, Cap.emit);
     try std.testing.expectEqualStrings("plan</think>2", c2.reason[0..c2.r_len]);
     try std.testing.expectEqualStrings("prepost", c2.content[0..c2.c_len]);
+}
+
+test "ThinkSplitter strips Inkling 2 envelope control tags across token and byte boundaries" {
+    const Cap = struct {
+        reason: [256]u8 = undefined,
+        r_len: usize = 0,
+        content: [256]u8 = undefined,
+        c_len: usize = 0,
+        fn emit(self: *@This(), ch: StreamChannel, s: []const u8) error{BufferTooSmall}!void {
+            switch (ch) {
+                .reasoning => {
+                    if (self.r_len + s.len > self.reason.len) return error.BufferTooSmall;
+                    @memcpy(self.reason[self.r_len .. self.r_len + s.len], s);
+                    self.r_len += s.len;
+                },
+                .content => {
+                    if (self.c_len + s.len > self.content.len) return error.BufferTooSmall;
+                    @memcpy(self.content[self.c_len .. self.c_len + s.len], s);
+                    self.c_len += s.len;
+                },
+            }
+        }
+    };
+
+    const tokens = [_][]const u8{
+        "<|message_model|>",
+        "<|content_thinking|>",
+        "The user asks...",
+        "<|end_message|>",
+        "<|message_model|>",
+        "<|content_text|>",
+        "你好！我是 Inkling。",
+        "<|end_message|>",
+        "<|content_model_end_sampling|>",
+    };
+
+    // Check both `.inkling2` and `.auto` modes, fed token-by-token and byte-by-byte.
+    for ([_]ThinkTagKind{ .inkling2, .auto }) |mode| {
+        // Token-by-token
+        {
+            var sp: ThinkSplitter = .{};
+            sp.resetWithMode(mode, false);
+            var cap: Cap = .{};
+            for (tokens) |tok| {
+                try sp.feed(tok, &cap, Cap.emit);
+            }
+            try sp.flush(&cap, Cap.emit);
+            try std.testing.expectEqualStrings("The user asks...", cap.reason[0..cap.r_len]);
+            try std.testing.expectEqualStrings("你好！我是 Inkling。", cap.content[0..cap.c_len]);
+            try std.testing.expect(std.mem.indexOf(u8, cap.reason[0..cap.r_len], "<|") == null);
+            try std.testing.expect(std.mem.indexOf(u8, cap.content[0..cap.c_len], "<|") == null);
+        }
+
+        // Byte-by-byte
+        {
+            var sp: ThinkSplitter = .{};
+            sp.resetWithMode(mode, false);
+            var cap: Cap = .{};
+            for (tokens) |tok| {
+                for (tok) |b| {
+                    const one = [1]u8{b};
+                    try sp.feed(&one, &cap, Cap.emit);
+                }
+            }
+            try sp.flush(&cap, Cap.emit);
+            try std.testing.expectEqualStrings("The user asks...", cap.reason[0..cap.r_len]);
+            try std.testing.expectEqualStrings("你好！我是 Inkling。", cap.content[0..cap.c_len]);
+        }
+    }
+
+    // Also verify `<|message_model|>` inside thinking preserves `in_think`, `<|endoftext|>` is swallowed,
+    // and incomplete non-tag prefix at EOF flushes verbatim.
+    {
+        var sp: ThinkSplitter = .{};
+        sp.resetForDialect(.inkling2, false);
+        var cap: Cap = .{};
+        try sp.feed("<|content_thinking|>stepA<|message_model|>stepB<|content_text|>ok<|endoftext|><|mes", &cap, Cap.emit);
+        try sp.flush(&cap, Cap.emit);
+        try std.testing.expectEqualStrings("stepAstepB", cap.reason[0..cap.r_len]);
+        try std.testing.expectEqualStrings("ok<|mes", cap.content[0..cap.c_len]);
+    }
 }
