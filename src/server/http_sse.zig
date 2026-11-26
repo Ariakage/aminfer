@@ -35,6 +35,7 @@ const qos = @import("../platform/qos.zig");
 const chat_template = @import("../model/chat_template.zig");
 const amf = @import("../format/amf.zig");
 const lora_mod = @import("../model/lora.zig");
+const tls_mod = @import("../bridge/tls.zig");
 const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
 const Sha256 = std.crypto.hash.sha2.Sha256;
 
@@ -115,7 +116,7 @@ pub const Error = error{
     ThreadSpawnFailed,
     AlreadyStarted,
     RingInitFailed,
-};
+} || tls_mod.TlsError;
 
 pub const ParseError = error{
     InvalidJson,
@@ -581,6 +582,12 @@ pub fn percentDecodeUrlPath(
     return out[0..out_len];
 }
 
+pub const ServerTlsConfig = struct {
+    cert_bytes: []const u8,
+    key_bytes: ?[]const u8 = null,
+    passphrase: ?[]const u8 = null,
+};
+
 pub const ServerConfig = struct {
     host: [4]u8 = .{ 127, 0, 0, 1 },
     /// `0` binds an ephemeral loopback port; read back via `server.boundPort()`.
@@ -642,6 +649,8 @@ pub const ServerConfig = struct {
     model_detail: ?ModelDetailMeta = null,
     /// Optional mounted LoRA adapter metadata reported alongside the base model (`C28`).
     lora_adapters: []const LoraAdapterMeta = &.{},
+    /// Optional native macOS `Network.framework` TLS 1.2/1.3 listener configuration (`C18`).
+    tls: ?ServerTlsConfig = null,
 };
 
 /// Parses a dotted-quad IPv4 address string (e.g. `"127.0.0.1"`, `"0.0.0.0"`).
@@ -5710,6 +5719,7 @@ pub const Server = struct {
     kq_fd: std.c.fd_t,
     worker_kq_fd: std.c.fd_t,
     listen_fd: std.c.fd_t,
+    tls_listener: ?tls_mod.TlsListener,
     unix_listen_fd: std.c.fd_t,
     bound_port: u16,
 
@@ -6043,47 +6053,85 @@ pub const Server = struct {
         try setCloexec(worker_kq_fd);
         try registerUserWakeup(worker_kq_fd, WORKER_IDENT_WAKEUP, WORKER_IDENT_WAKEUP);
 
-        // Open, configure, bind, and listen on the non-blocking TCP socket.
-        const listen_fd = std.c.socket(std.c.AF.INET, std.c.SOCK.STREAM, 0);
-        if (listen_fd < 0) return error.SocketFailed;
-        errdefer _ = std.c.close(listen_fd);
-
-        try setCloexec(listen_fd);
-        try setNonBlocking(listen_fd);
-        try setSockOptInt(listen_fd, std.c.SOL.SOCKET, std.c.SO.REUSEADDR, 1);
-        try setSockOptInt(listen_fd, std.c.SOL.SOCKET, std.c.SO.NOSIGPIPE, 1);
-
-        var addr = std.c.sockaddr.in{
-            .port = std.mem.nativeToBig(u16, config.port),
-            .addr = @bitCast(config.host),
-        };
-        if (std.c.bind(listen_fd, @ptrCast(&addr), @sizeOf(std.c.sockaddr.in)) != 0) {
-            return error.BindFailed;
+        // Open either the native TLS 1.2/1.3 listener (`Network.framework`) or the
+        // plain non-blocking TCP socket and register it on `kq_fd` under `UDATA_LISTEN`.
+        var listen_fd: std.c.fd_t = -1;
+        var tls_listener: ?tls_mod.TlsListener = null;
+        var bound_port: u16 = 0;
+        errdefer {
+            if (listen_fd >= 0) _ = std.c.close(listen_fd);
+            if (tls_listener) |tl| tl.deinit();
         }
-        if (std.c.listen(listen_fd, config.backlog) != 0) {
-            return error.ListenFailed;
-        }
-
-        var bound_addr: std.c.sockaddr.in = std.mem.zeroes(std.c.sockaddr.in);
-        var bound_len: std.c.socklen_t = @sizeOf(std.c.sockaddr.in);
-        if (std.c.getsockname(listen_fd, @ptrCast(&bound_addr), &bound_len) != 0) {
-            return error.GetSockNameFailed;
-        }
-        const bound_port = std.mem.bigToNative(u16, bound_addr.port);
-
-        // Register TCP listening socket on `kq_fd`.
-        const listen_ev = [1]std.c.kevent64_s{.{
-            .ident = @intCast(listen_fd),
-            .filter = std.c.EVFILT.READ,
-            .flags = std.c.EV.ADD | std.c.EV.ENABLE,
-            .fflags = 0,
-            .data = 0,
-            .udata = UDATA_LISTEN,
-            .ext = .{ 0, 0 },
-        }};
         var empty: [1]std.c.kevent64_s = .{std.mem.zeroes(std.c.kevent64_s)};
-        if (std.c.kevent64(kq_fd, &listen_ev, 1, &empty, 0, std.c.KEVENT.FLAG.NONE, null) < 0) {
-            return error.KeventFailed;
+
+        if (config.tls) |tcfg| {
+            var tls_lis = try tls_mod.TlsListener.init(.{
+                .host_ipv4 = config.host,
+                .port = config.port,
+                .backlog = @intCast(@min(config.backlog, std.math.maxInt(u16))),
+                .cert_bytes = tcfg.cert_bytes,
+                .key_bytes = tcfg.key_bytes,
+                .passphrase = tcfg.passphrase,
+            });
+            errdefer tls_lis.deinit();
+
+            const notify_fd = tls_lis.notifyFd();
+            if (notify_fd < 0) return error.KeventFailed;
+            const listen_ev = [1]std.c.kevent64_s{.{
+                .ident = @intCast(notify_fd),
+                .filter = std.c.EVFILT.READ,
+                .flags = std.c.EV.ADD | std.c.EV.ENABLE,
+                .fflags = 0,
+                .data = 0,
+                .udata = UDATA_LISTEN,
+                .ext = .{ 0, 0 },
+            }};
+            if (std.c.kevent64(kq_fd, &listen_ev, 1, &empty, 0, std.c.KEVENT.FLAG.NONE, null) < 0) {
+                return error.KeventFailed;
+            }
+            bound_port = tls_lis.boundPort();
+            tls_listener = tls_lis;
+        } else {
+            const tcp_fd = std.c.socket(std.c.AF.INET, std.c.SOCK.STREAM, 0);
+            if (tcp_fd < 0) return error.SocketFailed;
+            listen_fd = tcp_fd;
+
+            try setCloexec(tcp_fd);
+            try setNonBlocking(tcp_fd);
+            try setSockOptInt(tcp_fd, std.c.SOL.SOCKET, std.c.SO.REUSEADDR, 1);
+            try setSockOptInt(tcp_fd, std.c.SOL.SOCKET, std.c.SO.NOSIGPIPE, 1);
+
+            var addr = std.c.sockaddr.in{
+                .port = std.mem.nativeToBig(u16, config.port),
+                .addr = @bitCast(config.host),
+            };
+            if (std.c.bind(tcp_fd, @ptrCast(&addr), @sizeOf(std.c.sockaddr.in)) != 0) {
+                return error.BindFailed;
+            }
+            if (std.c.listen(tcp_fd, config.backlog) != 0) {
+                return error.ListenFailed;
+            }
+
+            var bound_addr: std.c.sockaddr.in = std.mem.zeroes(std.c.sockaddr.in);
+            var bound_len: std.c.socklen_t = @sizeOf(std.c.sockaddr.in);
+            if (std.c.getsockname(tcp_fd, @ptrCast(&bound_addr), &bound_len) != 0) {
+                return error.GetSockNameFailed;
+            }
+            bound_port = std.mem.bigToNative(u16, bound_addr.port);
+
+            // Register TCP listening socket on `kq_fd`.
+            const listen_ev = [1]std.c.kevent64_s{.{
+                .ident = @intCast(tcp_fd),
+                .filter = std.c.EVFILT.READ,
+                .flags = std.c.EV.ADD | std.c.EV.ENABLE,
+                .fflags = 0,
+                .data = 0,
+                .udata = UDATA_LISTEN,
+                .ext = .{ 0, 0 },
+            }};
+            if (std.c.kevent64(kq_fd, &listen_ev, 1, &empty, 0, std.c.KEVENT.FLAG.NONE, null) < 0) {
+                return error.KeventFailed;
+            }
         }
 
         // Optional `AF_UNIX` local IPC socket (`--unix-socket <path>`, `C18`) on the same kqueue!
@@ -6186,6 +6234,7 @@ pub const Server = struct {
         var stored_config = config;
         stored_config.model_detail = null;
         stored_config.lora_adapters = &.{};
+        stored_config.tls = null;
 
         self.* = .{
             .config = stored_config,
@@ -6205,6 +6254,7 @@ pub const Server = struct {
             .kq_fd = kq_fd,
             .worker_kq_fd = worker_kq_fd,
             .listen_fd = listen_fd,
+            .tls_listener = tls_listener,
             .unix_listen_fd = unix_listen_fd,
             .bound_port = bound_port,
             .arena_slab = arena_slab,
@@ -6270,6 +6320,10 @@ pub const Server = struct {
             }
             slot.state = .free;
         }
+        if (self.tls_listener) |*tl| {
+            tl.deinit();
+            self.tls_listener = null;
+        }
         if (self.listen_fd >= 0) {
             _ = std.c.close(self.listen_fd);
             self.listen_fd = -1;
@@ -6309,6 +6363,10 @@ pub const Server = struct {
 
     pub fn boundPort(self: *const Server) u16 {
         return self.bound_port;
+    }
+
+    pub fn isTlsEnabled(self: *const Server) bool {
+        return self.tls_listener != null;
     }
 
     pub fn unixSocketPath(self: *const Server) ?[]const u8 {
@@ -6815,7 +6873,11 @@ pub const Server = struct {
         var need_ring_drain = false;
         for (self.events[0..count]) |ev| {
             if (ev.udata == UDATA_LISTEN) {
-                self.acceptPendingConnectionsOn(self.listen_fd, true);
+                if (self.tls_listener) |*tl| {
+                    self.acceptPendingTlsConnections(tl);
+                } else {
+                    self.acceptPendingConnectionsOn(self.listen_fd, true);
+                }
             } else if (ev.udata == UDATA_UNIX_LISTEN) {
                 self.acceptPendingConnectionsOn(self.unix_listen_fd, false);
             } else if (ev.udata == UDATA_WAKEUP) {
@@ -6866,6 +6928,47 @@ pub const Server = struct {
         return null;
     }
 
+    fn admitAcceptedClientFd(self: *Server, client_fd: std.c.fd_t) void {
+        const slot = self.findFreeSlot() orelse {
+            // Connection pool completely saturated: best-effort zero-alloc 503 + graceful half-close.
+            _ = self.rejected_503_count.fetchAdd(1, .monotonic);
+            _ = std.c.send(client_fd, STATIC_503_RESPONSE.ptr, STATIC_503_RESPONSE.len, 0);
+            _ = std.c.shutdown(client_fd, std.c.SHUT.WR);
+            var drain_sink: [512]u8 = undefined;
+            _ = std.c.recv(client_fd, &drain_sink, drain_sink.len, 0);
+            _ = std.c.close(client_fd);
+            return;
+        };
+
+        slot.resetForConnection(client_fd);
+        _ = self.active_conns.fetchAdd(1, .acq_rel);
+
+        const reg = [1]std.c.kevent64_s{.{
+            .ident = @intCast(client_fd),
+            .filter = std.c.EVFILT.READ,
+            .flags = std.c.EV.ADD | std.c.EV.ENABLE,
+            .fflags = 0,
+            .data = 0,
+            .udata = slot.index,
+            .ext = .{ 0, 0 },
+        }};
+        var empty: [1]std.c.kevent64_s = .{std.mem.zeroes(std.c.kevent64_s)};
+        const rc = std.c.kevent64(self.kq_fd, &reg, 1, &empty, 0, std.c.KEVENT.FLAG.NONE, null);
+        if (rc < 0) {
+            self.closeSlotSocketAndRelease(slot, false);
+        }
+    }
+
+    fn acceptPendingTlsConnections(self: *Server, tl: *tls_mod.TlsListener) void {
+        while (true) {
+            const client_fd = (tl.popAcceptedFd() catch return) orelse return;
+            // Accepted TLS bridge fd is already an AF_UNIX SOCK_STREAM socketpair with
+            // FD_CLOEXEC, O_NONBLOCK, and SO_NOSIGPIPE configured by `apple_bridge.m`;
+            // do NOT apply TCP_NODELAY to it.
+            self.admitAcceptedClientFd(client_fd);
+        }
+    }
+
     fn acceptPendingConnectionsOn(self: *Server, listen_fd: std.c.fd_t, is_tcp: bool) void {
         if (listen_fd < 0) return;
         while (true) {
@@ -6896,35 +6999,7 @@ pub const Server = struct {
                 };
             }
 
-            const slot = self.findFreeSlot() orelse {
-                // Connection pool completely saturated: best-effort zero-alloc 503 + graceful half-close.
-                _ = self.rejected_503_count.fetchAdd(1, .monotonic);
-                _ = std.c.send(client_fd, STATIC_503_RESPONSE.ptr, STATIC_503_RESPONSE.len, 0);
-                _ = std.c.shutdown(client_fd, std.c.SHUT.WR);
-                var drain_sink: [512]u8 = undefined;
-                _ = std.c.recv(client_fd, &drain_sink, drain_sink.len, 0);
-                _ = std.c.close(client_fd);
-                continue;
-            };
-
-            slot.resetForConnection(client_fd);
-            _ = self.active_conns.fetchAdd(1, .acq_rel);
-
-            const reg = [1]std.c.kevent64_s{.{
-                .ident = @intCast(client_fd),
-                .filter = std.c.EVFILT.READ,
-                .flags = std.c.EV.ADD | std.c.EV.ENABLE,
-                .fflags = 0,
-                .data = 0,
-                .udata = slot.index,
-                .ext = .{ 0, 0 },
-            }};
-            var empty: [1]std.c.kevent64_s = .{std.mem.zeroes(std.c.kevent64_s)};
-            const rc = std.c.kevent64(self.kq_fd, &reg, 1, &empty, 0, std.c.KEVENT.FLAG.NONE, null);
-            if (rc < 0) {
-                self.closeSlotSocketAndRelease(slot, false);
-                continue;
-            }
+            self.admitAcceptedClientFd(client_fd);
         }
     }
 
@@ -14394,5 +14469,556 @@ test "C28 GET /v1/models (>4096 B) and GET /v1/models/{id} with LoRA adapters, p
         malloc_zone_statistics(null, &m_after);
         try std.testing.expect(m_after.blocks_in_use <= m_before.blocks_in_use);
         try std.testing.expect(m_after.size_in_use <= m_before.size_in_use);
+    }
+}
+
+fn testRunCmdChecked(allocator: std.mem.Allocator, io: std.Io, argv: []const []const u8) !void {
+    const res = try std.process.run(allocator, io, .{
+        .argv = argv,
+        .stdout_limit = .limited(64 * 1024),
+        .stderr_limit = .limited(64 * 1024),
+    });
+    defer allocator.free(res.stdout);
+    defer allocator.free(res.stderr);
+    switch (res.term) {
+        .exited => |code| if (code != 0) return error.SubprocessFailed,
+        else => return error.SubprocessFailed,
+    }
+}
+
+fn testNbSendAll(fd: std.c.fd_t, data: []const u8) TestClientError!void {
+    var sent: usize = 0;
+    while (sent < data.len) {
+        const n = std.c.send(fd, data.ptr + sent, data.len - sent, 0);
+        if (n > 0) {
+            sent += @intCast(n);
+            continue;
+        }
+        if (n < 0) {
+            const err = std.c.errno(n);
+            if (err == .INTR) continue;
+            if (err == .AGAIN) {
+                var pfd = [1]std.c.pollfd{.{ .fd = fd, .events = std.c.POLL.OUT, .revents = 0 }};
+                if (std.c.poll(&pfd, 1, 5000) <= 0) return error.SendFailed;
+                continue;
+            }
+        }
+        return error.SendFailed;
+    }
+}
+
+fn testNbRecvAll(fd: std.c.fd_t, out_buf: []u8) TestClientError![]const u8 {
+    var total: usize = 0;
+    while (true) {
+        if (total >= out_buf.len) return error.BufferTooSmall;
+        const n = std.c.recv(fd, out_buf.ptr + total, out_buf.len - total, 0);
+        if (n > 0) {
+            total += @intCast(n);
+            continue;
+        }
+        if (n == 0) return out_buf[0..total];
+        const err = std.c.errno(n);
+        if (err == .INTR) continue;
+        if (err == .AGAIN) {
+            var pfd = [1]std.c.pollfd{.{ .fd = fd, .events = std.c.POLL.IN, .revents = 0 }};
+            if (std.c.poll(&pfd, 1, 5000) <= 0) return error.RecvFailed;
+            continue;
+        }
+        return error.RecvFailed;
+    }
+}
+
+fn testNbRecvOneHttpResponse(fd: std.c.fd_t, out_buf: []u8) TestClientError![]const u8 {
+    var total: usize = 0;
+    var expected_end: ?usize = null;
+    while (true) {
+        if (expected_end) |ee| {
+            if (total >= ee) return out_buf[0..ee];
+        }
+        if (total >= out_buf.len) return error.BufferTooSmall;
+        const n = std.c.recv(fd, out_buf.ptr + total, out_buf.len - total, 0);
+        if (n > 0) {
+            total += @intCast(n);
+            if (expected_end == null) {
+                if (std.mem.indexOf(u8, out_buf[0..total], "\r\n\r\n")) |sep| {
+                    const hdr_end = sep + 4;
+                    if (extractHeaderValue(out_buf[0..hdr_end], "Content-Length")) |cl_str| {
+                        const cl = std.fmt.parseInt(usize, cl_str, 10) catch return error.RecvFailed;
+                        expected_end = hdr_end + cl;
+                        if (expected_end.? > out_buf.len) return error.BufferTooSmall;
+                    }
+                }
+            }
+            continue;
+        }
+        if (n == 0) return out_buf[0..total];
+        const err = std.c.errno(n);
+        if (err == .INTR) continue;
+        if (err == .AGAIN) {
+            var pfd = [1]std.c.pollfd{.{ .fd = fd, .events = std.c.POLL.IN, .revents = 0 }};
+            if (std.c.poll(&pfd, 1, 5000) <= 0) return error.RecvFailed;
+            continue;
+        }
+        return error.RecvFailed;
+    }
+}
+
+fn testTlsHttpExchange(
+    port: u16,
+    min_ver: u16,
+    max_ver: u16,
+    raw_request: []const u8,
+    resp_buf: []u8,
+) !struct { resp: []const u8, tls_version: u16 } {
+    const cc = try tls_mod.clientConnectSocketpair(.{ 127, 0, 0, 1 }, port, min_ver, max_ver);
+    defer _ = std.c.close(cc.fd);
+    try testNbSendAll(cc.fd, raw_request);
+    const resp = try testNbRecvOneHttpResponse(cc.fd, resp_buf);
+    return .{ .resp = resp, .tls_version = cc.tls_version };
+}
+
+fn testTlsHttpSsePost(
+    port: u16,
+    min_ver: u16,
+    max_ver: u16,
+    path: []const u8,
+    extra_headers: []const u8,
+    json_body: []const u8,
+    req_buf: []u8,
+    resp_buf: []u8,
+) !struct { resp: []const u8, tls_version: u16 } {
+    var w = FixedWriter.init(req_buf);
+    w.print(
+        "POST {s} HTTP/1.1\r\nHost: 127.0.0.1\r\n{s}Content-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}",
+        .{ path, extra_headers, json_body.len, json_body },
+    ) catch return error.BufferTooSmall;
+    const cc = try tls_mod.clientConnectSocketpair(.{ 127, 0, 0, 1 }, port, min_ver, max_ver);
+    defer _ = std.c.close(cc.fd);
+    try testNbSendAll(cc.fd, w.written());
+    const resp = try testNbRecvAll(cc.fd, resp_buf);
+    return .{ .resp = resp, .tls_version = cc.tls_version };
+}
+
+test "M8.3 HTTPS Server: TLS 1.3/1.2, encrypted PEM & .p12, C28 /v1/models/{id}, SSE, keep-alive, AF_UNIX, 503 saturation, and zero hot-path mallocs" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var threaded_io: std.Io.Threaded = .init(gpa, .{});
+    defer threaded_io.deinit();
+    const io = threaded_io.io();
+
+    const dir = try std.fmt.allocPrint(gpa, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer gpa.free(dir);
+
+    const ec_key = try std.fmt.allocPrint(gpa, "{s}/ec.key.pem", .{dir});
+    defer gpa.free(ec_key);
+    const ec_cert = try std.fmt.allocPrint(gpa, "{s}/ec.cert.pem", .{dir});
+    defer gpa.free(ec_cert);
+    const rsa_key = try std.fmt.allocPrint(gpa, "{s}/rsa.key.pem", .{dir});
+    defer gpa.free(rsa_key);
+    const rsa_cert = try std.fmt.allocPrint(gpa, "{s}/rsa.cert.pem", .{dir});
+    defer gpa.free(rsa_cert);
+    const rsa_enc_key = try std.fmt.allocPrint(gpa, "{s}/rsa.enc.key.pem", .{dir});
+    defer gpa.free(rsa_enc_key);
+    const ec_p12 = try std.fmt.allocPrint(gpa, "{s}/ec.p12", .{dir});
+    defer gpa.free(ec_p12);
+    const uds_path = try std.fmt.allocPrint(gpa, "/tmp/aminfer_m83_tls_{d}.sock", .{std.c.getpid()});
+    defer gpa.free(uds_path);
+
+    try testRunCmdChecked(gpa, io, &.{
+        "/usr/bin/openssl", "ecparam", "-name", "prime256v1", "-genkey", "-noout", "-out", ec_key,
+    });
+    try testRunCmdChecked(gpa, io, &.{
+        "/usr/bin/openssl", "req", "-x509", "-new", "-key", ec_key, "-subj", "/CN=127.0.0.1", "-days", "1", "-out", ec_cert,
+    });
+    try testRunCmdChecked(gpa, io, &.{
+        "/usr/bin/openssl", "req",           "-x509", "-newkey", "rsa:2048", "-nodes",
+        "-subj",            "/CN=127.0.0.1", "-days", "1",       "-keyout",  rsa_key,
+        "-out",             rsa_cert,
+    });
+    try testRunCmdChecked(gpa, io, &.{
+        "/usr/bin/openssl", "pkcs8", "-topk8", "-v2", "aes256", "-in", rsa_key, "-passout", "pass:m83-p8-pass", "-out", rsa_enc_key,
+    });
+    try testRunCmdChecked(gpa, io, &.{
+        "/usr/bin/openssl", "pkcs12", "-export", "-in", ec_cert, "-inkey", ec_key, "-passout", "pass:m83-p12-pass", "-out", ec_p12,
+    });
+
+    const Mock = struct {
+        fn generate(_: *anyopaque, _: *const InferenceJob, stream: *TokenStream) void {
+            _ = stream.setPromptTokens(6);
+            if (!stream.emitText("<think>plan</think>Hello TLS!", 4)) return;
+            stream.finish(.stop, 6);
+        }
+    };
+    var dummy: u8 = 0;
+    var req_buf: [4096]u8 = undefined;
+    var resp_buf: [32768]u8 = undefined;
+
+    // 1. Encrypted PKCS#8 PEM & .p12 error propagation + successful TLS 1.3 handshake via Server.
+    {
+        var enc_files = try tls_mod.loadFiles(gpa, rsa_cert, rsa_enc_key);
+        defer enc_files.deinit(gpa);
+
+        try std.testing.expectError(error.TlsPassphraseRequired, Server.init(gpa, .{
+            .port = 0,
+            .tls = .{ .cert_bytes = enc_files.cert_bytes, .key_bytes = enc_files.key_bytes, .passphrase = null },
+            .apply_qos = false,
+        }));
+        try std.testing.expectError(error.TlsIdentityInvalid, Server.init(gpa, .{
+            .port = 0,
+            .tls = .{ .cert_bytes = enc_files.cert_bytes, .key_bytes = enc_files.key_bytes, .passphrase = "wrong-pass" },
+            .apply_qos = false,
+        }));
+
+        const srv_p8 = try Server.init(gpa, .{
+            .port = 0,
+            .max_conns = 4,
+            .max_active_requests = 2,
+            .tls = .{ .cert_bytes = enc_files.cert_bytes, .key_bytes = enc_files.key_bytes, .passphrase = "m83-p8-pass" },
+            .apply_qos = false,
+        });
+        defer srv_p8.deinit(gpa);
+        try std.testing.expect(srv_p8.isTlsEnabled());
+        try srv_p8.start(.{ .ctx = &dummy, .generateFn = Mock.generate });
+        defer srv_p8.stop();
+
+        const ex = try testTlsHttpExchange(
+            srv_p8.boundPort(),
+            tls_mod.TLS_VERSION_1_3,
+            tls_mod.TLS_VERSION_1_3,
+            "GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+            &resp_buf,
+        );
+        try std.testing.expectEqual(tls_mod.TLS_VERSION_1_3, ex.tls_version);
+        try std.testing.expect(std.mem.startsWith(u8, ex.resp, "HTTP/1.1 200 OK\r\n"));
+        try std.testing.expect(std.mem.indexOf(u8, ex.resp, "\"status\":\"ok\"") != null);
+    }
+
+    {
+        var p12_files = try tls_mod.loadFiles(gpa, ec_p12, null);
+        defer p12_files.deinit(gpa);
+
+        try std.testing.expectError(error.TlsPassphraseRequired, Server.init(gpa, .{
+            .port = 0,
+            .tls = .{ .cert_bytes = p12_files.cert_bytes, .key_bytes = null, .passphrase = null },
+            .apply_qos = false,
+        }));
+        try std.testing.expectError(error.TlsIdentityInvalid, Server.init(gpa, .{
+            .port = 0,
+            .tls = .{ .cert_bytes = p12_files.cert_bytes, .key_bytes = null, .passphrase = "bad-p12" },
+            .apply_qos = false,
+        }));
+
+        const srv_p12 = try Server.init(gpa, .{
+            .port = 0,
+            .max_conns = 4,
+            .max_active_requests = 2,
+            .tls = .{ .cert_bytes = p12_files.cert_bytes, .key_bytes = null, .passphrase = "m83-p12-pass" },
+            .apply_qos = false,
+        });
+        defer srv_p12.deinit(gpa);
+        try std.testing.expect(srv_p12.isTlsEnabled());
+        try srv_p12.start(.{ .ctx = &dummy, .generateFn = Mock.generate });
+        defer srv_p12.stop();
+
+        const ex = try testTlsHttpExchange(
+            srv_p12.boundPort(),
+            tls_mod.TLS_VERSION_1_3,
+            tls_mod.TLS_VERSION_1_3,
+            "GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+            &resp_buf,
+        );
+        try std.testing.expectEqual(tls_mod.TLS_VERSION_1_3, ex.tls_version);
+        try std.testing.expect(std.mem.startsWith(u8, ex.resp, "HTTP/1.1 200 OK\r\n"));
+    }
+
+    // 2. Full EC P-256 HTTPS Server + api_key + AF_UNIX + model_detail + 8 LoRA adapters.
+    var ec_files = try tls_mod.loadFiles(gpa, ec_cert, ec_key);
+    defer ec_files.deinit(gpa);
+
+    const adp_suffixes = [_][]const u8{
+        "sql-r8",         "code-python-r16", "rust-systems-r8", "zig-metal-r16",
+        "finance-qa-r32", "medical-en-r16",  "legal-zh-r8",     "math-proof-r16",
+    };
+    var adps: [8]LoraAdapterMeta = undefined;
+    for (adp_suffixes, 0..) |nm, idx| {
+        adps[idx] = .{
+            .name = nm,
+            .rank = 8,
+            .lora_alpha = 16.0,
+            .scale = 2.0,
+            .wired_bytes = @as(u64, 65536) * (idx + 1),
+        };
+    }
+
+    const srv = try Server.init(gpa, .{
+        .port = 0,
+        .model_id = "unsloth/inkling-2-mini",
+        .wired_mib = 4096,
+        .api_key = "sk-m83-https",
+        .unix_socket_path = uds_path,
+        .model_detail = .{
+            .architecture = "inkling2_moe",
+            .max_model_len = 65536,
+            .vocab_size = 151936,
+            .effective_bits_per_weight = 4.25,
+            .wired_mib = 4096,
+            .cold_bytes = 0,
+            .capabilities = .{ .reasoning = true, .moe = true, .lora = true },
+        },
+        .lora_adapters = &adps,
+        .tls = .{ .cert_bytes = ec_files.cert_bytes, .key_bytes = ec_files.key_bytes },
+        .max_conns = 8,
+        .max_active_requests = 4,
+        .apply_qos = false,
+    });
+    defer srv.deinit(gpa);
+    try std.testing.expect(srv.isTlsEnabled());
+    try std.testing.expectEqualStrings(uds_path, srv.unixSocketPath().?);
+    try srv.start(.{ .ctx = &dummy, .generateFn = Mock.generate });
+    defer srv.stop();
+
+    const port = srv.boundPort();
+
+    // 2a. TLS 1.3 (0x0304) and forced TLS 1.2 (0x0303) route matrix.
+    for ([_]u16{ tls_mod.TLS_VERSION_1_3, tls_mod.TLS_VERSION_1_2 }) |ver| {
+        const r_health = try testTlsHttpExchange(
+            port,
+            ver,
+            ver,
+            "GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+            &resp_buf,
+        );
+        try std.testing.expectEqual(ver, r_health.tls_version);
+        try std.testing.expect(std.mem.startsWith(u8, r_health.resp, "HTTP/1.1 200 OK\r\n"));
+
+        const r_models = try testTlsHttpExchange(
+            port,
+            ver,
+            ver,
+            "GET /v1/models HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer sk-m83-https\r\nConnection: close\r\n\r\n",
+            &resp_buf,
+        );
+        try std.testing.expectEqual(ver, r_models.tls_version);
+        try std.testing.expect(std.mem.startsWith(u8, r_models.resp, "HTTP/1.1 200 OK\r\n"));
+        const body_models = extractHttpBody(r_models.resp) orelse return error.TestUnexpectedResult;
+        try std.testing.expect(body_models.len > 4096);
+        try expectValidJson(body_models);
+
+        const r_base = try testTlsHttpExchange(
+            port,
+            ver,
+            ver,
+            "GET /v1/models/unsloth%2Finkling-2-mini HTTP/1.1\r\nHost: 127.0.0.1\r\nx-api-key: sk-m83-https\r\nConnection: close\r\n\r\n",
+            &resp_buf,
+        );
+        try std.testing.expect(std.mem.startsWith(u8, r_base.resp, "HTTP/1.1 200 OK\r\n"));
+        try std.testing.expect(std.mem.indexOf(u8, r_base.resp, "\"id\":\"unsloth/inkling-2-mini\"") != null);
+
+        const r_adp = try testTlsHttpExchange(
+            port,
+            ver,
+            ver,
+            "GET /v1/models/unsloth%2Finkling-2-mini%3Asql-r8 HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer sk-m83-https\r\nConnection: close\r\n\r\n",
+            &resp_buf,
+        );
+        try std.testing.expect(std.mem.startsWith(u8, r_adp.resp, "HTTP/1.1 200 OK\r\n"));
+        try std.testing.expect(std.mem.indexOf(u8, r_adp.resp, "\"id\":\"unsloth/inkling-2-mini:sql-r8\"") != null);
+
+        const r_405 = try testTlsHttpExchange(
+            port,
+            ver,
+            ver,
+            "POST /v1/models/unsloth%2Finkling-2-mini HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer sk-m83-https\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            &resp_buf,
+        );
+        try std.testing.expect(std.mem.startsWith(u8, r_405.resp, "HTTP/1.1 405 Method Not Allowed\r\n"));
+
+        const r_404 = try testTlsHttpExchange(
+            port,
+            ver,
+            ver,
+            "GET /v1/models/unsloth%2Finkling-2-mini%3Anope HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer sk-m83-https\r\nConnection: close\r\n\r\n",
+            &resp_buf,
+        );
+        try std.testing.expect(std.mem.startsWith(u8, r_404.resp, "HTTP/1.1 404 Not Found\r\n"));
+        try std.testing.expect(std.mem.indexOf(u8, r_404.resp, "\"code\":\"model_not_found\"") != null);
+
+        const r_401_missing = try testTlsHttpExchange(
+            port,
+            ver,
+            ver,
+            "GET /v1/models HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+            &resp_buf,
+        );
+        try std.testing.expect(std.mem.startsWith(u8, r_401_missing.resp, "HTTP/1.1 401 Unauthorized\r\n"));
+
+        const r_401_wrong = try testTlsHttpExchange(
+            port,
+            ver,
+            ver,
+            "GET /v1/models HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer sk-wrong\r\nConnection: close\r\n\r\n",
+            &resp_buf,
+        );
+        try std.testing.expect(std.mem.startsWith(u8, r_401_wrong.resp, "HTTP/1.1 401 Unauthorized\r\n"));
+    }
+
+    // 2b. Streaming SSE over HTTPS: /v1/chat/completions, /v1/responses, /v1/messages.
+    {
+        const sse_chat = try testTlsHttpSsePost(
+            port,
+            tls_mod.TLS_VERSION_1_3,
+            tls_mod.TLS_VERSION_1_3,
+            "/v1/chat/completions",
+            "Authorization: Bearer sk-m83-https\r\n",
+            "{\"model\":\"unsloth/inkling-2-mini\",\"stream\":true,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}",
+            &req_buf,
+            &resp_buf,
+        );
+        try std.testing.expect(std.mem.startsWith(u8, sse_chat.resp, "HTTP/1.1 200 OK\r\n"));
+        try std.testing.expect(std.mem.indexOf(u8, sse_chat.resp, "text/event-stream") != null);
+        try std.testing.expect(std.mem.indexOf(u8, sse_chat.resp, "data: [DONE]") != null);
+        _ = try expectValidSseJsonFrames(extractHttpBody(sse_chat.resp).?);
+
+        const sse_resp = try testTlsHttpSsePost(
+            port,
+            tls_mod.TLS_VERSION_1_3,
+            tls_mod.TLS_VERSION_1_3,
+            "/v1/responses",
+            "Authorization: Bearer sk-m83-https\r\n",
+            "{\"model\":\"unsloth/inkling-2-mini\",\"stream\":true,\"input\":\"hi\"}",
+            &req_buf,
+            &resp_buf,
+        );
+        try std.testing.expect(std.mem.startsWith(u8, sse_resp.resp, "HTTP/1.1 200 OK\r\n"));
+        try std.testing.expect(std.mem.indexOf(u8, sse_resp.resp, "event: response.completed") != null);
+        _ = try expectValidSseJsonFrames(extractHttpBody(sse_resp.resp).?);
+
+        const sse_msg = try testTlsHttpSsePost(
+            port,
+            tls_mod.TLS_VERSION_1_3,
+            tls_mod.TLS_VERSION_1_3,
+            "/v1/messages",
+            "x-api-key: sk-m83-https\r\nanthropic-version: 2023-06-01\r\n",
+            "{\"model\":\"unsloth/inkling-2-mini\",\"max_tokens\":32,\"stream\":true,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}",
+            &req_buf,
+            &resp_buf,
+        );
+        try std.testing.expect(std.mem.startsWith(u8, sse_msg.resp, "HTTP/1.1 200 OK\r\n"));
+        try std.testing.expect(std.mem.indexOf(u8, sse_msg.resp, "event: message_stop") != null);
+        _ = try expectValidSseJsonFrames(extractHttpBody(sse_msg.resp).?);
+    }
+
+    // 2c. Keep-alive multi-turn reuse over one TLS 1.3 connection + concurrent AF_UNIX plain HTTP
+    //     + zero steady-state hot-path heap growth check.
+    {
+        const ka = try tls_mod.clientConnectSocketpair(.{ 127, 0, 0, 1 }, port, tls_mod.TLS_VERSION_1_3, tls_mod.TLS_VERSION_1_3);
+        defer _ = std.c.close(ka.fd);
+        try std.testing.expectEqual(tls_mod.TLS_VERSION_1_3, ka.tls_version);
+
+        try testNbSendAll(ka.fd, "GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: keep-alive\r\n\r\n");
+        const ka1 = try testNbRecvOneHttpResponse(ka.fd, &resp_buf);
+        try std.testing.expect(std.mem.startsWith(u8, ka1, "HTTP/1.1 200 OK\r\n"));
+
+        // Concurrent plain HTTP over AF_UNIX while the TLS keep-alive slot is open.
+        {
+            const ufd = try testConnectUnix(uds_path);
+            defer _ = std.c.close(ufd);
+            try testSendAll(ufd, "GET /v1/models HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer sk-m83-https\r\nConnection: close\r\n\r\n");
+            const uresp = try testRecvOneHttpResponse(ufd, &resp_buf);
+            try std.testing.expect(std.mem.startsWith(u8, uresp, "HTTP/1.1 200 OK\r\n"));
+            try std.testing.expect(extractHttpBody(uresp).?.len > 4096);
+        }
+
+        // Reuse the SAME TLS keep-alive fd for /v1/models/{id} and POST /v1/chat/completions.
+        try testNbSendAll(ka.fd, "GET /v1/models/unsloth%2Finkling-2-mini%3Asql-r8 HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer sk-m83-https\r\nConnection: keep-alive\r\n\r\n");
+        const ka2 = try testNbRecvOneHttpResponse(ka.fd, &resp_buf);
+        try std.testing.expect(std.mem.startsWith(u8, ka2, "HTTP/1.1 200 OK\r\n"));
+        try std.testing.expect(std.mem.indexOf(u8, ka2, "\"id\":\"unsloth/inkling-2-mini:sql-r8\"") != null);
+
+        const chat_body = "{\"model\":\"unsloth/inkling-2-mini\",\"stream\":false,\"messages\":[{\"role\":\"user\",\"content\":\"ping\"}]}";
+        var w = FixedWriter.init(&req_buf);
+        try w.print(
+            "POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer sk-m83-https\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: keep-alive\r\n\r\n{s}",
+            .{ chat_body.len, chat_body },
+        );
+        try testNbSendAll(ka.fd, w.written());
+        const ka3 = try testNbRecvOneHttpResponse(ka.fd, &resp_buf);
+        try std.testing.expect(std.mem.startsWith(u8, ka3, "HTTP/1.1 200 OK\r\n"));
+        try std.testing.expect(std.mem.indexOf(u8, ka3, "Hello TLS!") != null);
+
+        // Wait for earlier connections to drain, warm up steady-state TLS keep-alive path,
+        // then verify 0 net hot-path heap growth (up to 3 full passes to absorb any one-time
+        // macOS GCD workqueue thread creation; a real per-request leak fails every pass).
+        while (srv.stats().active_conns > 1 or srv.stats().active_requests > 0) {
+            sleepNs(500_000);
+        }
+        const ka_req = "GET /v1/models/unsloth%2Finkling-2-mini HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer sk-m83-https\r\nConnection: keep-alive\r\n\r\n";
+        for (0..12) |_| {
+            try testNbSendAll(ka.fd, ka_req);
+            const rw = try testNbRecvOneHttpResponse(ka.fd, &resp_buf);
+            try std.testing.expect(std.mem.startsWith(u8, rw, "HTTP/1.1 200 OK\r\n"));
+        }
+        sleepNs(20 * std.time.ns_per_ms);
+
+        var zero_growth_verified = false;
+        var pass_idx: usize = 0;
+        while (pass_idx < 3) : (pass_idx += 1) {
+            var m_before: MallocStatistics = std.mem.zeroes(MallocStatistics);
+            malloc_zone_statistics(null, &m_before);
+            for (0..12) |_| {
+                try testNbSendAll(ka.fd, ka_req);
+                const r = try testNbRecvOneHttpResponse(ka.fd, &resp_buf);
+                try std.testing.expect(std.mem.startsWith(u8, r, "HTTP/1.1 200 OK\r\n"));
+            }
+
+            var m_after: MallocStatistics = std.mem.zeroes(MallocStatistics);
+            var settle_iter: usize = 0;
+            while (settle_iter < 20) : (settle_iter += 1) {
+                sleepNs(10 * std.time.ns_per_ms);
+                malloc_zone_statistics(null, &m_after);
+                if (m_after.blocks_in_use <= m_before.blocks_in_use) {
+                    zero_growth_verified = true;
+                    break;
+                }
+            }
+            if (zero_growth_verified) break;
+        }
+        try std.testing.expect(zero_growth_verified);
+    }
+
+    // 3. 503 pool saturation over HTTPS delivers the complete STATIC_503_RESPONSE without truncation.
+    {
+        const srv_sat = try Server.init(gpa, .{
+            .port = 0,
+            .max_conns = 1,
+            .max_active_requests = 1,
+            .tls = .{ .cert_bytes = ec_files.cert_bytes, .key_bytes = ec_files.key_bytes },
+            .apply_qos = false,
+        });
+        defer srv_sat.deinit(gpa);
+        try srv_sat.start(.{ .ctx = &dummy, .generateFn = Mock.generate });
+        defer srv_sat.stop();
+
+        const sat_port = srv_sat.boundPort();
+        const holder = try tls_mod.clientConnectSocketpair(.{ 127, 0, 0, 1 }, sat_port, tls_mod.TLS_VERSION_1_3, tls_mod.TLS_VERSION_1_3);
+        defer _ = std.c.close(holder.fd);
+        try testNbSendAll(holder.fd, "GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: keep-alive\r\n\r\n");
+        const h_resp = try testNbRecvOneHttpResponse(holder.fd, &resp_buf);
+        try std.testing.expect(std.mem.startsWith(u8, h_resp, "HTTP/1.1 200 OK\r\n"));
+        try std.testing.expectEqual(@as(usize, 1), srv_sat.stats().active_conns);
+
+        const overflow = try tls_mod.clientConnectSocketpair(.{ 127, 0, 0, 1 }, sat_port, tls_mod.TLS_VERSION_1_3, tls_mod.TLS_VERSION_1_3);
+        defer _ = std.c.close(overflow.fd);
+        try testNbSendAll(overflow.fd, "GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
+        const r503 = try testNbRecvAll(overflow.fd, &resp_buf);
+        try std.testing.expectEqualStrings(STATIC_503_RESPONSE, r503);
+        try std.testing.expect(srv_sat.stats().rejected_503_count >= 1);
+
+        // Existing keep-alive holder connection remains healthy after rejecting the 2nd peer.
+        try testNbSendAll(holder.fd, "GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: keep-alive\r\n\r\n");
+        const h_resp2 = try testNbRecvOneHttpResponse(holder.fd, &resp_buf);
+        try std.testing.expect(std.mem.startsWith(u8, h_resp2, "HTTP/1.1 200 OK\r\n"));
     }
 }

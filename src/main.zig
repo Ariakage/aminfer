@@ -89,6 +89,8 @@ const usage =
     \\  bench-m82         run M8.2 Inkling 2 & Hy4 G25 fused kernels, 40/48 SWA KV, IndexCache/IndexPool, LatentMoE, C26 SME2+FP8 Engram, D14 DFlare/DFly2 parity & speedup
     \\  bench-m825        run M8.25 single-frame Inkling 2 parity gate, W8 48-step router-trace capture, and live 24 GB M4 Option A vs Option B A/B benchmark (--models-dir)
     \\                    [-h] [--skip-real] [--bus-bandwidth-gbs F] [--models-dir <dir>]
+    \\  bench-m83         run M8.3 C28 /v1/models/{id} LoRA discovery & native Network.framework TLS 1.2/1.3 HTTPS benchmark
+    \\                    [-h] [--json]
     \\  peer-worker       start a zero-allocation kqueue expert-parallel peer worker (M7 X1-X3)
     \\                    [-hRV] -l|--listen <ip:port> -m|--amf <path> -c|--config <path> -r|--rank N -w|--world-size N
     \\                    [--partition contiguous|round-robin] [--cluster-transport auto|tcp|rdma]
@@ -148,9 +150,10 @@ const usage =
     \\                    [--reasoning-effort <none|no_think|minimal|low|medium|high|xhigh|max|0.0..0.99>]
     \\                    [-S|--strict-live-ram] [--ane-predictor <path>]
     \\                    [-A|--no-ane-predictor] [-n|--max-tokens N] [-e|--ignore-eos] [-V|--no-verify-crc]
-    \\  serve             start the zero-allocation kqueue HTTP/SSE inference server (C7, C8, C14, C15, C18, C21, C22, W19, W24, R10)
+    \\  serve             start the zero-allocation kqueue HTTP/SSE inference server (C7, C8, C14, C15, C18, C21, C22, C28, W19, W24, R10)
     \\                    [-ABEhMNPSV] -m|--amf <path> [-c|--config <path>] [-k|--tokenizer <path>]
     \\                    [-H|--host 127.0.0.1] [-p|--port 8080] [-u|--unix-socket <path>] [-a|--api-key <secret>]
+    \\                    [--tls-cert <path>] [--tls-key <path>] [--tls-key-passphrase <secret>] [--tls-passphrase-env <ENV>]
     \\                    [--model-id <id>] [-L|--lora <name>=<path.amlora>] [-D|--disk-prefix-cache <dir>]
     \\                    [--max-seq-len N] [--max-conns N] [--max-active-requests N]
     \\                    [--max-response-bytes N] [--http-read-timeout-ms N]
@@ -302,6 +305,12 @@ pub fn main(init: std.process.Init) !void {
             try out.writeAll(usage);
         } else {
             try runBenchM825(arena, args[2..], out);
+        }
+    } else if (args.len >= 2 and std.mem.eql(u8, args[1], "bench-m83")) {
+        if (hasHelpFlag(args[2..])) {
+            try out.writeAll(usage);
+        } else {
+            try runBenchM83(arena, args[2..], out);
         }
     } else if (args.len >= 2 and std.mem.eql(u8, args[1], "peer-worker")) {
         if (hasHelpFlag(args[2..])) {
@@ -2905,6 +2914,35 @@ fn runBenchM825(allocator: std.mem.Allocator, raw_args: []const [:0]const u8, ou
     if (!report.all_passed) return error.BenchmarkGateFailed;
 }
 
+const M83CliFlags = struct {
+    json: bool = false,
+    cfg: aminfer.bench_m83.M83Config = .{},
+};
+
+fn parseM83Args(raw_args: []const [:0]const u8) !M83CliFlags {
+    var cli: M83CliFlags = .{};
+    for (raw_args) |flag| {
+        if (std.mem.eql(u8, flag, "--json")) {
+            cli.json = true;
+        } else {
+            return error.UnknownFlag;
+        }
+    }
+    return cli;
+}
+
+fn runBenchM83(allocator: std.mem.Allocator, raw_args: []const [:0]const u8, out: *Io.Writer) !void {
+    const cli = try parseM83Args(raw_args);
+    const report = try aminfer.bench_m83.runM83WithConfig(allocator, cli.cfg);
+    if (cli.json) {
+        try report.writeJson(out);
+    } else {
+        try report.write(out);
+    }
+    try out.flush();
+    if (!report.all_passed) return error.BenchmarkGateFailed;
+}
+
 fn parseQualityGateArgs(args: []const [:0]const u8) !aminfer.bench.QualityGateConfig {
     var cfg: aminfer.bench.QualityGateConfig = .{};
     var i: usize = 0;
@@ -4410,6 +4448,10 @@ const ServeCliArgs = struct {
     port: u16 = 8080,
     api_key: ?[]const u8 = null,
     unix_socket_path: ?[]const u8 = null,
+    tls_cert_path: ?[:0]const u8 = null,
+    tls_key_path: ?[:0]const u8 = null,
+    tls_key_passphrase: ?[]const u8 = null,
+    tls_passphrase_env: ?[]const u8 = null,
     lora_specs: [aminfer.lora.MAX_ADAPTERS]LoraSpecArg = undefined,
     lora_spec_count: usize = 0,
     disk_prefix_cache_dir: ?[]const u8 = null,
@@ -4464,6 +4506,10 @@ fn parseServeArgs(args: []const [:0]const u8) !ServeCliArgs {
     var port: u16 = 8080;
     var api_key: ?[]const u8 = null;
     var unix_socket_path: ?[]const u8 = null;
+    var tls_cert_path: ?[:0]const u8 = null;
+    var tls_key_path: ?[:0]const u8 = null;
+    var tls_key_passphrase: ?[]const u8 = null;
+    var tls_passphrase_env: ?[]const u8 = null;
     var lora_specs: [aminfer.lora.MAX_ADAPTERS]LoraSpecArg = undefined;
     var lora_spec_count: usize = 0;
     var disk_prefix_cache_dir: ?[]const u8 = null;
@@ -4688,6 +4734,25 @@ fn parseServeArgs(args: []const [:0]const u8) !ServeCliArgs {
             if (i >= args.len) return error.MissingFlagValue;
             if (args[i].len == 0 or args[i].len > aminfer.server.MAX_UNIX_SOCKET_PATH_BYTES) return error.InvalidUnixSocketPath;
             unix_socket_path = args[i];
+        } else if (std.mem.eql(u8, flag, "--tls-cert")) {
+            i += 1;
+            if (i >= args.len) return error.MissingFlagValue;
+            if (args[i].len == 0) return error.InvalidTlsArgs;
+            tls_cert_path = args[i];
+        } else if (std.mem.eql(u8, flag, "--tls-key")) {
+            i += 1;
+            if (i >= args.len) return error.MissingFlagValue;
+            if (args[i].len == 0) return error.InvalidTlsArgs;
+            tls_key_path = args[i];
+        } else if (std.mem.eql(u8, flag, "--tls-key-passphrase")) {
+            i += 1;
+            if (i >= args.len) return error.MissingFlagValue;
+            tls_key_passphrase = args[i];
+        } else if (std.mem.eql(u8, flag, "--tls-passphrase-env")) {
+            i += 1;
+            if (i >= args.len) return error.MissingFlagValue;
+            if (args[i].len == 0 or args[i].len >= 256) return error.InvalidTlsArgs;
+            tls_passphrase_env = args[i];
         } else if (std.mem.eql(u8, flag, "--lora") or std.mem.eql(u8, flag, "-L")) {
             i += 1;
             if (i >= args.len) return error.MissingFlagValue;
@@ -4719,6 +4784,13 @@ fn parseServeArgs(args: []const [:0]const u8) !ServeCliArgs {
         }
     }
 
+    if (tls_cert_path == null and (tls_key_path != null or tls_key_passphrase != null or tls_passphrase_env != null)) {
+        return error.MissingTlsCert;
+    }
+    if (tls_key_passphrase != null and tls_passphrase_env != null) {
+        return error.ConflictingTlsPassphraseFlags;
+    }
+
     return .{
         .amf_path = amf_path orelse return error.MissingRequiredFlag,
         .config_path = config_path,
@@ -4727,6 +4799,10 @@ fn parseServeArgs(args: []const [:0]const u8) !ServeCliArgs {
         .port = port,
         .api_key = api_key,
         .unix_socket_path = unix_socket_path,
+        .tls_cert_path = tls_cert_path,
+        .tls_key_path = tls_key_path,
+        .tls_key_passphrase = tls_key_passphrase,
+        .tls_passphrase_env = tls_passphrase_env,
         .lora_specs = lora_specs,
         .lora_spec_count = lora_spec_count,
         .disk_prefix_cache_dir = disk_prefix_cache_dir,
@@ -6463,6 +6539,111 @@ const ServeEmbedRerankCtx = struct {
     }
 };
 
+const PreparedServeTls = struct {
+    loaded: ?aminfer.tls.LoadedFiles = null,
+    passphrase_buf: [1024]u8 = @splat(0),
+    passphrase_len: usize = 0,
+    has_passphrase: bool = false,
+
+    fn prepare(allocator: std.mem.Allocator, cli: ServeCliArgs) !PreparedServeTls {
+        var out: PreparedServeTls = .{};
+        errdefer out.wipeAndDeinit(allocator);
+
+        const cert_path = cli.tls_cert_path orelse return out;
+        out.loaded = try aminfer.tls.loadFiles(allocator, cert_path, cli.tls_key_path);
+
+        if (cli.tls_passphrase_env) |env_name| {
+            if (env_name.len == 0 or env_name.len >= 256) return error.InvalidTlsArgs;
+            var env_z: [256]u8 = undefined;
+            @memcpy(env_z[0..env_name.len], env_name);
+            env_z[env_name.len] = 0;
+            const val_c = std.c.getenv(@ptrCast(&env_z)) orelse return error.MissingTlsPassphraseEnv;
+            const val = std.mem.span(val_c);
+            if (val.len > out.passphrase_buf.len) return error.InvalidTlsArgs;
+            @memcpy(out.passphrase_buf[0..val.len], val);
+            out.passphrase_len = val.len;
+            out.has_passphrase = true;
+        } else if (cli.tls_key_passphrase) |secret| {
+            if (secret.len > out.passphrase_buf.len) return error.InvalidTlsArgs;
+            @memcpy(out.passphrase_buf[0..secret.len], secret);
+            out.passphrase_len = secret.len;
+            out.has_passphrase = true;
+        }
+        return out;
+    }
+
+    fn serverTlsConfig(self: *const PreparedServeTls) ?aminfer.server.ServerTlsConfig {
+        const l = self.loaded orelse return null;
+        return .{
+            .cert_bytes = l.cert_bytes,
+            .key_bytes = l.key_bytes,
+            .passphrase = if (self.has_passphrase) self.passphrase_buf[0..self.passphrase_len] else null,
+        };
+    }
+
+    fn wipeAndDeinit(self: *PreparedServeTls, allocator: std.mem.Allocator) void {
+        std.crypto.secureZero(u8, &self.passphrase_buf);
+        self.passphrase_len = 0;
+        self.has_passphrase = false;
+        if (self.loaded) |*l| {
+            l.deinit(allocator);
+            self.loaded = null;
+        }
+    }
+};
+
+const PreparedServeDiscovery = struct {
+    insp: aminfer.amf.AmfInspection,
+    fallback_arch: []const u8,
+    max_seq_len: u32,
+    total_wired_mib: u64,
+    caps: aminfer.server.ModelCapabilities,
+    lora_meta_buf: [aminfer.lora.MAX_ADAPTERS]aminfer.server.LoraAdapterMeta = undefined,
+    lora_meta_len: usize = 0,
+
+    fn init(
+        allocator: std.mem.Allocator,
+        amf_path: []const u8,
+        fallback_arch: []const u8,
+        max_seq_len: u32,
+        total_wired_mib: u64,
+        base_caps: aminfer.server.ModelCapabilities,
+        lora_reg: ?*const aminfer.lora.LoraRegistry,
+    ) !PreparedServeDiscovery {
+        const insp = try aminfer.amf.inspectAmfPath(allocator, amf_path);
+        var out: PreparedServeDiscovery = .{
+            .insp = insp,
+            .fallback_arch = fallback_arch,
+            .max_seq_len = max_seq_len,
+            .total_wired_mib = total_wired_mib,
+            .caps = base_caps,
+        };
+        if (lora_reg) |lr| {
+            out.lora_meta_len = aminfer.server.LoraAdapterMeta.populateFromRegistry(lr, &out.lora_meta_buf);
+        }
+        out.caps.lora = out.caps.lora or (out.lora_meta_len > 0);
+        return out;
+    }
+
+    fn modelDetail(self: *const PreparedServeDiscovery) aminfer.server.ModelDetailMeta {
+        var detail = aminfer.server.ModelDetailMeta.fromInspection(&self.insp, self.max_seq_len, self.caps);
+        if (std.mem.eql(u8, detail.architecture, "unknown") and self.fallback_arch.len > 0) {
+            detail.architecture = self.fallback_arch;
+        }
+        detail.max_model_len = self.max_seq_len;
+        detail.wired_mib = self.total_wired_mib;
+        return detail;
+    }
+
+    fn loraAdapters(self: *const PreparedServeDiscovery) []const aminfer.server.LoraAdapterMeta {
+        return self.lora_meta_buf[0..self.lora_meta_len];
+    }
+
+    fn deinit(self: *PreparedServeDiscovery, allocator: std.mem.Allocator) void {
+        self.insp.deinit(allocator);
+    }
+};
+
 fn runServeGraph(
     allocator: std.mem.Allocator,
     cli: ServeCliArgs,
@@ -6471,6 +6652,8 @@ fn runServeGraph(
     tok_bytes: []const u8,
     out: *Io.Writer,
 ) !void {
+    if (cli.lora_spec_count > 0) return error.UnsupportedFeature;
+
     var gcfg = try aminfer.graph.GraphConfig.fromJson(allocator, cfg_bytes);
     defer gcfg.deinit(allocator);
 
@@ -6732,6 +6915,28 @@ fn runServeGraph(
     const total_wired_mib: u64 = total_wired_bytes >> 20;
     const model_id_str = cli.model_id orelse std.fs.path.stem(cli.amf_path);
 
+    var discovery = try PreparedServeDiscovery.init(
+        allocator,
+        cli.amf_path,
+        gcfg.axes.attentionSummaryLabel(),
+        max_seq_len,
+        total_wired_mib,
+        .{
+            .reasoning = serve_chat_tpl.thinking.supported,
+            .vision = model.hasVisionTower() or (cli.m6.vision_sidecar_path != null),
+            .moe = (gcfg.axes.ffn_kind == .moe_swiglu),
+            .embeddings = false,
+            .rerank = false,
+            .lora = false,
+            .speculative_decoding = (spec_eng_ptr != null),
+        },
+        null,
+    );
+    defer discovery.deinit(allocator);
+
+    var prepared_tls = try PreparedServeTls.prepare(allocator, cli);
+    defer prepared_tls.wipeAndDeinit(allocator);
+
     const srv = try aminfer.server.Server.init(allocator, .{
         .host = host_ipv4,
         .port = cli.port,
@@ -6751,7 +6956,11 @@ fn runServeGraph(
         .chat_template = serve_chat_tpl,
         .max_response_bytes = cli.m81.max_response_bytes,
         .http_read_timeout_ms = cli.m81.http_read_timeout_ms,
+        .model_detail = discovery.modelDetail(),
+        .lora_adapters = discovery.loraAdapters(),
+        .tls = prepared_tls.serverTlsConfig(),
     });
+    prepared_tls.wipeAndDeinit(allocator);
     defer srv.deinit(allocator);
     if (batch_runner_ptr) |br| br.server_ptr = srv;
     if (runner_ptr) |r| r.server_ptr = srv;
@@ -6773,7 +6982,8 @@ fn runServeGraph(
 
     try out.print(
         \\serve.status                     listening
-        \\serve.url                        http://{d}.{d}.{d}.{d}:{d}
+        \\serve.url                        {s}://{d}.{d}.{d}.{d}:{d}
+        \\serve.tls                        {s}
         \\serve.model_id                   {s}
         \\serve.arch                       graph ({s}, {s}, loop={s} R={d})
         \\serve.batch_mode                 {s} (max_batch_size={d})
@@ -6789,11 +6999,13 @@ fn runServeGraph(
         \\serve.max_seq_len                {d}
         \\
     , .{
+        if (srv.isTlsEnabled()) "https" else "http",
         host_ipv4[0],
         host_ipv4[1],
         host_ipv4[2],
         host_ipv4[3],
         srv.boundPort(),
+        if (srv.isTlsEnabled()) "enabled (TLS 1.2/1.3, Network.framework)" else "disabled",
         srv.modelId(),
         gcfg.axes.attentionSummaryLabel(),
         gcfg.axes.ffn_kind.label(),
@@ -7204,6 +7416,28 @@ fn runServe(allocator: std.mem.Allocator, raw_args: []const [:0]const u8, out: *
     const total_wired_mib: u64 = total_wired_bytes >> 20;
     const model_id_str = cli.model_id orelse std.fs.path.stem(cli.amf_path);
 
+    var discovery = try PreparedServeDiscovery.init(
+        allocator,
+        cli.amf_path,
+        cfg.arch.label(),
+        max_seq_len,
+        total_wired_mib,
+        .{
+            .reasoning = serve_chat_tpl.thinking.supported,
+            .vision = false,
+            .moe = (cfg.num_experts > 0),
+            .embeddings = true,
+            .rerank = true,
+            .lora = (lora_reg_ptr != null),
+            .speculative_decoding = (spec_eng_ptr != null),
+        },
+        lora_reg_ptr,
+    );
+    defer discovery.deinit(allocator);
+
+    var prepared_tls = try PreparedServeTls.prepare(allocator, cli);
+    defer prepared_tls.wipeAndDeinit(allocator);
+
     const srv = try aminfer.server.Server.init(allocator, .{
         .host = host_ipv4,
         .port = cli.port,
@@ -7225,7 +7459,11 @@ fn runServe(allocator: std.mem.Allocator, raw_args: []const [:0]const u8, out: *
         .http_read_timeout_ms = cli.m81.http_read_timeout_ms,
         .embedding_handler = embed_ctx.embeddingHandler(),
         .rerank_handler = embed_ctx.rerankHandler(),
+        .model_detail = discovery.modelDetail(),
+        .lora_adapters = discovery.loraAdapters(),
+        .tls = prepared_tls.serverTlsConfig(),
     });
+    prepared_tls.wipeAndDeinit(allocator);
     defer srv.deinit(allocator);
     if (batch_runner_ptr) |br| br.server_ptr = srv;
     if (runner_ptr) |r| r.server_ptr = srv;
@@ -7247,7 +7485,8 @@ fn runServe(allocator: std.mem.Allocator, raw_args: []const [:0]const u8, out: *
 
     try out.print(
         \\serve.status                     listening
-        \\serve.url                        http://{d}.{d}.{d}.{d}:{d}
+        \\serve.url                        {s}://{d}.{d}.{d}.{d}:{d}
+        \\serve.tls                        {s}
         \\serve.model_id                   {s}
         \\serve.arch                       {s} ({s})
         \\serve.batch_mode                 {s} (max_batch_size={d})
@@ -7265,11 +7504,13 @@ fn runServe(allocator: std.mem.Allocator, raw_args: []const [:0]const u8, out: *
         \\serve.max_seq_len                {d}
         \\
     , .{
+        if (srv.isTlsEnabled()) "https" else "http",
         host_ipv4[0],
         host_ipv4[1],
         host_ipv4[2],
         host_ipv4[3],
         srv.boundPort(),
+        if (srv.isTlsEnabled()) "enabled (TLS 1.2/1.3, Network.framework)" else "disabled",
         srv.modelId(),
         cfg.arch.label(),
         cfg.precisionLabel(),
@@ -9922,4 +10163,98 @@ test "benchmark CLI subcommands parse --models-dir and reject empty or missing v
     try std.testing.expect(!m82_cli.cfg.include_python_synths);
     try std.testing.expectEqual(@as(u32, 8), m82_cli.cfg.synth_tokens);
     try std.testing.expectEqualStrings("/opt/m82-models", m82_cli.models_dir.?);
+}
+
+test "M8.3 CLI parsers validate --tls-* flag combinations, PreparedServeTls env resolution, and bench-m83 flags" {
+    // Valid: --tls-cert alone (e.g. .p12 bundle)
+    const p12 = try parseServeArgs(&.{ "--amf", "m.amf", "--tls-cert", "bundle.p12" });
+    try std.testing.expectEqualStrings("bundle.p12", p12.tls_cert_path.?);
+    try std.testing.expectEqual(@as(?[:0]const u8, null), p12.tls_key_path);
+    try std.testing.expectEqual(@as(?[]const u8, null), p12.tls_key_passphrase);
+    try std.testing.expectEqual(@as(?[]const u8, null), p12.tls_passphrase_env);
+
+    // Valid: --tls-cert + --tls-key + --tls-key-passphrase
+    const pem_direct = try parseServeArgs(&.{
+        "--amf",                "m.amf",
+        "--tls-cert",           "fullchain.pem",
+        "--tls-key",            "privkey.pem",
+        "--tls-key-passphrase", "direct-pass",
+    });
+    try std.testing.expectEqualStrings("fullchain.pem", pem_direct.tls_cert_path.?);
+    try std.testing.expectEqualStrings("privkey.pem", pem_direct.tls_key_path.?);
+    try std.testing.expectEqualStrings("direct-pass", pem_direct.tls_key_passphrase.?);
+    try std.testing.expectEqual(@as(?[]const u8, null), pem_direct.tls_passphrase_env);
+
+    // Valid: --tls-cert + --tls-key + --tls-passphrase-env
+    const pem_env = try parseServeArgs(&.{
+        "--amf",                "m.amf",
+        "--tls-cert",           "fullchain.pem",
+        "--tls-key",            "privkey.pem",
+        "--tls-passphrase-env", "AMINFER_TLS_PASS",
+    });
+    try std.testing.expectEqualStrings("AMINFER_TLS_PASS", pem_env.tls_passphrase_env.?);
+    try std.testing.expectEqual(@as(?[]const u8, null), pem_env.tls_key_passphrase);
+
+    // Valid: --tls-cert + --tls-passphrase-env (.p12 + env)
+    const p12_env = try parseServeArgs(&.{
+        "--amf",                "m.amf",
+        "--tls-cert",           "bundle.p12",
+        "--tls-passphrase-env", "AMINFER_P12_PASS",
+    });
+    try std.testing.expectEqualStrings("bundle.p12", p12_env.tls_cert_path.?);
+    try std.testing.expectEqualStrings("AMINFER_P12_PASS", p12_env.tls_passphrase_env.?);
+
+    // Invalid: --tls-key / --tls-key-passphrase / --tls-passphrase-env without --tls-cert
+    try std.testing.expectError(error.MissingTlsCert, parseServeArgs(&.{ "--amf", "m.amf", "--tls-key", "k.pem" }));
+    try std.testing.expectError(error.MissingTlsCert, parseServeArgs(&.{ "--amf", "m.amf", "--tls-key-passphrase", "pw" }));
+    try std.testing.expectError(error.MissingTlsCert, parseServeArgs(&.{ "--amf", "m.amf", "--tls-passphrase-env", "ENV_PW" }));
+
+    // Invalid: conflicting passphrase flags
+    try std.testing.expectError(error.ConflictingTlsPassphraseFlags, parseServeArgs(&.{
+        "--amf",                "m.amf",
+        "--tls-cert",           "c.pem",
+        "--tls-key-passphrase", "pw",
+        "--tls-passphrase-env", "ENV_PW",
+    }));
+
+    // Invalid: empty --tls-cert / --tls-key / --tls-passphrase-env
+    try std.testing.expectError(error.InvalidTlsArgs, parseServeArgs(&.{ "--amf", "m.amf", "--tls-cert", "" }));
+    try std.testing.expectError(error.InvalidTlsArgs, parseServeArgs(&.{ "--amf", "m.amf", "--tls-cert", "c.pem", "--tls-key", "" }));
+    try std.testing.expectError(error.InvalidTlsArgs, parseServeArgs(&.{ "--amf", "m.amf", "--tls-cert", "c.pem", "--tls-passphrase-env", "" }));
+
+    // Invalid: missing flag values
+    try std.testing.expectError(error.MissingFlagValue, parseServeArgs(&.{ "--amf", "m.amf", "--tls-cert" }));
+    try std.testing.expectError(error.MissingFlagValue, parseServeArgs(&.{ "--amf", "m.amf", "--tls-cert", "c.pem", "--tls-key" }));
+    try std.testing.expectError(error.MissingFlagValue, parseServeArgs(&.{ "--amf", "m.amf", "--tls-cert", "c.pem", "--tls-key-passphrase" }));
+    try std.testing.expectError(error.MissingFlagValue, parseServeArgs(&.{ "--amf", "m.amf", "--tls-cert", "c.pem", "--tls-passphrase-env" }));
+
+    // PreparedServeTls returns error.MissingTlsPassphraseEnv when env var is unset (using real temp file).
+    {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const cert_path = try std.fmt.allocPrintSentinel(std.testing.allocator, ".zig-cache/tmp/{s}/dummy.pem", .{tmp.sub_path}, 0);
+        defer std.testing.allocator.free(cert_path);
+        const fd = std.c.open(cert_path.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o600));
+        try std.testing.expect(fd >= 0);
+        _ = std.c.write(fd, "dummy", 5);
+        _ = std.c.close(fd);
+
+        var cli_unset = try parseServeArgs(&.{
+            "--amf",                "m.amf",
+            "--tls-cert",           cert_path,
+            "--tls-passphrase-env", "AMINFER_DEFINITELY_UNSET_TLS_PASS_9991",
+        });
+        _ = &cli_unset;
+        try std.testing.expectError(
+            error.MissingTlsPassphraseEnv,
+            PreparedServeTls.prepare(std.testing.allocator, cli_unset),
+        );
+    }
+
+    // bench-m83 CLI parser
+    const m83_def = try parseM83Args(&.{});
+    try std.testing.expect(!m83_def.json);
+    const m83_json = try parseM83Args(&.{"--json"});
+    try std.testing.expect(m83_json.json);
+    try std.testing.expectError(error.UnknownFlag, parseM83Args(&.{"--bogus"}));
 }

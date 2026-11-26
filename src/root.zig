@@ -36,6 +36,7 @@ pub const embed_rerank = @import("model/embed_rerank.zig");
 pub const graph = @import("model/graph.zig");
 pub const m82_runtime = @import("model/m82_runtime.zig");
 pub const bench = @import("bench/runner.zig");
+pub const bench_m83 = @import("bench/m83.zig");
 pub const sam = @import("spec/sam.zig");
 pub const tree = @import("spec/tree.zig");
 pub const accept = @import("spec/accept.zig");
@@ -98,6 +99,7 @@ test {
     _ = graph;
     _ = m82_runtime;
     _ = bench;
+    _ = bench_m83;
     _ = sam;
     _ = tree;
     _ = accept;

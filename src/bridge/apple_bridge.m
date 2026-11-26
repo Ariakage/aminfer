@@ -5027,6 +5027,29 @@ static void ami_tls_pump_on_conn_state(ami_tls_pump *p, nw_connection_state_t st
     }
 }
 
+static void ami_tls_pump_stop_write(ami_tls_pump *p) {
+    p->write_eof_done = true;
+    p->write_eof_pending = false;
+    if (p->pending_write != NULL) {
+        CFRelease((CFTypeRef)p->pending_write);
+        p->pending_write = NULL;
+        p->pending_write_offset = 0;
+    }
+    if (!p->write_src_cancelled && p->write_src != NULL) {
+        p->write_src_cancelled = true;
+        dispatch_source_t ws = (__bridge dispatch_source_t)p->write_src;
+        dispatch_source_cancel(ws);
+        if (p->write_src_suspended) {
+            p->write_src_suspended = false;
+            dispatch_resume(ws);
+        }
+    }
+    // Keep read_src and nw_connection alive so buffered outbound replies (e.g.
+    // 503/401/413 + Connection: close written before close(client_fd)) drain
+    // completely and end with a clean TLS close_notify.
+    ami_tls_pump_maybe_retire(p);
+}
+
 static void ami_tls_pump_flush_pending_write(ami_tls_pump *p) {
     if (p->write_src_cancelled || p->bridge_fd < 0 || p->pending_write == NULL) {
         return;
@@ -5042,6 +5065,9 @@ static void ami_tls_pump_flush_pending_write(ami_tls_pump *p) {
         } else if (rc < 0 && errno == EINTR) {
             continue;
         } else if (rc < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            return;
+        } else if (rc < 0 && (errno == EPIPE || errno == ECONNRESET)) {
+            ami_tls_pump_stop_write(p);
             return;
         } else {
             ami_tls_pump_shutdown(p);
@@ -5099,6 +5125,10 @@ static void ami_tls_pump_schedule_receive(ami_tls_pump *p) {
                 } else if (rc < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
                     would_block = true;
                     break;
+                } else if (rc < 0 && (errno == EPIPE || errno == ECONNRESET)) {
+                    ami_tls_pump_stop_write(p);
+                    ami_tls_pump_release(p);
+                    return;
                 } else {
                     ami_tls_pump_shutdown(p);
                     ami_tls_pump_release(p);
@@ -5336,7 +5366,9 @@ ami_status ami_tls_listener_create(const ami_tls_config *cfg,
         }
 
         lst->identity = sec_id;
-        lst->queue = dispatch_queue_create("com.aminfer.tls.listener", DISPATCH_QUEUE_SERIAL);
+        dispatch_queue_attr_t qattr = dispatch_queue_attr_make_with_autorelease_frequency(
+            DISPATCH_QUEUE_SERIAL, DISPATCH_AUTORELEASE_FREQUENCY_WORK_ITEM);
+        lst->queue = dispatch_queue_create("com.aminfer.tls.listener", qattr);
         lst->pump_group = dispatch_group_create();
         lst->active_pumps = [NSMutableSet set];
         lst->pending_conns = [NSMutableSet set];
@@ -5610,7 +5642,9 @@ ami_status ami_tls_client_connect_socketpair(const uint8_t host_ipv4[4],
     }
 
     @autoreleasepool {
-        dispatch_queue_t cq = dispatch_queue_create("com.aminfer.tls.client", DISPATCH_QUEUE_SERIAL);
+        dispatch_queue_attr_t cq_attr = dispatch_queue_attr_make_with_autorelease_frequency(
+            DISPATCH_QUEUE_SERIAL, DISPATCH_AUTORELEASE_FREQUENCY_WORK_ITEM);
+        dispatch_queue_t cq = dispatch_queue_create("com.aminfer.tls.client", cq_attr);
         uint16_t min_v = min_tls_version != 0 ? min_tls_version : (uint16_t)tls_protocol_version_TLSv12;
         uint16_t max_v = max_tls_version != 0 ? max_tls_version : (uint16_t)tls_protocol_version_TLSv13;
 
