@@ -33,6 +33,8 @@ const sampling_mod = @import("../spec/sampling.zig");
 const tokenizer_mod = @import("../model/tokenizer.zig");
 const qos = @import("../platform/qos.zig");
 const chat_template = @import("../model/chat_template.zig");
+const amf = @import("../format/amf.zig");
+const lora_mod = @import("../model/lora.zig");
 const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
 const Sha256 = std.crypto.hash.sha2.Sha256;
 
@@ -461,6 +463,124 @@ pub const TokenEvent = struct {
     }
 };
 
+pub const ModelCapabilities = struct {
+    chat: bool = true,
+    responses: bool = true,
+    messages: bool = true,
+    tool_calling: bool = true,
+    structured_outputs: bool = true,
+    reasoning: bool = false,
+    vision: bool = false,
+    embeddings: bool = false,
+    rerank: bool = false,
+    lora: bool = false,
+    speculative_decoding: bool = false,
+    moe: bool = false,
+};
+
+pub const ModelDetailMeta = struct {
+    architecture: []const u8 = "unknown",
+    max_model_len: u32 = 0,
+    vocab_size: u32 = 0,
+    effective_bits_per_weight: f64 = 0.0,
+    wired_mib: u64 = 0,
+    cold_bytes: u64 = 0,
+    capabilities: ModelCapabilities = .{},
+
+    pub fn fromInspection(
+        insp: *const amf.AmfInspection,
+        max_seq_len: u32,
+        caps_override: ?ModelCapabilities,
+    ) ModelDetailMeta {
+        const arch = insp.archSlice();
+        var caps = caps_override orelse ModelCapabilities{};
+        if (insp.arch.has_moe) caps.moe = true;
+        if (insp.arch.has_vision) caps.vision = true;
+        return .{
+            .architecture = if (arch.len > 0) arch else "unknown",
+            .max_model_len = if (max_seq_len > 0) max_seq_len else insp.arch.max_position_embeddings,
+            .vocab_size = insp.arch.vocab_size,
+            .effective_bits_per_weight = insp.effective_bits_per_weight,
+            .wired_mib = insp.estimated_total_wired_bytes >> 20,
+            .cold_bytes = insp.cold_weight_bytes + insp.sparse_table_bytes,
+            .capabilities = caps,
+        };
+    }
+};
+
+pub const LoraAdapterMeta = struct {
+    name: []const u8,
+    rank: u32,
+    lora_alpha: f32,
+    scale: f32,
+    wired_bytes: u64 = 0,
+
+    pub fn populateFromRegistry(
+        reg: *const lora_mod.LoraRegistry,
+        out: *[lora_mod.MAX_ADAPTERS]LoraAdapterMeta,
+    ) usize {
+        var count: usize = 0;
+        for (&reg.slots) |*slot| {
+            if (!slot.in_use) continue;
+            out[count] = .{
+                .name = slot.nameSlice(),
+                .rank = slot.rank,
+                .lora_alpha = slot.lora_alpha,
+                .scale = slot.scale,
+                .wired_bytes = slot.wired_bytes,
+            };
+            count += 1;
+        }
+        return count;
+    }
+};
+
+fn hexNibble(c: u8) ?u8 {
+    return switch (c) {
+        '0'...'9' => c - '0',
+        'a'...'f' => c - 'a' + 10,
+        'A'...'F' => c - 'A' + 10,
+        else => null,
+    };
+}
+
+/// Decodes `%XX` URL percent-encoded bytes into `out` without heap allocation.
+/// Literal `'+'` stays `'+'`; `%00`, truncated `%`, and non-hex escapes return
+/// `error.InvalidPercentEncoding`.
+pub fn percentDecodeUrlPath(
+    raw: []const u8,
+    out: []u8,
+) error{ InvalidPercentEncoding, BufferTooSmall }![]const u8 {
+    var out_len: usize = 0;
+    var overflow = false;
+    var i: usize = 0;
+    while (i < raw.len) {
+        const ch = raw[i];
+        const decoded: u8 = if (ch == '%') blk: {
+            if (i + 2 >= raw.len) return error.InvalidPercentEncoding;
+            const hi = hexNibble(raw[i + 1]) orelse return error.InvalidPercentEncoding;
+            const lo = hexNibble(raw[i + 2]) orelse return error.InvalidPercentEncoding;
+            const val: u8 = (hi << 4) | lo;
+            if (val == 0) return error.InvalidPercentEncoding;
+            i += 3;
+            break :blk val;
+        } else blk: {
+            if (ch == 0) return error.InvalidPercentEncoding;
+            i += 1;
+            break :blk ch;
+        };
+
+        if (out_len < out.len) {
+            out[out_len] = decoded;
+            out_len += 1;
+        } else {
+            overflow = true;
+        }
+    }
+    if (overflow) return error.BufferTooSmall;
+    return out[0..out_len];
+}
+
 pub const ServerConfig = struct {
     host: [4]u8 = .{ 127, 0, 0, 1 },
     /// `0` binds an ephemeral loopback port; read back via `server.boundPort()`.
@@ -518,6 +638,10 @@ pub const ServerConfig = struct {
     /// Require `anthropic-version` header on `/v1/messages*` when set to `true` (default `false`
     /// keeps legacy clients working while still validating non-empty header format when provided).
     require_anthropic_version: bool = false,
+    /// Optional model metadata reported on `GET /v1/models` and `GET /v1/models/{id}` (`C28`).
+    model_detail: ?ModelDetailMeta = null,
+    /// Optional mounted LoRA adapter metadata reported alongside the base model (`C28`).
+    lora_adapters: []const LoraAdapterMeta = &.{},
 };
 
 /// Parses a dotted-quad IPv4 address string (e.g. `"127.0.0.1"`, `"0.0.0.0"`).
@@ -5554,10 +5678,29 @@ fn utf8ChunkLen(slice: []const u8, max_len: usize) usize {
 // Zero-allocation `kqueue` HTTP/1.1 + SSE Server
 // ---------------------------------------------------------------------------
 
+const StoredLoraAdapter = struct {
+    name_buf: [lora_mod.MAX_ADAPTER_NAME_LEN]u8 = @splat(0),
+    name_len: u8 = 0,
+    rank: u32 = 0,
+    lora_alpha: f32 = 0.0,
+    scale: f32 = 0.0,
+    wired_bytes: u64 = 0,
+
+    fn nameSlice(self: *const StoredLoraAdapter) []const u8 {
+        return self.name_buf[0..self.name_len];
+    }
+};
+
 pub const Server = struct {
     config: ServerConfig,
     model_id_buf: [MAX_MODEL_ID_BYTES]u8,
     model_id_len: u16,
+    created_unix_sec: i64,
+    model_arch_buf: [64]u8,
+    model_arch_len: u8,
+    model_detail: ModelDetailMeta,
+    lora_adapters_storage: [lora_mod.MAX_ADAPTERS]StoredLoraAdapter,
+    lora_adapter_count: u8,
     api_key_buf: [MAX_API_KEY_BYTES]u8,
     api_key_len: u16,
     signature_key: [32]u8,
@@ -5644,6 +5787,18 @@ pub const Server = struct {
         if (config.tx_buf_bytes < STREAM_TX_HEADROOM_BYTES * 2) return error.InvalidConfig;
         if (config.nonstream_reasoning_bytes < 256 or config.nonstream_content_bytes < 256) return error.InvalidConfig;
         if (config.model_id.len == 0 or config.model_id.len > MAX_MODEL_ID_BYTES) return error.InvalidConfig;
+        if (config.lora_adapters.len > lora_mod.MAX_ADAPTERS) return error.InvalidConfig;
+        for (config.lora_adapters, 0..) |adp, i| {
+            if (adp.name.len == 0 or adp.name.len > lora_mod.MAX_ADAPTER_NAME_LEN) return error.InvalidConfig;
+            if (adp.rank == 0) return error.InvalidConfig;
+            if (!std.math.isFinite(adp.lora_alpha) or !std.math.isFinite(adp.scale)) return error.InvalidConfig;
+            if (config.model_id.len + 1 + adp.name.len > MAX_MODEL_ID_BYTES) return error.InvalidConfig;
+            for (config.lora_adapters[0..i]) |prev| {
+                if (std.mem.eql(u8, prev.name, adp.name)) return error.InvalidConfig;
+            }
+        }
+        var init_meta = config.model_detail orelse ModelDetailMeta{};
+        if (!std.math.isFinite(init_meta.effective_bits_per_weight)) return error.InvalidConfig;
         if (config.api_key) |ak| {
             if (ak.len > MAX_API_KEY_BYTES) return error.InvalidConfig;
         }
@@ -5999,10 +6154,49 @@ pub const Server = struct {
             r.random().bytes(&signature_key);
         }
 
+        const raw_arch = if (init_meta.architecture.len > 0) init_meta.architecture else "unknown";
+        var model_arch_buf: [64]u8 = @splat(0);
+        const model_arch_len: u8 = @intCast(@min(raw_arch.len, model_arch_buf.len));
+        @memcpy(model_arch_buf[0..model_arch_len], raw_arch[0..model_arch_len]);
+
+        init_meta.architecture = &.{};
+        if (init_meta.max_model_len == 0) {
+            init_meta.max_model_len = @intCast(@min(config.max_prompt_tokens, std.math.maxInt(u32)));
+        }
+        if (init_meta.vocab_size == 0) {
+            if (config.tokenizer) |tok| {
+                init_meta.vocab_size = @intCast(@min(tok.vocabSize(), std.math.maxInt(u32)));
+            }
+        }
+        init_meta.capabilities.embeddings = init_meta.capabilities.embeddings or (config.embedding_handler != null);
+        init_meta.capabilities.rerank = init_meta.capabilities.rerank or (config.rerank_handler != null);
+        init_meta.capabilities.lora = init_meta.capabilities.lora or (config.lora_adapters.len > 0);
+
+        var lora_adapters_storage: [lora_mod.MAX_ADAPTERS]StoredLoraAdapter = @splat(.{});
+        for (config.lora_adapters, 0..) |adp, i| {
+            @memcpy(lora_adapters_storage[i].name_buf[0..adp.name.len], adp.name);
+            lora_adapters_storage[i].name_len = @intCast(adp.name.len);
+            lora_adapters_storage[i].rank = adp.rank;
+            lora_adapters_storage[i].lora_alpha = adp.lora_alpha;
+            lora_adapters_storage[i].scale = adp.scale;
+            lora_adapters_storage[i].wired_bytes = adp.wired_bytes;
+        }
+        const created_unix_sec: i64 = @intCast(@min(unixTimestampSec(), @as(u64, std.math.maxInt(i64))));
+
+        var stored_config = config;
+        stored_config.model_detail = null;
+        stored_config.lora_adapters = &.{};
+
         self.* = .{
-            .config = config,
+            .config = stored_config,
             .model_id_buf = undefined,
             .model_id_len = @intCast(config.model_id.len),
+            .created_unix_sec = created_unix_sec,
+            .model_arch_buf = model_arch_buf,
+            .model_arch_len = model_arch_len,
+            .model_detail = init_meta,
+            .lora_adapters_storage = lora_adapters_storage,
+            .lora_adapter_count = @intCast(config.lora_adapters.len),
             .api_key_buf = api_key_buf,
             .api_key_len = api_key_len,
             .signature_key = signature_key,
@@ -6124,6 +6318,10 @@ pub const Server = struct {
 
     pub fn modelId(self: *const Server) []const u8 {
         return self.model_id_buf[0..self.model_id_len];
+    }
+
+    pub fn modelArchSlice(self: *const Server) []const u8 {
+        return self.model_arch_buf[0..self.model_arch_len];
     }
 
     pub fn setWiredMib(self: *Server, mib: u64) void {
@@ -7059,12 +7257,27 @@ pub const Server = struct {
             }
         }
 
-        if (std.mem.eql(u8, hdr.path, "/v1/models")) {
+        const route_path = if (std.mem.indexOfScalar(u8, hdr.path, '?')) |q| hdr.path[0..q] else hdr.path;
+
+        if (std.mem.eql(u8, route_path, "/v1/models")) {
             if (hdr.method != .get) {
                 self.sendErrorResponse(slot, 405, "Method Not Allowed", "GET", "method not allowed", "invalid_request_error", "method_not_allowed");
                 return;
             }
             self.handleModels(slot);
+            return;
+        }
+        if (std.mem.startsWith(u8, route_path, "/v1/models/")) {
+            const raw_id = route_path["/v1/models/".len..];
+            if (raw_id.len == 0) {
+                self.sendErrorResponse(slot, 404, "Not Found", null, "model not found", "invalid_request_error", "model_not_found");
+                return;
+            }
+            if (hdr.method != .get) {
+                self.sendErrorResponse(slot, 405, "Method Not Allowed", "GET", "method not allowed", "invalid_request_error", "method_not_allowed");
+                return;
+            }
+            self.handleModelById(slot, raw_id);
             return;
         }
         if (std.mem.eql(u8, hdr.path, "/v1/ngram-packs")) {
@@ -7491,24 +7704,180 @@ pub const Server = struct {
         self.sendJsonResponse(slot, 200, "OK", null, null, null, w.written());
     }
 
+    inline fn jsonBoolStr(b: bool) []const u8 {
+        return if (b) "true" else "false";
+    }
+
+    inline fn sanitizeFiniteF64(v: f64) f64 {
+        if (!std.math.isFinite(v) or v == 0.0) return 0.0;
+        return v;
+    }
+
+    inline fn sanitizeFiniteF32(v: f32) f32 {
+        if (!std.math.isFinite(v) or v == 0.0) return 0.0;
+        return v;
+    }
+
+    fn writeModelCapabilitiesJson(w: *FixedWriter, caps: ModelCapabilities) error{BufferTooSmall}!void {
+        try w.print(
+            "{{\"chat\":{s},\"responses\":{s},\"messages\":{s},\"tool_calling\":{s},\"structured_outputs\":{s},\"reasoning\":{s},\"vision\":{s},\"embeddings\":{s},\"rerank\":{s},\"lora\":{s},\"speculative_decoding\":{s},\"moe\":{s}}}",
+            .{
+                jsonBoolStr(caps.chat),
+                jsonBoolStr(caps.responses),
+                jsonBoolStr(caps.messages),
+                jsonBoolStr(caps.tool_calling),
+                jsonBoolStr(caps.structured_outputs),
+                jsonBoolStr(caps.reasoning),
+                jsonBoolStr(caps.vision),
+                jsonBoolStr(caps.embeddings),
+                jsonBoolStr(caps.rerank),
+                jsonBoolStr(caps.lora),
+                jsonBoolStr(caps.speculative_decoding),
+                jsonBoolStr(caps.moe),
+            },
+        );
+    }
+
+    fn writeBaseModelJson(self: *const Server, w: *FixedWriter) error{BufferTooSmall}!void {
+        const base_id = self.modelId();
+        const arch = self.modelArchSlice();
+        const meta = self.model_detail;
+        const live_wired = self.wired_mib.load(.monotonic);
+        const effective_wired_mib = if (live_wired > 0) live_wired else meta.wired_mib;
+        const safe_bpw = sanitizeFiniteF64(meta.effective_bits_per_weight);
+
+        try w.writeAll("{\"id\":\"");
+        try w.writeJsonEscaped(base_id);
+        try w.print("\",\"object\":\"model\",\"created\":{d},\"owned_by\":\"aminfer\",\"root\":\"", .{
+            self.created_unix_sec,
+        });
+        try w.writeJsonEscaped(base_id);
+        try w.writeAll("\",\"parent\":null,\"architecture\":\"");
+        try w.writeJsonEscaped(arch);
+        try w.print(
+            "\",\"max_model_len\":{d},\"vocab_size\":{d},\"effective_bits_per_weight\":{d:.6},\"wired_mib\":{d},\"cold_bytes\":{d},\"capabilities\":",
+            .{
+                meta.max_model_len,
+                meta.vocab_size,
+                safe_bpw,
+                effective_wired_mib,
+                meta.cold_bytes,
+            },
+        );
+        try writeModelCapabilitiesJson(w, meta.capabilities);
+        try w.writeByte('}');
+    }
+
+    fn writeLoraModelJson(
+        self: *const Server,
+        w: *FixedWriter,
+        adp: *const StoredLoraAdapter,
+    ) error{BufferTooSmall}!void {
+        const base_id = self.modelId();
+        const arch = self.modelArchSlice();
+        const meta = self.model_detail;
+        const safe_alpha = sanitizeFiniteF32(adp.lora_alpha);
+        const safe_scale = sanitizeFiniteF32(adp.scale);
+
+        try w.writeAll("{\"id\":\"");
+        try w.writeJsonEscaped(base_id);
+        try w.writeByte(':');
+        try w.writeJsonEscaped(adp.nameSlice());
+        try w.print("\",\"object\":\"model\",\"created\":{d},\"owned_by\":\"aminfer\",\"root\":\"", .{
+            self.created_unix_sec,
+        });
+        try w.writeJsonEscaped(base_id);
+        try w.writeAll("\",\"parent\":\"");
+        try w.writeJsonEscaped(base_id);
+        try w.writeAll("\",\"architecture\":\"");
+        try w.writeJsonEscaped(arch);
+        try w.print(
+            "\",\"max_model_len\":{d},\"vocab_size\":{d},\"rank\":{d},\"lora_alpha\":{d:.6},\"scale\":{d:.6},\"wired_bytes\":{d},\"capabilities\":",
+            .{
+                meta.max_model_len,
+                meta.vocab_size,
+                adp.rank,
+                safe_alpha,
+                safe_scale,
+                adp.wired_bytes,
+            },
+        );
+        try writeModelCapabilitiesJson(w, meta.capabilities);
+        try w.writeByte('}');
+    }
+
+    fn writeModelsListJson(self: *const Server, w: *FixedWriter) error{BufferTooSmall}!void {
+        try w.writeAll("{\"object\":\"list\",\"data\":[");
+        try self.writeBaseModelJson(w);
+        for (self.lora_adapters_storage[0..self.lora_adapter_count]) |*adp| {
+            try w.writeByte(',');
+            try self.writeLoraModelJson(w, adp);
+        }
+        try w.writeAll("]}");
+    }
+
+    fn sendModelJsonOrError(self: *Server, slot: *ConnectionSlot, json_body: []const u8) void {
+        if (json_body.len + 256 > slot.tx_buf.len) {
+            self.sendErrorResponse(slot, 500, "Internal Server Error", null, "model response exceeds slot tx buffer", "server_error", "response_too_large");
+            return;
+        }
+        self.sendJsonResponse(slot, 200, "OK", null, null, null, json_body);
+    }
+
     fn handleModels(self: *Server, slot: *ConnectionSlot) void {
-        var body_buf: [512]u8 = undefined;
+        var body_buf: [16384]u8 = undefined;
         var w = FixedWriter.init(&body_buf);
-        w.writeAll("{\"object\":\"list\",\"data\":[{\"id\":\"") catch {
-            self.closeSlotSocketAndRelease(slot, false);
+        self.writeModelsListJson(&w) catch {
+            self.sendErrorResponse(slot, 500, "Internal Server Error", null, "models list exceeds response buffer", "server_error", "response_too_large");
             return;
         };
-        w.writeJsonEscaped(self.modelId()) catch {
-            self.closeSlotSocketAndRelease(slot, false);
-            return;
+        self.sendModelJsonOrError(slot, w.written());
+    }
+
+    fn handleModelById(self: *Server, slot: *ConnectionSlot, raw_id: []const u8) void {
+        var decoded_buf: [MAX_MODEL_ID_BYTES]u8 = undefined;
+        const decoded_id = percentDecodeUrlPath(raw_id, &decoded_buf) catch |err| switch (err) {
+            error.InvalidPercentEncoding => {
+                self.sendErrorResponse(slot, 400, "Bad Request", null, "invalid percent-encoded model identifier", "invalid_request_error", "invalid_model_id");
+                return;
+            },
+            error.BufferTooSmall => {
+                self.sendErrorResponse(slot, 404, "Not Found", null, "model not found", "invalid_request_error", "model_not_found");
+                return;
+            },
         };
-        w.print("\",\"object\":\"model\",\"created\":{d},\"owned_by\":\"aminfer\"}}]}}", .{
-            unixTimestampSec(),
-        }) catch {
-            self.closeSlotSocketAndRelease(slot, false);
+
+        const base_id = self.modelId();
+        var body_buf: [4096]u8 = undefined;
+        var w = FixedWriter.init(&body_buf);
+
+        if (std.mem.eql(u8, decoded_id, base_id)) {
+            self.writeBaseModelJson(&w) catch {
+                self.sendErrorResponse(slot, 500, "Internal Server Error", null, "model detail exceeds response buffer", "server_error", "response_too_large");
+                return;
+            };
+        } else if (decoded_id.len > base_id.len + 1 and
+            std.mem.startsWith(u8, decoded_id, base_id) and
+            decoded_id[base_id.len] == ':')
+        {
+            const adp_name = decoded_id[base_id.len + 1 ..];
+            const matched: ?*const StoredLoraAdapter = for (self.lora_adapters_storage[0..self.lora_adapter_count]) |*adp| {
+                if (std.mem.eql(u8, adp.nameSlice(), adp_name)) break adp;
+            } else null;
+            const adp = matched orelse {
+                self.sendErrorResponse(slot, 404, "Not Found", null, "model not found", "invalid_request_error", "model_not_found");
+                return;
+            };
+            self.writeLoraModelJson(&w, adp) catch {
+                self.sendErrorResponse(slot, 500, "Internal Server Error", null, "model detail exceeds response buffer", "server_error", "response_too_large");
+                return;
+            };
+        } else {
+            self.sendErrorResponse(slot, 404, "Not Found", null, "model not found", "invalid_request_error", "model_not_found");
             return;
-        };
-        self.sendJsonResponse(slot, 200, "OK", null, null, null, w.written());
+        }
+
+        self.sendModelJsonOrError(slot, w.written());
     }
 
     // -----------------------------------------------------------------------
@@ -13554,4 +13923,476 @@ test "C18 M8.1 hardening: Inkling2 recipient-header tool call, model_id-bound HM
     try std.testing.expectEqual(@as(f64, 0.0), zt.ttft_ms);
     try std.testing.expectEqual(@as(f64, 0.0), zt.tpot_ms);
     try std.testing.expectEqual(@as(f64, 0.0), zt.tok_per_s);
+}
+
+test "C28 GET /v1/models (>4096 B) and GET /v1/models/{id} with LoRA adapters, percent-decoding, auth, and zero hot-path allocs" {
+    const gpa = std.testing.allocator;
+    const Mock = struct {
+        fn generate(_: *anyopaque, _: *const InferenceJob, stream: *TokenStream) void {
+            _ = stream.setPromptTokens(2);
+            _ = stream.emitTokenBytes("ok");
+            stream.finish(.stop, 2);
+        }
+
+        fn embed(_: *anyopaque, _: *const EmbedRequest, _: []f32) anyerror!EmbedResult {
+            return .{ .dim = 4, .prompt_tokens = 1 };
+        }
+
+        fn rerank(_: *anyopaque, _: *const RerankRequest, _: []RerankItem) anyerror!RerankResult {
+            return .{ .count = 0, .prompt_tokens = 1 };
+        }
+    };
+    var dummy: u8 = 0;
+
+    // 1. Unit tests for `percentDecodeUrlPath` and `ModelDetailMeta.fromInspection` and `LoraAdapterMeta.populateFromRegistry`.
+    {
+        var out: [64]u8 = undefined;
+        try std.testing.expectEqualStrings("unsloth/inkling-2-mini", try percentDecodeUrlPath("unsloth%2Finkling-2-mini", &out));
+        try std.testing.expectEqualStrings("unsloth/inkling-2-mini:sql-r8", try percentDecodeUrlPath("unsloth%2finkling-2-mini%3asql-r8", &out));
+        try std.testing.expectEqualStrings("a b+c+d", try percentDecodeUrlPath("a%20b%2Bc+d", &out));
+        try std.testing.expectError(error.InvalidPercentEncoding, percentDecodeUrlPath("bad%ZZid", &out));
+        try std.testing.expectError(error.InvalidPercentEncoding, percentDecodeUrlPath("bad%00id", &out));
+        try std.testing.expectError(error.InvalidPercentEncoding, percentDecodeUrlPath("trunc%2", &out));
+        try std.testing.expectError(error.InvalidPercentEncoding, percentDecodeUrlPath("trunc%", &out));
+        var tiny: [4]u8 = undefined;
+        try std.testing.expectError(error.BufferTooSmall, percentDecodeUrlPath("abcde", &tiny));
+        try std.testing.expectError(error.InvalidPercentEncoding, percentDecodeUrlPath("abcd%ZZ", &tiny));
+
+        var insp = std.mem.zeroInit(amf.AmfInspection, .{
+            .path = @as([]u8, &.{}),
+            .cold_weight_bytes = 1234,
+            .sparse_table_bytes = 566,
+            .estimated_total_wired_bytes = 6400 * (1024 * 1024),
+            .effective_bits_per_weight = 4.375,
+        });
+        insp.arch.setArch("qwen3_vl_moe");
+        insp.arch.vocab_size = 151936;
+        insp.arch.max_position_embeddings = 131072;
+        insp.arch.has_moe = true;
+        insp.arch.has_vision = true;
+
+        const m_auto = ModelDetailMeta.fromInspection(&insp, 0, .{ .reasoning = true });
+        try std.testing.expectEqualStrings("qwen3_vl_moe", m_auto.architecture);
+        try std.testing.expectEqual(@as(u32, 131072), m_auto.max_model_len);
+        try std.testing.expectEqual(@as(u32, 151936), m_auto.vocab_size);
+        try std.testing.expectApproxEqAbs(@as(f64, 4.375), m_auto.effective_bits_per_weight, 1e-6);
+        try std.testing.expectEqual(@as(u64, 6400), m_auto.wired_mib);
+        try std.testing.expectEqual(@as(u64, 1800), m_auto.cold_bytes);
+        try std.testing.expect(m_auto.capabilities.reasoning);
+        try std.testing.expect(m_auto.capabilities.moe);
+        try std.testing.expect(m_auto.capabilities.vision);
+
+        const m_override = ModelDetailMeta.fromInspection(&insp, 32768, null);
+        try std.testing.expectEqual(@as(u32, 32768), m_override.max_model_len);
+
+        insp.arch.arch_len = 0;
+        const m_unk = ModelDetailMeta.fromInspection(&insp, 0, null);
+        try std.testing.expectEqualStrings("unknown", m_unk.architecture);
+
+        var reg = try lora_mod.LoraRegistry.init(.{
+            .pool_bytes = APPLE_PAGE_SIZE,
+            .base_shape = .{ .num_layers = 1, .hidden_size = 64, .q_dim = 64, .kv_dim = 64, .intermediate_size = 128 },
+        });
+        defer reg.deinit(gpa);
+        reg.slots[0].in_use = true;
+        @memcpy(reg.slots[0].name[0..6], "sql-r8");
+        reg.slots[0].name_len = 6;
+        reg.slots[0].rank = 8;
+        reg.slots[0].lora_alpha = 16.0;
+        reg.slots[0].scale = 2.0;
+        reg.slots[0].wired_bytes = 65536;
+        reg.slots[3].in_use = true;
+        @memcpy(reg.slots[3].name[0..7], "code-r4");
+        reg.slots[3].name_len = 7;
+        reg.slots[3].rank = 4;
+        reg.slots[3].lora_alpha = 8.0;
+        reg.slots[3].scale = 2.0;
+        reg.slots[3].wired_bytes = 32768;
+
+        var reg_out: [lora_mod.MAX_ADAPTERS]LoraAdapterMeta = undefined;
+        const pop_n = LoraAdapterMeta.populateFromRegistry(&reg, &reg_out);
+        try std.testing.expectEqual(@as(usize, 2), pop_n);
+        try std.testing.expectEqualStrings("sql-r8", reg_out[0].name);
+        try std.testing.expectEqual(@as(u32, 8), reg_out[0].rank);
+        try std.testing.expectEqual(@as(u64, 65536), reg_out[0].wired_bytes);
+        try std.testing.expectEqualStrings("code-r4", reg_out[1].name);
+        try std.testing.expectEqual(@as(u32, 4), reg_out[1].rank);
+    }
+
+    // 2. Server.init validation checks for model_detail & lora_adapters.
+    {
+        const dup_adps = [_]LoraAdapterMeta{
+            .{ .name = "dup", .rank = 8, .lora_alpha = 16.0, .scale = 2.0 },
+            .{ .name = "dup", .rank = 16, .lora_alpha = 32.0, .scale = 2.0 },
+        };
+        try std.testing.expectError(error.InvalidConfig, Server.init(gpa, .{
+            .port = 0,
+            .model_id = "m",
+            .lora_adapters = &dup_adps,
+            .apply_qos = false,
+        }));
+
+        const zero_rank = [_]LoraAdapterMeta{
+            .{ .name = "bad", .rank = 0, .lora_alpha = 16.0, .scale = 2.0 },
+        };
+        try std.testing.expectError(error.InvalidConfig, Server.init(gpa, .{
+            .port = 0,
+            .model_id = "m",
+            .lora_adapters = &zero_rank,
+            .apply_qos = false,
+        }));
+
+        const nan_scale = [_]LoraAdapterMeta{
+            .{ .name = "nan", .rank = 8, .lora_alpha = 16.0, .scale = std.math.nan(f32) },
+        };
+        try std.testing.expectError(error.InvalidConfig, Server.init(gpa, .{
+            .port = 0,
+            .model_id = "m",
+            .lora_adapters = &nan_scale,
+            .apply_qos = false,
+        }));
+
+        const long_model: [100]u8 = @splat('a');
+        const long_adp: [29]u8 = @splat('b');
+        const too_long_adp = [_]LoraAdapterMeta{
+            .{ .name = &long_adp, .rank = 8, .lora_alpha = 16.0, .scale = 2.0 },
+        };
+        try std.testing.expectError(error.InvalidConfig, Server.init(gpa, .{
+            .port = 0,
+            .model_id = &long_model,
+            .lora_adapters = &too_long_adp,
+            .apply_qos = false,
+        }));
+
+        var too_many: [lora_mod.MAX_ADAPTERS + 1]LoraAdapterMeta = undefined;
+        for (&too_many, 0..) |*slot, idx| {
+            slot.* = .{ .name = if (idx == 0) "a" else "b", .rank = 8, .lora_alpha = 16.0, .scale = 2.0 };
+        }
+        try std.testing.expectError(error.InvalidConfig, Server.init(gpa, .{
+            .port = 0,
+            .model_id = "m",
+            .lora_adapters = &too_many,
+            .apply_qos = false,
+        }));
+    }
+
+    // 3. Full HTTP integration: 8 mounted LoRA adapters (> 4096 B response), URL percent-decoding,
+    //    dangling-slice safety, live wired_mib, 405/404/400/401, and zero hot-path mallocs!
+    var arch_tmp: [20]u8 = undefined;
+    @memcpy(&arch_tmp, "qwen3_next_moe_coder");
+    var adp_names_tmp: [8][32]u8 = undefined;
+    var adps_tmp: [8]LoraAdapterMeta = undefined;
+    const adp_suffixes = [_][]const u8{
+        "sql-r8",
+        "code-python-r16",
+        "rust-systems-r8",
+        "zig-metal-r16",
+        "finance-qa-r32",
+        "medical-en-r16",
+        "legal-zh-r8",
+        "math-proof-r16",
+    };
+    for (adp_suffixes, 0..) |nm, idx| {
+        const len = nm.len;
+        @memcpy(adp_names_tmp[idx][0..len], nm);
+        adps_tmp[idx] = .{
+            .name = adp_names_tmp[idx][0..len],
+            .rank = @intCast(8 * ((idx % 3) + 1)),
+            .lora_alpha = @as(f32, @floatFromInt(16 * ((idx % 3) + 1))),
+            .scale = 2.0 + @as(f32, @floatFromInt(idx)) * 0.25,
+            .wired_bytes = @as(u64, 65536) * (idx + 1),
+        };
+    }
+
+    const srv = try Server.init(gpa, .{
+        .port = 0,
+        .model_id = "unsloth/inkling-2-mini",
+        .wired_mib = 0,
+        .api_key = "sk-c28-test",
+        .embedding_handler = .{ .ctx = &dummy, .embedFn = Mock.embed },
+        .rerank_handler = .{ .ctx = &dummy, .rerankFn = Mock.rerank },
+        .model_detail = .{
+            .architecture = &arch_tmp,
+            .max_model_len = 65536,
+            .vocab_size = 151936,
+            .effective_bits_per_weight = 4.25,
+            .wired_mib = 4096,
+            .cold_bytes = 987654321,
+            .capabilities = .{
+                .reasoning = true,
+                .vision = true,
+                .speculative_decoding = true,
+                .moe = true,
+            },
+        },
+        .lora_adapters = &adps_tmp,
+        .max_conns = 8,
+        .max_active_requests = 4,
+        .apply_qos = false,
+    });
+    defer srv.deinit(gpa);
+
+    // Poison caller stack buffers to prove `Server.init` owns copies with zero dangling slices!
+    @memset(&arch_tmp, 'X');
+    for (&adp_names_tmp) |*buf| @memset(buf, 'Z');
+
+    try srv.start(.{ .ctx = &dummy, .generateFn = Mock.generate });
+    defer srv.stop();
+
+    const port = srv.boundPort();
+    var resp_buf: [32768]u8 = undefined;
+
+    const ModelCapsJson = struct {
+        chat: bool,
+        responses: bool,
+        messages: bool,
+        tool_calling: bool,
+        structured_outputs: bool,
+        reasoning: bool,
+        vision: bool,
+        embeddings: bool,
+        rerank: bool,
+        lora: bool,
+        speculative_decoding: bool,
+        moe: bool,
+    };
+    const ModelEntryJson = struct {
+        id: []const u8,
+        object: []const u8,
+        created: i64,
+        owned_by: []const u8,
+        root: []const u8,
+        parent: ?[]const u8 = null,
+        architecture: []const u8,
+        max_model_len: u32,
+        vocab_size: u32,
+        effective_bits_per_weight: ?f64 = null,
+        wired_mib: ?u64 = null,
+        cold_bytes: ?u64 = null,
+        rank: ?u32 = null,
+        lora_alpha: ?f64 = null,
+        scale: ?f64 = null,
+        wired_bytes: ?u64 = null,
+        capabilities: ModelCapsJson,
+    };
+    const ModelsListJson = struct {
+        object: []const u8,
+        data: []const ModelEntryJson,
+    };
+
+    // 3a. GET /v1/models (> 4096 B payload parsed via std.json.parseFromSlice).
+    {
+        const resp = try testHttpExchange(
+            port,
+            "GET /v1/models?page=1 HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer sk-c28-test\r\n\r\n",
+            &resp_buf,
+        );
+        try std.testing.expect(std.mem.startsWith(u8, resp, "HTTP/1.1 200 OK\r\n"));
+        const body = extractHttpBody(resp) orelse return error.TestUnexpectedResult;
+        try std.testing.expect(body.len > 4096);
+
+        const parsed = try std.json.parseFromSlice(ModelsListJson, gpa, body, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqualStrings("list", parsed.value.object);
+        try std.testing.expectEqual(@as(usize, 9), parsed.value.data.len);
+
+        const base = parsed.value.data[0];
+        try std.testing.expectEqualStrings("unsloth/inkling-2-mini", base.id);
+        try std.testing.expectEqualStrings("model", base.object);
+        try std.testing.expectEqualStrings("aminfer", base.owned_by);
+        try std.testing.expectEqualStrings("unsloth/inkling-2-mini", base.root);
+        try std.testing.expectEqual(@as(?[]const u8, null), base.parent);
+        try std.testing.expectEqualStrings("qwen3_next_moe_coder", base.architecture);
+        try std.testing.expectEqual(@as(u32, 65536), base.max_model_len);
+        try std.testing.expectEqual(@as(u32, 151936), base.vocab_size);
+        try std.testing.expectApproxEqAbs(@as(f64, 4.25), base.effective_bits_per_weight.?, 1e-6);
+        try std.testing.expectEqual(@as(u64, 4096), base.wired_mib.?);
+        try std.testing.expectEqual(@as(u64, 987654321), base.cold_bytes.?);
+        try std.testing.expect(base.capabilities.chat);
+        try std.testing.expect(base.capabilities.responses);
+        try std.testing.expect(base.capabilities.messages);
+        try std.testing.expect(base.capabilities.tool_calling);
+        try std.testing.expect(base.capabilities.structured_outputs);
+        try std.testing.expect(base.capabilities.reasoning);
+        try std.testing.expect(base.capabilities.vision);
+        try std.testing.expect(base.capabilities.embeddings);
+        try std.testing.expect(base.capabilities.rerank);
+        try std.testing.expect(base.capabilities.lora);
+        try std.testing.expect(base.capabilities.speculative_decoding);
+        try std.testing.expect(base.capabilities.moe);
+
+        for (adp_suffixes, 0..) |nm, idx| {
+            const item = parsed.value.data[idx + 1];
+            var exp_id_buf: [128]u8 = undefined;
+            const exp_id = try std.fmt.bufPrint(&exp_id_buf, "unsloth/inkling-2-mini:{s}", .{nm});
+            try std.testing.expectEqualStrings(exp_id, item.id);
+            try std.testing.expectEqualStrings("model", item.object);
+            try std.testing.expectEqualStrings("aminfer", item.owned_by);
+            try std.testing.expectEqualStrings("unsloth/inkling-2-mini", item.root);
+            try std.testing.expectEqualStrings("unsloth/inkling-2-mini", item.parent.?);
+            try std.testing.expectEqualStrings("qwen3_next_moe_coder", item.architecture);
+            try std.testing.expectEqual(@as(u32, 65536), item.max_model_len);
+            try std.testing.expectEqual(@as(u32, 151936), item.vocab_size);
+            try std.testing.expectEqual(adps_tmp[idx].rank, item.rank.?);
+            try std.testing.expectApproxEqAbs(@as(f64, adps_tmp[idx].lora_alpha), item.lora_alpha.?, 1e-5);
+            try std.testing.expectApproxEqAbs(@as(f64, adps_tmp[idx].scale), item.scale.?, 1e-5);
+            try std.testing.expectEqual(adps_tmp[idx].wired_bytes, item.wired_bytes.?);
+            try std.testing.expect(item.capabilities.lora);
+        }
+    }
+
+    // Live wired_mib update overrides meta.wired_mib when > 0.
+    srv.setWiredMib(8192);
+
+    // 3b. GET /v1/models/{id} with uppercase & lowercase %2F / %3A.
+    {
+        const r_base_upper = try testHttpExchange(
+            port,
+            "GET /v1/models/unsloth%2Finkling-2-mini HTTP/1.1\r\nHost: localhost\r\nx-api-key: sk-c28-test\r\n\r\n",
+            &resp_buf,
+        );
+        try std.testing.expect(std.mem.startsWith(u8, r_base_upper, "HTTP/1.1 200 OK\r\n"));
+        const p_base = try std.json.parseFromSlice(ModelEntryJson, gpa, extractHttpBody(r_base_upper).?, .{});
+        defer p_base.deinit();
+        try std.testing.expectEqualStrings("unsloth/inkling-2-mini", p_base.value.id);
+        try std.testing.expectEqual(@as(u64, 8192), p_base.value.wired_mib.?);
+        try std.testing.expectEqual(@as(?[]const u8, null), p_base.value.parent);
+
+        const r_lora_upper = try testHttpExchange(
+            port,
+            "GET /v1/models/unsloth%2Finkling-2-mini%3Asql-r8 HTTP/1.1\r\nHost: localhost\r\nx-api-key: sk-c28-test\r\n\r\n",
+            &resp_buf,
+        );
+        try std.testing.expect(std.mem.startsWith(u8, r_lora_upper, "HTTP/1.1 200 OK\r\n"));
+        const p_lora_u = try std.json.parseFromSlice(ModelEntryJson, gpa, extractHttpBody(r_lora_upper).?, .{});
+        defer p_lora_u.deinit();
+        try std.testing.expectEqualStrings("unsloth/inkling-2-mini:sql-r8", p_lora_u.value.id);
+        try std.testing.expectEqualStrings("unsloth/inkling-2-mini", p_lora_u.value.parent.?);
+        try std.testing.expectEqual(@as(u32, 8), p_lora_u.value.rank.?);
+
+        const r_lora_lower = try testHttpExchange(
+            port,
+            "GET /v1/models/unsloth%2finkling-2-mini%3asql-r8?detail=full HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer sk-c28-test\r\n\r\n",
+            &resp_buf,
+        );
+        try std.testing.expect(std.mem.startsWith(u8, r_lora_lower, "HTTP/1.1 200 OK\r\n"));
+        const p_lora_l = try std.json.parseFromSlice(ModelEntryJson, gpa, extractHttpBody(r_lora_lower).?, .{});
+        defer p_lora_l.deinit();
+        try std.testing.expectEqualStrings("unsloth/inkling-2-mini:sql-r8", p_lora_l.value.id);
+    }
+
+    // 3c. 405 Method Not Allowed with Allow: GET (checked BEFORE lookup).
+    {
+        const r_post_id = try testHttpExchange(
+            port,
+            "POST /v1/models/unsloth%2Finkling-2-mini HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer sk-c28-test\r\nContent-Length: 0\r\n\r\n",
+            &resp_buf,
+        );
+        try std.testing.expect(std.mem.startsWith(u8, r_post_id, "HTTP/1.1 405 Method Not Allowed\r\n"));
+        try std.testing.expectEqualStrings("GET", extractHeaderValue(r_post_id, "Allow") orelse "");
+        try std.testing.expect(std.mem.indexOf(u8, extractHttpBody(r_post_id).?, "\"code\":\"method_not_allowed\"") != null);
+
+        const r_del = try testHttpExchange(
+            port,
+            "DELETE /v1/models/foo HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer sk-c28-test\r\n\r\n",
+            &resp_buf,
+        );
+        try std.testing.expect(std.mem.startsWith(u8, r_del, "HTTP/1.1 405 Method Not Allowed\r\n"));
+        try std.testing.expectEqualStrings("GET", extractHeaderValue(r_del, "Allow") orelse "");
+    }
+
+    // 3d. 404 Not Found with code="model_not_found".
+    {
+        const r_miss = try testHttpExchange(
+            port,
+            "GET /v1/models/nonexistent HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer sk-c28-test\r\n\r\n",
+            &resp_buf,
+        );
+        try std.testing.expect(std.mem.startsWith(u8, r_miss, "HTTP/1.1 404 Not Found\r\n"));
+        try std.testing.expect(std.mem.indexOf(u8, extractHttpBody(r_miss).?, "\"code\":\"model_not_found\"") != null);
+
+        const r_miss_adp = try testHttpExchange(
+            port,
+            "GET /v1/models/unsloth%2Finkling-2-mini%3Aunknown HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer sk-c28-test\r\n\r\n",
+            &resp_buf,
+        );
+        try std.testing.expect(std.mem.startsWith(u8, r_miss_adp, "HTTP/1.1 404 Not Found\r\n"));
+        try std.testing.expect(std.mem.indexOf(u8, extractHttpBody(r_miss_adp).?, "\"code\":\"model_not_found\"") != null);
+
+        const r_empty = try testHttpExchange(
+            port,
+            "GET /v1/models/ HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer sk-c28-test\r\n\r\n",
+            &resp_buf,
+        );
+        try std.testing.expect(std.mem.startsWith(u8, r_empty, "HTTP/1.1 404 Not Found\r\n"));
+        try std.testing.expect(std.mem.indexOf(u8, extractHttpBody(r_empty).?, "\"code\":\"model_not_found\"") != null);
+
+        const over_x: [140]u8 = @splat('x');
+        var over_req_buf: [256]u8 = undefined;
+        const over_req = try std.fmt.bufPrint(
+            &over_req_buf,
+            "GET /v1/models/{s} HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer sk-c28-test\r\n\r\n",
+            .{over_x[0..]},
+        );
+        const r_over_buf = try testHttpExchange(port, over_req, &resp_buf);
+        try std.testing.expect(std.mem.startsWith(u8, r_over_buf, "HTTP/1.1 404 Not Found\r\n"));
+        try std.testing.expect(std.mem.indexOf(u8, extractHttpBody(r_over_buf).?, "\"code\":\"model_not_found\"") != null);
+    }
+
+    // 3e. 400 Bad Request for malformed percent-encoding (%ZZ / %00) & 401 Unauthorized without API key.
+    {
+        const r_zz = try testHttpExchange(
+            port,
+            "GET /v1/models/bad%ZZid HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer sk-c28-test\r\n\r\n",
+            &resp_buf,
+        );
+        try std.testing.expect(std.mem.startsWith(u8, r_zz, "HTTP/1.1 400 Bad Request\r\n"));
+        try std.testing.expect(std.mem.indexOf(u8, extractHttpBody(r_zz).?, "\"code\":\"invalid_model_id\"") != null);
+
+        const r_nul = try testHttpExchange(
+            port,
+            "GET /v1/models/bad%00id HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer sk-c28-test\r\n\r\n",
+            &resp_buf,
+        );
+        try std.testing.expect(std.mem.startsWith(u8, r_nul, "HTTP/1.1 400 Bad Request\r\n"));
+        try std.testing.expect(std.mem.indexOf(u8, extractHttpBody(r_nul).?, "\"code\":\"invalid_model_id\"") != null);
+
+        const r_401 = try testHttpExchange(
+            port,
+            "GET /v1/models/unsloth%2Finkling-2-mini HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            &resp_buf,
+        );
+        try std.testing.expect(std.mem.startsWith(u8, r_401, "HTTP/1.1 401 Unauthorized\r\n"));
+    }
+
+    // 3f. Zero hot-path heap allocations across GET /v1/models and GET /v1/models/{id}.
+    {
+        _ = try testHttpExchange(port, "GET /v1/models HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer sk-c28-test\r\n\r\n", &resp_buf);
+        _ = try testHttpExchange(port, "GET /v1/models/unsloth%2Finkling-2-mini HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer sk-c28-test\r\n\r\n", &resp_buf);
+        _ = try testHttpExchange(port, "GET /v1/models/unsloth%2Finkling-2-mini%3Asql-r8 HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer sk-c28-test\r\n\r\n", &resp_buf);
+        while (srv.stats().active_conns > 0 or srv.stats().active_requests > 0) {
+            sleepNs(500_000);
+        }
+
+        var m_before: MallocStatistics = std.mem.zeroes(MallocStatistics);
+        malloc_zone_statistics(null, &m_before);
+
+        for (0..8) |_| {
+            const rl = try testHttpExchange(port, "GET /v1/models HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer sk-c28-test\r\n\r\n", &resp_buf);
+            try std.testing.expect(std.mem.startsWith(u8, rl, "HTTP/1.1 200 OK\r\n"));
+            const rb = try testHttpExchange(port, "GET /v1/models/unsloth%2Finkling-2-mini HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer sk-c28-test\r\n\r\n", &resp_buf);
+            try std.testing.expect(std.mem.startsWith(u8, rb, "HTTP/1.1 200 OK\r\n"));
+            const ra = try testHttpExchange(port, "GET /v1/models/unsloth%2Finkling-2-mini%3Asql-r8 HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer sk-c28-test\r\n\r\n", &resp_buf);
+            try std.testing.expect(std.mem.startsWith(u8, ra, "HTTP/1.1 200 OK\r\n"));
+        }
+
+        while (srv.stats().active_conns > 0 or srv.stats().active_requests > 0) {
+            sleepNs(500_000);
+        }
+
+        var m_after: MallocStatistics = std.mem.zeroes(MallocStatistics);
+        malloc_zone_statistics(null, &m_after);
+        try std.testing.expect(m_after.blocks_in_use <= m_before.blocks_in_use);
+        try std.testing.expect(m_after.size_in_use <= m_before.size_in_use);
+    }
 }

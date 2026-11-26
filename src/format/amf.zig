@@ -1476,6 +1476,7 @@ pub const ArchAxesSummary = struct {
     num_key_value_heads: u32 = 0,
     head_dim: u32 = 0,
     vocab_size: u32 = 0,
+    max_position_embeddings: u32 = 0,
     intermediate_size: u32 = 0,
     moe_intermediate_size: u32 = 0,
     num_experts: u32 = 0,
@@ -1487,6 +1488,7 @@ pub const ArchAxesSummary = struct {
     has_mla: bool = false,
     has_sparse_ple_engram: bool = false,
     has_loop_adapter: bool = false,
+    has_vision: bool = false,
     lora_rank: u32 = 0,
 
     pub fn setArch(self: *ArchAxesSummary, s: []const u8) void {
@@ -1623,6 +1625,17 @@ fn populateArchFromJson(allocator: std.mem.Allocator, json_bytes: []const u8, ar
     if (jsonU32Opt(obj, "num_key_value_heads")) |v| arch.num_key_value_heads = v;
     if (jsonU32Opt(obj, "head_dim")) |v| arch.head_dim = v;
     if (jsonU32Opt(obj, "vocab_size")) |v| arch.vocab_size = v;
+    if (jsonU32Opt(obj, "max_position_embeddings") orelse
+        jsonU32Opt(obj, "max_seq_len") orelse
+        jsonU32Opt(obj, "seq_length") orelse
+        jsonU32Opt(obj, "n_ctx") orelse
+        jsonU32Opt(root, "max_position_embeddings")) |v|
+    {
+        arch.max_position_embeddings = v;
+    }
+    if (root.get("vision_config")) |vc| {
+        if (vc != .null) arch.has_vision = true;
+    }
     if (jsonU32Opt(obj, "intermediate_size")) |v| arch.intermediate_size = v;
     if (jsonU32Opt(obj, "moe_intermediate_size")) |v| arch.moe_intermediate_size = v;
     if (jsonU32Opt(obj, "num_experts") orelse jsonU32Opt(obj, "n_routed_experts")) |v| arch.num_experts = v;
@@ -1708,6 +1721,12 @@ fn inferMissingArchAxesFromEntries(entries: []const TensorEntry, arch: *ArchAxes
         }
         if (std.mem.indexOf(u8, nm, "kv_a_proj") != null or std.mem.indexOf(u8, nm, "q_a_proj") != null) {
             arch.has_mla = true;
+        }
+        if (std.mem.startsWith(u8, nm, "vision.") or
+            std.mem.startsWith(u8, nm, "visual.") or
+            std.mem.startsWith(u8, nm, "vision_tower."))
+        {
+            arch.has_vision = true;
         }
 
         if ((std.mem.eql(u8, nm, "embed_tokens") or std.mem.eql(u8, nm, "embed_tokens.weight")) and e.rank == 2) {
@@ -3438,4 +3457,76 @@ test "M8.1 DType enum discriminants 0..37, generalized affine group_size, FP8/MX
         const got_legacy = (try parsed.extractMetadataFromBytes(with_ct, LEGACY_CHAT_TEMPLATE_METADATA_NAME)).?;
         try std.testing.expectEqualStrings(spec_json, got_legacy);
     }
+}
+
+test "C28 populateArchFromJson and inspectAmfPath extract max_position_embeddings and has_vision" {
+    const gpa = std.testing.allocator;
+
+    // 1. Top-level max_position_embeddings + vision_config.
+    {
+        var arch: ArchAxesSummary = .{};
+        try populateArchFromJson(
+            gpa,
+            "{\"model_type\":\"qwen3_vl\",\"vocab_size\":151936,\"max_position_embeddings\":131072,\"vision_config\":{\"hidden_size\":1152}}",
+            &arch,
+        );
+        try std.testing.expectEqualStrings("qwen3_vl", arch.archSlice());
+        try std.testing.expectEqual(@as(u32, 131072), arch.max_position_embeddings);
+        try std.testing.expect(arch.has_vision);
+    }
+
+    // 2. Nested text_config with fallback keys (n_ctx / max_seq_len) and top-level max_position_embeddings fallback.
+    {
+        var arch_nested: ArchAxesSummary = .{};
+        try populateArchFromJson(
+            gpa,
+            "{\"model_type\":\"gemma3\",\"max_position_embeddings\":65536,\"text_config\":{\"model_type\":\"gemma3_text\",\"vocab_size\":262144,\"max_position_embeddings\":32768}}",
+            &arch_nested,
+        );
+        try std.testing.expectEqual(@as(u32, 32768), arch_nested.max_position_embeddings);
+        try std.testing.expect(!arch_nested.has_vision);
+
+        var arch_fallback: ArchAxesSummary = .{};
+        try populateArchFromJson(
+            gpa,
+            "{\"max_position_embeddings\":40960,\"text_config\":{\"model_type\":\"llama\",\"vocab_size\":128256},\"vision_config\":null}",
+            &arch_fallback,
+        );
+        try std.testing.expectEqual(@as(u32, 40960), arch_fallback.max_position_embeddings);
+        try std.testing.expect(!arch_fallback.has_vision);
+
+        var arch_nctx: ArchAxesSummary = .{};
+        try populateArchFromJson(gpa, "{\"text_config\":{\"n_ctx\":8192}}", &arch_nctx);
+        try std.testing.expectEqual(@as(u32, 8192), arch_nctx.max_position_embeddings);
+    }
+
+    // 3. inspectAmfPath with embedded config.json + vision.* tensor prefix inference.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var e = TensorEntry.zeroed("vision.blocks.0.attn.qkv.weight", .dense, .f16);
+    e.rank = 2;
+    e.shape = .{ 4, 4, 0, 0 };
+    e.data_bytes = 32;
+    var wbytes: [32]u8 = @splat(0);
+    const base = try buildTestAmf(gpa, e, &wbytes);
+    defer gpa.free(base);
+
+    const cfg_json = "{\"model_type\":\"qwen2_5_vl\",\"text_config\":{\"vocab_size\":152064,\"max_seq_len\":65536}}";
+    const img = try embedMetadataIntoAmfBytes(gpa, base, &.{
+        .{ .name = META_CONFIG_JSON, .payload = cfg_json },
+    });
+    defer gpa.free(img);
+
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "vision_model.amf", .data = img });
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const amf_path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/vision_model.amf", .{tmp.sub_path});
+    var insp = try inspectAmfPath(gpa, amf_path);
+    defer insp.deinit(gpa);
+
+    try std.testing.expectEqualStrings("qwen2_5_vl", insp.archSlice());
+    try std.testing.expectEqual(@as(u32, 152064), insp.arch.vocab_size);
+    try std.testing.expectEqual(@as(u32, 65536), insp.arch.max_position_embeddings);
+    try std.testing.expect(insp.arch.has_vision);
 }
