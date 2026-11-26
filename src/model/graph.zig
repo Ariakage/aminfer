@@ -87,6 +87,9 @@ pub const AttentionKind = enum {
     gqa_full,
     gated_deltanet,
     qsa_sparse,
+    /// `G26` constant-memory circular sliding-window attention (`128 + sink`,
+    /// asymmetric `K/V` e.g. `192/128` on `MiMo-V2.6-Flash`/`Pro`).
+    swa_ring,
     /// Reserved for M7 Tier 3 (`CSA2`).
     mla_csa2,
 
@@ -95,6 +98,7 @@ pub const AttentionKind = enum {
             .gqa_full => "gqa_full",
             .gated_deltanet => "gated_deltanet",
             .qsa_sparse => "qsa_sparse",
+            .swa_ring => "swa_ring",
             .mla_csa2 => "mla_csa2",
         };
     }
@@ -103,6 +107,7 @@ pub const AttentionKind = enum {
         if (std.mem.eql(u8, s, "gqa_full") or std.mem.eql(u8, s, "full_attention")) return .gqa_full;
         if (std.mem.eql(u8, s, "gated_deltanet") or std.mem.eql(u8, s, "linear_attention")) return .gated_deltanet;
         if (std.mem.eql(u8, s, "qsa_sparse") or std.mem.eql(u8, s, "qsa")) return .qsa_sparse;
+        if (std.mem.eql(u8, s, "swa_ring") or std.mem.eql(u8, s, "sliding_attention") or std.mem.eql(u8, s, "sliding_window_attention")) return .swa_ring;
         if (std.mem.eql(u8, s, "mla_csa2") or std.mem.eql(u8, s, "csa2")) return .mla_csa2;
         return error.InvalidOperatorAxis;
     }
@@ -306,6 +311,11 @@ pub const OperatorAxes = struct {
         return false;
     }
 
+    pub fn hasSwa(self: OperatorAxes) bool {
+        for (self.layer_attention_kinds) |k| if (k == .swa_ring) return true;
+        return false;
+    }
+
     pub fn hasMlaCsa2(self: OperatorAxes) bool {
         for (self.layer_attention_kinds) |k| if (k == .mla_csa2) return true;
         return false;
@@ -408,6 +418,30 @@ pub const GraphConfig = struct {
     m82_family: m82_rt.M82Family = .none,
     m82_cfg: m82_rt.M82Config = .{},
 
+    // M9.1 (`G26`): `mimo_v2` (`Flash`/`Pro` asymmetric `192/128` `128+sink` SWA +
+    // dense L0 / sigmoid+bias MoE L1..N-1) and `qwen3_5` (`(1+w)` RMSNorm +
+    // `attn_output_gate` `q_gate_proj` + GDN + partial-RoPE 256-dim GQA).
+    is_mimo_v2: bool = false,
+    is_qwen3_5: bool = false,
+    /// Optional per-layer FFN override (e.g., dense L0 + MoE L1..N-1 on `mimo_v2`).
+    layer_ffn_kinds: []FfnKind = &.{},
+    swa_num_attention_heads: u32 = 0,
+    swa_num_key_value_heads: u32 = 0,
+    swa_head_dim: u32 = 0,
+    swa_v_head_dim: u32 = 0,
+    swa_rope_theta: f32 = 0.0,
+    sliding_window: u32 = 0,
+    partial_rotary_factor: f32 = 1.0,
+    attention_value_scale: f32 = 1.0,
+    add_swa_attention_sink_bias: bool = false,
+    add_full_attention_sink_bias: bool = false,
+    moe_scoring_sigmoid: bool = false,
+    moe_routed_scaling_factor: f32 = 1.0,
+    moe_n_group: u32 = 1,
+    moe_topk_group: u32 = 1,
+    rmsnorm_unit_offset: bool = false,
+    attn_output_gate: bool = false,
+
     pub const ConfigError = error{
         InvalidJson,
         InvalidConfig,
@@ -419,6 +453,10 @@ pub const GraphConfig = struct {
         if (self.axes.layer_attention_kinds.len > 0) {
             allocator.free(self.axes.layer_attention_kinds);
             self.axes.layer_attention_kinds = &.{};
+        }
+        if (self.layer_ffn_kinds.len > 0) {
+            allocator.free(self.layer_ffn_kinds);
+            self.layer_ffn_kinds = &.{};
         }
         if (self.csa2_modes.len > 0) {
             allocator.free(self.csa2_modes);
@@ -446,6 +484,102 @@ pub const GraphConfig = struct {
             self.dspark_config_file = null;
         }
         self.m82_cfg.deinit(allocator);
+    }
+
+    pub fn layerFfnKind(self: GraphConfig, layer_idx: usize) FfnKind {
+        if (layer_idx < self.layer_ffn_kinds.len) return self.layer_ffn_kinds[layer_idx];
+        return self.axes.ffn_kind;
+    }
+
+    pub fn hasDenseFfn(self: GraphConfig) bool {
+        if (self.layer_ffn_kinds.len > 0) {
+            for (self.layer_ffn_kinds) |fk| if (fk == .dense_swiglu) return true;
+            return false;
+        }
+        return self.axes.ffn_kind == .dense_swiglu;
+    }
+
+    pub fn hasMoeFfn(self: GraphConfig) bool {
+        if (self.layer_ffn_kinds.len > 0) {
+            for (self.layer_ffn_kinds) |fk| if (fk == .moe_swiglu) return true;
+            return false;
+        }
+        return self.axes.ffn_kind == .moe_swiglu;
+    }
+
+    pub fn globalVHeadDim(self: GraphConfig) u32 {
+        return if (self.v_head_dim > 0) self.v_head_dim else self.head_dim;
+    }
+
+    pub fn globalVDim(self: GraphConfig) u32 {
+        return self.num_key_value_heads * self.globalVHeadDim();
+    }
+
+    pub fn globalAttnOutDim(self: GraphConfig) u32 {
+        return self.num_attention_heads * self.globalVHeadDim();
+    }
+
+    pub fn swaQHeads(self: GraphConfig) u32 {
+        return if (self.swa_num_attention_heads > 0) self.swa_num_attention_heads else self.num_attention_heads;
+    }
+
+    pub fn swaKvHeads(self: GraphConfig) u32 {
+        return if (self.swa_num_key_value_heads > 0) self.swa_num_key_value_heads else self.num_key_value_heads;
+    }
+
+    pub fn swaKHeadDim(self: GraphConfig) u32 {
+        return if (self.swa_head_dim > 0) self.swa_head_dim else self.head_dim;
+    }
+
+    pub fn swaVHeadDim(self: GraphConfig) u32 {
+        return if (self.swa_v_head_dim > 0) self.swa_v_head_dim else self.globalVHeadDim();
+    }
+
+    pub fn swaQDim(self: GraphConfig) u32 {
+        return self.swaQHeads() * self.swaKHeadDim();
+    }
+
+    pub fn swaKDim(self: GraphConfig) u32 {
+        return self.swaKvHeads() * self.swaKHeadDim();
+    }
+
+    pub fn swaVDim(self: GraphConfig) u32 {
+        return self.swaKvHeads() * self.swaVHeadDim();
+    }
+
+    pub fn swaAttnOutDim(self: GraphConfig) u32 {
+        return self.swaQHeads() * self.swaVHeadDim();
+    }
+
+    pub fn swaRopeTheta(self: GraphConfig) f32 {
+        return if (self.swa_rope_theta > 0.0) self.swa_rope_theta else self.rope_theta;
+    }
+
+    pub fn effectiveSlidingWindow(self: GraphConfig) u32 {
+        if (self.sliding_window > 0) return self.sliding_window;
+        if (self.swa_window > 0) return self.swa_window;
+        return hybrid.QSA_SWA_WINDOW_TOKENS;
+    }
+
+    pub fn effectiveRotaryDim(self: GraphConfig, k_head_dim: u32) u32 {
+        if (self.partial_rotary_factor > 0.0 and self.partial_rotary_factor < 0.9999) {
+            const raw: u32 = @intFromFloat(@floor(@as(f64, @floatFromInt(k_head_dim)) * @as(f64, self.partial_rotary_factor)));
+            const even = raw & ~@as(u32, 1);
+            if (even > 0 and even <= k_head_dim) return even;
+        }
+        return k_head_dim;
+    }
+
+    pub fn usesG26GlobalGqa(self: GraphConfig) bool {
+        const vd = self.globalVHeadDim();
+        return self.head_dim != vd or
+            (self.head_dim != 64 and self.head_dim != 128) or
+            self.partial_rotary_factor < 0.9999 or
+            self.attention_value_scale != 1.0 or
+            self.add_full_attention_sink_bias or
+            self.rmsnorm_unit_offset or
+            self.is_mimo_v2 or
+            self.is_qwen3_5;
     }
 
     pub fn isCausalEncDec(self: GraphConfig) bool {
@@ -533,6 +667,18 @@ pub const GraphConfig = struct {
             if (self.num_attention_heads == 0 or self.num_key_value_heads == 0 or self.head_dim == 0) return error.InvalidConfig;
             if ((self.num_attention_heads % self.num_key_value_heads) != 0) return error.InvalidConfig;
             if ((self.head_dim % 4) != 0 or self.head_dim > hybrid.MAX_QSA_HEAD_DIM) return error.InvalidConfig;
+            const gvd = self.globalVHeadDim();
+            if (gvd == 0 or (gvd % 4) != 0 or gvd > hybrid.MAX_QSA_HEAD_DIM) return error.InvalidConfig;
+        }
+        if (self.axes.hasSwa()) {
+            const sq = self.swaQHeads();
+            const skv = self.swaKvHeads();
+            const skd = self.swaKHeadDim();
+            const svd = self.swaVHeadDim();
+            if (sq == 0 or skv == 0 or skd == 0 or svd == 0) return error.InvalidConfig;
+            if ((sq % skv) != 0) return error.InvalidConfig;
+            if ((skd % 4) != 0 or skd > hybrid.MAX_QSA_HEAD_DIM) return error.InvalidConfig;
+            if ((svd % 4) != 0 or svd > hybrid.MAX_QSA_HEAD_DIM) return error.InvalidConfig;
         }
         if (self.axes.hasMlaCsa2()) {
             if (self.num_attention_heads == 0 or self.kv_lora_rank == 0 or self.q_lora_rank == 0 or
@@ -579,23 +725,24 @@ pub const GraphConfig = struct {
             }
             if (self.linear_conv_kernel_dim > 8) return error.InvalidConfig;
         }
-        switch (self.axes.ffn_kind) {
-            .dense_swiglu => {
-                if (self.intermediate_size == 0) return error.InvalidConfig;
-            },
-            .moe_swiglu => {
-                if (self.num_experts == 0 or self.num_experts > moe.MAX_EXPERTS) return error.InvalidConfig;
-                const max_tk = self.maxLayerTopK();
-                if (max_tk == 0 or max_tk > moe.MAX_TOP_K or max_tk > self.num_experts) return error.InvalidConfig;
-                if (self.axes.backbone_kind == .causal_enc_dec) {
-                    const enc_tk = self.layerTopK(0);
-                    const dec_tk = self.layerTopK(self.num_encoder_layers);
-                    if (enc_tk == 0 or enc_tk > moe.MAX_TOP_K or enc_tk > self.num_experts) return error.InvalidConfig;
-                    if (dec_tk == 0 or dec_tk > moe.MAX_TOP_K or dec_tk > self.num_experts) return error.InvalidConfig;
-                }
-                if (self.moe_intermediate_size == 0) return error.InvalidConfig;
-                if (self.axes.has_shared_expert and self.shared_expert_intermediate_size == 0) return error.InvalidConfig;
-            },
+        if (self.layer_ffn_kinds.len > 0 and self.layer_ffn_kinds.len != self.num_hidden_layers) {
+            return error.InvalidConfig;
+        }
+        if (self.hasDenseFfn()) {
+            if (self.intermediate_size == 0) return error.InvalidConfig;
+        }
+        if (self.hasMoeFfn()) {
+            if (self.num_experts == 0 or self.num_experts > moe.MAX_EXPERTS) return error.InvalidConfig;
+            const max_tk = self.maxLayerTopK();
+            if (max_tk == 0 or max_tk > moe.MAX_TOP_K or max_tk > self.num_experts) return error.InvalidConfig;
+            if (self.axes.backbone_kind == .causal_enc_dec) {
+                const enc_tk = self.layerTopK(0);
+                const dec_tk = self.layerTopK(self.num_encoder_layers);
+                if (enc_tk == 0 or enc_tk > moe.MAX_TOP_K or enc_tk > self.num_experts) return error.InvalidConfig;
+                if (dec_tk == 0 or dec_tk > moe.MAX_TOP_K or dec_tk > self.num_experts) return error.InvalidConfig;
+            }
+            if (self.moe_intermediate_size == 0) return error.InvalidConfig;
+            if (self.axes.has_shared_expert and self.shared_expert_intermediate_size == 0) return error.InvalidConfig;
         }
         if (self.axes.residual_kind == .gated_4branch and self.axes.residual_branches != hybrid.GR_NUM_BRANCHES) {
             return error.InvalidConfig;
@@ -624,6 +771,17 @@ pub const GraphConfig = struct {
     /// or `max_loops > 1`).
     pub fn isGraphConfigJson(json_bytes: []const u8) bool {
         if (m82_rt.M82Config.isM82ConfigJson(json_bytes)) return true;
+        if (std.mem.indexOf(u8, json_bytes, "\"mimo_v2\"") != null) return true;
+        if (std.mem.indexOf(u8, json_bytes, "\"mimo_v2_flash\"") != null) return true;
+        if (std.mem.indexOf(u8, json_bytes, "\"mimo2\"") != null) return true;
+        if (std.mem.indexOf(u8, json_bytes, "\"qwen3_5\"") != null) return true;
+        if (std.mem.indexOf(u8, json_bytes, "\"qwen3_5_text\"") != null) return true;
+        if (std.mem.indexOf(u8, json_bytes, "\"sliding_attention\"") != null) return true;
+        if (std.mem.indexOf(u8, json_bytes, "\"sliding_window_attention\"") != null) return true;
+        if (std.mem.indexOf(u8, json_bytes, "\"linear_attention\"") != null) return true;
+        if (std.mem.indexOf(u8, json_bytes, "\"rmsnorm_unit_offset\"") != null) return true;
+        if (std.mem.indexOf(u8, json_bytes, "\"attn_output_gate\"") != null) return true;
+        if (std.mem.indexOf(u8, json_bytes, "\"add_swa_attention_sink_bias\"") != null) return true;
         if (std.mem.indexOf(u8, json_bytes, "\"qwen4_exp\"") != null) return true;
         if (std.mem.indexOf(u8, json_bytes, "\"deepseek41\"") != null) return true;
         if (std.mem.indexOf(u8, json_bytes, "\"causal_enc_dec\"") != null) return true;
@@ -662,13 +820,26 @@ pub const GraphConfig = struct {
             if (num_attn_heads > 0) (hidden_size / num_attn_heads) else 0;
 
         const model_type = jsonStr(obj, "model_type") orelse jsonStr(root, "model_type") orelse "";
+        const root_model_type = jsonStr(root, "model_type") orelse "";
         const m82_family = m82_rt.M82Config.detectFamily(root, obj);
         const is_qwen4 = std.mem.eql(u8, model_type, "qwen4_exp");
         const is_deepseek41 = std.mem.eql(u8, model_type, "deepseek41");
+        const is_mimo_v2 = std.mem.eql(u8, model_type, "mimo_v2") or
+            std.mem.eql(u8, model_type, "mimo_v2_flash") or
+            std.mem.eql(u8, model_type, "mimo2") or
+            std.mem.eql(u8, root_model_type, "mimo_v2") or
+            std.mem.eql(u8, root_model_type, "mimo_v2_flash") or
+            std.mem.eql(u8, root_model_type, "mimo2");
+        const is_qwen3_5 = std.mem.eql(u8, model_type, "qwen3_5") or
+            std.mem.eql(u8, model_type, "qwen3_5_text") or
+            std.mem.eql(u8, root_model_type, "qwen3_5") or
+            std.mem.eql(u8, root_model_type, "qwen3_5_text");
         const is_looplm = std.mem.eql(u8, model_type, "looplm") or
             std.mem.eql(u8, model_type, "huginn") or
             std.mem.eql(u8, model_type, "ouro");
-        const raw_num_experts: u32 = jsonU32(obj, "num_experts") orelse jsonU32(obj, "n_routed_experts") orelse 0;
+        const raw_num_experts: u32 = jsonU32(obj, "num_experts") orelse
+            jsonU32(obj, "n_routed_experts") orelse
+            jsonU32(obj, "num_local_experts") orelse 0;
         var m82_cfg = if (m82_family != .none)
             try m82_rt.M82Config.parseFromJson(allocator, m82_family, root, obj, num_layers, raw_num_experts)
         else
@@ -680,6 +851,34 @@ pub const GraphConfig = struct {
             backbone_kind = BackboneKind.parse(s) catch return error.UnsupportedOperatorAxis;
         }
         var ffn_kind: FfnKind = if (raw_num_experts > 0) .moe_swiglu else .dense_swiglu;
+        var layer_ffn_kinds: []FfnKind = &.{};
+        errdefer if (layer_ffn_kinds.len > 0) allocator.free(layer_ffn_kinds);
+        if (raw_num_experts > 0) {
+            if (obj.get("moe_layer_freq") orelse root.get("moe_layer_freq")) |mlf_val| {
+                if (mlf_val == .array and mlf_val.array.items.len == num_layers) {
+                    layer_ffn_kinds = try allocator.alloc(FfnKind, num_layers);
+                    for (mlf_val.array.items, 0..) |item, l| {
+                        const freq = jsonItemU32(item) orelse 1;
+                        layer_ffn_kinds[l] = if (freq > 0) .moe_swiglu else .dense_swiglu;
+                    }
+                }
+            } else if (obj.get("mlp_only_layers") orelse root.get("mlp_only_layers")) |mol_val| {
+                if (mol_val == .array and mol_val.array.items.len > 0) {
+                    layer_ffn_kinds = try allocator.alloc(FfnKind, num_layers);
+                    @memset(layer_ffn_kinds, .moe_swiglu);
+                    for (mol_val.array.items) |item| {
+                        if (jsonItemU32(item)) |dl| {
+                            if (dl < num_layers) layer_ffn_kinds[dl] = .dense_swiglu;
+                        }
+                    }
+                }
+            } else if (is_mimo_v2 and num_layers > 1 and (jsonU32(obj, "intermediate_size") orelse 0) > 0) {
+                // Canonical MiMo-V2.6 layout when `moe_layer_freq` is omitted: dense L0 + MoE L1..N-1.
+                layer_ffn_kinds = try allocator.alloc(FfnKind, num_layers);
+                @memset(layer_ffn_kinds, .moe_swiglu);
+                layer_ffn_kinds[0] = .dense_swiglu;
+            }
+        }
         var has_shared_expert: bool = jsonBool(obj, "has_shared_expert") orelse
             ((jsonU32(obj, "shared_expert_intermediate_size") orelse 0) > 0) or
             ((jsonU32(obj, "n_shared_experts") orelse 0) > 0);
@@ -713,8 +912,22 @@ pub const GraphConfig = struct {
                 .mla_csa2
             else if (is_qwen4)
                 (if (((l + 1) % full_interval) == 0) .qsa_sparse else .gated_deltanet)
+            else if (is_qwen3_5)
+                (if (((l + 1) % full_interval) == 0) .gqa_full else .gated_deltanet)
             else
                 .gqa_full;
+        }
+
+        // Override from `hybrid_layer_pattern` (raw HF `MiMo-V2.6`: 0 = full_attention, 1 = sliding_attention).
+        if (m82_family == .none) {
+            if (obj.get("hybrid_layer_pattern") orelse root.get("hybrid_layer_pattern")) |hlp_val| {
+                if (hlp_val == .array and hlp_val.array.items.len == num_layers) {
+                    for (hlp_val.array.items, 0..) |item, l| {
+                        const pat = jsonItemU32(item) orelse 0;
+                        layer_attns[l] = if (pat == 1) .swa_ring else .gqa_full;
+                    }
+                }
+            }
         }
 
         // Override from `layer_types` if provided (skip M8.2 custom strings handled by `M82Config`).
@@ -877,8 +1090,10 @@ pub const GraphConfig = struct {
             };
         }
 
-        // Parse YaRN + MRoPE `rope_scaling`.
+        // Parse YaRN + MRoPE `rope_scaling` / `rope_parameters` (transformers v5).
         var yarn: hybrid.YarnConfig = .{};
+        var partial_rotary_factor: f32 = jsonF32(obj, "partial_rotary_factor") orelse
+            jsonF32(root, "partial_rotary_factor") orelse 1.0;
         var mrope_sec: hybrid.MropeSection = if (head_dim == 64)
             hybrid.MropeSection.QWEN38_DEFAULT
         else if (head_dim > 0)
@@ -886,24 +1101,36 @@ pub const GraphConfig = struct {
         else
             hybrid.MropeSection.QWEN38_DEFAULT;
         var mrope_interleaved: bool = true;
-        if (obj.get("rope_scaling")) |rs_val| {
-            if (rs_val == .object) {
-                const rs = rs_val.object;
-                if (jsonF32(rs, "factor")) |f| yarn.factor = f;
-                if (jsonF32(rs, "mscale")) |m| yarn.mscale = m;
-                if (jsonF32(rs, "beta_fast")) |bf| yarn.beta_fast = bf;
-                if (jsonF32(rs, "beta_slow")) |bs| yarn.beta_slow = bs;
-                if (jsonU32(rs, "original_max_position_embeddings")) |omp| yarn.original_max_pos = omp;
-                if (jsonBool(rs, "mrope_interleaved")) |mi| mrope_interleaved = mi;
-                if (rs.get("mrope_section")) |ms_val| {
-                    if (ms_val == .array and ms_val.array.items.len == 3) {
-                        mrope_sec = .{ .section = .{
-                            jsonItemU32(ms_val.array.items[0]) orelse 11,
-                            jsonItemU32(ms_val.array.items[1]) orelse 11,
-                            jsonItemU32(ms_val.array.items[2]) orelse 10,
-                        } };
+        var has_explicit_mrope_sec: bool = false;
+        const rope_objs = [_]?std.json.Value{ obj.get("rope_parameters"), obj.get("rope_scaling") };
+        for (rope_objs) |rs_opt| {
+            if (rs_opt) |rs_val| {
+                if (rs_val == .object) {
+                    const rs = rs_val.object;
+                    if (jsonF32(rs, "partial_rotary_factor")) |prf| partial_rotary_factor = prf;
+                    if (jsonF32(rs, "factor")) |f| yarn.factor = f;
+                    if (jsonF32(rs, "mscale")) |m| yarn.mscale = m;
+                    if (jsonF32(rs, "beta_fast")) |bf| yarn.beta_fast = bf;
+                    if (jsonF32(rs, "beta_slow")) |bs| yarn.beta_slow = bs;
+                    if (jsonU32(rs, "original_max_position_embeddings")) |omp| yarn.original_max_pos = omp;
+                    if (jsonBool(rs, "mrope_interleaved")) |mi| mrope_interleaved = mi;
+                    if (rs.get("mrope_section")) |ms_val| {
+                        if (ms_val == .array and ms_val.array.items.len == 3) {
+                            mrope_sec = .{ .section = .{
+                                jsonItemU32(ms_val.array.items[0]) orelse 11,
+                                jsonItemU32(ms_val.array.items[1]) orelse 11,
+                                jsonItemU32(ms_val.array.items[2]) orelse 10,
+                            } };
+                            has_explicit_mrope_sec = true;
+                        }
                     }
                 }
+            }
+        }
+        if (!has_explicit_mrope_sec and partial_rotary_factor < 0.9999 and head_dim > 0) {
+            const eff_rot: u32 = @as(u32, @intFromFloat(@floor(@as(f64, @floatFromInt(head_dim)) * @as(f64, partial_rotary_factor)))) & ~@as(u32, 1);
+            if (eff_rot > 0 and eff_rot <= head_dim) {
+                mrope_sec = hybrid.MropeSection.text1d(eff_rot);
             }
         }
 
@@ -1025,6 +1252,16 @@ pub const GraphConfig = struct {
             }
         }
 
+        const sliding_window: u32 = jsonU32(obj, "sliding_window") orelse
+            jsonU32(obj, "sliding_window_size") orelse swa_window;
+        const scoring_func = jsonStr(obj, "scoring_func") orelse jsonStr(root, "scoring_func") orelse "";
+        const moe_scoring_sigmoid: bool = std.mem.eql(u8, scoring_func, "sigmoid") or
+            (jsonBool(obj, "moe_router_use_sigmoid") orelse false);
+        const rmsnorm_unit_offset: bool = jsonBool(obj, "rmsnorm_unit_offset") orelse
+            jsonBool(root, "rmsnorm_unit_offset") orelse is_qwen3_5;
+        const attn_output_gate: bool = jsonBool(obj, "attn_output_gate") orelse
+            jsonBool(root, "attn_output_gate") orelse is_qwen3_5;
+
         const cfg: GraphConfig = .{
             .axes = .{
                 .backbone_kind = backbone_kind,
@@ -1048,7 +1285,7 @@ pub const GraphConfig = struct {
             .num_experts = raw_num_experts,
             .num_experts_per_tok = raw_top_k,
             .norm_topk_prob = jsonBool(obj, "norm_topk_prob") orelse true,
-            .rms_norm_eps = jsonF32(obj, "rms_norm_eps") orelse 1e-6,
+            .rms_norm_eps = jsonF32(obj, "rms_norm_eps") orelse jsonF32(obj, "layernorm_epsilon") orelse 1e-6,
             .rope_theta = jsonF32(obj, "rope_theta") orelse blk_rt: {
                 if (obj.get("rope_parameters")) |rp| {
                     if (rp == .object) {
@@ -1107,6 +1344,25 @@ pub const GraphConfig = struct {
             .dspark_max_tree_nodes = dspark_max_tree_nodes,
             .m82_family = m82_family,
             .m82_cfg = m82_cfg,
+            .is_mimo_v2 = is_mimo_v2,
+            .is_qwen3_5 = is_qwen3_5,
+            .layer_ffn_kinds = layer_ffn_kinds,
+            .swa_num_attention_heads = jsonU32(obj, "swa_num_attention_heads") orelse 0,
+            .swa_num_key_value_heads = jsonU32(obj, "swa_num_key_value_heads") orelse 0,
+            .swa_head_dim = jsonU32(obj, "swa_head_dim") orelse 0,
+            .swa_v_head_dim = jsonU32(obj, "swa_v_head_dim") orelse 0,
+            .swa_rope_theta = jsonF32(obj, "swa_rope_theta") orelse 0.0,
+            .sliding_window = sliding_window,
+            .partial_rotary_factor = partial_rotary_factor,
+            .attention_value_scale = jsonF32(obj, "attention_value_scale") orelse 1.0,
+            .add_swa_attention_sink_bias = jsonBool(obj, "add_swa_attention_sink_bias") orelse false,
+            .add_full_attention_sink_bias = jsonBool(obj, "add_full_attention_sink_bias") orelse false,
+            .moe_scoring_sigmoid = moe_scoring_sigmoid,
+            .moe_routed_scaling_factor = jsonF32(obj, "routed_scaling_factor") orelse 1.0,
+            .moe_n_group = jsonU32(obj, "n_group") orelse 1,
+            .moe_topk_group = jsonU32(obj, "topk_group") orelse 1,
+            .rmsnorm_unit_offset = rmsnorm_unit_offset,
+            .attn_output_gate = attn_output_gate,
         };
         try cfg.validate();
         return cfg;
@@ -1252,6 +1508,16 @@ pub const GraphLoadOptions = struct {
     use_sme2_controllers: bool = false,
     /// Enable zero-alloc per-step top-k router trace capture for `inkling2_loop` / `inkling2` (`--dump-router-trace`).
     enable_router_trace: bool = false,
+
+    // M9.1 (`D15` `DFlash` target taps on pure `GraphModel`, e.g., `mimo_v2` 5-tap `[0,11,23,35,47]`)
+    /// Optional explicit 0-indexed target layer IDs (up to `dflare_dfly.MAX_TARGET_TAPS = 8`)
+    /// captured into a wired `GpuContextHistory` ring for `DFlareProposer` (`arch = dflash`).
+    /// When `null` on `mimo_v2`, automatically selects canonical 5-tap indices.
+    dflare_target_layers: ?[]const u16 = null,
+    /// Force-enable `DFlash` target tap capture on non-`mimo_v2` `GraphModel` runs.
+    enable_dflare_taps: bool = false,
+    /// Circular `GpuContextHistory` ring capacity in tokens (clamped to `max_seq_len`).
+    dflare_ctx_hist_cap: u32 = 1024,
 };
 
 pub const M7Stats = struct {
@@ -1529,9 +1795,17 @@ const GqaLayerWeights = struct {
     k_proj: qwen3.LinearBinding,
     v_proj: qwen3.LinearBinding,
     o_proj: qwen3.LinearBinding,
+    /// Optional `qwen3_5` `attn_output_gate` (`layers.{L}.self_attn.q_gate_proj`).
+    q_gate_proj: ?qwen3.LinearBinding = null,
     q_norm: ?metal.BufferBinding,
     k_norm: ?metal.BufferBinding,
     qk_norm_dtype: quant.FloatDType,
+    /// Optional `layers.{L}.self_attn.sink_bias` (`[num_q_heads]`).
+    sink_bias: ?metal.BufferBinding = null,
+    sink_bias_dtype: hybrid.ScalarDType = .bf16,
+    k_head_dim: u32,
+    v_head_dim: u32,
+    rotary_dim: u32,
     kv_tiles_binding: metal.BufferBinding,
     kv_tiles_host: []attention.KvTilePair = &.{},
     retired_ids_binding: metal.BufferBinding = undefined,
@@ -1541,10 +1815,35 @@ const GqaLayerWeights = struct {
     tree_v_off: u64,
 };
 
+const SwaLayerWeights = struct {
+    swa_idx: u32,
+    q_proj: qwen3.LinearBinding,
+    k_proj: qwen3.LinearBinding,
+    v_proj: qwen3.LinearBinding,
+    o_proj: qwen3.LinearBinding,
+    q_norm: ?metal.BufferBinding,
+    k_norm: ?metal.BufferBinding,
+    qk_norm_dtype: quant.FloatDType,
+    sink_bias: ?metal.BufferBinding = null,
+    sink_bias_dtype: hybrid.ScalarDType = .bf16,
+    num_q_heads: u32,
+    num_kv_heads: u32,
+    k_head_dim: u32,
+    v_head_dim: u32,
+    rotary_dim: u32,
+    rope_theta: f32,
+    kv_ring: hybrid.HybridKvRing,
+    tree_k_off: u64,
+    tree_v_off: u64,
+    wp_k_off: u64 = 0,
+    wp_v_off: u64 = 0,
+};
+
 const LayerAttention = union(enum) {
     gqa: GqaLayerWeights,
     gdn: GdnLayerWeights,
     qsa: QsaLayerWeights,
+    swa: SwaLayerWeights,
     mla_csa2: MlaCsa2LayerWeights,
 };
 
@@ -1556,12 +1855,12 @@ const GraphLayerWeights = struct {
     mhc: ?MhcLayerWeights = null,
     attn: LayerAttention,
 
-    // Dense SwiGLU (when `ffn_kind == .dense_swiglu`)
+    // Dense SwiGLU (when `config.layerFfnKind(l) == .dense_swiglu`)
     dense_gate: qwen3.LinearBinding = undefined,
     dense_up: qwen3.LinearBinding = undefined,
     dense_down: qwen3.LinearBinding = undefined,
 
-    // MoE SwiGLU (when `ffn_kind == .moe_swiglu`)
+    // MoE SwiGLU (when `config.layerFfnKind(l) == .moe_swiglu`)
     router_binding: metal.BufferBinding = undefined,
     router_dtype: moe.RouterWeightDType = .bf16,
     router_quant_dtype: ?quant.WeightDType = null,
@@ -1569,6 +1868,9 @@ const GraphLayerWeights = struct {
     router_group_size: u16 = 64,
     router_tensor_scale_per_row: bool = false,
     router_scale_bias: ?metal.BufferBinding = null,
+    /// Optional `e_score_correction_bias` (`layers.{L}.mlp.gate.bias`).
+    router_bias: ?metal.BufferBinding = null,
+    router_bias_dtype: hybrid.ScalarDType = .f32,
     expert_weights_buf: metal.Buffer = undefined,
     expert_table: metal.BufferBinding = undefined,
     expert_table_host: []moe.ExpertWeights = &.{},
@@ -1882,6 +2184,21 @@ pub const GraphModel = struct {
     lora_pipes: ?lora_gpu.GpuLoraPipelines = null,
     lora_ws: ?lora_gpu.GpuLoraWorkspace = null,
 
+    // M9.1 (`D15` `DFlash`) Pure-GraphModel Target Hidden Taps & `GpuContextHistory` Ring
+    // Active when `m82 == null` and `dflare_tap_count > 0` (e.g., `mimo_v2` 5-tap `[0,11,23,35,47]`).
+    dflare_target_layers: [dflare_dfly.MAX_TARGET_TAPS]u16 = @splat(0),
+    dflare_tap_count: usize = 0,
+    /// Wired `[dflare_tap_count, max_tree_nodes, H]` `f16` scratch for decode / `verifyTree`.
+    dflare_taps_gpu_off: u64 = 0,
+    dflare_tap_gpu_binds: [dflare_dfly.MAX_TARGET_TAPS]metal.BufferBinding = undefined,
+    dflare_tap_storage: []f32 = &.{},
+    dflare_tap_slices: [dflare_dfly.MAX_TARGET_TAPS][]const f32 = @splat(&.{}),
+    /// Wired `[dflare_ctx_hist_cap, dflare_tap_count, H]` `f16` circular history ring.
+    dflare_ctx_hist_off: u64 = 0,
+    dflare_ctx_hist_cap: u32 = 0,
+    dflare_ctx_hist_len: u32 = 0,
+    dflare_ctx_hist_epoch: u64 = 0,
+
     pub fn baseModelShape(self: *const GraphModel) lora.BaseModelShape {
         return .{
             .num_layers = self.config.num_hidden_layers,
@@ -2075,29 +2392,34 @@ pub const GraphModel = struct {
             .q_proj => switch (layer.attn) {
                 .gqa => |gqa| gqa.q_proj,
                 .qsa => |qsa| qsa.q_proj,
+                .swa => |swa| swa.q_proj,
                 .gdn => |g| g.q_proj,
                 .mla_csa2 => null,
             },
             .k_proj => switch (layer.attn) {
                 .gqa => |gqa| gqa.k_proj,
                 .qsa => |qsa| qsa.k_proj,
+                .swa => |swa| swa.k_proj,
                 .gdn => |g| g.k_proj,
                 .mla_csa2 => null,
             },
             .v_proj => switch (layer.attn) {
                 .gqa => |gqa| gqa.v_proj,
                 .qsa => |qsa| qsa.v_proj,
+                .swa => |swa| swa.v_proj,
                 .gdn => |g| g.v_proj,
                 .mla_csa2 => null,
             },
             .o_proj => switch (layer.attn) {
                 .gqa => |gqa| gqa.o_proj,
                 .qsa => |qsa| qsa.o_proj,
+                .swa => |swa| swa.o_proj,
                 .gdn => |g| g.o_proj,
                 .mla_csa2 => |mla| mla.o_proj,
             },
             .gate_attn => switch (layer.attn) {
                 .gdn => |g| g.g_proj,
+                .gqa => |gqa| gqa.q_gate_proj,
                 else => null,
             },
             .q_a_proj => switch (layer.attn) {
@@ -2112,9 +2434,9 @@ pub const GraphModel = struct {
                 .mla_csa2 => |mla| mla.kv_a_proj,
                 else => null,
             },
-            .gate_proj => if (self.config.axes.ffn_kind == .dense_swiglu) layer.dense_gate else null,
-            .up_proj => if (self.config.axes.ffn_kind == .dense_swiglu) layer.dense_up else null,
-            .down_proj => if (self.config.axes.ffn_kind == .dense_swiglu) layer.dense_down else null,
+            .gate_proj => if (self.config.layerFfnKind(layer_idx) == .dense_swiglu) layer.dense_gate else null,
+            .up_proj => if (self.config.layerFfnKind(layer_idx) == .dense_swiglu) layer.dense_up else null,
+            .down_proj => if (self.config.layerFfnKind(layer_idx) == .dense_swiglu) layer.dense_down else null,
             else => null,
         };
     }
@@ -2330,6 +2652,12 @@ pub const GraphModel = struct {
                     };
                     qsa.kv_ring.deinit(allocator);
                 },
+                .swa => |*swa| {
+                    swa.kv_ring.removeResident(self.compute) catch |err| {
+                        std.debug.panic("SWA kv_ring.removeResident failed: {}", .{err});
+                    };
+                    swa.kv_ring.deinit(allocator);
+                },
                 .mla_csa2 => |*mla| {
                     if (mla.w_uk_t_heads.len > 0) allocator.free(mla.w_uk_t_heads);
                     if (mla.w_uv_heads.len > 0) allocator.free(mla.w_uv_heads);
@@ -2338,6 +2666,7 @@ pub const GraphModel = struct {
             }
             if (layer.expert_sources.len > 0) allocator.free(layer.expert_sources);
         }
+        if (self.dflare_tap_storage.len > 0) allocator.free(self.dflare_tap_storage);
         if (self.cluster_assignments.len > 0) allocator.free(self.cluster_assignments);
         if (self.cluster_accum_f32.len > 0) allocator.free(self.cluster_accum_f32);
         if (self.ced_encoder_sum_host.len > 0) allocator.free(self.ced_encoder_sum_host);
@@ -2395,6 +2724,8 @@ pub const GraphModel = struct {
         self.last_verified_nodes = 0;
         self.num_retired_chunks = 0;
         self.kv_retire_events = 0;
+        self.dflare_ctx_hist_len = 0;
+        self.dflare_ctx_hist_epoch +%= 1;
         if (self.ced_encoder_sum_host.len > 0) @memset(self.ced_encoder_sum_host, 0.0);
         if (self.ced_encoder_summary_host.len > 0) @memset(self.ced_encoder_summary_host, 0.0);
         if (self.ced_last_decoder_hidden_host.len > 0) @memset(self.ced_last_decoder_hidden_host, 0.0);
@@ -2476,7 +2807,7 @@ pub const GraphModel = struct {
                         );
                     }
                 },
-                .gdn, .mla_csa2 => {},
+                .gdn, .swa, .mla_csa2 => {},
             }
         }
     }
@@ -2520,7 +2851,7 @@ pub const GraphModel = struct {
                     }, false);
                     dispatched = true;
                 },
-                .gdn, .mla_csa2 => {},
+                .gdn, .swa, .mla_csa2 => {},
             }
         }
 
@@ -2739,6 +3070,119 @@ pub const GraphModel = struct {
                     out_f32[i] = out_f32[i] * inv_rms * enw[i];
                 }
             }
+        } else if (self.hasDFlareCtxHistory()) {
+            dflare_dfly.registerContextHistoryProvider(self, graphDFlareContextHistoryCb);
+        }
+    }
+
+    pub fn hasDFlareCtxHistory(self: *const GraphModel) bool {
+        if (self.m82) |rt| return rt.hasDFlareCtxHistory();
+        return self.dflare_tap_count > 0 and self.dflare_ctx_hist_cap > 0 and self.dflare_ctx_hist_off > 0;
+    }
+
+    pub fn dflareTapCount(self: *const GraphModel) usize {
+        if (self.m82) |rt| return rt.dflare_tap_count;
+        return self.dflare_tap_count;
+    }
+
+    pub fn dflareTargetLayerIds(self: *const GraphModel) []const u16 {
+        return self.dflare_target_layers[0..self.dflare_tap_count];
+    }
+
+    pub fn dflareTargetTaps(self: *const GraphModel) []const []const f32 {
+        if (self.m82) |rt| return rt.dflareTargetTaps();
+        return self.dflare_tap_slices[0..self.dflare_tap_count];
+    }
+
+    pub fn dflareGpuTargetTaps(self: *const GraphModel) ?dflare_dfly.GpuTargetTaps {
+        if (self.m82) |rt| return rt.dflareGpuTargetTaps();
+        if (self.dflare_tap_count == 0 or self.dflare_taps_gpu_off == 0) return null;
+        return .{
+            .taps = self.dflare_tap_gpu_binds[0..self.dflare_tap_count],
+        };
+    }
+
+    pub fn dflareGpuContextHistory(self: *const GraphModel) ?dflare_dfly.GpuContextHistory {
+        if (self.m82) |rt| return rt.dflareGpuContextHistory();
+        if (!self.hasDFlareCtxHistory()) return null;
+        return .{
+            .taps_ring = .{ .buffer = self.scratch_buf, .offset = self.dflare_ctx_hist_off },
+            .dtype = .f16,
+            .cap = self.dflare_ctx_hist_cap,
+            .len = self.dflare_ctx_hist_len,
+            .epoch = self.dflare_ctx_hist_epoch,
+        };
+    }
+
+    pub fn readDFlareCtxTapF32(self: *const GraphModel, pos: u32, tap_idx: usize, dst_f32: []f32) bool {
+        if (self.m82) |rt| return rt.readDFlareCtxTapF32(pos, tap_idx, dst_f32);
+        if (!self.hasDFlareCtxHistory() or tap_idx >= self.dflare_tap_count) return false;
+        if (pos >= self.dflare_ctx_hist_len) return false;
+        if (self.dflare_ctx_hist_len > self.dflare_ctx_hist_cap and pos + self.dflare_ctx_hist_cap < self.dflare_ctx_hist_len) {
+            return false;
+        }
+        const h: usize = self.config.hidden_size;
+        if (dst_f32.len < h) return false;
+        const taps: usize = self.dflare_tap_count;
+        const slot: usize = @intCast(pos % self.dflare_ctx_hist_cap);
+        const total_elems: usize = @as(usize, self.dflare_ctx_hist_cap) * taps * h;
+        const base = self.scratch_arena.bytes()[@intCast(self.dflare_ctx_hist_off)..][0 .. total_elems * @sizeOf(f16)];
+        const hist_f16: []const f16 = @alignCast(std.mem.bytesAsSlice(f16, base));
+        const src = hist_f16[(slot * taps + tap_idx) * h ..][0..h];
+        for (0..h) |d| dst_f32[d] = @floatCast(src[d]);
+        return true;
+    }
+
+    fn syncDFlareTapsFromTreeNode(self: *GraphModel, node_idx: usize) void {
+        if (self.dflare_tap_count == 0 or self.dflare_taps_gpu_off == 0) return;
+        const h: usize = self.config.hidden_size;
+        const max_m: usize = self.max_tree_nodes;
+        if (node_idx >= max_m) return;
+        const stride_elems: usize = max_m * h;
+        const stride_bytes: u64 = @as(u64, stride_elems) * @sizeOf(f16);
+        const row_bytes: u64 = @as(u64, node_idx) * h * @sizeOf(f16);
+        const all_bytes = self.scratch_arena.bytes()[@intCast(self.dflare_taps_gpu_off)..][0 .. self.dflare_tap_count * stride_elems * @sizeOf(f16)];
+        const all_f16: []const f16 = @alignCast(std.mem.bytesAsSlice(f16, all_bytes));
+        for (0..self.dflare_tap_count) |ti| {
+            self.dflare_tap_gpu_binds[ti] = .{
+                .buffer = self.scratch_buf,
+                .offset = self.dflare_taps_gpu_off + @as(u64, ti) * stride_bytes + row_bytes,
+            };
+            if (self.dflare_tap_storage.len >= (ti + 1) * h) {
+                const src = all_f16[(ti * max_m + node_idx) * h ..][0..h];
+                const dst = self.dflare_tap_storage[ti * h ..][0..h];
+                for (0..h) |d| dst[d] = @floatCast(src[d]);
+                self.dflare_tap_slices[ti] = dst;
+            }
+        }
+    }
+
+    fn syncDFlareTapsFromRingPos(self: *GraphModel, pos: u32) void {
+        if (!self.hasDFlareCtxHistory()) return;
+        const h: usize = self.config.hidden_size;
+        const taps: usize = self.dflare_tap_count;
+        const slot: usize = @intCast(pos % self.dflare_ctx_hist_cap);
+        const total_elems: usize = @as(usize, self.dflare_ctx_hist_cap) * taps * h;
+        const ring_bytes = self.scratch_arena.bytes()[@intCast(self.dflare_ctx_hist_off)..][0 .. total_elems * @sizeOf(f16)];
+        const hist_f16: []const f16 = @alignCast(std.mem.bytesAsSlice(f16, ring_bytes));
+        const max_m: usize = self.max_tree_nodes;
+        const stride_elems: usize = max_m * h;
+        const stride_bytes: u64 = @as(u64, stride_elems) * @sizeOf(f16);
+        const taps_bytes = self.scratch_arena.bytes()[@intCast(self.dflare_taps_gpu_off)..][0 .. taps * stride_elems * @sizeOf(f16)];
+        const taps_f16: []f16 = @alignCast(std.mem.bytesAsSlice(f16, taps_bytes));
+        for (0..taps) |ti| {
+            const src = hist_f16[(slot * taps + ti) * h ..][0..h];
+            // Mirror into node 0 of `dflare_taps_gpu_off` so `dflareGpuTargetTaps` points to contiguous f16.
+            @memcpy(taps_f16[ti * stride_elems ..][0..h], src);
+            self.dflare_tap_gpu_binds[ti] = .{
+                .buffer = self.scratch_buf,
+                .offset = self.dflare_taps_gpu_off + @as(u64, ti) * stride_bytes,
+            };
+            if (self.dflare_tap_storage.len >= (ti + 1) * h) {
+                const dst = self.dflare_tap_storage[ti * h ..][0..h];
+                for (0..h) |d| dst[d] = @floatCast(src[d]);
+                self.dflare_tap_slices[ti] = dst;
+            }
         }
     }
 
@@ -2751,11 +3195,16 @@ pub const GraphModel = struct {
         dst_f32: []f32,
     ) bool {
         const gm: *const GraphModel = @ptrCast(@alignCast(ctx));
-        const rt = gm.m82 orelse return false;
-        out_len.* = rt.dflare_ctx_hist_len;
-        out_epoch.* = rt.dflare_ctx_hist_epoch;
-        if (dst_f32.len == 0) return rt.hasDFlareCtxHistory();
-        return rt.readDFlareCtxTapF32(pos, tap_idx, dst_f32);
+        if (gm.m82) |rt| {
+            out_len.* = rt.dflare_ctx_hist_len;
+            out_epoch.* = rt.dflare_ctx_hist_epoch;
+            if (dst_f32.len == 0) return rt.hasDFlareCtxHistory();
+            return rt.readDFlareCtxTapF32(pos, tap_idx, dst_f32);
+        }
+        out_len.* = gm.dflare_ctx_hist_len;
+        out_epoch.* = gm.dflare_ctx_hist_epoch;
+        if (dst_f32.len == 0) return gm.hasDFlareCtxHistory();
+        return gm.readDFlareCtxTapF32(pos, tap_idx, dst_f32);
     }
 
     pub fn bytesPerDecodeToken(self: *const GraphModel, seq_len: u32) u64 {
@@ -2767,8 +3216,8 @@ pub const GraphModel = struct {
         const dec_start: usize = if (self.config.isCausalEncDec()) self.config.num_encoder_layers else 0;
         for (self.layers[dec_start..]) |layer| {
             switch (layer.attn) {
-                .gqa => {
-                    kv_bytes += 2 * @as(u64, self.config.num_key_value_heads) * seq_len * self.config.head_dim * @sizeOf(f16);
+                .gqa => |gqa| {
+                    kv_bytes += @as(u64, self.config.num_key_value_heads) * seq_len * (@as(u64, gqa.k_head_dim) + gqa.v_head_dim) * @sizeOf(f16);
                 },
                 .qsa => |qsa| {
                     const vis_tok: u64 = if (qsa.kv_ring.window_size > 0)
@@ -2776,6 +3225,10 @@ pub const GraphModel = struct {
                     else
                         @min(@as(u64, seq_len), @as(u64, self.config.qsa_top_k_blocks) * self.config.qsa_block_size);
                     kv_bytes += 2 * @as(u64, self.config.num_key_value_heads) * vis_tok * self.config.head_dim * @sizeOf(f16);
+                },
+                .swa => |swa| {
+                    const vis_tok: u64 = @min(@as(u64, seq_len), swa.kv_ring.window_size);
+                    kv_bytes += @as(u64, swa.num_kv_heads) * vis_tok * (@as(u64, swa.k_head_dim) + swa.v_head_dim) * @sizeOf(f16);
                 },
                 .gdn => {
                     const state_b = @as(u64, self.config.linear_num_value_heads) *
@@ -3146,6 +3599,7 @@ pub const GraphModel = struct {
                 .hidden_dim = self.config.hidden_size,
                 .eps = self.config.rms_norm_eps,
                 .w_dtype = norm.dtype,
+                .unit_offset = self.config.rmsnorm_unit_offset,
             }, barrier_before);
             return;
         }
@@ -3162,6 +3616,7 @@ pub const GraphModel = struct {
             .hidden_dim = self.config.hidden_size,
             .eps = self.config.rms_norm_eps,
             .w_dtype = norm.dtype,
+            .unit_offset = self.config.rmsnorm_unit_offset,
         }, true);
     }
 
@@ -3426,7 +3881,7 @@ pub const GraphModel = struct {
         const aux_needs_last = self.enable_feature_taps and
             (self.aux_layer_ids[0] == last_l or self.aux_layer_ids[1] == last_l or self.aux_layer_ids[2] == last_l);
         const allow_tail_prune = (!is_ced) and self.enable_prompt_tail_pruning and !self.compute_all_logits and
-            !preserve_all_top_hidden and !aux_needs_last;
+            !preserve_all_top_hidden and !aux_needs_last and !self.hasDFlareCtxHistory();
         const prune_non_final_last = allow_tail_prune and (!is_final_chunk or !compute_logits);
         const prune_final_last_to_m1 = allow_tail_prune and is_final_chunk and compute_logits and (m > 1);
 
@@ -3636,6 +4091,7 @@ pub const GraphModel = struct {
                     .hidden_dim = h,
                     .eps = self.config.rms_norm_eps,
                     .w_dtype = self.final_norm.dtype,
+                    .unit_offset = self.config.rmsnorm_unit_offset,
                 }, true);
                 try self.encodeLinearGemmWithTile(&frame, self.lm_head, self.wp_x_norm_bind, self.logits_bind, m, true, true);
                 try self.moe_pipes.encodeArgmaxRows(&frame, .{
@@ -3659,6 +4115,7 @@ pub const GraphModel = struct {
                     .hidden_dim = h,
                     .eps = self.config.rms_norm_eps,
                     .w_dtype = self.final_norm.dtype,
+                    .unit_offset = self.config.rmsnorm_unit_offset,
                 }, true);
                 try self.encodeLinearGemv(&frame, self.lm_head, self.wp_x_norm_bind, self.logits_bind, true);
                 try self.moe_pipes.encodeArgmaxRows(&frame, .{
@@ -3680,6 +4137,10 @@ pub const GraphModel = struct {
         }
         self.seq_len = base_pos + m;
         self.mrope_next_pos = self.seq_len;
+        if (self.hasDFlareCtxHistory()) {
+            self.dflare_ctx_hist_len = @max(self.dflare_ctx_hist_len, base_pos + m);
+            self.syncDFlareTapsFromRingPos(base_pos + m - 1);
+        }
         try self.retireExcessCompletedChunks();
 
         if (logits_rows_computed > 0) {
@@ -3775,6 +4236,7 @@ pub const GraphModel = struct {
                 .hidden_dim = h,
                 .eps = self.config.rms_norm_eps,
                 .w_dtype = layer.input_layernorm.dtype,
+                .unit_offset = self.config.rmsnorm_unit_offset,
             }, true);
 
             if (self.ple_rt) |prt| {
@@ -3794,6 +4256,7 @@ pub const GraphModel = struct {
                         .hidden_dim = h,
                         .eps = self.config.rms_norm_eps,
                         .w_dtype = layer.input_layernorm.dtype,
+                        .unit_offset = self.config.rmsnorm_unit_offset,
                     }, true);
                 }
             }
@@ -4476,10 +4939,23 @@ pub const GraphModel = struct {
             },
             .gqa => |gqa| {
                 const kv_d = self.config.kvDim();
+                const v_d = self.config.globalVDim();
                 const has_retired = (self.retired_kv_pool != null and self.num_retired_chunks > 0);
                 const rpool_bind: ?metal.BufferBinding = if (has_retired) self.retired_kv_pool.?.binding(self.scratch_buf) else null;
                 const ret_plane_stride: u32 = if (has_retired) self.retired_kv_pool.?.plane_stride_bytes else 0;
                 const ret_chunk_stride: u32 = if (has_retired) self.retired_kv_pool.?.chunk_stride_bytes else 0;
+                const use_g26 = self.config.usesG26GlobalGqa() or gqa.sink_bias != null or
+                    gqa.k_head_dim != gqa.v_head_dim or gqa.rotary_dim != gqa.k_head_dim or gqa.k_head_dim > 128;
+                const mrope_ms = self.config.mrope_section;
+                const mrope_sum2 = (mrope_ms.section[0] + mrope_ms.section[1] + mrope_ms.section[2]) * 2;
+                const eff_mrope: hybrid.MropeSection = if ((mrope_ms.section[1] > 0 or mrope_ms.section[2] > 0) and mrope_sum2 == gqa.rotary_dim)
+                    mrope_ms
+                else
+                    hybrid.MropeSection.text1d(gqa.rotary_dim);
+                const last_p3d_bind: metal.BufferBinding = .{
+                    .buffer = self.scratch_buf,
+                    .offset = self.wp_pos3d_bind.offset + @as(u64, m - 1) * @sizeOf(hybrid.Pos3D),
+                };
 
                 if (loop_step == 0) {
                     if (skip_last_rest) {
@@ -4489,25 +4965,55 @@ pub const GraphModel = struct {
                             _ = try self.encodeLoraSingle(frame, l, .k_proj, self.wp_x_norm_bind, self.wp_k_bind, m, gqa.k_proj.k, gqa.k_proj.n, true);
                             _ = try self.encodeLoraSingle(frame, l, .v_proj, self.wp_x_norm_bind, self.wp_v_bind, m, gqa.v_proj.k, gqa.v_proj.n, true);
                         }
-                        try self.attn_pipes.encodePrefillQkNormRopeKvWrite(frame, .{
-                            .q = self.wp_q_bind,
-                            .k = self.wp_k_bind,
-                            .v = self.wp_v_bind,
-                            .q_norm = gqa.q_norm,
-                            .k_norm = gqa.k_norm,
-                            .kv_tiles = gqa.kv_tiles_binding,
-                            .num_tokens = m,
-                            .num_q_heads = self.config.num_attention_heads,
-                            .num_kv_heads = self.config.num_key_value_heads,
-                            .head_dim = self.config.head_dim,
-                            .start_pos = base_pos,
-                            .chunk_tokens = self.chunk_tokens,
-                            .num_retired_chunks = self.num_retired_chunks,
-                            .kv_only = true,
-                            .rms_eps = self.config.rms_norm_eps,
-                            .rope_theta = self.config.rope_theta,
-                            .norm_dtype = gqa.qk_norm_dtype,
-                        }, true);
+                        if (use_g26) {
+                            try self.hybrid_pipes.encodeG26QkNormRopeKv(frame, .{
+                                .q = self.wp_q_bind,
+                                .k = self.wp_k_bind,
+                                .v = self.wp_v_bind,
+                                .q_norm = gqa.q_norm,
+                                .k_norm = gqa.k_norm,
+                                .norm_dtype = gqa.qk_norm_dtype,
+                                .positions_3d = self.wp_pos3d_bind,
+                                .kv_tiles = gqa.kv_tiles_binding,
+                                .num_tokens = m,
+                                .num_q_heads = self.config.num_attention_heads,
+                                .num_kv_heads = self.config.num_key_value_heads,
+                                .k_head_dim = gqa.k_head_dim,
+                                .v_head_dim = gqa.v_head_dim,
+                                .rotary_dim = gqa.rotary_dim,
+                                .start_pos = base_pos,
+                                .mrope = eff_mrope,
+                                .yarn = self.config.yarn,
+                                .chunk_tokens = self.chunk_tokens,
+                                .num_retired_chunks = self.num_retired_chunks,
+                                .kv_only = true,
+                                .write_to_tiles = true,
+                                .qk_norm_unit_offset = self.config.rmsnorm_unit_offset,
+                                .rms_eps = self.config.rms_norm_eps,
+                                .rope_theta = self.config.rope_theta,
+                                .v_scale = self.config.attention_value_scale,
+                            }, true);
+                        } else {
+                            try self.attn_pipes.encodePrefillQkNormRopeKvWrite(frame, .{
+                                .q = self.wp_q_bind,
+                                .k = self.wp_k_bind,
+                                .v = self.wp_v_bind,
+                                .q_norm = gqa.q_norm,
+                                .k_norm = gqa.k_norm,
+                                .kv_tiles = gqa.kv_tiles_binding,
+                                .num_tokens = m,
+                                .num_q_heads = self.config.num_attention_heads,
+                                .num_kv_heads = self.config.num_key_value_heads,
+                                .head_dim = self.config.head_dim,
+                                .start_pos = base_pos,
+                                .chunk_tokens = self.chunk_tokens,
+                                .num_retired_chunks = self.num_retired_chunks,
+                                .kv_only = true,
+                                .rms_eps = self.config.rms_norm_eps,
+                                .rope_theta = self.config.rope_theta,
+                                .norm_dtype = gqa.qk_norm_dtype,
+                            }, true);
+                        }
                         return;
                     } else if (tail_m1_last) {
                         try self.encodeLinearGemmWithTile(frame, gqa.k_proj, self.wp_x_norm_bind, self.wp_k_bind, m, true, true);
@@ -4518,52 +5024,109 @@ pub const GraphModel = struct {
                             _ = try self.encodeLoraSingle(frame, l, .v_proj, self.wp_x_norm_bind, self.wp_v_bind, m, gqa.v_proj.k, gqa.v_proj.n, true);
                             _ = try self.encodeLoraSingle(frame, l, .q_proj, last_x_norm_bind, self.wp_q_bind, 1, gqa.q_proj.k, gqa.q_proj.n, true);
                         }
-                        try self.attn_pipes.encodePrefillQkNormRopeKvWrite(frame, .{
-                            .q = self.wp_q_bind,
-                            .k = self.wp_k_bind,
-                            .v = self.wp_v_bind,
-                            .q_norm = gqa.q_norm,
-                            .k_norm = gqa.k_norm,
-                            .kv_tiles = gqa.kv_tiles_binding,
-                            .num_tokens = m - 1,
-                            .num_q_heads = self.config.num_attention_heads,
-                            .num_kv_heads = self.config.num_key_value_heads,
-                            .head_dim = self.config.head_dim,
-                            .start_pos = base_pos,
-                            .chunk_tokens = self.chunk_tokens,
-                            .num_retired_chunks = self.num_retired_chunks,
-                            .kv_only = true,
-                            .rms_eps = self.config.rms_norm_eps,
-                            .rope_theta = self.config.rope_theta,
-                            .norm_dtype = gqa.qk_norm_dtype,
-                        }, true);
                         const last_k_bind: metal.BufferBinding = .{
                             .buffer = self.scratch_buf,
                             .offset = self.wp_k_bind.offset + @as(u64, m - 1) * kv_d * @sizeOf(f16),
                         };
                         const last_v_bind: metal.BufferBinding = .{
                             .buffer = self.scratch_buf,
-                            .offset = self.wp_v_bind.offset + @as(u64, m - 1) * kv_d * @sizeOf(f16),
+                            .offset = self.wp_v_bind.offset + @as(u64, m - 1) * v_d * @sizeOf(f16),
                         };
-                        try self.attn_pipes.encodePrefillQkNormRopeKvWrite(frame, .{
-                            .q = self.wp_q_bind,
-                            .k = last_k_bind,
-                            .v = last_v_bind,
-                            .q_norm = gqa.q_norm,
-                            .k_norm = gqa.k_norm,
-                            .kv_tiles = gqa.kv_tiles_binding,
-                            .num_tokens = 1,
-                            .num_q_heads = self.config.num_attention_heads,
-                            .num_kv_heads = self.config.num_key_value_heads,
-                            .head_dim = self.config.head_dim,
-                            .start_pos = base_pos + m - 1,
-                            .chunk_tokens = self.chunk_tokens,
-                            .num_retired_chunks = self.num_retired_chunks,
-                            .kv_only = false,
-                            .rms_eps = self.config.rms_norm_eps,
-                            .rope_theta = self.config.rope_theta,
-                            .norm_dtype = gqa.qk_norm_dtype,
-                        }, false);
+                        if (use_g26) {
+                            try self.hybrid_pipes.encodeG26QkNormRopeKv(frame, .{
+                                .q = self.wp_q_bind,
+                                .k = self.wp_k_bind,
+                                .v = self.wp_v_bind,
+                                .q_norm = gqa.q_norm,
+                                .k_norm = gqa.k_norm,
+                                .norm_dtype = gqa.qk_norm_dtype,
+                                .positions_3d = self.wp_pos3d_bind,
+                                .kv_tiles = gqa.kv_tiles_binding,
+                                .num_tokens = m - 1,
+                                .num_q_heads = self.config.num_attention_heads,
+                                .num_kv_heads = self.config.num_key_value_heads,
+                                .k_head_dim = gqa.k_head_dim,
+                                .v_head_dim = gqa.v_head_dim,
+                                .rotary_dim = gqa.rotary_dim,
+                                .start_pos = base_pos,
+                                .mrope = eff_mrope,
+                                .yarn = self.config.yarn,
+                                .chunk_tokens = self.chunk_tokens,
+                                .num_retired_chunks = self.num_retired_chunks,
+                                .kv_only = true,
+                                .write_to_tiles = true,
+                                .qk_norm_unit_offset = self.config.rmsnorm_unit_offset,
+                                .rms_eps = self.config.rms_norm_eps,
+                                .rope_theta = self.config.rope_theta,
+                                .v_scale = self.config.attention_value_scale,
+                            }, true);
+                            try self.hybrid_pipes.encodeG26QkNormRopeKv(frame, .{
+                                .q = self.wp_q_bind,
+                                .k = last_k_bind,
+                                .v = last_v_bind,
+                                .q_norm = gqa.q_norm,
+                                .k_norm = gqa.k_norm,
+                                .norm_dtype = gqa.qk_norm_dtype,
+                                .positions_3d = last_p3d_bind,
+                                .kv_tiles = gqa.kv_tiles_binding,
+                                .num_tokens = 1,
+                                .num_q_heads = self.config.num_attention_heads,
+                                .num_kv_heads = self.config.num_key_value_heads,
+                                .k_head_dim = gqa.k_head_dim,
+                                .v_head_dim = gqa.v_head_dim,
+                                .rotary_dim = gqa.rotary_dim,
+                                .start_pos = base_pos + m - 1,
+                                .mrope = eff_mrope,
+                                .yarn = self.config.yarn,
+                                .chunk_tokens = self.chunk_tokens,
+                                .num_retired_chunks = self.num_retired_chunks,
+                                .kv_only = false,
+                                .write_to_tiles = true,
+                                .qk_norm_unit_offset = self.config.rmsnorm_unit_offset,
+                                .rms_eps = self.config.rms_norm_eps,
+                                .rope_theta = self.config.rope_theta,
+                                .v_scale = self.config.attention_value_scale,
+                            }, false);
+                        } else {
+                            try self.attn_pipes.encodePrefillQkNormRopeKvWrite(frame, .{
+                                .q = self.wp_q_bind,
+                                .k = self.wp_k_bind,
+                                .v = self.wp_v_bind,
+                                .q_norm = gqa.q_norm,
+                                .k_norm = gqa.k_norm,
+                                .kv_tiles = gqa.kv_tiles_binding,
+                                .num_tokens = m - 1,
+                                .num_q_heads = self.config.num_attention_heads,
+                                .num_kv_heads = self.config.num_key_value_heads,
+                                .head_dim = self.config.head_dim,
+                                .start_pos = base_pos,
+                                .chunk_tokens = self.chunk_tokens,
+                                .num_retired_chunks = self.num_retired_chunks,
+                                .kv_only = true,
+                                .rms_eps = self.config.rms_norm_eps,
+                                .rope_theta = self.config.rope_theta,
+                                .norm_dtype = gqa.qk_norm_dtype,
+                            }, true);
+                            try self.attn_pipes.encodePrefillQkNormRopeKvWrite(frame, .{
+                                .q = self.wp_q_bind,
+                                .k = last_k_bind,
+                                .v = last_v_bind,
+                                .q_norm = gqa.q_norm,
+                                .k_norm = gqa.k_norm,
+                                .kv_tiles = gqa.kv_tiles_binding,
+                                .num_tokens = 1,
+                                .num_q_heads = self.config.num_attention_heads,
+                                .num_kv_heads = self.config.num_key_value_heads,
+                                .head_dim = self.config.head_dim,
+                                .start_pos = base_pos + m - 1,
+                                .chunk_tokens = self.chunk_tokens,
+                                .num_retired_chunks = self.num_retired_chunks,
+                                .kv_only = false,
+                                .rms_eps = self.config.rms_norm_eps,
+                                .rope_theta = self.config.rope_theta,
+                                .norm_dtype = gqa.qk_norm_dtype,
+                            }, false);
+                        }
                     } else {
                         try self.encodeQkvProj(frame, gqa.q_proj, gqa.k_proj, gqa.v_proj, self.wp_x_norm_bind, self.wp_q_bind, self.wp_k_bind, self.wp_v_bind, m, .gemm_wide, true);
                         if (self.hasActiveLora()) {
@@ -4571,25 +5134,55 @@ pub const GraphModel = struct {
                             _ = try self.encodeLoraSingle(frame, l, .k_proj, self.wp_x_norm_bind, self.wp_k_bind, m, gqa.k_proj.k, gqa.k_proj.n, true);
                             _ = try self.encodeLoraSingle(frame, l, .v_proj, self.wp_x_norm_bind, self.wp_v_bind, m, gqa.v_proj.k, gqa.v_proj.n, true);
                         }
-                        try self.attn_pipes.encodePrefillQkNormRopeKvWrite(frame, .{
-                            .q = self.wp_q_bind,
-                            .k = self.wp_k_bind,
-                            .v = self.wp_v_bind,
-                            .q_norm = gqa.q_norm,
-                            .k_norm = gqa.k_norm,
-                            .kv_tiles = gqa.kv_tiles_binding,
-                            .num_tokens = m,
-                            .num_q_heads = self.config.num_attention_heads,
-                            .num_kv_heads = self.config.num_key_value_heads,
-                            .head_dim = self.config.head_dim,
-                            .start_pos = base_pos,
-                            .chunk_tokens = self.chunk_tokens,
-                            .num_retired_chunks = self.num_retired_chunks,
-                            .kv_only = false,
-                            .rms_eps = self.config.rms_norm_eps,
-                            .rope_theta = self.config.rope_theta,
-                            .norm_dtype = gqa.qk_norm_dtype,
-                        }, true);
+                        if (use_g26) {
+                            try self.hybrid_pipes.encodeG26QkNormRopeKv(frame, .{
+                                .q = self.wp_q_bind,
+                                .k = self.wp_k_bind,
+                                .v = self.wp_v_bind,
+                                .q_norm = gqa.q_norm,
+                                .k_norm = gqa.k_norm,
+                                .norm_dtype = gqa.qk_norm_dtype,
+                                .positions_3d = self.wp_pos3d_bind,
+                                .kv_tiles = gqa.kv_tiles_binding,
+                                .num_tokens = m,
+                                .num_q_heads = self.config.num_attention_heads,
+                                .num_kv_heads = self.config.num_key_value_heads,
+                                .k_head_dim = gqa.k_head_dim,
+                                .v_head_dim = gqa.v_head_dim,
+                                .rotary_dim = gqa.rotary_dim,
+                                .start_pos = base_pos,
+                                .mrope = eff_mrope,
+                                .yarn = self.config.yarn,
+                                .chunk_tokens = self.chunk_tokens,
+                                .num_retired_chunks = self.num_retired_chunks,
+                                .kv_only = false,
+                                .write_to_tiles = true,
+                                .qk_norm_unit_offset = self.config.rmsnorm_unit_offset,
+                                .rms_eps = self.config.rms_norm_eps,
+                                .rope_theta = self.config.rope_theta,
+                                .v_scale = self.config.attention_value_scale,
+                            }, true);
+                        } else {
+                            try self.attn_pipes.encodePrefillQkNormRopeKvWrite(frame, .{
+                                .q = self.wp_q_bind,
+                                .k = self.wp_k_bind,
+                                .v = self.wp_v_bind,
+                                .q_norm = gqa.q_norm,
+                                .k_norm = gqa.k_norm,
+                                .kv_tiles = gqa.kv_tiles_binding,
+                                .num_tokens = m,
+                                .num_q_heads = self.config.num_attention_heads,
+                                .num_kv_heads = self.config.num_key_value_heads,
+                                .head_dim = self.config.head_dim,
+                                .start_pos = base_pos,
+                                .chunk_tokens = self.chunk_tokens,
+                                .num_retired_chunks = self.num_retired_chunks,
+                                .kv_only = false,
+                                .rms_eps = self.config.rms_norm_eps,
+                                .rope_theta = self.config.rope_theta,
+                                .norm_dtype = gqa.qk_norm_dtype,
+                            }, true);
+                        }
                     }
                 } else {
                     if (skip_last_rest) return;
@@ -4598,48 +5191,370 @@ pub const GraphModel = struct {
                     if (self.hasActiveLora()) {
                         _ = try self.encodeLoraSingle(frame, l, .q_proj, q_src, self.wp_q_bind, eff_m, gqa.q_proj.k, gqa.q_proj.n, true);
                     }
-                    // Rotate Q in-place without overwriting committed r = 0 KvTiles using QsaPrefillRope (write_to_tiles = false, 1D RoPE).
-                    try self.hybrid_pipes.encodeQsaPrefillRope(frame, .{
+                    if (use_g26) {
+                        try self.hybrid_pipes.encodeG26QkNormRopeKv(frame, .{
+                            .q = self.wp_q_bind,
+                            .k = self.wp_k_bind,
+                            .v = self.wp_v_bind,
+                            .q_norm = gqa.q_norm,
+                            .k_norm = gqa.k_norm,
+                            .norm_dtype = gqa.qk_norm_dtype,
+                            .positions_3d = if (tail_m1_last) last_p3d_bind else self.wp_pos3d_bind,
+                            .num_tokens = eff_m,
+                            .num_q_heads = self.config.num_attention_heads,
+                            .num_kv_heads = self.config.num_key_value_heads,
+                            .k_head_dim = gqa.k_head_dim,
+                            .v_head_dim = gqa.v_head_dim,
+                            .rotary_dim = gqa.rotary_dim,
+                            .start_pos = if (tail_m1_last) base_pos + m - 1 else base_pos,
+                            .mrope = eff_mrope,
+                            .yarn = self.config.yarn,
+                            .chunk_tokens = self.chunk_tokens,
+                            .kv_only = false,
+                            .write_to_tiles = false,
+                            .qk_norm_unit_offset = self.config.rmsnorm_unit_offset,
+                            .rms_eps = self.config.rms_norm_eps,
+                            .rope_theta = self.config.rope_theta,
+                            .v_scale = self.config.attention_value_scale,
+                        }, true);
+                    } else {
+                        // Rotate Q in-place without overwriting committed r = 0 KvTiles using QsaPrefillRope (write_to_tiles = false, 1D RoPE).
+                        try self.hybrid_pipes.encodeQsaPrefillRope(frame, .{
+                            .q = self.wp_q_bind,
+                            .k = self.wp_k_bind,
+                            .v = self.wp_v_bind,
+                            .q_norm = gqa.q_norm,
+                            .k_norm = gqa.k_norm,
+                            .norm_dtype = gqa.qk_norm_dtype,
+                            .num_tokens = eff_m,
+                            .num_q_heads = self.config.num_attention_heads,
+                            .num_kv_heads = self.config.num_key_value_heads,
+                            .head_dim = self.config.head_dim,
+                            .start_pos = if (tail_m1_last) base_pos + m - 1 else base_pos,
+                            .mrope = .{ .section = .{ self.config.head_dim / 2, 0, 0 } },
+                            .chunk_tokens = self.chunk_tokens,
+                            .kv_only = false,
+                            .write_to_tiles = false,
+                            .rms_eps = self.config.rms_norm_eps,
+                            .rope_theta = self.config.rope_theta,
+                        }, true);
+                    }
+                }
+
+                if (use_g26) {
+                    try self.attn_pipes.encodeG26GqaPrefill(frame, .{
                         .q = self.wp_q_bind,
-                        .k = self.wp_k_bind,
-                        .v = self.wp_v_bind,
-                        .q_norm = gqa.q_norm,
-                        .k_norm = gqa.k_norm,
-                        .norm_dtype = gqa.qk_norm_dtype,
-                        .num_tokens = eff_m,
+                        .kv_tiles = gqa.kv_tiles_binding,
+                        .sink_bias = gqa.sink_bias,
+                        .sink_dtype = @backingInt(gqa.sink_bias_dtype),
+                        .out = self.wp_attn_out_bind,
+                        .num_q = eff_m,
+                        .q_start_pos = if (tail_m1_last) base_pos + m - 1 else base_pos,
+                        .kv_len = kv_len_after,
+                        .num_q_heads = self.config.num_attention_heads,
+                        .num_kv_heads = self.config.num_key_value_heads,
+                        .k_head_dim = gqa.k_head_dim,
+                        .v_head_dim = gqa.v_head_dim,
+                        .chunk_tokens = self.chunk_tokens,
+                        .num_retired_chunks = if (has_retired) self.num_retired_chunks else 0,
+                    }, true);
+                } else {
+                    try self.attn_pipes.encodeGqaCausalPrefillFlashAttn(frame, .{
+                        .q = self.wp_q_bind,
+                        .kv_tiles = gqa.kv_tiles_binding,
+                        .retired_pool = rpool_bind,
+                        .retired_chunk_ids = if (has_retired) gqa.retired_ids_binding else null,
+                        .out = self.wp_attn_out_bind,
+                        .num_q = eff_m,
+                        .q_start_pos = if (tail_m1_last) base_pos + m - 1 else base_pos,
+                        .kv_len = kv_len_after,
                         .num_q_heads = self.config.num_attention_heads,
                         .num_kv_heads = self.config.num_key_value_heads,
                         .head_dim = self.config.head_dim,
-                        .start_pos = if (tail_m1_last) base_pos + m - 1 else base_pos,
-                        .mrope = .{ .section = .{ self.config.head_dim / 2, 0, 0 } },
                         .chunk_tokens = self.chunk_tokens,
-                        .kv_only = false,
-                        .write_to_tiles = false,
-                        .rms_eps = self.config.rms_norm_eps,
-                        .rope_theta = self.config.rope_theta,
+                        .num_retired_chunks = if (has_retired) self.num_retired_chunks else 0,
+                        .retired_plane_stride_bytes = ret_plane_stride,
+                        .retired_chunk_stride_bytes = ret_chunk_stride,
                     }, true);
                 }
-
-                try self.attn_pipes.encodeGqaCausalPrefillFlashAttn(frame, .{
-                    .q = self.wp_q_bind,
-                    .kv_tiles = gqa.kv_tiles_binding,
-                    .retired_pool = rpool_bind,
-                    .retired_chunk_ids = if (has_retired) gqa.retired_ids_binding else null,
-                    .out = self.wp_attn_out_bind,
-                    .num_q = eff_m,
-                    .q_start_pos = if (tail_m1_last) base_pos + m - 1 else base_pos,
-                    .kv_len = kv_len_after,
-                    .num_q_heads = self.config.num_attention_heads,
-                    .num_kv_heads = self.config.num_key_value_heads,
-                    .head_dim = self.config.head_dim,
-                    .chunk_tokens = self.chunk_tokens,
-                    .num_retired_chunks = if (has_retired) self.num_retired_chunks else 0,
-                    .retired_plane_stride_bytes = ret_plane_stride,
-                    .retired_chunk_stride_bytes = ret_chunk_stride,
-                }, true);
+                if (gqa.q_gate_proj) |qgp| {
+                    const q_src = if (tail_m1_last) last_x_norm_bind else self.wp_x_norm_bind;
+                    try self.encodeLinearGemmWithTile(frame, qgp, q_src, self.wp_gdn_z_bind, eff_m, true, true);
+                    if (self.hasActiveLora()) {
+                        _ = try self.encodeLoraSingle(frame, l, .gate_attn, q_src, self.wp_gdn_z_bind, eff_m, qgp.k, qgp.n, true);
+                    }
+                    try self.attn_pipes.encodeMulSigmoidF16(frame, .{
+                        .out = self.wp_attn_out_bind,
+                        .gate = self.wp_gdn_z_bind,
+                        .count = eff_m * self.config.globalAttnOutDim(),
+                    }, true);
+                }
                 try self.encodeLinearGemmWithTile(frame, gqa.o_proj, self.wp_attn_out_bind, self.wp_proj_out_bind, eff_m, true, true);
                 if (self.hasActiveLora()) {
                     _ = try self.encodeLoraSingle(frame, l, .o_proj, self.wp_attn_out_bind, self.wp_proj_out_bind, eff_m, gqa.o_proj.k, gqa.o_proj.n, true);
+                }
+            },
+            .swa => |*swa| {
+                const swa_k_dim = swa.num_kv_heads * swa.k_head_dim;
+                const swa_v_dim = swa.num_kv_heads * swa.v_head_dim;
+                const k_chunk_bind: metal.BufferBinding = if (multi_loop)
+                    .{ .buffer = self.scratch_buf, .offset = swa.wp_k_off }
+                else
+                    self.wp_k_bind;
+                const v_chunk_bind: metal.BufferBinding = if (multi_loop)
+                    .{ .buffer = self.scratch_buf, .offset = swa.wp_v_off }
+                else
+                    self.wp_v_bind;
+                const mrope_ms = self.config.mrope_section;
+                const mrope_sum2 = (mrope_ms.section[0] + mrope_ms.section[1] + mrope_ms.section[2]) * 2;
+                const eff_mrope: hybrid.MropeSection = if ((mrope_ms.section[1] > 0 or mrope_ms.section[2] > 0) and mrope_sum2 == swa.rotary_dim)
+                    mrope_ms
+                else
+                    hybrid.MropeSection.text1d(swa.rotary_dim);
+                const last_p3d_bind: metal.BufferBinding = .{
+                    .buffer = self.scratch_buf,
+                    .offset = self.wp_pos3d_bind.offset + @as(u64, m - 1) * @sizeOf(hybrid.Pos3D),
+                };
+
+                if (loop_step == 0) {
+                    if (skip_last_rest) {
+                        try self.encodeLinearGemmWithTile(frame, swa.k_proj, self.wp_x_norm_bind, self.wp_k_bind, m, true, true);
+                        try self.encodeLinearGemmWithTile(frame, swa.v_proj, self.wp_x_norm_bind, self.wp_v_bind, m, true, false);
+                        if (self.hasActiveLora()) {
+                            _ = try self.encodeLoraSingle(frame, l, .k_proj, self.wp_x_norm_bind, self.wp_k_bind, m, swa.k_proj.k, swa.k_proj.n, true);
+                            _ = try self.encodeLoraSingle(frame, l, .v_proj, self.wp_x_norm_bind, self.wp_v_bind, m, swa.v_proj.k, swa.v_proj.n, true);
+                        }
+                        try self.hybrid_pipes.encodeG26QkNormRopeKv(frame, .{
+                            .q = self.wp_q_bind,
+                            .k = self.wp_k_bind,
+                            .v = self.wp_v_bind,
+                            .q_norm = swa.q_norm,
+                            .k_norm = swa.k_norm,
+                            .norm_dtype = swa.qk_norm_dtype,
+                            .positions_3d = self.wp_pos3d_bind,
+                            .k_out = k_chunk_bind,
+                            .v_out = v_chunk_bind,
+                            .num_tokens = m,
+                            .num_q_heads = swa.num_q_heads,
+                            .num_kv_heads = swa.num_kv_heads,
+                            .k_head_dim = swa.k_head_dim,
+                            .v_head_dim = swa.v_head_dim,
+                            .rotary_dim = swa.rotary_dim,
+                            .start_pos = base_pos,
+                            .mrope = eff_mrope,
+                            .yarn = self.config.yarn,
+                            .chunk_tokens = swa.kv_ring.chunk_tokens,
+                            .ring_capacity = swa.kv_ring.ring_capacity,
+                            .kv_only = true,
+                            .write_to_tiles = false,
+                            .qk_norm_unit_offset = self.config.rmsnorm_unit_offset,
+                            .rms_eps = self.config.rms_norm_eps,
+                            .rope_theta = swa.rope_theta,
+                            .v_scale = self.config.attention_value_scale,
+                        }, true);
+                        try self.hybrid_pipes.encodeG26KvCommit(frame, .{
+                            .k_src = k_chunk_bind,
+                            .v_src = v_chunk_bind,
+                            .kv_tiles = swa.kv_ring.tileTableBinding(self.scratch_buf),
+                            .num_kv_heads = swa.num_kv_heads,
+                            .k_head_dim = swa.k_head_dim,
+                            .v_head_dim = swa.v_head_dim,
+                            .num_tokens = m,
+                            .start_pos = base_pos,
+                            .chunk_tokens = swa.kv_ring.chunk_tokens,
+                            .ring_capacity = swa.kv_ring.ring_capacity,
+                        }, true);
+                        return;
+                    } else if (tail_m1_last) {
+                        try self.encodeLinearGemmWithTile(frame, swa.k_proj, self.wp_x_norm_bind, self.wp_k_bind, m, true, true);
+                        try self.encodeLinearGemmWithTile(frame, swa.v_proj, self.wp_x_norm_bind, self.wp_v_bind, m, true, false);
+                        try self.encodeLinearGemv(frame, swa.q_proj, last_x_norm_bind, self.wp_q_bind, false);
+                        if (self.hasActiveLora()) {
+                            _ = try self.encodeLoraSingle(frame, l, .k_proj, self.wp_x_norm_bind, self.wp_k_bind, m, swa.k_proj.k, swa.k_proj.n, true);
+                            _ = try self.encodeLoraSingle(frame, l, .v_proj, self.wp_x_norm_bind, self.wp_v_bind, m, swa.v_proj.k, swa.v_proj.n, true);
+                            _ = try self.encodeLoraSingle(frame, l, .q_proj, last_x_norm_bind, self.wp_q_bind, 1, swa.q_proj.k, swa.q_proj.n, true);
+                        }
+                        try self.hybrid_pipes.encodeG26QkNormRopeKv(frame, .{
+                            .q = self.wp_q_bind,
+                            .k = self.wp_k_bind,
+                            .v = self.wp_v_bind,
+                            .q_norm = swa.q_norm,
+                            .k_norm = swa.k_norm,
+                            .norm_dtype = swa.qk_norm_dtype,
+                            .positions_3d = self.wp_pos3d_bind,
+                            .k_out = k_chunk_bind,
+                            .v_out = v_chunk_bind,
+                            .num_tokens = m - 1,
+                            .num_q_heads = swa.num_q_heads,
+                            .num_kv_heads = swa.num_kv_heads,
+                            .k_head_dim = swa.k_head_dim,
+                            .v_head_dim = swa.v_head_dim,
+                            .rotary_dim = swa.rotary_dim,
+                            .start_pos = base_pos,
+                            .mrope = eff_mrope,
+                            .yarn = self.config.yarn,
+                            .chunk_tokens = swa.kv_ring.chunk_tokens,
+                            .ring_capacity = swa.kv_ring.ring_capacity,
+                            .kv_only = true,
+                            .write_to_tiles = false,
+                            .qk_norm_unit_offset = self.config.rmsnorm_unit_offset,
+                            .rms_eps = self.config.rms_norm_eps,
+                            .rope_theta = swa.rope_theta,
+                            .v_scale = self.config.attention_value_scale,
+                        }, true);
+                        const last_k_in: metal.BufferBinding = .{
+                            .buffer = self.scratch_buf,
+                            .offset = self.wp_k_bind.offset + @as(u64, m - 1) * swa_k_dim * @sizeOf(f16),
+                        };
+                        const last_v_in: metal.BufferBinding = .{
+                            .buffer = self.scratch_buf,
+                            .offset = self.wp_v_bind.offset + @as(u64, m - 1) * swa_v_dim * @sizeOf(f16),
+                        };
+                        const last_k_out: metal.BufferBinding = .{
+                            .buffer = self.scratch_buf,
+                            .offset = k_chunk_bind.offset + @as(u64, m - 1) * swa_k_dim * @sizeOf(f16),
+                        };
+                        const last_v_out: metal.BufferBinding = .{
+                            .buffer = self.scratch_buf,
+                            .offset = v_chunk_bind.offset + @as(u64, m - 1) * swa_v_dim * @sizeOf(f16),
+                        };
+                        try self.hybrid_pipes.encodeG26QkNormRopeKv(frame, .{
+                            .q = self.wp_q_bind,
+                            .k = last_k_in,
+                            .v = last_v_in,
+                            .q_norm = swa.q_norm,
+                            .k_norm = swa.k_norm,
+                            .norm_dtype = swa.qk_norm_dtype,
+                            .positions_3d = last_p3d_bind,
+                            .k_out = last_k_out,
+                            .v_out = last_v_out,
+                            .num_tokens = 1,
+                            .num_q_heads = swa.num_q_heads,
+                            .num_kv_heads = swa.num_kv_heads,
+                            .k_head_dim = swa.k_head_dim,
+                            .v_head_dim = swa.v_head_dim,
+                            .rotary_dim = swa.rotary_dim,
+                            .start_pos = base_pos + m - 1,
+                            .mrope = eff_mrope,
+                            .yarn = self.config.yarn,
+                            .chunk_tokens = swa.kv_ring.chunk_tokens,
+                            .ring_capacity = swa.kv_ring.ring_capacity,
+                            .kv_only = false,
+                            .write_to_tiles = false,
+                            .qk_norm_unit_offset = self.config.rmsnorm_unit_offset,
+                            .rms_eps = self.config.rms_norm_eps,
+                            .rope_theta = swa.rope_theta,
+                            .v_scale = self.config.attention_value_scale,
+                        }, false);
+                    } else {
+                        try self.encodeQkvProj(frame, swa.q_proj, swa.k_proj, swa.v_proj, self.wp_x_norm_bind, self.wp_q_bind, self.wp_k_bind, self.wp_v_bind, m, .gemm_wide, true);
+                        if (self.hasActiveLora()) {
+                            _ = try self.encodeLoraSingle(frame, l, .q_proj, self.wp_x_norm_bind, self.wp_q_bind, m, swa.q_proj.k, swa.q_proj.n, true);
+                            _ = try self.encodeLoraSingle(frame, l, .k_proj, self.wp_x_norm_bind, self.wp_k_bind, m, swa.k_proj.k, swa.k_proj.n, true);
+                            _ = try self.encodeLoraSingle(frame, l, .v_proj, self.wp_x_norm_bind, self.wp_v_bind, m, swa.v_proj.k, swa.v_proj.n, true);
+                        }
+                        try self.hybrid_pipes.encodeG26QkNormRopeKv(frame, .{
+                            .q = self.wp_q_bind,
+                            .k = self.wp_k_bind,
+                            .v = self.wp_v_bind,
+                            .q_norm = swa.q_norm,
+                            .k_norm = swa.k_norm,
+                            .norm_dtype = swa.qk_norm_dtype,
+                            .positions_3d = self.wp_pos3d_bind,
+                            .k_out = k_chunk_bind,
+                            .v_out = v_chunk_bind,
+                            .num_tokens = m,
+                            .num_q_heads = swa.num_q_heads,
+                            .num_kv_heads = swa.num_kv_heads,
+                            .k_head_dim = swa.k_head_dim,
+                            .v_head_dim = swa.v_head_dim,
+                            .rotary_dim = swa.rotary_dim,
+                            .start_pos = base_pos,
+                            .mrope = eff_mrope,
+                            .yarn = self.config.yarn,
+                            .chunk_tokens = swa.kv_ring.chunk_tokens,
+                            .ring_capacity = swa.kv_ring.ring_capacity,
+                            .kv_only = false,
+                            .write_to_tiles = false,
+                            .qk_norm_unit_offset = self.config.rmsnorm_unit_offset,
+                            .rms_eps = self.config.rms_norm_eps,
+                            .rope_theta = swa.rope_theta,
+                            .v_scale = self.config.attention_value_scale,
+                        }, true);
+                    }
+                } else {
+                    if (skip_last_rest) return;
+                    const q_src = if (tail_m1_last) last_x_norm_bind else self.wp_x_norm_bind;
+                    try self.encodeLinearGemmWithTile(frame, swa.q_proj, q_src, self.wp_q_bind, eff_m, true, true);
+                    if (self.hasActiveLora()) {
+                        _ = try self.encodeLoraSingle(frame, l, .q_proj, q_src, self.wp_q_bind, eff_m, swa.q_proj.k, swa.q_proj.n, true);
+                    }
+                    try self.hybrid_pipes.encodeG26QkNormRopeKv(frame, .{
+                        .q = self.wp_q_bind,
+                        .k = self.wp_k_bind,
+                        .v = self.wp_v_bind,
+                        .q_norm = swa.q_norm,
+                        .k_norm = swa.k_norm,
+                        .norm_dtype = swa.qk_norm_dtype,
+                        .positions_3d = if (tail_m1_last) last_p3d_bind else self.wp_pos3d_bind,
+                        .num_tokens = eff_m,
+                        .num_q_heads = swa.num_q_heads,
+                        .num_kv_heads = swa.num_kv_heads,
+                        .k_head_dim = swa.k_head_dim,
+                        .v_head_dim = swa.v_head_dim,
+                        .rotary_dim = swa.rotary_dim,
+                        .start_pos = if (tail_m1_last) base_pos + m - 1 else base_pos,
+                        .mrope = eff_mrope,
+                        .yarn = self.config.yarn,
+                        .chunk_tokens = swa.kv_ring.chunk_tokens,
+                        .ring_capacity = swa.kv_ring.ring_capacity,
+                        .kv_only = false,
+                        .write_to_tiles = false,
+                        .qk_norm_unit_offset = self.config.rmsnorm_unit_offset,
+                        .rms_eps = self.config.rms_norm_eps,
+                        .rope_theta = swa.rope_theta,
+                        .v_scale = self.config.attention_value_scale,
+                    }, true);
+                }
+
+                try self.hybrid_pipes.encodeG26SwaAttn(frame, .{
+                    .q = self.wp_q_bind,
+                    .kv_tiles = if (base_pos > 0) swa.kv_ring.tileTableBinding(self.scratch_buf) else null,
+                    .k_extra = k_chunk_bind,
+                    .v_extra = v_chunk_bind,
+                    .sink_bias = swa.sink_bias,
+                    .sink_dtype = swa.sink_bias_dtype,
+                    .out = self.wp_attn_out_bind,
+                    .num_q = eff_m,
+                    .q_start_pos = if (tail_m1_last) base_pos + m - 1 else base_pos,
+                    .chunk_start_pos = base_pos,
+                    .kv_len = kv_len_after,
+                    .num_q_heads = swa.num_q_heads,
+                    .num_kv_heads = swa.num_kv_heads,
+                    .k_head_dim = swa.k_head_dim,
+                    .v_head_dim = swa.v_head_dim,
+                    .window_size = swa.kv_ring.window_size,
+                    .ring_capacity = swa.kv_ring.ring_capacity,
+                    .chunk_tokens = swa.kv_ring.chunk_tokens,
+                    .is_prefill = true,
+                }, true);
+                if (loop_step == 0) {
+                    try self.hybrid_pipes.encodeG26KvCommit(frame, .{
+                        .k_src = k_chunk_bind,
+                        .v_src = v_chunk_bind,
+                        .kv_tiles = swa.kv_ring.tileTableBinding(self.scratch_buf),
+                        .num_kv_heads = swa.num_kv_heads,
+                        .k_head_dim = swa.k_head_dim,
+                        .v_head_dim = swa.v_head_dim,
+                        .num_tokens = m,
+                        .start_pos = base_pos,
+                        .chunk_tokens = swa.kv_ring.chunk_tokens,
+                        .ring_capacity = swa.kv_ring.ring_capacity,
+                    }, true);
+                }
+                try self.encodeLinearGemmWithTile(frame, swa.o_proj, self.wp_attn_out_bind, self.wp_proj_out_bind, eff_m, true, true);
+                if (self.hasActiveLora()) {
+                    _ = try self.encodeLoraSingle(frame, l, .o_proj, self.wp_attn_out_bind, self.wp_proj_out_bind, eff_m, swa.o_proj.k, swa.o_proj.n, true);
                 }
             },
             .mla_csa2 => |*mla| {
@@ -4702,6 +5617,7 @@ pub const GraphModel = struct {
                     .hidden_dim = h,
                     .eps = self.config.rms_norm_eps,
                     .w_dtype = layer.post_attention_layernorm.dtype,
+                    .unit_offset = self.config.rmsnorm_unit_offset,
                 }, true);
             } else {
                 try self.encodeResidualThenRmsNorm(
@@ -4716,7 +5632,7 @@ pub const GraphModel = struct {
             }
         }
 
-        switch (self.config.axes.ffn_kind) {
+        switch (self.config.layerFfnKind(l)) {
             .dense_swiglu => {
                 const gu_lora_mask = lora.TargetProjection.gate_proj.bit() | lora.TargetProjection.up_proj.bit();
                 if (self.hasActiveLoraMask(l, gu_lora_mask)) {
@@ -4896,6 +5812,36 @@ pub const GraphModel = struct {
                 }
             }
         }
+
+        // Capture pure-GraphModel `DFlash` target hidden taps into circular GPU ring.
+        if (self.hasDFlareCtxHistory() and is_final_pass and !tail_m1_last) {
+            for (self.dflare_target_layers[0..self.dflare_tap_count], 0..) |tap_l, slot| {
+                if (tap_l == @as(u32, @intCast(l))) {
+                    if (self.wp_gr_arena) |*gr| {
+                        try self.hybrid_pipes.encodeGrCollapse(frame, .{
+                            .stream = gr.binding(self.scratch_buf),
+                            .out = self.wp_x_bind,
+                            .mode = .mean,
+                            .m = m,
+                            .hidden_dim = h,
+                            .branch_token_stride = w_stride,
+                        }, true);
+                    } else if (self.wp_mhc_arena) |*mhc| {
+                        try self.encodeMhcCollapseStreams(frame, mhc.binding(self.scratch_buf), self.wp_x_bind, m, true);
+                    }
+                    try self.hybrid_pipes.encodeG26CaptureTapRing(frame, .{
+                        .src = self.wp_x_bind,
+                        .ring = .{ .buffer = self.scratch_buf, .offset = self.dflare_ctx_hist_off },
+                        .num_rows = m,
+                        .hidden_size = h,
+                        .base_pos = base_pos,
+                        .ring_cap = self.dflare_ctx_hist_cap,
+                        .num_taps = @intCast(self.dflare_tap_count),
+                        .tap_idx = @intCast(slot),
+                    }, true);
+                }
+            }
+        }
     }
 
     pub fn prefillToken(self: *GraphModel, token_id: u32, pos: u32) GraphStepError!void {
@@ -5060,6 +6006,10 @@ pub const GraphModel = struct {
                     try self.encodeGqaCommitAccepted(&frame, gqa, base_pos, accepted_nodes, had_dispatch);
                     had_dispatch = true;
                 },
+                .swa => |*swa| {
+                    try self.encodeSwaCommitAccepted(&frame, swa, base_pos, accepted_nodes, had_dispatch);
+                    had_dispatch = true;
+                },
                 .mla_csa2 => |mla| {
                     if (mla.mode == .full) {
                         // Gather accepted rows from this layer's uncommitted `tree_latent_off` / `tree_rope_off`
@@ -5126,12 +6076,35 @@ pub const GraphModel = struct {
             try self.encodeCommitFeatureTaps(&frame, accepted_nodes, had_dispatch);
             had_dispatch = true;
         }
+        if (self.hasDFlareCtxHistory()) {
+            try self.hybrid_pipes.encodeG26CaptureTapRing(&frame, .{
+                .src = .{ .buffer = self.scratch_buf, .offset = self.dflare_taps_gpu_off },
+                .ring = .{ .buffer = self.scratch_buf, .offset = self.dflare_ctx_hist_off },
+                .num_rows = @intCast(accepted_nodes.len),
+                .hidden_size = self.config.hidden_size,
+                .base_pos = base_pos,
+                .ring_cap = self.dflare_ctx_hist_cap,
+                .num_taps = @intCast(self.dflare_tap_count),
+                .tap_idx = 0,
+                .src_stride_rows = self.max_tree_nodes,
+                .accepted_nodes = accepted_nodes,
+            }, had_dispatch);
+            had_dispatch = true;
+        }
 
         if (had_dispatch) {
             const sig = try frame.commit();
             try self.compute.wait(sig, self.timeout_ms);
         } else {
             frame.abort();
+        }
+
+        if (self.hasDFlareCtxHistory()) {
+            self.dflare_ctx_hist_len = base_pos + @as(u32, @intCast(accepted_nodes.len));
+            const last_acc = accepted_nodes[accepted_nodes.len - 1];
+            if (last_acc < self.max_tree_nodes) {
+                self.syncDFlareTapsFromTreeNode(last_acc);
+            }
         }
 
         // Update DSpark `last_decoder_hidden` to the last accepted node's top hidden state.
@@ -6313,6 +7286,7 @@ pub const GraphModel = struct {
                 .hidden_dim = h,
                 .eps = self.config.rms_norm_eps,
                 .w_dtype = self.final_norm.dtype,
+                .unit_offset = self.config.rmsnorm_unit_offset,
             }, true);
             try self.encodeLinearBatched(f, self.lm_head, self.x_norm_bind, self.logits_bind, m, true);
             try self.moe_pipes.encodeArgmaxRows(f, .{
@@ -6335,6 +7309,10 @@ pub const GraphModel = struct {
         }
 
         try self.flushFrame(&frame_opt);
+        if (commit_state_on_final and self.hasDFlareCtxHistory()) {
+            self.dflare_ctx_hist_len = @max(self.dflare_ctx_hist_len, base_pos + m);
+            self.syncDFlareTapsFromTreeNode(m - 1);
+        }
         if (phase != .ced_encoder_only and self.ced_last_decoder_hidden_host.len == h) {
             if (commit_state_on_final or kv_len_override != null) {
                 const last_row = self.x_host[@as(usize, m - 1) * h ..][0..h];
@@ -6355,21 +7333,23 @@ pub const GraphModel = struct {
 
         // Gather measured unique active experts across active MoE layers.
         var total_unique: u64 = 0;
-        if (self.config.axes.ffn_kind == .moe_swiglu) {
+        var active_moe_layers: usize = 0;
+        if (self.config.hasMoeFfn()) {
             for (phase_start..phase_end) |l| {
+                if (self.config.layerFfnKind(l) != .moe_swiglu) continue;
                 const hdr: *const moe.ScheduleHeader = @ptrCast(@alignCast(self.layer_sched_hdr_raw.ptr + l * 64));
                 total_unique += hdr.num_unique_experts;
+                active_moe_layers += 1;
             }
         }
-        const active_layer_count: usize = @max(@as(usize, 1), @as(usize, phase_end - phase_start));
-        const avg_unique: f64 = if (self.config.axes.ffn_kind == .moe_swiglu)
-            @as(f64, @floatFromInt(total_unique)) / @as(f64, @floatFromInt(active_layer_count))
+        const avg_unique: f64 = if (active_moe_layers > 0)
+            @as(f64, @floatFromInt(total_unique)) / @as(f64, @floatFromInt(active_moe_layers))
         else
             0.0;
 
         const core_layers: u64 = core_end - core_start;
-        const base_layer_bytes: u64 = if (self.config.axes.ffn_kind == .moe_swiglu)
-            self.total_layers_non_expert_bytes + total_unique * self.single_expert_bytes
+        const base_layer_bytes: u64 = if (self.config.hasMoeFfn())
+            self.total_layers_static_bytes + self.total_layers_non_expert_bytes + total_unique * self.single_expert_bytes
         else
             self.total_layers_static_bytes;
         const loop_extra_bytes: u64 = if (R > 1)
@@ -6494,6 +7474,7 @@ pub const GraphModel = struct {
                     .hidden_dim = h,
                     .eps = self.config.rms_norm_eps,
                     .w_dtype = layer.input_layernorm.dtype,
+                    .unit_offset = self.config.rmsnorm_unit_offset,
                 }, true);
             }
 
@@ -6515,6 +7496,7 @@ pub const GraphModel = struct {
                         .hidden_dim = h,
                         .eps = self.config.rms_norm_eps,
                         .w_dtype = layer.input_layernorm.dtype,
+                        .unit_offset = self.config.rmsnorm_unit_offset,
                     }, true);
                 }
             }
@@ -6530,6 +7512,9 @@ pub const GraphModel = struct {
             },
             .gqa => |gqa| {
                 try self.execGqaAttention(frame_opt, l, gqa, base_pos, m, loop_step, commit_kv_and_gdn);
+            },
+            .swa => |*swa| {
+                try self.execSwaAttention(frame_opt, l, swa, base_pos, m, loop_step, commit_kv_and_gdn);
             },
             .mla_csa2 => |*mla| {
                 try self.execMlaCsa2LayerForward(frame_opt, l, mla, base_pos, m, loop_step, commit_kv_and_gdn, false, kv_len_override);
@@ -6571,6 +7556,7 @@ pub const GraphModel = struct {
                     .hidden_dim = h,
                     .eps = self.config.rms_norm_eps,
                     .w_dtype = layer.post_attention_layernorm.dtype,
+                    .unit_offset = self.config.rmsnorm_unit_offset,
                 }, true);
             } else {
                 const f = try self.ensureFrame(frame_opt);
@@ -6579,7 +7565,7 @@ pub const GraphModel = struct {
         }
 
         // --- FFN / MoE Dispatch ---
-        switch (self.config.axes.ffn_kind) {
+        switch (self.config.layerFfnKind(l)) {
             .dense_swiglu => {
                 const gu_lora_mask = lora.TargetProjection.gate_proj.bit() | lora.TargetProjection.up_proj.bit();
                 const use_fused_gu = !self.hasActiveStepLora(l, loop_step, .gate_proj) and
@@ -6662,6 +7648,48 @@ pub const GraphModel = struct {
                         .dst_stride = 3 * h,
                         .dst_col_off = @as(u32, @intCast(slot)) * h,
                     }, true);
+                }
+            }
+        }
+
+        // Capture pure-GraphModel `DFlash` target hidden taps (`verifyTree` staging + direct ring commit).
+        if (is_final_pass and self.dflare_tap_count > 0 and self.dflare_taps_gpu_off > 0) {
+            const tap_slot_bytes: u64 = @as(u64, self.max_tree_nodes) * h * @sizeOf(f16);
+            for (self.dflare_target_layers[0..self.dflare_tap_count], 0..) |tap_l, slot| {
+                if (tap_l == @as(u32, @intCast(l))) {
+                    const f = try self.ensureFrame(frame_opt);
+                    if (self.gr_arena) |*gr| {
+                        try self.hybrid_pipes.encodeGrCollapse(f, .{
+                            .stream = gr.binding(self.scratch_buf),
+                            .out = self.x_bind,
+                            .mode = .mean,
+                            .m = m,
+                            .hidden_dim = h,
+                            .branch_token_stride = self.max_tree_nodes,
+                        }, true);
+                    } else if (self.mhc_arena) |*mhc| {
+                        try self.encodeMhcCollapseStreams(f, mhc.binding(self.scratch_buf), self.x_bind, m, true);
+                    }
+                    try self.moe_pipes.encodeCopyStrided(f, .{
+                        .src = self.x_bind,
+                        .dst = .{ .buffer = self.scratch_buf, .offset = self.dflare_taps_gpu_off + @as(u64, @intCast(slot)) * tap_slot_bytes },
+                        .num_rows = m,
+                        .copy_cols = h,
+                        .src_stride = h,
+                        .dst_stride = h,
+                    }, true);
+                    if (commit_kv_and_gdn and self.hasDFlareCtxHistory()) {
+                        try self.hybrid_pipes.encodeG26CaptureTapRing(f, .{
+                            .src = self.x_bind,
+                            .ring = .{ .buffer = self.scratch_buf, .offset = self.dflare_ctx_hist_off },
+                            .num_rows = m,
+                            .hidden_size = h,
+                            .base_pos = base_pos,
+                            .ring_cap = self.dflare_ctx_hist_cap,
+                            .num_taps = @intCast(self.dflare_tap_count),
+                            .tap_idx = @intCast(slot),
+                        }, true);
+                    }
                 }
             }
         }
@@ -7075,6 +8103,15 @@ pub const GraphModel = struct {
         loop_step: u32,
         commit_kv: bool,
     ) GraphStepError!void {
+        const use_g26 = self.config.usesG26GlobalGqa() or gqa.sink_bias != null or
+            gqa.k_head_dim != gqa.v_head_dim or gqa.rotary_dim != gqa.k_head_dim or gqa.k_head_dim > 128;
+        const mrope_ms = self.config.mrope_section;
+        const mrope_sum2 = (mrope_ms.section[0] + mrope_ms.section[1] + mrope_ms.section[2]) * 2;
+        const eff_mrope: hybrid.MropeSection = if ((mrope_ms.section[1] > 0 or mrope_ms.section[2] > 0) and mrope_sum2 == gqa.rotary_dim)
+            mrope_ms
+        else
+            hybrid.MropeSection.text1d(gqa.rotary_dim);
+
         if (loop_step == 0 and !self.hasActiveStepLora(l, loop_step, .q_proj)) {
             const f = try self.ensureFrame(frame_opt);
             try self.encodeQkvProj(f, gqa.q_proj, gqa.k_proj, gqa.v_proj, self.x_norm_bind, self.q_bind, self.k_bind, self.v_bind, m, .batched_gemv, true);
@@ -7086,23 +8123,53 @@ pub const GraphModel = struct {
             const tree_k: metal.BufferBinding = .{ .buffer = self.scratch_buf, .offset = gqa.tree_k_off };
             const tree_v: metal.BufferBinding = .{ .buffer = self.scratch_buf, .offset = gqa.tree_v_off };
 
-            try self.attn_pipes.encodeTreeQkNormRope(f, .{
-                .q = self.q_bind,
-                .k = self.k_bind,
-                .v = self.v_bind,
-                .q_norm = gqa.q_norm,
-                .k_norm = gqa.k_norm,
-                .positions = self.positions_bind,
-                .k_tree_out = tree_k,
-                .v_tree_out = tree_v,
-                .num_nodes = m,
-                .num_q_heads = self.config.num_attention_heads,
-                .num_kv_heads = self.config.num_key_value_heads,
-                .head_dim = self.config.head_dim,
-                .rms_eps = self.config.rms_norm_eps,
-                .rope_theta = self.config.rope_theta,
-                .norm_dtype = gqa.qk_norm_dtype,
-            }, true);
+            if (use_g26) {
+                try self.hybrid_pipes.encodeG26QkNormRopeKv(f, .{
+                    .q = self.q_bind,
+                    .k = self.k_bind,
+                    .v = self.v_bind,
+                    .q_norm = gqa.q_norm,
+                    .k_norm = gqa.k_norm,
+                    .norm_dtype = gqa.qk_norm_dtype,
+                    .positions_3d = self.pos3d_bind,
+                    .k_out = tree_k,
+                    .v_out = tree_v,
+                    .num_tokens = m,
+                    .num_q_heads = self.config.num_attention_heads,
+                    .num_kv_heads = self.config.num_key_value_heads,
+                    .k_head_dim = gqa.k_head_dim,
+                    .v_head_dim = gqa.v_head_dim,
+                    .rotary_dim = gqa.rotary_dim,
+                    .start_pos = base_pos,
+                    .mrope = eff_mrope,
+                    .yarn = self.config.yarn,
+                    .chunk_tokens = self.chunk_tokens,
+                    .kv_only = false,
+                    .write_to_tiles = false,
+                    .qk_norm_unit_offset = self.config.rmsnorm_unit_offset,
+                    .rms_eps = self.config.rms_norm_eps,
+                    .rope_theta = self.config.rope_theta,
+                    .v_scale = self.config.attention_value_scale,
+                }, true);
+            } else {
+                try self.attn_pipes.encodeTreeQkNormRope(f, .{
+                    .q = self.q_bind,
+                    .k = self.k_bind,
+                    .v = self.v_bind,
+                    .q_norm = gqa.q_norm,
+                    .k_norm = gqa.k_norm,
+                    .positions = self.positions_bind,
+                    .k_tree_out = tree_k,
+                    .v_tree_out = tree_v,
+                    .num_nodes = m,
+                    .num_q_heads = self.config.num_attention_heads,
+                    .num_kv_heads = self.config.num_key_value_heads,
+                    .head_dim = self.config.head_dim,
+                    .rms_eps = self.config.rms_norm_eps,
+                    .rope_theta = self.config.rope_theta,
+                    .norm_dtype = gqa.qk_norm_dtype,
+                }, true);
+            }
         } else {
             try self.execLinearWithOptionalStepLora(frame_opt, l, loop_step, .q_proj, gqa.q_proj, self.x_norm_bind, self.x_norm_host, self.q_bind, self.q_host, m, true);
             {
@@ -7125,23 +8192,53 @@ pub const GraphModel = struct {
                     }
                 }
 
-                try self.attn_pipes.encodeTreeQkNormRope(f, .{
-                    .q = self.q_bind,
-                    .k = self.k_bind,
-                    .v = self.v_bind,
-                    .q_norm = gqa.q_norm,
-                    .k_norm = gqa.k_norm,
-                    .positions = self.positions_bind,
-                    .k_tree_out = if (loop_step == 0) tree_k else self.k_bind,
-                    .v_tree_out = if (loop_step == 0) tree_v else self.v_bind,
-                    .num_nodes = m,
-                    .num_q_heads = self.config.num_attention_heads,
-                    .num_kv_heads = self.config.num_key_value_heads,
-                    .head_dim = self.config.head_dim,
-                    .rms_eps = self.config.rms_norm_eps,
-                    .rope_theta = self.config.rope_theta,
-                    .norm_dtype = gqa.qk_norm_dtype,
-                }, true);
+                if (use_g26) {
+                    try self.hybrid_pipes.encodeG26QkNormRopeKv(f, .{
+                        .q = self.q_bind,
+                        .k = self.k_bind,
+                        .v = self.v_bind,
+                        .q_norm = gqa.q_norm,
+                        .k_norm = gqa.k_norm,
+                        .norm_dtype = gqa.qk_norm_dtype,
+                        .positions_3d = self.pos3d_bind,
+                        .k_out = if (loop_step == 0) tree_k else self.k_bind,
+                        .v_out = if (loop_step == 0) tree_v else self.v_bind,
+                        .num_tokens = m,
+                        .num_q_heads = self.config.num_attention_heads,
+                        .num_kv_heads = self.config.num_key_value_heads,
+                        .k_head_dim = gqa.k_head_dim,
+                        .v_head_dim = gqa.v_head_dim,
+                        .rotary_dim = gqa.rotary_dim,
+                        .start_pos = base_pos,
+                        .mrope = eff_mrope,
+                        .yarn = self.config.yarn,
+                        .chunk_tokens = self.chunk_tokens,
+                        .kv_only = false,
+                        .write_to_tiles = false,
+                        .qk_norm_unit_offset = self.config.rmsnorm_unit_offset,
+                        .rms_eps = self.config.rms_norm_eps,
+                        .rope_theta = self.config.rope_theta,
+                        .v_scale = self.config.attention_value_scale,
+                    }, true);
+                } else {
+                    try self.attn_pipes.encodeTreeQkNormRope(f, .{
+                        .q = self.q_bind,
+                        .k = self.k_bind,
+                        .v = self.v_bind,
+                        .q_norm = gqa.q_norm,
+                        .k_norm = gqa.k_norm,
+                        .positions = self.positions_bind,
+                        .k_tree_out = if (loop_step == 0) tree_k else self.k_bind,
+                        .v_tree_out = if (loop_step == 0) tree_v else self.v_bind,
+                        .num_nodes = m,
+                        .num_q_heads = self.config.num_attention_heads,
+                        .num_kv_heads = self.config.num_key_value_heads,
+                        .head_dim = self.config.head_dim,
+                        .rms_eps = self.config.rms_norm_eps,
+                        .rope_theta = self.config.rope_theta,
+                        .norm_dtype = gqa.qk_norm_dtype,
+                    }, true);
+                }
             }
         }
         {
@@ -7149,7 +8246,34 @@ pub const GraphModel = struct {
             const tree_k: metal.BufferBinding = .{ .buffer = self.scratch_buf, .offset = gqa.tree_k_off };
             const tree_v: metal.BufferBinding = .{ .buffer = self.scratch_buf, .offset = gqa.tree_v_off };
 
-            if (self.num_retired_chunks > 0 and base_pos > 0 and self.retired_kv_pool != null) {
+            if (use_g26) {
+                const has_ret = (self.num_retired_chunks > 0 and base_pos > 0 and self.retired_kv_pool != null);
+                const ret_toks: u64 = @as(u64, self.num_retired_chunks) * @as(u64, self.chunk_tokens);
+                try self.attn_pipes.encodeG26GqaAttn(f, .{
+                    .q = self.q_bind,
+                    .kv_tiles = if (base_pos > 0 and (!has_ret or @as(u64, base_pos) > ret_toks)) gqa.kv_tiles_binding else null,
+                    .k_tree = tree_k,
+                    .v_tree = tree_v,
+                    .ancestor_masks = self.ancestor_masks_bind,
+                    .sink_bias = gqa.sink_bias,
+                    .sink_dtype = @backingInt(gqa.sink_bias_dtype),
+                    .retired_pool = if (has_ret) self.retired_kv_pool.?.binding(self.scratch_buf) else null,
+                    .retired_chunk_ids = if (has_ret) gqa.retired_ids_binding else null,
+                    .out = self.attn_out_bind,
+                    .scratch = self.gqa_scratch_bind,
+                    .max_splits = attention.MAX_SPLITS,
+                    .num_nodes = m,
+                    .num_q_heads = self.config.num_attention_heads,
+                    .num_kv_heads = self.config.num_key_value_heads,
+                    .k_head_dim = gqa.k_head_dim,
+                    .v_head_dim = gqa.v_head_dim,
+                    .base_pos = base_pos,
+                    .chunk_tokens = self.chunk_tokens,
+                    .num_retired_chunks = if (has_ret) self.num_retired_chunks else 0,
+                    .retired_plane_stride_bytes = if (has_ret) self.retired_kv_pool.?.plane_stride_bytes else 0,
+                    .retired_chunk_stride_bytes = if (has_ret) self.retired_kv_pool.?.chunk_stride_bytes else 0,
+                }, true);
+            } else if (self.num_retired_chunks > 0 and base_pos > 0 and self.retired_kv_pool != null) {
                 const rpool = self.retired_kv_pool.?;
                 const ret_toks: u64 = @as(u64, self.num_retired_chunks) * @as(u64, self.chunk_tokens);
                 try self.attn_pipes.encodeGqaTieredTreeVerifyAttn(f, .{
@@ -7192,6 +8316,18 @@ pub const GraphModel = struct {
                 }, true);
             }
 
+            if (gqa.q_gate_proj) |qgp| {
+                try self.encodeLinearBatched(f, qgp, self.x_norm_bind, self.gdn_z_bind, m, true);
+                if (self.hasActiveLora()) {
+                    _ = try self.encodeLoraSingle(f, l, .gate_attn, self.x_norm_bind, self.gdn_z_bind, m, qgp.k, qgp.n, true);
+                }
+                try self.attn_pipes.encodeMulSigmoidF16(f, .{
+                    .out = self.attn_out_bind,
+                    .gate = self.gdn_z_bind,
+                    .count = m * self.config.globalAttnOutDim(),
+                }, true);
+            }
+
             if (commit_kv) {
                 var chain: [hybrid.MAX_TREE_NODES]u16 = undefined;
                 for (0..m) |i| chain[i] = @intCast(i);
@@ -7203,6 +8339,144 @@ pub const GraphModel = struct {
         if (self.hasActiveLoraFor(l, .o_proj)) {
             const f = try self.ensureFrame(frame_opt);
             _ = try self.encodeLoraSingle(f, l, .o_proj, self.attn_out_bind, self.proj_out_bind, m, gqa.o_proj.k, gqa.o_proj.n, true);
+        }
+    }
+
+    fn execSwaAttention(
+        self: *GraphModel,
+        frame_opt: *?metal.Compute.Frame,
+        l: usize,
+        swa: *const SwaLayerWeights,
+        base_pos: u32,
+        m: u32,
+        loop_step: u32,
+        commit_kv: bool,
+    ) GraphStepError!void {
+        const mrope_ms = self.config.mrope_section;
+        const mrope_sum2 = (mrope_ms.section[0] + mrope_ms.section[1] + mrope_ms.section[2]) * 2;
+        const eff_mrope: hybrid.MropeSection = if ((mrope_ms.section[1] > 0 or mrope_ms.section[2] > 0) and mrope_sum2 == swa.rotary_dim)
+            mrope_ms
+        else
+            hybrid.MropeSection.text1d(swa.rotary_dim);
+        const tree_k: metal.BufferBinding = .{ .buffer = self.scratch_buf, .offset = swa.tree_k_off };
+        const tree_v: metal.BufferBinding = .{ .buffer = self.scratch_buf, .offset = swa.tree_v_off };
+
+        if (loop_step == 0 and !self.hasActiveStepLora(l, loop_step, .q_proj)) {
+            const f = try self.ensureFrame(frame_opt);
+            try self.encodeQkvProj(f, swa.q_proj, swa.k_proj, swa.v_proj, self.x_norm_bind, self.q_bind, self.k_bind, self.v_bind, m, .batched_gemv, true);
+            if (self.hasActiveLora()) {
+                _ = try self.encodeLoraSingle(f, l, .q_proj, self.x_norm_bind, self.q_bind, m, swa.q_proj.k, swa.q_proj.n, true);
+                _ = try self.encodeLoraSingle(f, l, .k_proj, self.x_norm_bind, self.k_bind, m, swa.k_proj.k, swa.k_proj.n, true);
+                _ = try self.encodeLoraSingle(f, l, .v_proj, self.x_norm_bind, self.v_bind, m, swa.v_proj.k, swa.v_proj.n, true);
+            }
+            try self.hybrid_pipes.encodeG26QkNormRopeKv(f, .{
+                .q = self.q_bind,
+                .k = self.k_bind,
+                .v = self.v_bind,
+                .q_norm = swa.q_norm,
+                .k_norm = swa.k_norm,
+                .norm_dtype = swa.qk_norm_dtype,
+                .positions_3d = self.pos3d_bind,
+                .k_out = tree_k,
+                .v_out = tree_v,
+                .num_tokens = m,
+                .num_q_heads = swa.num_q_heads,
+                .num_kv_heads = swa.num_kv_heads,
+                .k_head_dim = swa.k_head_dim,
+                .v_head_dim = swa.v_head_dim,
+                .rotary_dim = swa.rotary_dim,
+                .start_pos = base_pos,
+                .mrope = eff_mrope,
+                .yarn = self.config.yarn,
+                .chunk_tokens = swa.kv_ring.chunk_tokens,
+                .ring_capacity = swa.kv_ring.ring_capacity,
+                .kv_only = false,
+                .write_to_tiles = false,
+                .qk_norm_unit_offset = self.config.rmsnorm_unit_offset,
+                .rms_eps = self.config.rms_norm_eps,
+                .rope_theta = swa.rope_theta,
+                .v_scale = self.config.attention_value_scale,
+            }, true);
+        } else {
+            try self.execLinearWithOptionalStepLora(frame_opt, l, loop_step, .q_proj, swa.q_proj, self.x_norm_bind, self.x_norm_host, self.q_bind, self.q_host, m, true);
+            {
+                const f = try self.ensureFrame(frame_opt);
+                if (loop_step == 0) {
+                    try self.encodeLinearBatched(f, swa.k_proj, self.x_norm_bind, self.k_bind, m, false);
+                    try self.encodeLinearBatched(f, swa.v_proj, self.x_norm_bind, self.v_bind, m, false);
+                }
+                if (self.hasActiveLora()) {
+                    _ = try self.encodeLoraSingle(f, l, .q_proj, self.x_norm_bind, self.q_bind, m, swa.q_proj.k, swa.q_proj.n, true);
+                    if (loop_step == 0) {
+                        _ = try self.encodeLoraSingle(f, l, .k_proj, self.x_norm_bind, self.k_bind, m, swa.k_proj.k, swa.k_proj.n, true);
+                        _ = try self.encodeLoraSingle(f, l, .v_proj, self.x_norm_bind, self.v_bind, m, swa.v_proj.k, swa.v_proj.n, true);
+                    }
+                }
+                try self.hybrid_pipes.encodeG26QkNormRopeKv(f, .{
+                    .q = self.q_bind,
+                    .k = self.k_bind,
+                    .v = self.v_bind,
+                    .q_norm = swa.q_norm,
+                    .k_norm = swa.k_norm,
+                    .norm_dtype = swa.qk_norm_dtype,
+                    .positions_3d = self.pos3d_bind,
+                    .k_out = if (loop_step == 0) tree_k else self.k_bind,
+                    .v_out = if (loop_step == 0) tree_v else self.v_bind,
+                    .num_tokens = m,
+                    .num_q_heads = swa.num_q_heads,
+                    .num_kv_heads = swa.num_kv_heads,
+                    .k_head_dim = swa.k_head_dim,
+                    .v_head_dim = swa.v_head_dim,
+                    .rotary_dim = swa.rotary_dim,
+                    .start_pos = base_pos,
+                    .mrope = eff_mrope,
+                    .yarn = self.config.yarn,
+                    .chunk_tokens = swa.kv_ring.chunk_tokens,
+                    .ring_capacity = swa.kv_ring.ring_capacity,
+                    .kv_only = false,
+                    .write_to_tiles = false,
+                    .qk_norm_unit_offset = self.config.rmsnorm_unit_offset,
+                    .rms_eps = self.config.rms_norm_eps,
+                    .rope_theta = swa.rope_theta,
+                    .v_scale = self.config.attention_value_scale,
+                }, true);
+            }
+        }
+        {
+            const f = try self.ensureFrame(frame_opt);
+            try self.hybrid_pipes.encodeG26SwaAttn(f, .{
+                .q = self.q_bind,
+                .kv_tiles = if (base_pos > 0) swa.kv_ring.tileTableBinding(self.scratch_buf) else null,
+                .k_extra = tree_k,
+                .v_extra = tree_v,
+                .ancestor_masks = self.ancestor_masks_bind,
+                .node_positions = self.positions_bind,
+                .sink_bias = swa.sink_bias,
+                .sink_dtype = swa.sink_bias_dtype,
+                .out = self.attn_out_bind,
+                .num_q = m,
+                .q_start_pos = base_pos,
+                .kv_len = base_pos,
+                .num_q_heads = swa.num_q_heads,
+                .num_kv_heads = swa.num_kv_heads,
+                .k_head_dim = swa.k_head_dim,
+                .v_head_dim = swa.v_head_dim,
+                .window_size = swa.kv_ring.window_size,
+                .ring_capacity = swa.kv_ring.ring_capacity,
+                .chunk_tokens = swa.kv_ring.chunk_tokens,
+                .is_prefill = false,
+            }, true);
+            if (commit_kv) {
+                var chain: [hybrid.MAX_TREE_NODES]u16 = undefined;
+                for (0..m) |i| chain[i] = @intCast(i);
+                try self.encodeSwaCommitAccepted(f, swa, base_pos, chain[0..m], true);
+            }
+        }
+
+        try self.execLinearWithOptionalStepLora(frame_opt, l, loop_step, .o_proj, swa.o_proj, self.attn_out_bind, self.attn_out_host, self.proj_out_bind, self.proj_out_host, m, true);
+        if (self.hasActiveLoraFor(l, .o_proj)) {
+            const f = try self.ensureFrame(frame_opt);
+            _ = try self.encodeLoraSingle(f, l, .o_proj, self.attn_out_bind, self.proj_out_bind, m, swa.o_proj.k, swa.o_proj.n, true);
         }
     }
 
@@ -7368,18 +8642,54 @@ pub const GraphModel = struct {
                 self.loop_stats.moe_r_ge1_pinned_routes += 1;
             }
 
-            // 2. Run top-k CSR schedule on GPU (`ami_moe_route_topk`), then pin active experts.
+            // 2. Run top-k CSR schedule on GPU (`ami_moe_route_topk` or `ami_moe_route_topk_sigmoid`), then pin active experts.
             {
                 const f = try self.ensureFrame(frame_opt);
-                try self.moe_pipes.encodeRouteTopK(f, .f32, .{
-                    .logits = logits_bind,
-                    .workspace = &layer_ws,
-                    .workspace_buf = self.scratch_buf,
-                    .m = m,
-                    .num_experts = self.config.num_experts,
-                    .top_k = layer_top_k,
-                    .norm_topk_prob = self.config.norm_topk_prob,
-                }, false);
+                if (self.config.moe_scoring_sigmoid or layer.router_bias != null) {
+                    const use_bkt = layer.is_hetero_moe and layer.expert_dtypes_binding != null;
+                    try self.hybrid_pipes.encodeG26MoeRouteSigmoid(f, .{
+                        .logits = logits_bind,
+                        .logits_f16 = false,
+                        .bias = layer.router_bias,
+                        .bias_dtype = layer.router_bias_dtype,
+                        .sched_hdr = .{ .buffer = self.scratch_buf, .offset = layer_ws.schedule_header_off },
+                        .unique_experts = .{ .buffer = self.scratch_buf, .offset = layer_ws.unique_experts_off },
+                        .expert_token_offsets = .{ .buffer = self.scratch_buf, .offset = layer_ws.expert_token_offsets_off },
+                        .token_indices = .{ .buffer = self.scratch_buf, .offset = layer_ws.token_indices_off },
+                        .routing_weights = .{ .buffer = self.scratch_buf, .offset = layer_ws.routing_weights_off },
+                        .slot_k_indices = .{ .buffer = self.scratch_buf, .offset = layer_ws.slot_k_indices_off },
+                        .scratch_topk_experts = .{ .buffer = self.scratch_buf, .offset = layer_ws.scratch_topk_experts_off },
+                        .scratch_topk_weights = .{ .buffer = self.scratch_buf, .offset = layer_ws.scratch_topk_weights_off },
+                        .expert_schemes = if (use_bkt) layer.expert_dtypes_binding else null,
+                        .bucket_headers = if (use_bkt) .{ .buffer = self.scratch_buf, .offset = layer_ws.bucket_headers_off } else null,
+                        .bucket_unique_experts = if (use_bkt) .{ .buffer = self.scratch_buf, .offset = layer_ws.bucket_unique_experts_off } else null,
+                        .bucket_expert_token_offsets = if (use_bkt) .{ .buffer = self.scratch_buf, .offset = layer_ws.bucket_expert_token_offsets_off } else null,
+                        .is_bucketed = use_bkt,
+                        .bucket_unique_stride = layer_ws.bucket_unique_stride_u32,
+                        .bucket_offsets_stride = layer_ws.bucket_offsets_stride_u32,
+                        .m = m,
+                        .num_experts = self.config.num_experts,
+                        .top_k = layer_top_k,
+                        .norm_topk_prob = self.config.norm_topk_prob,
+                        .n_group = self.config.moe_n_group,
+                        .topk_group = self.config.moe_topk_group,
+                        .routed_scaling_factor = self.config.moe_routed_scaling_factor,
+                        .gate_up_groups_x_q = moe.gateUpGroupsXQ(self.config.moe_intermediate_size),
+                        .gate_up_groups_x_f = moe.gateUpGroupsXF(self.config.moe_intermediate_size),
+                        .down_groups_x = moe.downGroupsX(h),
+                        .down_groups_x_q8 = moe.downGroupsXQ8(h),
+                    }, false);
+                } else {
+                    try self.moe_pipes.encodeRouteTopK(f, .f32, .{
+                        .logits = logits_bind,
+                        .workspace = &layer_ws,
+                        .workspace_buf = self.scratch_buf,
+                        .m = m,
+                        .num_experts = self.config.num_experts,
+                        .top_k = layer_top_k,
+                        .norm_topk_prob = self.config.norm_topk_prob,
+                    }, false);
+                }
             }
             try self.flushFrame(frame_opt);
 
@@ -7496,6 +8806,9 @@ pub const GraphModel = struct {
             dequant.usesQuantFormats(se_dt, layer.shared_expert_group_size)
         else
             false;
+        if (self.config.moe_scoring_sigmoid or layer.router_bias != null) {
+            return self.encodeMoESigmoidDispatch(frame, layer, resolved_args, barrier_before);
+        }
         if (layer.uses_quant_formats_moe or self.act_quant_policy.isEnabled() or router_uses_qf or se_uses_qf) {
             const qf_ptr: ?*const quant_formats.QuantFormatPipelines = if (self.qf_pipes) |*qfp| qfp else null;
             const act_b: ?metal.BufferBinding = if (self.act_quant_buf) |ab| .{ .buffer = ab, .offset = 0 } else null;
@@ -7585,6 +8898,243 @@ pub const GraphModel = struct {
                 return error.InvalidArgument;
             },
         }
+    }
+
+    fn encodeMoESigmoidDispatch(
+        self: *const GraphModel,
+        frame: *metal.Compute.Frame,
+        layer: *const GraphLayerWeights,
+        args: moe.MoELayerArgs,
+        barrier_before: bool,
+    ) moe.EncodeError!void {
+        const ws = args.workspace;
+        const wb = args.workspace_buf;
+        const logits_bind: metal.BufferBinding = switch (args.router) {
+            .logits => |l| l.binding,
+            else => .{ .buffer = wb, .offset = ws.router_logits_off },
+        };
+        var logits_f16 = false;
+        var route_barrier = barrier_before;
+        switch (args.router) {
+            .weights => |w| {
+                try self.moe_pipes.encodeRouterProj(frame, w.dtype, .{
+                    .x = args.x,
+                    .router_weights = w.binding,
+                    .logits = logits_bind,
+                    .m = args.m,
+                    .num_experts = args.num_experts,
+                    .hidden_size = args.hidden_size,
+                }, barrier_before);
+                route_barrier = true;
+            },
+            .quant_weights => |qw| {
+                try self.moe_pipes.encodeRouterProjQuant(frame, qw.bits, .{
+                    .x = args.x,
+                    .qweight = qw.qweight,
+                    .scale_bias = qw.scale_bias,
+                    .logits = logits_bind,
+                    .m = args.m,
+                    .num_experts = args.num_experts,
+                    .hidden_size = args.hidden_size,
+                }, barrier_before);
+                route_barrier = true;
+            },
+            .quant_format => |qfr| {
+                if (args.m == 1) {
+                    qfr.qf_pipes.encodeGemv(frame, qfr.dtype, qfr.group_size, .{
+                        .x = args.x,
+                        .qweight = qfr.qweight,
+                        .params = qfr.params,
+                        .y = logits_bind,
+                        .n = args.num_experts,
+                        .k = args.hidden_size,
+                        .tensor_scale_per_row = qfr.tensor_scale_per_row,
+                    }, barrier_before) catch |err| return mapQuantOrHybridErr(err);
+                } else {
+                    qfr.qf_pipes.encodeGemvBatch(frame, qfr.dtype, qfr.group_size, .{
+                        .x = args.x,
+                        .qweight = qfr.qweight,
+                        .params = qfr.params,
+                        .y = logits_bind,
+                        .m = args.m,
+                        .n = args.num_experts,
+                        .k = args.hidden_size,
+                        .tensor_scale_per_row = qfr.tensor_scale_per_row,
+                    }, barrier_before) catch |err| return mapQuantOrHybridErr(err);
+                }
+                logits_f16 = true;
+                route_barrier = true;
+            },
+            .logits => |l| {
+                logits_f16 = (l.dtype == .f16);
+            },
+        }
+
+        const use_bkt = layer.is_hetero_moe and layer.expert_dtypes_binding != null;
+        self.hybrid_pipes.encodeG26MoeRouteSigmoid(frame, .{
+            .logits = logits_bind,
+            .logits_f16 = logits_f16,
+            .bias = layer.router_bias,
+            .bias_dtype = layer.router_bias_dtype,
+            .sched_hdr = .{ .buffer = wb, .offset = ws.schedule_header_off },
+            .unique_experts = .{ .buffer = wb, .offset = ws.unique_experts_off },
+            .expert_token_offsets = .{ .buffer = wb, .offset = ws.expert_token_offsets_off },
+            .token_indices = .{ .buffer = wb, .offset = ws.token_indices_off },
+            .routing_weights = .{ .buffer = wb, .offset = ws.routing_weights_off },
+            .slot_k_indices = .{ .buffer = wb, .offset = ws.slot_k_indices_off },
+            .scratch_topk_experts = .{ .buffer = wb, .offset = ws.scratch_topk_experts_off },
+            .scratch_topk_weights = .{ .buffer = wb, .offset = ws.scratch_topk_weights_off },
+            .expert_schemes = if (use_bkt) layer.expert_dtypes_binding else null,
+            .bucket_headers = if (use_bkt) .{ .buffer = wb, .offset = ws.bucket_headers_off } else null,
+            .bucket_unique_experts = if (use_bkt) .{ .buffer = wb, .offset = ws.bucket_unique_experts_off } else null,
+            .bucket_expert_token_offsets = if (use_bkt) .{ .buffer = wb, .offset = ws.bucket_expert_token_offsets_off } else null,
+            .is_bucketed = use_bkt,
+            .bucket_unique_stride = ws.bucket_unique_stride_u32,
+            .bucket_offsets_stride = ws.bucket_offsets_stride_u32,
+            .m = args.m,
+            .num_experts = args.num_experts,
+            .top_k = args.top_k,
+            .norm_topk_prob = args.norm_topk_prob,
+            .n_group = self.config.moe_n_group,
+            .topk_group = self.config.moe_topk_group,
+            .routed_scaling_factor = self.config.moe_routed_scaling_factor,
+            .gate_up_groups_x_q = moe.gateUpGroupsXQ(args.intermediate_size),
+            .gate_up_groups_x_f = moe.gateUpGroupsXF(args.intermediate_size),
+            .down_groups_x = moe.downGroupsX(args.hidden_size),
+            .down_groups_x_q8 = moe.downGroupsXQ8(args.hidden_size),
+        }, route_barrier) catch |err| return mapQuantOrHybridErr(err);
+
+        const qf_ptr: ?*const quant_formats.QuantFormatPipelines = if (self.qf_pipes) |*qfp| qfp else null;
+        const act_b: ?metal.BufferBinding = if (self.act_quant_buf) |ab| .{ .buffer = ab, .offset = 0 } else null;
+        const multi_args: moe.MoELayerMultiFormatArgs = .{
+            .base = args,
+            .is_heterogeneous = use_bkt,
+            .expert_schemes = if (use_bkt) layer.expert_dtypes_binding else null,
+            .scheme_counts = layer.expert_scheme_counts,
+            .scheme_descs = layer.expert_scheme_descs,
+            .qf_pipes = qf_ptr,
+            .act_quant_policy = self.act_quant_policy,
+            .act_scratch = act_b,
+            .act_scratch_bytes = self.act_quant_bytes,
+            .shared_expert_amf_dtype = layer.shared_expert_amf_dtype,
+            .shared_expert_group_size = layer.shared_expert_group_size,
+            .shared_expert_tensor_scale_per_row = layer.shared_expert_tensor_scale_per_row,
+        };
+
+        if (use_bkt) {
+            const num_buckets = moe.countActiveSchemeBuckets(layer.expert_scheme_counts);
+            const use_indirect = moe.shouldUseIndirectDispatch(args.m, num_buckets);
+            var first_gu = true;
+            for (0..moe.NUM_SCHEME_BUCKETS) |s_idx| {
+                const cap = layer.expert_scheme_counts[s_idx];
+                if (cap == 0) continue;
+                const scheme: quant.WeightDType = @fromBackingInt(@intCast(s_idx));
+                const desc = layer.expert_scheme_descs[s_idx];
+                try self.encodeOneBucketGateUpAfterRoute(frame, args, desc, scheme, cap, use_indirect, qf_ptr, act_b, first_gu);
+                first_gu = false;
+            }
+        } else {
+            const desc = layer.expert_scheme_descs[0];
+            const use_indirect = moe.shouldUseIndirectDispatch(args.m, 1);
+            try self.encodeOneBucketGateUpAfterRoute(frame, args, desc, null, args.num_experts, use_indirect, qf_ptr, act_b, true);
+        }
+
+        return self.moe_pipes.encodeDownAndReduceMultiFormat(frame, multi_args, true);
+    }
+
+    fn encodeOneBucketGateUpAfterRoute(
+        self: *const GraphModel,
+        frame: *metal.Compute.Frame,
+        base: moe.MoELayerArgs,
+        desc: moe.MoeSchemeDesc,
+        scheme_bucket: ?quant.WeightDType,
+        cap: u32,
+        use_indirect: bool,
+        qf_pipes: ?*const quant_formats.QuantFormatPipelines,
+        act_scratch: ?metal.BufferBinding,
+        insert_barrier_before: bool,
+    ) moe.EncodeError!void {
+        var x_eff = base.x;
+        var gu_barrier = insert_barrier_before;
+        const aq_gu = self.act_quant_policy.resolveForTensor(desc.gate_up_dtype, base.hidden_size);
+        if (aq_gu != .none) {
+            const need = std.math.mul(u64, @as(u64, base.m) * base.hidden_size, @sizeOf(f16)) catch return error.Overflow;
+            if (qf_pipes) |qf| {
+                if (act_scratch) |scratch| {
+                    if (self.act_quant_bytes >= need) {
+                        qf.encodeActQuantEmulate(frame, aq_gu, .{
+                            .x_in = base.x,
+                            .x_out = scratch,
+                            .m = base.m,
+                            .k = base.hidden_size,
+                        }, true) catch |err| return mapQuantOrHybridErr(err);
+                        x_eff = scratch;
+                        gu_barrier = true;
+                    }
+                }
+            }
+        }
+        if (!desc.usesQuantFormatsGateUp()) {
+            const gu_args: moe.GateUpSwigluArgs = .{
+                .x = x_eff,
+                .weights_base = base.weights_base,
+                .expert_table = base.expert_table,
+                .workspace = base.workspace,
+                .workspace_buf = base.workspace_buf,
+                .m = base.m,
+                .num_experts = base.num_experts,
+                .top_k = base.top_k,
+                .hidden_size = base.hidden_size,
+                .intermediate_size = base.intermediate_size,
+                .scheme_bucket = scheme_bucket,
+                .max_active_override = cap,
+                .use_indirect = use_indirect,
+            };
+            switch (desc.gate_up_dtype) {
+                .f16 => try self.moe_pipes.encodeGateUpSwigluFloat(frame, .f16, gu_args, gu_barrier),
+                .bf16 => try self.moe_pipes.encodeGateUpSwigluFloat(frame, .bf16, gu_args, gu_barrier),
+                .q4_affine => try self.moe_pipes.encodeGateUpSwiglu(frame, .q4, gu_args, gu_barrier),
+                .q3_affine => try self.moe_pipes.encodeGateUpSwiglu(frame, .q3, gu_args, gu_barrier),
+                .q2_affine => try self.moe_pipes.encodeGateUpSwiglu(frame, .q2, gu_args, gu_barrier),
+                else => return error.InvalidArgument,
+            }
+            return;
+        }
+        const qf = qf_pipes orelse return error.PipelineNotInitialized;
+        const qf_dt = quant_formats.DType.fromAmf(desc.gate_up_dtype) orelse return error.InvalidArgument;
+        const cap_active: u32 = @min(cap, base.num_experts);
+        const max_active: u32 = @min(base.m * base.top_k, cap_active);
+        if (max_active == 0) return;
+        const ws = base.workspace;
+        const wb = base.workspace_buf;
+        const hdr_off = if (scheme_bucket) |s| ws.bucketHeaderOffset(s) else ws.schedule_header_off;
+        const unique_off = if (scheme_bucket) |s| ws.bucketUniqueOffset(s) else ws.unique_experts_off;
+        const offsets_off = if (scheme_bucket) |s| ws.bucketOffsetsOffset(s) else ws.expert_token_offsets_off;
+        qf.encodeMoeGateUpSwiglu(frame, qf_dt, desc.gate_up_group_size, .{
+            .x = x_eff,
+            .weights_base = base.weights_base,
+            .expert_table = base.expert_table,
+            .sched_hdr = .{ .buffer = wb, .offset = hdr_off },
+            .unique_experts = .{ .buffer = wb, .offset = unique_off },
+            .expert_token_offsets = .{ .buffer = wb, .offset = offsets_off },
+            .token_indices = .{ .buffer = wb, .offset = ws.token_indices_off },
+            .inter = .{ .buffer = wb, .offset = ws.inter_off },
+            .num_unique_experts = max_active,
+            .hidden_size = base.hidden_size,
+            .intermediate_size = base.intermediate_size,
+            .tensor_scale_per_row = desc.gate_up_tensor_scale_per_row,
+            .indirect_args = if (use_indirect) .{ .buffer = wb, .offset = ws.scheduleIndirectOffset(scheme_bucket, moe.INDIRECT_GATE_UP_Q_OFFSET) } else null,
+        }, gu_barrier) catch |err| return mapQuantOrHybridErr(err);
+    }
+
+    fn mapQuantOrHybridErr(err: anyerror) moe.EncodeError {
+        return switch (err) {
+            error.ZeroDimension => error.ZeroDimension,
+            error.Overflow => error.Overflow,
+            error.PipelineNotInitialized => error.PipelineNotInitialized,
+            error.NoActiveFrame, error.EncodingFailed, error.CommandBufferFailed, error.GpuTimeout, error.InvalidBuffer, error.InvalidTexture, error.TooManyBindings, error.UnsupportedDevice, error.MetalError => @errorCast(err),
+            else => error.InvalidArgument,
+        };
     }
 
     fn encodeMoEFfnOnlyDispatch(
@@ -8776,6 +10326,9 @@ pub const GraphModel = struct {
                 .gqa => |gqa| {
                     try self.encodeGqaCommitAccepted(f, gqa, base_pos, chain[0..m], true);
                 },
+                .swa => |*swa| {
+                    try self.encodeSwaCommitAccepted(f, swa, base_pos, chain[0..m], true);
+                },
                 .mla_csa2 => |mla| {
                     if (mla.mode == .full) {
                         const kv_arena = &(self.mla_kv_arena.?);
@@ -8912,6 +10465,22 @@ pub const GraphModel = struct {
     ) GraphStepError!void {
         const tree_k: metal.BufferBinding = .{ .buffer = self.scratch_buf, .offset = gqa.tree_k_off };
         const tree_v: metal.BufferBinding = .{ .buffer = self.scratch_buf, .offset = gqa.tree_v_off };
+        if (gqa.k_head_dim != gqa.v_head_dim or gqa.k_head_dim > 128) {
+            try self.hybrid_pipes.encodeG26KvCommit(frame, .{
+                .k_src = tree_k,
+                .v_src = tree_v,
+                .kv_tiles = gqa.kv_tiles_binding,
+                .num_kv_heads = self.config.num_key_value_heads,
+                .k_head_dim = gqa.k_head_dim,
+                .v_head_dim = gqa.v_head_dim,
+                .start_pos = base_pos,
+                .accepted_nodes = accepted_nodes,
+                .chunk_tokens = self.chunk_tokens,
+                .num_retired_chunks = self.num_retired_chunks,
+                .ring_capacity = 0,
+            }, barrier_before);
+            return;
+        }
         var offset: usize = 0;
         var first = barrier_before;
         while (offset < accepted_nodes.len) {
@@ -8939,6 +10508,30 @@ pub const GraphModel = struct {
             first = true;
             offset += take;
         }
+    }
+
+    fn encodeSwaCommitAccepted(
+        self: *const GraphModel,
+        frame: *metal.Compute.Frame,
+        swa: *const SwaLayerWeights,
+        base_pos: u32,
+        accepted_nodes: []const u16,
+        barrier_before: bool,
+    ) GraphStepError!void {
+        const tree_k: metal.BufferBinding = .{ .buffer = self.scratch_buf, .offset = swa.tree_k_off };
+        const tree_v: metal.BufferBinding = .{ .buffer = self.scratch_buf, .offset = swa.tree_v_off };
+        try self.hybrid_pipes.encodeG26KvCommit(frame, .{
+            .k_src = tree_k,
+            .v_src = tree_v,
+            .kv_tiles = swa.kv_ring.tileTableBinding(self.scratch_buf),
+            .num_kv_heads = swa.num_kv_heads,
+            .k_head_dim = swa.k_head_dim,
+            .v_head_dim = swa.v_head_dim,
+            .start_pos = base_pos,
+            .accepted_nodes = accepted_nodes,
+            .chunk_tokens = swa.kv_ring.chunk_tokens,
+            .ring_capacity = swa.kv_ring.ring_capacity,
+        }, barrier_before);
     }
 
     fn gqaTilePair(self: *const GraphModel, gqa: GqaLayerWeights, chunk: u32) struct { k: metal.KvTile, v: metal.KvTile } {
@@ -9410,6 +11003,7 @@ pub const GraphModel = struct {
         var num_gdn_layers: u32 = 0;
         var num_qsa_layers: u32 = 0;
         var num_gqa_layers: u32 = 0;
+        var num_swa_layers: u32 = 0;
         var num_mla_layers: u32 = 0;
         var num_mla_full_layers: u32 = 0;
         var num_mla_index_layers: u32 = 0;
@@ -9419,6 +11013,7 @@ pub const GraphModel = struct {
                     .gated_deltanet => num_gdn_layers += 1,
                     .qsa_sparse => num_qsa_layers += 1,
                     .gqa_full => num_gqa_layers += 1,
+                    .swa_ring => num_swa_layers += 1,
                     .mla_csa2 => {
                         num_mla_layers += 1;
                         switch (config.csa2_modes[l_idx]) {
@@ -9433,6 +11028,13 @@ pub const GraphModel = struct {
                 }
             }
         }
+        const has_dense_ffn = config.hasDenseFfn();
+        const has_moe_ffn = config.hasMoeFfn();
+        const swa_window = config.effectiveSlidingWindow();
+        const swa_num_tiles: u32 = if (num_swa_layers > 0)
+            @max(@as(u32, 1), (swa_window + hybrid.QSA_SWA_WINDOW_TOKENS - 1) / hybrid.QSA_SWA_WINDOW_TOKENS)
+        else
+            0;
         const num_chunks: u32 = (options.max_seq_len + options.chunk_tokens - 1) / options.chunk_tokens;
         const qsa_ring_mode: hybrid.HybridKvRingMode = if (config.qsa_window_size > 0 and config.qsa_window_size <= hybrid.QSA_SWA_WINDOW_TOKENS)
             .sliding_window_128
@@ -9443,7 +11045,7 @@ pub const GraphModel = struct {
             .full_chunk_512 => (options.max_seq_len + hybrid.QSA_FULL_CHUNK_TOKENS - 1) / hybrid.QSA_FULL_CHUNK_TOKENS,
         };
         const qsa_supports_retire = (num_qsa_layers > 0 and qsa_ring_mode == .full_chunk_512);
-        const retire_after: u32 = if (options.continuous_batch_only) 0 else options.kv_retire_q8_after_chunks;
+        const retire_after: u32 = if (options.continuous_batch_only or config.head_dim != config.globalVHeadDim()) 0 else options.kv_retire_q8_after_chunks;
         const retire_chunk_tokens: u32 = if (qsa_supports_retire) hybrid.QSA_FULL_CHUNK_TOKENS else options.chunk_tokens;
         const retire_total_chunks: u32 = if (qsa_supports_retire) qsa_full_chunks else num_chunks;
         const num_retirable_kv_layers: u32 = num_gqa_layers + (if (qsa_supports_retire) num_qsa_layers else 0);
@@ -9484,7 +11086,8 @@ pub const GraphModel = struct {
             .full_chunk_512 => (options.max_seq_len + config.qsa_block_size - 1) / config.qsa_block_size,
         };
 
-        const supports_wide_prefill = (config.m82_family == .none) and ((num_gqa_layers == 0) or (config.head_dim == 64 or config.head_dim == 128));
+        const supports_wide_prefill = (config.m82_family == .none) and
+            ((num_gqa_layers == 0) or (config.head_dim <= hybrid.MAX_QSA_HEAD_DIM and config.globalVHeadDim() <= hybrid.MAX_QSA_HEAD_DIM));
         const req_wide_cap: u32 = @min(attention.MAX_WIDE_PREFILL_TOKENS, @max(@as(u32, 1), options.wide_prefill_chunk_tokens));
         const ple_limited_wide: u32 = if (options.ple_paths.len > 0)
             @min(req_wide_cap, @as(u32, ple_mod.MAX_BATCH_TOKENS))
@@ -9501,34 +11104,90 @@ pub const GraphModel = struct {
         const logits_cap: usize = if (options.compute_all_logits and wide_enabled) @max(@as(usize, max_m), w_cap) else max_m;
         const feat_cap: usize = if (wide_enabled and options.enable_feature_taps) @max(@as(usize, max_m), w_cap) else max_m;
 
+        // Pure-GraphModel `DFlash` (`D15`) target hidden tap configuration (`m82 == null`).
+        var dflare_target_layers: [dflare_dfly.MAX_TARGET_TAPS]u16 = @splat(0);
+        var dflare_tap_count: usize = 0;
+        if (config.m82_family == .none) {
+            if (options.dflare_target_layers) |custom| {
+                const n_taps = @min(custom.len, dflare_dfly.MAX_TARGET_TAPS);
+                for (0..n_taps) |ti| {
+                    if (custom[ti] >= config.num_hidden_layers) return error.InvalidConfig;
+                    dflare_target_layers[ti] = @intCast(custom[ti]);
+                }
+                dflare_tap_count = n_taps;
+            } else if (config.is_mimo_v2 or options.enable_dflare_taps) {
+                const nl = config.num_hidden_layers;
+                if (nl == 48) {
+                    dflare_target_layers[0] = 0;
+                    dflare_target_layers[1] = 11;
+                    dflare_target_layers[2] = 23;
+                    dflare_target_layers[3] = 35;
+                    dflare_target_layers[4] = 47;
+                    dflare_tap_count = 5;
+                } else if (nl == 70) {
+                    dflare_target_layers[0] = 0;
+                    dflare_target_layers[1] = 15;
+                    dflare_target_layers[2] = 31;
+                    dflare_target_layers[3] = 47;
+                    dflare_target_layers[4] = 69;
+                    dflare_tap_count = 5;
+                } else if (nl >= 5) {
+                    const last = nl - 1;
+                    dflare_target_layers[0] = 0;
+                    dflare_target_layers[1] = @intCast(last / 4);
+                    dflare_target_layers[2] = @intCast(last / 2);
+                    dflare_target_layers[3] = @intCast((last * 3) / 4);
+                    dflare_target_layers[4] = @intCast(last);
+                    dflare_tap_count = 5;
+                } else {
+                    for (0..nl) |ti| dflare_target_layers[ti] = @intCast(ti);
+                    dflare_tap_count = nl;
+                }
+            }
+        }
+        const dflare_ctx_hist_cap: u32 = if (dflare_tap_count > 0 and options.dflare_ctx_hist_cap > 0)
+            @min(options.max_seq_len, options.dflare_ctx_hist_cap)
+        else
+            0;
+
         const addAligned = struct {
             fn call(total: *usize, n_bytes: usize) void {
                 total.* += amf.align64(n_bytes) + 64;
             }
         }.call;
 
-        const max_q_dim: u32 = @max(@max(config.qDim(), config.gdnQkDim()), @max(config.mlaQDim(), h));
-        const max_kv_dim: u32 = @max(@max(config.kvDim(), config.gdnQkDim()), @max(config.gdnVDim(), @max(config.mlaKvADim(), h)));
-        const max_attn_out: u32 = @max(@max(config.qDim(), config.gdnVDim()), @max(config.mlaVDim(), h));
+        const swa_q_d = if (num_swa_layers > 0) config.swaQDim() else 0;
+        const swa_k_d = if (num_swa_layers > 0) config.swaKDim() else 0;
+        const swa_v_d = if (num_swa_layers > 0) config.swaVDim() else 0;
+        const swa_o_d = if (num_swa_layers > 0) config.swaAttnOutDim() else 0;
+        const max_q_dim: u32 = @max(@max(config.qDim(), swa_q_d), @max(config.gdnQkDim(), @max(config.mlaQDim(), h)));
+        const max_kv_dim: u32 = @max(
+            @max(@max(config.kvDim(), config.globalVDim()), @max(swa_k_d, swa_v_d)),
+            @max(config.gdnQkDim(), @max(config.gdnVDim(), @max(config.mlaKvADim(), h))),
+        );
+        const max_attn_out: u32 = @max(
+            @max(@max(config.qDim(), config.globalAttnOutDim()), swa_o_d),
+            @max(config.gdnVDim(), @max(config.mlaVDim(), h)),
+        );
         const max_inter: u32 = @max(@max(config.intermediate_size, config.moe_intermediate_size), @max(config.shared_expert_intermediate_size, h));
-        const max_top_k: u32 = if (config.axes.ffn_kind == .moe_swiglu) config.maxLayerTopK() else 1;
+        const max_top_k: u32 = if (has_moe_ffn) config.maxLayerTopK() else 1;
         const mla_head_in_dim: u32 = @max(config.qk_nope_head_dim, config.v_head_dim);
         const mla_head_out_dim: u32 = @max(config.kv_lora_rank, 1);
 
         const moe_ws_spec: moe.WorkspaceSpec = .{
             .max_tokens = max_m,
-            .num_experts = if (config.axes.ffn_kind == .moe_swiglu) config.num_experts else 1,
+            .num_experts = if (has_moe_ffn) config.num_experts else 1,
             .top_k = max_top_k,
             .hidden_size = h,
-            .intermediate_size = if (config.axes.ffn_kind == .moe_swiglu) config.moe_intermediate_size else h,
+            .intermediate_size = if (has_moe_ffn) config.moe_intermediate_size else h,
             .shared_intermediate_size = config.shared_expert_intermediate_size,
         };
         const wp_moe_ws_spec: moe.WorkspaceSpec = .{
             .max_tokens = if (wide_enabled) wide_prefill_max_tokens else 1,
-            .num_experts = if (config.axes.ffn_kind == .moe_swiglu) config.num_experts else 1,
+            .num_experts = if (has_moe_ffn) config.num_experts else 1,
             .top_k = max_top_k,
             .hidden_size = h,
-            .intermediate_size = if (config.axes.ffn_kind == .moe_swiglu) config.moe_intermediate_size else h,
+            .intermediate_size = if (has_moe_ffn) config.moe_intermediate_size else h,
             .shared_intermediate_size = config.shared_expert_intermediate_size,
         };
 
@@ -9580,11 +11239,12 @@ pub const GraphModel = struct {
         addAligned(&tree_scratch_bytes, if (is_inkling2) 64 else @as(usize, max_m) * max_inter * 2); // dense_act
         addAligned(&tree_scratch_bytes, if (is_m82) 64 else @as(usize, max_m) * 3 * h * 2); // aux_tree
         if (num_gqa_layers > 0) {
-            addAligned(&tree_scratch_bytes, @as(usize, max_m) * config.num_attention_heads * attention.MAX_SPLITS * (config.head_dim + 2) * 4);
+            const gqa_max_hd = @max(config.head_dim, config.globalVHeadDim());
+            addAligned(&tree_scratch_bytes, @as(usize, max_m) * config.num_attention_heads * attention.MAX_SPLITS * (gqa_max_hd + 2) * 4);
         } else {
             addAligned(&tree_scratch_bytes, 64);
         }
-        if (config.axes.ffn_kind == .moe_swiglu and !is_m82) {
+        if (has_moe_ffn and !is_m82) {
             addAligned(&tree_scratch_bytes, (try moe.MoeWorkspace.requiredBytes(moe_ws_spec)) + 4096);
         }
         if (num_gdn_layers > 0) {
@@ -9614,7 +11274,13 @@ pub const GraphModel = struct {
         if (num_gqa_layers > 0) {
             for (0..num_gqa_layers) |_| {
                 addAligned(&tree_scratch_bytes, @as(usize, max_m) * config.kvDim() * 2);
-                addAligned(&tree_scratch_bytes, @as(usize, max_m) * config.kvDim() * 2);
+                addAligned(&tree_scratch_bytes, @as(usize, max_m) * config.globalVDim() * 2);
+            }
+        }
+        if (num_swa_layers > 0) {
+            for (0..num_swa_layers) |_| {
+                addAligned(&tree_scratch_bytes, @as(usize, max_m) * swa_k_d * 2);
+                addAligned(&tree_scratch_bytes, @as(usize, max_m) * swa_v_d * 2);
             }
         }
         if (num_mla_layers > 0) {
@@ -9691,15 +11357,24 @@ pub const GraphModel = struct {
                         addAligned(&wide_scratch_bytes, w_cap * qk_d * 2); // wp_q_raw
                     }
                 }
+            } else if (config.attn_output_gate) {
+                addAligned(&wide_scratch_bytes, w_cap * max_attn_out * 2); // wp_gdn_z (q_gate_proj)
             }
             addAligned(&wide_scratch_bytes, w_cap * max_attn_out * 2); // wp_attn_out
             addAligned(&wide_scratch_bytes, w_cap * h * 2); // wp_proj_out
-            if (config.axes.ffn_kind == .dense_swiglu) {
+            if (has_dense_ffn) {
                 addAligned(&wide_scratch_bytes, w_cap * max_inter * 2); // wp_dense_gate
                 addAligned(&wide_scratch_bytes, w_cap * max_inter * 2); // wp_dense_up
                 addAligned(&wide_scratch_bytes, w_cap * max_inter * 2); // wp_dense_act
-            } else {
+            }
+            if (has_moe_ffn) {
                 addAligned(&wide_scratch_bytes, (try moe.MoeWorkspace.requiredBytes(wp_moe_ws_spec)) + 4096);
+            }
+            if (num_swa_layers > 0 and multi_loop) {
+                for (0..num_swa_layers) |_| {
+                    addAligned(&wide_scratch_bytes, w_cap * swa_k_d * 2);
+                    addAligned(&wide_scratch_bytes, w_cap * swa_v_d * 2);
+                }
             }
             if (num_qsa_layers > 0) {
                 for (0..num_qsa_layers) |_| {
@@ -9826,14 +11501,26 @@ pub const GraphModel = struct {
                 }
             }
         }
+        if (num_swa_layers > 0) {
+            for (0..num_swa_layers) |_| {
+                persist_bytes += try hybrid.HybridKvRing.tableRequiredBytes(swa_num_tiles) + 64;
+            }
+        }
+        if (dflare_tap_count > 0) {
+            addAligned(&persist_bytes, @as(usize, dflare_tap_count) * max_m * h * 2); // dflare_taps_gpu
+            if (dflare_ctx_hist_cap > 0) {
+                addAligned(&persist_bytes, @as(usize, dflare_ctx_hist_cap) * dflare_tap_count * h * 2); // dflare_ctx_hist
+            }
+        }
         addAligned(&persist_bytes, logits_cap * 4); // out_token_ids
         addAligned(&persist_bytes, logits_cap * config.vocab_size * 2); // logits
         addAligned(&persist_bytes, @as(usize, max_m) * moe.MAX_TOP_K * @sizeOf(moe.TopKCandidate)); // topk
         addAligned(&persist_bytes, feat_cap * h * 2); // accepted_top
         addAligned(&persist_bytes, feat_cap * 3 * h * 2); // accepted_aux
         addAligned(&persist_bytes, @as(usize, config.num_hidden_layers) * 64); // per-layer sched headers
-        if (config.axes.ffn_kind == .moe_swiglu) {
-            for (0..config.num_hidden_layers) |_| {
+        if (has_moe_ffn) {
+            for (0..config.num_hidden_layers) |l_idx| {
+                if (config.layerFfnKind(l_idx) != .moe_swiglu) continue;
                 addAligned(&persist_bytes, @as(usize, config.num_experts) * @sizeOf(moe.ExpertWeights));
                 addAligned(&persist_bytes, @as(usize, config.num_experts)); // hetero expert_dtypes
             }
@@ -10121,20 +11808,24 @@ pub const GraphModel = struct {
                 wp_gdn_z_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(wgz.ptr) };
                 wp_gdn_g_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(wgg.ptr) };
                 wp_gdn_beta_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(wgb.ptr) };
+            } else if (config.attn_output_gate) {
+                const wgz = try wp_arena.allocAligned(w_cap * max_attn_out * 2, 64);
+                wp_gdn_z_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(wgz.ptr) };
             }
             const wao_raw = try wp_arena.allocAligned(w_cap * max_attn_out * 2, 64);
             const wpo_raw = try wp_arena.allocAligned(w_cap * h * 2, 64);
             wp_attn_out_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(wao_raw.ptr) };
             wp_proj_out_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(wpo_raw.ptr) };
             wp_proj_out_host = @alignCast(std.mem.bytesAsSlice(f16, wpo_raw[0 .. w_cap * h * 2]));
-            if (config.axes.ffn_kind == .dense_swiglu) {
+            if (has_dense_ffn) {
                 const wdg = try wp_arena.allocAligned(w_cap * max_inter * 2, 64);
                 const wdu = try wp_arena.allocAligned(w_cap * max_inter * 2, 64);
                 const wda = try wp_arena.allocAligned(w_cap * max_inter * 2, 64);
                 wp_dense_gate_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(wdg.ptr) };
                 wp_dense_up_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(wdu.ptr) };
                 wp_dense_act_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(wda.ptr) };
-            } else {
+            }
+            if (has_moe_ffn) {
                 wp_moe_ws = try moe.MoeWorkspace.init(wp_arena, wp_moe_ws_spec);
             }
             if (num_mla_layers > 0) {
@@ -10217,12 +11908,13 @@ pub const GraphModel = struct {
         const dup_raw = try tr_arena.allocAligned(if (is_inkling2) 64 else @as(usize, max_m) * max_inter * 2, 64);
         const dact_raw = try tr_arena.allocAligned(if (is_inkling2) 64 else @as(usize, max_m) * max_inter * 2, 64);
         const aux_tree_raw = try tr_arena.allocAligned(if (is_m82) 64 else @as(usize, max_m) * 3 * h * 2, 64);
+        const gqa_max_hd = @max(config.head_dim, config.globalVHeadDim());
         const gqa_scratch_raw = if (num_gqa_layers > 0)
-            try tr_arena.allocAligned(@as(usize, max_m) * config.num_attention_heads * attention.MAX_SPLITS * (config.head_dim + 2) * 4, 64)
+            try tr_arena.allocAligned(@as(usize, max_m) * config.num_attention_heads * attention.MAX_SPLITS * (gqa_max_hd + 2) * 4, 64)
         else
             try tr_arena.allocAligned(64, 64);
 
-        const moe_ws: ?moe.MoeWorkspace = if (config.axes.ffn_kind == .moe_swiglu and !is_m82)
+        const moe_ws: ?moe.MoeWorkspace = if (has_moe_ffn and !is_m82)
             try moe.MoeWorkspace.init(tr_arena, moe_ws_spec)
         else
             null;
@@ -10323,6 +12015,36 @@ pub const GraphModel = struct {
         const layer_sched_hdr_raw = try scratch_arena.allocAligned(@as(usize, config.num_hidden_layers) * 64, 64);
         @memset(layer_sched_hdr_raw, 0);
 
+        var dflare_taps_gpu_off: u64 = 0;
+        var dflare_tap_gpu_binds: [dflare_dfly.MAX_TARGET_TAPS]metal.BufferBinding = @splat(.{ .buffer = scratch_buf, .offset = 0 });
+        var dflare_ctx_hist_off: u64 = 0;
+        var dflare_tap_storage: []f32 = &.{};
+        errdefer if (dflare_tap_storage.len > 0) allocator.free(dflare_tap_storage);
+        var dflare_tap_slices: [dflare_dfly.MAX_TARGET_TAPS][]const f32 = @splat(&.{});
+        if (dflare_tap_count > 0) {
+            const tap_slot_bytes: u64 = @as(u64, max_m) * h * @sizeOf(f16);
+            const taps_raw = try scratch_arena.allocAligned(@as(usize, dflare_tap_count) * @as(usize, @intCast(tap_slot_bytes)), 64);
+            @memset(taps_raw, 0);
+            dflare_taps_gpu_off = scratch_arena.offsetOf(taps_raw.ptr);
+            for (0..dflare_tap_count) |ti| {
+                dflare_tap_gpu_binds[ti] = .{
+                    .buffer = scratch_buf,
+                    .offset = dflare_taps_gpu_off + @as(u64, ti) * tap_slot_bytes,
+                };
+            }
+            if (dflare_ctx_hist_cap > 0) {
+                const hist_bytes = @as(usize, dflare_ctx_hist_cap) * dflare_tap_count * h * @sizeOf(f16);
+                const hist_raw = try scratch_arena.allocAligned(hist_bytes, 64);
+                @memset(hist_raw, 0);
+                dflare_ctx_hist_off = scratch_arena.offsetOf(hist_raw.ptr);
+            }
+            dflare_tap_storage = try allocator.alloc(f32, @as(usize, dflare_tap_count) * h);
+            @memset(dflare_tap_storage, 0.0);
+            for (0..dflare_tap_count) |ti| {
+                dflare_tap_slices[ti] = dflare_tap_storage[ti * h ..][0..h];
+            }
+        }
+
         // --- 4. Initialize optional ColdRuntime (`C3`-`C5`) ---
         var cold_rt: ?*ColdRuntime = null;
         errdefer if (cold_rt) |crt| {
@@ -10389,6 +12111,12 @@ pub const GraphModel = struct {
                         };
                         qsa.kv_ring.deinit(allocator);
                     },
+                    .swa => |*swa| {
+                        swa.kv_ring.removeResident(compute) catch |err| {
+                            std.debug.panic("SWA kv_ring.removeResident failed during errdefer: {}", .{err});
+                        };
+                        swa.kv_ring.deinit(allocator);
+                    },
                     .mla_csa2 => |*mla| {
                         if (mla.w_uk_t_heads.len > 0) allocator.free(mla.w_uk_t_heads);
                         if (mla.w_uv_heads.len > 0) allocator.free(mla.w_uv_heads);
@@ -10403,6 +12131,7 @@ pub const GraphModel = struct {
         var gdn_cursor: u32 = 0;
         var qsa_cursor: u32 = 0;
         var gqa_cursor: u32 = 0;
+        var swa_cursor: u32 = 0;
         var mla_cursor: u32 = 0;
         var mla_full_cursor: u32 = 0;
         var cur_kv_owner_slot: u32 = 0;
@@ -10738,37 +12467,65 @@ pub const GraphModel = struct {
                     layer_attn_bytes = q_p.alg_bytes + k_p.alg_bytes + v_p.alg_bytes + o_p.alg_bytes;
                 },
                 .gqa_full => {
+                    const g_k_hd = config.head_dim;
+                    const g_v_hd = config.globalVHeadDim();
+                    const g_q_dim = config.qDim();
+                    const g_k_dim = config.kvDim();
+                    const g_v_dim = config.globalVDim();
+                    const g_o_dim = config.globalAttnOutDim();
                     const q_nm = std.fmt.bufPrint(&name_buf, "layers.{d}.self_attn.q_proj", .{l}) catch unreachable;
-                    const q_p = try bindLinear(source, weight_shards, entry_shard, entry_offsets, entry_slices, entry_base_ptr, q_nm, config.qDim(), h);
+                    const q_p = try bindLinear(source, weight_shards, entry_shard, entry_offsets, entry_slices, entry_base_ptr, q_nm, g_q_dim, h);
                     const k_nm = std.fmt.bufPrint(&name_buf, "layers.{d}.self_attn.k_proj", .{l}) catch unreachable;
-                    const k_p = try bindLinear(source, weight_shards, entry_shard, entry_offsets, entry_slices, entry_base_ptr, k_nm, config.kvDim(), h);
+                    const k_p = try bindLinear(source, weight_shards, entry_shard, entry_offsets, entry_slices, entry_base_ptr, k_nm, g_k_dim, h);
                     const v_nm = std.fmt.bufPrint(&name_buf, "layers.{d}.self_attn.v_proj", .{l}) catch unreachable;
-                    const v_p = try bindLinear(source, weight_shards, entry_shard, entry_offsets, entry_slices, entry_base_ptr, v_nm, config.kvDim(), h);
+                    const v_p = try bindLinear(source, weight_shards, entry_shard, entry_offsets, entry_slices, entry_base_ptr, v_nm, g_v_dim, h);
                     const o_nm = std.fmt.bufPrint(&name_buf, "layers.{d}.self_attn.o_proj", .{l}) catch unreachable;
-                    const o_p = try bindLinear(source, weight_shards, entry_shard, entry_offsets, entry_slices, entry_base_ptr, o_nm, h, config.qDim());
+                    const o_p = try bindLinear(source, weight_shards, entry_shard, entry_offsets, entry_slices, entry_base_ptr, o_nm, h, g_o_dim);
+
+                    const qg_nm = std.fmt.bufPrint(&name_buf, "layers.{d}.self_attn.q_gate_proj", .{l}) catch unreachable;
+                    const qg_w_nm = std.fmt.bufPrint(&name_buf, "layers.{d}.self_attn.q_gate_proj.weight", .{l}) catch unreachable;
+                    const has_q_gate = (source.find(qg_nm) != null) or (source.find(qg_w_nm) != null);
+                    const qg_p: ?qwen3.LinearBinding = if (config.attn_output_gate or has_q_gate) blk: {
+                        const nm = std.fmt.bufPrint(&name_buf, "layers.{d}.self_attn.q_gate_proj", .{l}) catch unreachable;
+                        break :blk try bindLinear(source, weight_shards, entry_shard, entry_offsets, entry_slices, entry_base_ptr, nm, g_o_dim, h);
+                    } else null;
 
                     const qn_nm = std.fmt.bufPrint(&name_buf, "layers.{d}.self_attn.q_norm.weight", .{l}) catch unreachable;
                     const qn: ?qwen3.NormBinding = if (source.find(qn_nm) != null)
-                        try bindNorm(source, weight_shards, entry_shard, entry_offsets, entry_slices, entry_base_ptr, qn_nm, config.head_dim)
+                        try bindNorm(source, weight_shards, entry_shard, entry_offsets, entry_slices, entry_base_ptr, qn_nm, g_k_hd)
                     else
                         null;
                     const kn_nm = std.fmt.bufPrint(&name_buf, "layers.{d}.self_attn.k_norm.weight", .{l}) catch unreachable;
                     const kn: ?qwen3.NormBinding = if (source.find(kn_nm) != null)
-                        try bindNorm(source, weight_shards, entry_shard, entry_offsets, entry_slices, entry_base_ptr, kn_nm, config.head_dim)
+                        try bindNorm(source, weight_shards, entry_shard, entry_offsets, entry_slices, entry_base_ptr, kn_nm, g_k_hd)
                     else
                         null;
+
+                    var sink_bind: ?metal.BufferBinding = null;
+                    var sink_dt: hybrid.ScalarDType = .bf16;
+                    const sb_nm = std.fmt.bufPrint(&name_buf, "layers.{d}.self_attn.sink_bias", .{l}) catch unreachable;
+                    if (source.find(sb_nm)) |sbe| {
+                        const sb_idx = entryIndexOf(entry_base_ptr, sbe);
+                        sink_bind = .{ .buffer = weight_shards[entry_shard[sb_idx]].buffer, .offset = entry_offsets[sb_idx] };
+                        sink_dt = switch (try sbe.dataType()) {
+                            .f16 => .f16,
+                            .bf16 => .bf16,
+                            .f32 => .f32,
+                            else => return error.UnsupportedDType,
+                        };
+                    }
 
                     const tile_start = gqa_tiles_built;
                     const tbl_raw = try scratch_arena.allocAligned(@as(usize, gqa_num_tiles) * @sizeOf(attention.KvTilePair), 64);
                     const tbl: []attention.KvTilePair = @alignCast(std.mem.bytesAsSlice(attention.KvTilePair, tbl_raw[0 .. @as(usize, gqa_num_tiles) * @sizeOf(attention.KvTilePair)]));
                     const rows = config.num_key_value_heads * options.chunk_tokens;
                     for (0..gqa_num_tiles) |c| {
-                        gqa_kv_tiles[gqa_tiles_built] = try metal.KvTile.init(device, config.head_dim, rows, .{});
+                        gqa_kv_tiles[gqa_tiles_built] = try metal.KvTile.init(device, g_k_hd, rows, .{});
                         const tbk = (try gqa_kv_tiles[gqa_tiles_built].info()).allocBytes();
                         total_wired_bytes += tbk;
                         active_kv_wired_bytes += tbk;
                         gqa_tiles_built += 1;
-                        gqa_kv_tiles[gqa_tiles_built] = try metal.KvTile.init(device, config.head_dim, rows, .{});
+                        gqa_kv_tiles[gqa_tiles_built] = try metal.KvTile.init(device, g_v_hd, rows, .{});
                         const tbv = (try gqa_kv_tiles[gqa_tiles_built].info()).allocBytes();
                         total_wired_bytes += tbv;
                         active_kv_wired_bytes += tbv;
@@ -10784,18 +12541,24 @@ pub const GraphModel = struct {
                             @alignCast(std.mem.bytesAsSlice(u32, r_raw[0 .. @as(usize, max_retired_per_layer) * @sizeOf(u32)])),
                         };
                     } else .{ .{ .buffer = scratch_buf, .offset = 0 }, &.{} };
-                    const tk_r = try tr_arena.allocAligned(@as(usize, max_m) * config.kvDim() * 2, 64);
-                    const tv_r = try tr_arena.allocAligned(@as(usize, max_m) * config.kvDim() * 2, 64);
+                    const tk_r = try tr_arena.allocAligned(@as(usize, max_m) * g_k_dim * 2, 64);
+                    const tv_r = try tr_arena.allocAligned(@as(usize, max_m) * g_v_dim * 2, 64);
 
                     attn_union = .{ .gqa = .{
                         .gqa_idx = gqa_cursor,
                         .q_proj = q_p,
+                        .q_gate_proj = qg_p,
                         .k_proj = k_p,
                         .v_proj = v_p,
                         .o_proj = o_p,
                         .q_norm = if (qn) |n| n.binding else null,
                         .k_norm = if (kn) |n| n.binding else null,
                         .qk_norm_dtype = if (qn) |n| n.dtype else .bf16,
+                        .sink_bias = sink_bind,
+                        .sink_bias_dtype = sink_dt,
+                        .k_head_dim = g_k_hd,
+                        .v_head_dim = g_v_hd,
+                        .rotary_dim = config.effectiveRotaryDim(g_k_hd),
                         .kv_tiles_binding = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(tbl_raw.ptr) },
                         .kv_tiles_host = tbl,
                         .retired_ids_binding = gqa_ret_bind,
@@ -10805,6 +12568,109 @@ pub const GraphModel = struct {
                         .tree_v_off = scratch_arena.offsetOf(tv_r.ptr),
                     } };
                     gqa_cursor += 1;
+                    layer_attn_bytes = q_p.alg_bytes + k_p.alg_bytes + v_p.alg_bytes + o_p.alg_bytes +
+                        (if (qg_p) |p| p.alg_bytes else 0);
+                },
+                .swa_ring => {
+                    const s_qh = config.swaQHeads();
+                    const s_kvh = config.swaKvHeads();
+                    const s_khd = config.swaKHeadDim();
+                    const s_vhd = config.swaVHeadDim();
+                    const s_q_dim = s_qh * s_khd;
+                    const s_k_dim = s_kvh * s_khd;
+                    const s_v_dim = s_kvh * s_vhd;
+                    const s_o_dim = s_qh * s_vhd;
+
+                    const q_nm = std.fmt.bufPrint(&name_buf, "layers.{d}.self_attn.q_proj", .{l}) catch unreachable;
+                    const q_p = try bindLinear(source, weight_shards, entry_shard, entry_offsets, entry_slices, entry_base_ptr, q_nm, s_q_dim, h);
+                    const k_nm = std.fmt.bufPrint(&name_buf, "layers.{d}.self_attn.k_proj", .{l}) catch unreachable;
+                    const k_p = try bindLinear(source, weight_shards, entry_shard, entry_offsets, entry_slices, entry_base_ptr, k_nm, s_k_dim, h);
+                    const v_nm = std.fmt.bufPrint(&name_buf, "layers.{d}.self_attn.v_proj", .{l}) catch unreachable;
+                    const v_p = try bindLinear(source, weight_shards, entry_shard, entry_offsets, entry_slices, entry_base_ptr, v_nm, s_v_dim, h);
+                    const o_nm = std.fmt.bufPrint(&name_buf, "layers.{d}.self_attn.o_proj", .{l}) catch unreachable;
+                    const o_p = try bindLinear(source, weight_shards, entry_shard, entry_offsets, entry_slices, entry_base_ptr, o_nm, h, s_o_dim);
+
+                    const qn_nm = std.fmt.bufPrint(&name_buf, "layers.{d}.self_attn.q_norm.weight", .{l}) catch unreachable;
+                    const qn: ?qwen3.NormBinding = if (source.find(qn_nm) != null)
+                        try bindNorm(source, weight_shards, entry_shard, entry_offsets, entry_slices, entry_base_ptr, qn_nm, s_khd)
+                    else
+                        null;
+                    const kn_nm = std.fmt.bufPrint(&name_buf, "layers.{d}.self_attn.k_norm.weight", .{l}) catch unreachable;
+                    const kn: ?qwen3.NormBinding = if (source.find(kn_nm) != null)
+                        try bindNorm(source, weight_shards, entry_shard, entry_offsets, entry_slices, entry_base_ptr, kn_nm, s_khd)
+                    else
+                        null;
+
+                    var sink_bind: ?metal.BufferBinding = null;
+                    var sink_dt: hybrid.ScalarDType = .bf16;
+                    const sb_nm = std.fmt.bufPrint(&name_buf, "layers.{d}.self_attn.sink_bias", .{l}) catch unreachable;
+                    if (source.find(sb_nm)) |sbe| {
+                        const sb_idx = entryIndexOf(entry_base_ptr, sbe);
+                        sink_bind = .{ .buffer = weight_shards[entry_shard[sb_idx]].buffer, .offset = entry_offsets[sb_idx] };
+                        sink_dt = switch (try sbe.dataType()) {
+                            .f16 => .f16,
+                            .bf16 => .bf16,
+                            .f32 => .f32,
+                            else => return error.UnsupportedDType,
+                        };
+                    }
+
+                    var kv_ring = try hybrid.HybridKvRing.init(allocator, device, &scratch_arena, .{
+                        .mode = .sliding_window_128,
+                        .num_kv_heads = s_kvh,
+                        .head_dim = s_khd,
+                        .v_head_dim = s_vhd,
+                        .num_tiles = swa_num_tiles,
+                        .window_size_override = swa_window,
+                    });
+                    errdefer kv_ring.deinit(allocator);
+                    try kv_ring.makeResident(compute);
+                    for (kv_ring.k_tiles) |kt| {
+                        const tb = (try kt.info()).allocBytes();
+                        total_wired_bytes += tb;
+                        active_kv_wired_bytes += tb;
+                    }
+                    for (kv_ring.v_tiles) |vt| {
+                        const tb = (try vt.info()).allocBytes();
+                        total_wired_bytes += tb;
+                        active_kv_wired_bytes += tb;
+                    }
+
+                    const tk_r = try tr_arena.allocAligned(@as(usize, max_m) * s_k_dim * 2, 64);
+                    const tv_r = try tr_arena.allocAligned(@as(usize, max_m) * s_v_dim * 2, 64);
+                    var swa_wp_k_off: u64 = 0;
+                    var swa_wp_v_off: u64 = 0;
+                    if (wide_enabled and multi_loop) {
+                        const wk_r = try wp_arena.allocAligned(w_cap * s_k_dim * 2, 64);
+                        const wv_r = try wp_arena.allocAligned(w_cap * s_v_dim * 2, 64);
+                        swa_wp_k_off = scratch_arena.offsetOf(wk_r.ptr);
+                        swa_wp_v_off = scratch_arena.offsetOf(wv_r.ptr);
+                    }
+
+                    attn_union = .{ .swa = .{
+                        .swa_idx = swa_cursor,
+                        .q_proj = q_p,
+                        .k_proj = k_p,
+                        .v_proj = v_p,
+                        .o_proj = o_p,
+                        .q_norm = if (qn) |n| n.binding else null,
+                        .k_norm = if (kn) |n| n.binding else null,
+                        .qk_norm_dtype = if (qn) |n| n.dtype else .bf16,
+                        .sink_bias = sink_bind,
+                        .sink_bias_dtype = sink_dt,
+                        .num_q_heads = s_qh,
+                        .num_kv_heads = s_kvh,
+                        .k_head_dim = s_khd,
+                        .v_head_dim = s_vhd,
+                        .rotary_dim = config.effectiveRotaryDim(s_khd),
+                        .rope_theta = config.swaRopeTheta(),
+                        .kv_ring = kv_ring,
+                        .tree_k_off = scratch_arena.offsetOf(tk_r.ptr),
+                        .tree_v_off = scratch_arena.offsetOf(tv_r.ptr),
+                        .wp_k_off = swa_wp_k_off,
+                        .wp_v_off = swa_wp_v_off,
+                    } };
+                    swa_cursor += 1;
                     layer_attn_bytes = q_p.alg_bytes + k_p.alg_bytes + v_p.alg_bytes + o_p.alg_bytes;
                 },
                 .mla_csa2 => {
@@ -10967,7 +12833,7 @@ pub const GraphModel = struct {
                 .attn = attn_union,
             };
 
-            switch (config.axes.ffn_kind) {
+            switch (config.layerFfnKind(l)) {
                 .dense_swiglu => {
                     const gp_nm = std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.gate_proj", .{l}) catch unreachable;
                     lw.dense_gate = try bindLinear(source, weight_shards, entry_shard, entry_offsets, entry_slices, entry_base_ptr, gp_nm, config.intermediate_size, h);
@@ -11007,6 +12873,21 @@ pub const GraphModel = struct {
                     } else if (rdt == .f32) {
                         lw.router_dtype = .f32;
                     } else return error.UnsupportedDType;
+
+                    // Optional MoE router `e_score_correction_bias` (`layers.{l}.mlp.gate.bias`).
+                    const rb_nm = std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.gate.bias", .{l}) catch unreachable;
+                    const rb_alt_nm = std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.gate.e_score_correction_bias", .{l}) catch unreachable;
+                    const rb_entry = source.find(rb_nm) orelse source.find(rb_alt_nm);
+                    if (rb_entry) |rbe| {
+                        const rb_idx = entryIndexOf(entry_base_ptr, rbe);
+                        lw.router_bias = .{ .buffer = weight_shards[entry_shard[rb_idx]].buffer, .offset = entry_offsets[rb_idx] };
+                        lw.router_bias_dtype = switch (try rbe.dataType()) {
+                            .f16 => .f16,
+                            .bf16 => .bf16,
+                            .f32 => .f32,
+                            else => return error.UnsupportedDType,
+                        };
+                    }
 
                     // Optional `shared_expert` + `shared_expert_gate` (`G7`).
                     const sg_nm = std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.shared_expert.gate_proj", .{l}) catch unreachable;
@@ -11439,6 +13320,16 @@ pub const GraphModel = struct {
             .accepted_top_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(acc_top_raw.ptr) },
             .accepted_aux_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(acc_aux_raw.ptr) },
             .aux_tree_base_off = scratch_arena.offsetOf(aux_tree_raw.ptr),
+            .dflare_target_layers = dflare_target_layers,
+            .dflare_tap_count = dflare_tap_count,
+            .dflare_taps_gpu_off = dflare_taps_gpu_off,
+            .dflare_tap_gpu_binds = dflare_tap_gpu_binds,
+            .dflare_tap_storage = dflare_tap_storage,
+            .dflare_tap_slices = dflare_tap_slices,
+            .dflare_ctx_hist_off = dflare_ctx_hist_off,
+            .dflare_ctx_hist_cap = dflare_ctx_hist_cap,
+            .dflare_ctx_hist_len = 0,
+            .dflare_ctx_hist_epoch = 0,
             .single_expert_bytes = single_expert_bytes,
             .total_layers_non_expert_bytes = total_layers_non_expert_bytes,
             .total_layers_static_bytes = total_layers_static_bytes,
@@ -11653,13 +13544,14 @@ pub const LoadedCpuMoeStore = struct {
         plan: expert_parallel.ExpertPartitionPlan,
         budget_override: ?budget_mod.Budget,
     ) GraphLoadError!LoadedCpuMoeStore {
-        if (config.axes.ffn_kind != .moe_swiglu) return error.InvalidConfig;
+        if (!config.hasMoeFfn()) return error.InvalidConfig;
         const num_layers: usize = config.num_hidden_layers;
         const num_experts: usize = config.num_experts;
         var name_buf: [160]u8 = undefined;
 
         var total_bytes: usize = 0;
         for (0..num_layers) |l| {
+            if (config.layerFfnKind(l) != .moe_swiglu) continue;
             for (0..num_experts) |e| {
                 if (!plan.isLocal(@intCast(e))) continue;
                 const gn = std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.experts.{d}.gate_proj", .{ l, e }) catch unreachable;
@@ -11697,6 +13589,7 @@ pub const LoadedCpuMoeStore = struct {
         });
 
         for (0..num_layers) |l| {
+            if (config.layerFfnKind(l) != .moe_swiglu) continue;
             for (0..num_experts) |e| {
                 if (!plan.isLocal(@intCast(e))) continue;
                 const gn = std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.experts.{d}.gate_proj", .{ l, e }) catch unreachable;
@@ -11946,6 +13839,10 @@ pub const GraphBatchRuntime = struct {
                     num_kv_layers += 1;
                     num_gqa_layers += 1;
                 },
+                .swa => {
+                    layer_to_kv_idx[l] = num_kv_layers;
+                    num_kv_layers += 1;
+                },
                 .mla_csa2 => {},
             }
         }
@@ -11997,7 +13894,7 @@ pub const GraphBatchRuntime = struct {
         const gqa_batch_layout = attention.gqaBatchScratchLayout(
             cfg.max_slots,
             model.config.num_attention_heads,
-            model.config.head_dim,
+            @max(model.config.head_dim, model.config.globalVHeadDim()),
             attention.MAX_SPLITS,
         );
         const gqa_batch_bytes: usize = if (num_gqa_layers > 0) amf.align64(gqa_batch_layout.total_bytes) else 0;
@@ -12011,10 +13908,28 @@ pub const GraphBatchRuntime = struct {
 
         // P1-B (`R9`, ADR-0020): Evaluate required runtime bytes vs live non-anonymous Mach RAM
         // and softly auto-scale optional `PrefixCache` + `GdnSnapshotPool` entries if tighter.
-        const kv_tile_rows: u32 = model.config.num_key_value_heads * kv_chunk_tokens;
         const bytes_per_group: u64 = if (num_kv_layers > 0) blk: {
-            const tile_bytes: u64 = try page.alignUp(@as(usize, kv_tile_rows) * model.config.head_dim * @sizeOf(f16));
-            break :blk @as(u64, num_kv_layers) * 2 * tile_bytes;
+            var acc: u64 = 0;
+            for (0..num_kv_layers) |ki| {
+                const li = kv_idx_to_layer[ki];
+                switch (model.layers[li].attn) {
+                    .swa => |swa| {
+                        const r: usize = @as(usize, swa.num_kv_heads) * kv_chunk_tokens;
+                        acc += try page.alignUp(r * swa.k_head_dim * @sizeOf(f16));
+                        acc += try page.alignUp(r * swa.v_head_dim * @sizeOf(f16));
+                    },
+                    .gqa => |gqa| {
+                        const r: usize = @as(usize, model.config.num_key_value_heads) * kv_chunk_tokens;
+                        acc += try page.alignUp(r * gqa.k_head_dim * @sizeOf(f16));
+                        acc += try page.alignUp(r * gqa.v_head_dim * @sizeOf(f16));
+                    },
+                    else => {
+                        const r: usize = @as(usize, model.config.num_key_value_heads) * kv_chunk_tokens;
+                        acc += 2 * try page.alignUp(r * model.config.head_dim * @sizeOf(f16));
+                    },
+                }
+            }
+            break :blk acc;
         } else 0;
         const base_arena_raw: usize =
             gdn_pool_bytes +
@@ -12286,7 +14201,7 @@ pub const GraphBatchRuntime = struct {
             }
         }
 
-        // Allocate shared IOSurface KV tiles.
+        // Allocate shared IOSurface KV tiles (per-layer geometry supporting asymmetric `192/128` SWA & GQA).
         const total_pool_tiles: usize = @as(usize, pool_chunk_groups) * num_kv_layers * 2;
         const pool_tiles = try allocator.alloc(metal.KvTile, total_pool_tiles);
         var tiles_built: usize = 0;
@@ -12294,9 +14209,30 @@ pub const GraphBatchRuntime = struct {
             for (0..tiles_built) |ti| pool_tiles[ti].close();
             allocator.free(pool_tiles);
         }
-        for (0..total_pool_tiles) |ti| {
-            pool_tiles[ti] = try metal.KvTile.init(model.device, model.config.head_dim, kv_tile_rows, .{});
-            tiles_built += 1;
+        for (0..pool_chunk_groups) |_| {
+            for (0..num_kv_layers) |ki| {
+                const li = kv_idx_to_layer[ki];
+                var k_hd: u32 = model.config.head_dim;
+                var v_hd: u32 = model.config.head_dim;
+                var kvh: u32 = model.config.num_key_value_heads;
+                switch (model.layers[li].attn) {
+                    .swa => |swa| {
+                        k_hd = swa.k_head_dim;
+                        v_hd = swa.v_head_dim;
+                        kvh = swa.num_kv_heads;
+                    },
+                    .gqa => |gqa| {
+                        k_hd = gqa.k_head_dim;
+                        v_hd = gqa.v_head_dim;
+                    },
+                    else => {},
+                }
+                const l_rows: u32 = kvh * kv_chunk_tokens;
+                pool_tiles[tiles_built] = try metal.KvTile.init(model.device, k_hd, l_rows, .{});
+                tiles_built += 1;
+                pool_tiles[tiles_built] = try metal.KvTile.init(model.device, v_hd, l_rows, .{});
+                tiles_built += 1;
+            }
         }
 
         try model.compute.makeResident(&.{batch_buf});
@@ -13197,6 +15133,7 @@ pub const GraphBatchRuntime = struct {
                 .hidden_dim = h,
                 .eps = model.config.rms_norm_eps,
                 .w_dtype = layer.input_layernorm.dtype,
+                .unit_offset = model.config.rmsnorm_unit_offset,
             }, true);
 
             const last_x_bind: metal.BufferBinding = .{
@@ -13495,7 +15432,11 @@ pub const GraphBatchRuntime = struct {
                 .gqa => |gqa| {
                     const kv_idx = self.layer_to_kv_idx[l];
                     const kv_d = model.config.kvDim();
+                    const v_d = model.config.globalVDim();
                     const slot_kv_bind = self.slotKvTilesBinding(kv_idx, slot_id);
+                    const use_g26 = model.config.usesG26GlobalGqa() or gqa.sink_bias != null or
+                        gqa.k_head_dim != gqa.v_head_dim or gqa.rotary_dim != gqa.k_head_dim or gqa.k_head_dim > 128;
+                    const eff_mrope = hybrid.MropeSection.text1d(gqa.rotary_dim);
                     if (skip_last_rest) {
                         try model.encodeLinearGemmWithTile(&frame, gqa.k_proj, model.wp_x_norm_bind, model.wp_k_bind, m, true, true);
                         try model.encodeLinearGemmWithTile(&frame, gqa.v_proj, model.wp_x_norm_bind, model.wp_v_bind, m, true, false);
@@ -13503,24 +15444,52 @@ pub const GraphBatchRuntime = struct {
                             _ = try model.encodeLoraSingle(&frame, l, .k_proj, model.wp_x_norm_bind, model.wp_k_bind, m, gqa.k_proj.k, gqa.k_proj.n, true);
                             _ = try model.encodeLoraSingle(&frame, l, .v_proj, model.wp_x_norm_bind, model.wp_v_bind, m, gqa.v_proj.k, gqa.v_proj.n, true);
                         }
-                        try model.attn_pipes.encodePrefillQkNormRopeKvWrite(&frame, .{
-                            .q = model.wp_q_bind,
-                            .k = model.wp_k_bind,
-                            .v = model.wp_v_bind,
-                            .q_norm = gqa.q_norm,
-                            .k_norm = gqa.k_norm,
-                            .kv_tiles = slot_kv_bind,
-                            .num_tokens = m,
-                            .num_q_heads = model.config.num_attention_heads,
-                            .num_kv_heads = model.config.num_key_value_heads,
-                            .head_dim = model.config.head_dim,
-                            .start_pos = base_pos,
-                            .chunk_tokens = self.kv_chunk_tokens,
-                            .kv_only = true,
-                            .rms_eps = model.config.rms_norm_eps,
-                            .rope_theta = model.config.rope_theta,
-                            .norm_dtype = gqa.qk_norm_dtype,
-                        }, true);
+                        if (use_g26) {
+                            try model.hybrid_pipes.encodeG26QkNormRopeKv(&frame, .{
+                                .q = model.wp_q_bind,
+                                .k = model.wp_k_bind,
+                                .v = model.wp_v_bind,
+                                .q_norm = gqa.q_norm,
+                                .k_norm = gqa.k_norm,
+                                .norm_dtype = gqa.qk_norm_dtype,
+                                .kv_tiles = slot_kv_bind,
+                                .num_tokens = m,
+                                .num_q_heads = model.config.num_attention_heads,
+                                .num_kv_heads = model.config.num_key_value_heads,
+                                .k_head_dim = gqa.k_head_dim,
+                                .v_head_dim = gqa.v_head_dim,
+                                .rotary_dim = gqa.rotary_dim,
+                                .start_pos = base_pos,
+                                .mrope = eff_mrope,
+                                .yarn = model.config.yarn,
+                                .chunk_tokens = self.kv_chunk_tokens,
+                                .kv_only = true,
+                                .write_to_tiles = true,
+                                .qk_norm_unit_offset = model.config.rmsnorm_unit_offset,
+                                .rms_eps = model.config.rms_norm_eps,
+                                .rope_theta = model.config.rope_theta,
+                                .v_scale = model.config.attention_value_scale,
+                            }, true);
+                        } else {
+                            try model.attn_pipes.encodePrefillQkNormRopeKvWrite(&frame, .{
+                                .q = model.wp_q_bind,
+                                .k = model.wp_k_bind,
+                                .v = model.wp_v_bind,
+                                .q_norm = gqa.q_norm,
+                                .k_norm = gqa.k_norm,
+                                .kv_tiles = slot_kv_bind,
+                                .num_tokens = m,
+                                .num_q_heads = model.config.num_attention_heads,
+                                .num_kv_heads = model.config.num_key_value_heads,
+                                .head_dim = model.config.head_dim,
+                                .start_pos = base_pos,
+                                .chunk_tokens = self.kv_chunk_tokens,
+                                .kv_only = true,
+                                .rms_eps = model.config.rms_norm_eps,
+                                .rope_theta = model.config.rope_theta,
+                                .norm_dtype = gqa.qk_norm_dtype,
+                            }, true);
+                        }
                         break;
                     }
                     if (tail_m1_last) {
@@ -13532,42 +15501,97 @@ pub const GraphBatchRuntime = struct {
                             _ = try model.encodeLoraSingle(&frame, l, .v_proj, model.wp_x_norm_bind, model.wp_v_bind, m, gqa.v_proj.k, gqa.v_proj.n, true);
                             _ = try model.encodeLoraSingle(&frame, l, .q_proj, last_x_norm_bind, model.wp_q_bind, 1, gqa.q_proj.k, gqa.q_proj.n, true);
                         }
-                        try model.attn_pipes.encodePrefillQkNormRopeKvWrite(&frame, .{
-                            .q = model.wp_q_bind,
-                            .k = model.wp_k_bind,
-                            .v = model.wp_v_bind,
-                            .q_norm = gqa.q_norm,
-                            .k_norm = gqa.k_norm,
-                            .kv_tiles = slot_kv_bind,
-                            .num_tokens = m - 1,
-                            .num_q_heads = model.config.num_attention_heads,
-                            .num_kv_heads = model.config.num_key_value_heads,
-                            .head_dim = model.config.head_dim,
-                            .start_pos = base_pos,
-                            .chunk_tokens = self.kv_chunk_tokens,
-                            .kv_only = true,
-                            .rms_eps = model.config.rms_norm_eps,
-                            .rope_theta = model.config.rope_theta,
-                            .norm_dtype = gqa.qk_norm_dtype,
-                        }, true);
-                        try model.attn_pipes.encodePrefillQkNormRopeKvWrite(&frame, .{
-                            .q = model.wp_q_bind,
-                            .k = .{ .buffer = model.scratch_buf, .offset = model.wp_k_bind.offset + @as(u64, m - 1) * kv_d * @sizeOf(f16) },
-                            .v = .{ .buffer = model.scratch_buf, .offset = model.wp_v_bind.offset + @as(u64, m - 1) * kv_d * @sizeOf(f16) },
-                            .q_norm = gqa.q_norm,
-                            .k_norm = gqa.k_norm,
-                            .kv_tiles = slot_kv_bind,
-                            .num_tokens = 1,
-                            .num_q_heads = model.config.num_attention_heads,
-                            .num_kv_heads = model.config.num_key_value_heads,
-                            .head_dim = model.config.head_dim,
-                            .start_pos = base_pos + m - 1,
-                            .chunk_tokens = self.kv_chunk_tokens,
-                            .kv_only = false,
-                            .rms_eps = model.config.rms_norm_eps,
-                            .rope_theta = model.config.rope_theta,
-                            .norm_dtype = gqa.qk_norm_dtype,
-                        }, false);
+                        const last_k = metal.BufferBinding{ .buffer = model.scratch_buf, .offset = model.wp_k_bind.offset + @as(u64, m - 1) * kv_d * @sizeOf(f16) };
+                        const last_v = metal.BufferBinding{ .buffer = model.scratch_buf, .offset = model.wp_v_bind.offset + @as(u64, m - 1) * v_d * @sizeOf(f16) };
+                        if (use_g26) {
+                            try model.hybrid_pipes.encodeG26QkNormRopeKv(&frame, .{
+                                .q = model.wp_q_bind,
+                                .k = model.wp_k_bind,
+                                .v = model.wp_v_bind,
+                                .q_norm = gqa.q_norm,
+                                .k_norm = gqa.k_norm,
+                                .norm_dtype = gqa.qk_norm_dtype,
+                                .kv_tiles = slot_kv_bind,
+                                .num_tokens = m - 1,
+                                .num_q_heads = model.config.num_attention_heads,
+                                .num_kv_heads = model.config.num_key_value_heads,
+                                .k_head_dim = gqa.k_head_dim,
+                                .v_head_dim = gqa.v_head_dim,
+                                .rotary_dim = gqa.rotary_dim,
+                                .start_pos = base_pos,
+                                .mrope = eff_mrope,
+                                .yarn = model.config.yarn,
+                                .chunk_tokens = self.kv_chunk_tokens,
+                                .kv_only = true,
+                                .write_to_tiles = true,
+                                .qk_norm_unit_offset = model.config.rmsnorm_unit_offset,
+                                .rms_eps = model.config.rms_norm_eps,
+                                .rope_theta = model.config.rope_theta,
+                                .v_scale = model.config.attention_value_scale,
+                            }, true);
+                            try model.hybrid_pipes.encodeG26QkNormRopeKv(&frame, .{
+                                .q = model.wp_q_bind,
+                                .k = last_k,
+                                .v = last_v,
+                                .q_norm = gqa.q_norm,
+                                .k_norm = gqa.k_norm,
+                                .norm_dtype = gqa.qk_norm_dtype,
+                                .kv_tiles = slot_kv_bind,
+                                .num_tokens = 1,
+                                .num_q_heads = model.config.num_attention_heads,
+                                .num_kv_heads = model.config.num_key_value_heads,
+                                .k_head_dim = gqa.k_head_dim,
+                                .v_head_dim = gqa.v_head_dim,
+                                .rotary_dim = gqa.rotary_dim,
+                                .start_pos = base_pos + m - 1,
+                                .mrope = eff_mrope,
+                                .yarn = model.config.yarn,
+                                .chunk_tokens = self.kv_chunk_tokens,
+                                .kv_only = false,
+                                .write_to_tiles = true,
+                                .qk_norm_unit_offset = model.config.rmsnorm_unit_offset,
+                                .rms_eps = model.config.rms_norm_eps,
+                                .rope_theta = model.config.rope_theta,
+                                .v_scale = model.config.attention_value_scale,
+                            }, false);
+                        } else {
+                            try model.attn_pipes.encodePrefillQkNormRopeKvWrite(&frame, .{
+                                .q = model.wp_q_bind,
+                                .k = model.wp_k_bind,
+                                .v = model.wp_v_bind,
+                                .q_norm = gqa.q_norm,
+                                .k_norm = gqa.k_norm,
+                                .kv_tiles = slot_kv_bind,
+                                .num_tokens = m - 1,
+                                .num_q_heads = model.config.num_attention_heads,
+                                .num_kv_heads = model.config.num_key_value_heads,
+                                .head_dim = model.config.head_dim,
+                                .start_pos = base_pos,
+                                .chunk_tokens = self.kv_chunk_tokens,
+                                .kv_only = true,
+                                .rms_eps = model.config.rms_norm_eps,
+                                .rope_theta = model.config.rope_theta,
+                                .norm_dtype = gqa.qk_norm_dtype,
+                            }, true);
+                            try model.attn_pipes.encodePrefillQkNormRopeKvWrite(&frame, .{
+                                .q = model.wp_q_bind,
+                                .k = last_k,
+                                .v = last_v,
+                                .q_norm = gqa.q_norm,
+                                .k_norm = gqa.k_norm,
+                                .kv_tiles = slot_kv_bind,
+                                .num_tokens = 1,
+                                .num_q_heads = model.config.num_attention_heads,
+                                .num_kv_heads = model.config.num_key_value_heads,
+                                .head_dim = model.config.head_dim,
+                                .start_pos = base_pos + m - 1,
+                                .chunk_tokens = self.kv_chunk_tokens,
+                                .kv_only = false,
+                                .rms_eps = model.config.rms_norm_eps,
+                                .rope_theta = model.config.rope_theta,
+                                .norm_dtype = gqa.qk_norm_dtype,
+                            }, false);
+                        }
                     } else {
                         try model.encodeQkvProj(&frame, gqa.q_proj, gqa.k_proj, gqa.v_proj, model.wp_x_norm_bind, model.wp_q_bind, model.wp_k_bind, model.wp_v_bind, m, .gemm_wide, true);
                         if (model.hasActiveLora()) {
@@ -13575,40 +15599,260 @@ pub const GraphBatchRuntime = struct {
                             _ = try model.encodeLoraSingle(&frame, l, .k_proj, model.wp_x_norm_bind, model.wp_k_bind, m, gqa.k_proj.k, gqa.k_proj.n, true);
                             _ = try model.encodeLoraSingle(&frame, l, .v_proj, model.wp_x_norm_bind, model.wp_v_bind, m, gqa.v_proj.k, gqa.v_proj.n, true);
                         }
-                        try model.attn_pipes.encodePrefillQkNormRopeKvWrite(&frame, .{
+                        if (use_g26) {
+                            try model.hybrid_pipes.encodeG26QkNormRopeKv(&frame, .{
+                                .q = model.wp_q_bind,
+                                .k = model.wp_k_bind,
+                                .v = model.wp_v_bind,
+                                .q_norm = gqa.q_norm,
+                                .k_norm = gqa.k_norm,
+                                .norm_dtype = gqa.qk_norm_dtype,
+                                .kv_tiles = slot_kv_bind,
+                                .num_tokens = m,
+                                .num_q_heads = model.config.num_attention_heads,
+                                .num_kv_heads = model.config.num_key_value_heads,
+                                .k_head_dim = gqa.k_head_dim,
+                                .v_head_dim = gqa.v_head_dim,
+                                .rotary_dim = gqa.rotary_dim,
+                                .start_pos = base_pos,
+                                .mrope = eff_mrope,
+                                .yarn = model.config.yarn,
+                                .chunk_tokens = self.kv_chunk_tokens,
+                                .kv_only = false,
+                                .write_to_tiles = true,
+                                .qk_norm_unit_offset = model.config.rmsnorm_unit_offset,
+                                .rms_eps = model.config.rms_norm_eps,
+                                .rope_theta = model.config.rope_theta,
+                                .v_scale = model.config.attention_value_scale,
+                            }, true);
+                        } else {
+                            try model.attn_pipes.encodePrefillQkNormRopeKvWrite(&frame, .{
+                                .q = model.wp_q_bind,
+                                .k = model.wp_k_bind,
+                                .v = model.wp_v_bind,
+                                .q_norm = gqa.q_norm,
+                                .k_norm = gqa.k_norm,
+                                .kv_tiles = slot_kv_bind,
+                                .num_tokens = m,
+                                .num_q_heads = model.config.num_attention_heads,
+                                .num_kv_heads = model.config.num_key_value_heads,
+                                .head_dim = model.config.head_dim,
+                                .start_pos = base_pos,
+                                .chunk_tokens = self.kv_chunk_tokens,
+                                .kv_only = false,
+                                .rms_eps = model.config.rms_norm_eps,
+                                .rope_theta = model.config.rope_theta,
+                                .norm_dtype = gqa.qk_norm_dtype,
+                            }, true);
+                        }
+                    }
+                    if (use_g26) {
+                        try model.attn_pipes.encodeG26GqaPrefill(&frame, .{
                             .q = model.wp_q_bind,
-                            .k = model.wp_k_bind,
-                            .v = model.wp_v_bind,
-                            .q_norm = gqa.q_norm,
-                            .k_norm = gqa.k_norm,
                             .kv_tiles = slot_kv_bind,
-                            .num_tokens = m,
+                            .sink_bias = gqa.sink_bias,
+                            .sink_dtype = @backingInt(gqa.sink_bias_dtype),
+                            .out = model.wp_attn_out_bind,
+                            .num_q = eff_m,
+                            .q_start_pos = if (tail_m1_last) base_pos + m - 1 else base_pos,
+                            .kv_len = kv_len_after,
+                            .num_q_heads = model.config.num_attention_heads,
+                            .num_kv_heads = model.config.num_key_value_heads,
+                            .k_head_dim = gqa.k_head_dim,
+                            .v_head_dim = gqa.v_head_dim,
+                            .chunk_tokens = self.kv_chunk_tokens,
+                        }, true);
+                    } else {
+                        try model.attn_pipes.encodeGqaCausalPrefillFlashAttn(&frame, .{
+                            .q = model.wp_q_bind,
+                            .kv_tiles = slot_kv_bind,
+                            .out = model.wp_attn_out_bind,
+                            .num_q = eff_m,
+                            .q_start_pos = if (tail_m1_last) base_pos + m - 1 else base_pos,
+                            .kv_len = kv_len_after,
                             .num_q_heads = model.config.num_attention_heads,
                             .num_kv_heads = model.config.num_key_value_heads,
                             .head_dim = model.config.head_dim,
-                            .start_pos = base_pos,
                             .chunk_tokens = self.kv_chunk_tokens,
-                            .kv_only = false,
-                            .rms_eps = model.config.rms_norm_eps,
-                            .rope_theta = model.config.rope_theta,
-                            .norm_dtype = gqa.qk_norm_dtype,
                         }, true);
                     }
-                    try model.attn_pipes.encodeGqaCausalPrefillFlashAttn(&frame, .{
-                        .q = model.wp_q_bind,
-                        .kv_tiles = slot_kv_bind,
-                        .out = model.wp_attn_out_bind,
-                        .num_q = eff_m,
-                        .q_start_pos = if (tail_m1_last) base_pos + m - 1 else base_pos,
-                        .kv_len = kv_len_after,
-                        .num_q_heads = model.config.num_attention_heads,
-                        .num_kv_heads = model.config.num_key_value_heads,
-                        .head_dim = model.config.head_dim,
-                        .chunk_tokens = self.kv_chunk_tokens,
-                    }, true);
+                    if (gqa.q_gate_proj) |qgp| {
+                        const q_src = if (tail_m1_last) last_x_norm_bind else model.wp_x_norm_bind;
+                        try model.encodeLinearGemmWithTile(&frame, qgp, q_src, model.wp_gdn_z_bind, eff_m, true, true);
+                        if (model.hasActiveLora()) {
+                            _ = try model.encodeLoraSingle(&frame, l, .gate_attn, q_src, model.wp_gdn_z_bind, eff_m, qgp.k, qgp.n, true);
+                        }
+                        try model.attn_pipes.encodeMulSigmoidF16(&frame, .{
+                            .out = model.wp_attn_out_bind,
+                            .gate = model.wp_gdn_z_bind,
+                            .count = eff_m * model.config.globalAttnOutDim(),
+                        }, true);
+                    }
                     try model.encodeLinearGemmWithTile(&frame, gqa.o_proj, model.wp_attn_out_bind, model.wp_proj_out_bind, eff_m, true, true);
                     if (model.hasActiveLora()) {
                         _ = try model.encodeLoraSingle(&frame, l, .o_proj, model.wp_attn_out_bind, model.wp_proj_out_bind, eff_m, gqa.o_proj.k, gqa.o_proj.n, true);
+                    }
+                },
+                .swa => |swa| {
+                    const kv_idx = self.layer_to_kv_idx[l];
+                    const slot_kv_bind = self.slotKvTilesBinding(kv_idx, slot_id);
+                    const eff_mrope = hybrid.MropeSection.text1d(swa.rotary_dim);
+                    const swa_k_d = swa.num_kv_heads * swa.k_head_dim;
+                    const swa_v_d = swa.num_kv_heads * swa.v_head_dim;
+                    if (skip_last_rest) {
+                        try model.encodeLinearGemmWithTile(&frame, swa.k_proj, model.wp_x_norm_bind, model.wp_k_bind, m, true, true);
+                        try model.encodeLinearGemmWithTile(&frame, swa.v_proj, model.wp_x_norm_bind, model.wp_v_bind, m, true, false);
+                        if (model.hasActiveLora()) {
+                            _ = try model.encodeLoraSingle(&frame, l, .k_proj, model.wp_x_norm_bind, model.wp_k_bind, m, swa.k_proj.k, swa.k_proj.n, true);
+                            _ = try model.encodeLoraSingle(&frame, l, .v_proj, model.wp_x_norm_bind, model.wp_v_bind, m, swa.v_proj.k, swa.v_proj.n, true);
+                        }
+                        try model.hybrid_pipes.encodeG26QkNormRopeKv(&frame, .{
+                            .q = model.wp_q_bind,
+                            .k = model.wp_k_bind,
+                            .v = model.wp_v_bind,
+                            .q_norm = swa.q_norm,
+                            .k_norm = swa.k_norm,
+                            .norm_dtype = swa.qk_norm_dtype,
+                            .kv_tiles = slot_kv_bind,
+                            .num_tokens = m,
+                            .num_q_heads = swa.num_q_heads,
+                            .num_kv_heads = swa.num_kv_heads,
+                            .k_head_dim = swa.k_head_dim,
+                            .v_head_dim = swa.v_head_dim,
+                            .rotary_dim = swa.rotary_dim,
+                            .start_pos = base_pos,
+                            .mrope = eff_mrope,
+                            .yarn = model.config.yarn,
+                            .chunk_tokens = self.kv_chunk_tokens,
+                            .ring_capacity = 0,
+                            .kv_only = true,
+                            .write_to_tiles = true,
+                            .qk_norm_unit_offset = model.config.rmsnorm_unit_offset,
+                            .rms_eps = model.config.rms_norm_eps,
+                            .rope_theta = swa.rope_theta,
+                            .v_scale = model.config.attention_value_scale,
+                        }, true);
+                        break;
+                    }
+                    if (tail_m1_last) {
+                        try model.encodeLinearGemmWithTile(&frame, swa.k_proj, model.wp_x_norm_bind, model.wp_k_bind, m, true, true);
+                        try model.encodeLinearGemmWithTile(&frame, swa.v_proj, model.wp_x_norm_bind, model.wp_v_bind, m, true, false);
+                        try model.encodeLinearGemv(&frame, swa.q_proj, last_x_norm_bind, model.wp_q_bind, false);
+                        if (model.hasActiveLora()) {
+                            _ = try model.encodeLoraSingle(&frame, l, .k_proj, model.wp_x_norm_bind, model.wp_k_bind, m, swa.k_proj.k, swa.k_proj.n, true);
+                            _ = try model.encodeLoraSingle(&frame, l, .v_proj, model.wp_x_norm_bind, model.wp_v_bind, m, swa.v_proj.k, swa.v_proj.n, true);
+                            _ = try model.encodeLoraSingle(&frame, l, .q_proj, last_x_norm_bind, model.wp_q_bind, 1, swa.q_proj.k, swa.q_proj.n, true);
+                        }
+                        try model.hybrid_pipes.encodeG26QkNormRopeKv(&frame, .{
+                            .q = model.wp_q_bind,
+                            .k = model.wp_k_bind,
+                            .v = model.wp_v_bind,
+                            .q_norm = swa.q_norm,
+                            .k_norm = swa.k_norm,
+                            .norm_dtype = swa.qk_norm_dtype,
+                            .kv_tiles = slot_kv_bind,
+                            .num_tokens = m - 1,
+                            .num_q_heads = swa.num_q_heads,
+                            .num_kv_heads = swa.num_kv_heads,
+                            .k_head_dim = swa.k_head_dim,
+                            .v_head_dim = swa.v_head_dim,
+                            .rotary_dim = swa.rotary_dim,
+                            .start_pos = base_pos,
+                            .mrope = eff_mrope,
+                            .yarn = model.config.yarn,
+                            .chunk_tokens = self.kv_chunk_tokens,
+                            .ring_capacity = 0,
+                            .kv_only = true,
+                            .write_to_tiles = true,
+                            .qk_norm_unit_offset = model.config.rmsnorm_unit_offset,
+                            .rms_eps = model.config.rms_norm_eps,
+                            .rope_theta = swa.rope_theta,
+                            .v_scale = model.config.attention_value_scale,
+                        }, true);
+                        try model.hybrid_pipes.encodeG26QkNormRopeKv(&frame, .{
+                            .q = model.wp_q_bind,
+                            .k = .{ .buffer = model.scratch_buf, .offset = model.wp_k_bind.offset + @as(u64, m - 1) * swa_k_d * @sizeOf(f16) },
+                            .v = .{ .buffer = model.scratch_buf, .offset = model.wp_v_bind.offset + @as(u64, m - 1) * swa_v_d * @sizeOf(f16) },
+                            .q_norm = swa.q_norm,
+                            .k_norm = swa.k_norm,
+                            .norm_dtype = swa.qk_norm_dtype,
+                            .kv_tiles = slot_kv_bind,
+                            .num_tokens = 1,
+                            .num_q_heads = swa.num_q_heads,
+                            .num_kv_heads = swa.num_kv_heads,
+                            .k_head_dim = swa.k_head_dim,
+                            .v_head_dim = swa.v_head_dim,
+                            .rotary_dim = swa.rotary_dim,
+                            .start_pos = base_pos + m - 1,
+                            .mrope = eff_mrope,
+                            .yarn = model.config.yarn,
+                            .chunk_tokens = self.kv_chunk_tokens,
+                            .ring_capacity = 0,
+                            .kv_only = false,
+                            .write_to_tiles = true,
+                            .qk_norm_unit_offset = model.config.rmsnorm_unit_offset,
+                            .rms_eps = model.config.rms_norm_eps,
+                            .rope_theta = swa.rope_theta,
+                            .v_scale = model.config.attention_value_scale,
+                        }, false);
+                    } else {
+                        try model.encodeQkvProj(&frame, swa.q_proj, swa.k_proj, swa.v_proj, model.wp_x_norm_bind, model.wp_q_bind, model.wp_k_bind, model.wp_v_bind, m, .gemm_wide, true);
+                        if (model.hasActiveLora()) {
+                            _ = try model.encodeLoraSingle(&frame, l, .q_proj, model.wp_x_norm_bind, model.wp_q_bind, m, swa.q_proj.k, swa.q_proj.n, true);
+                            _ = try model.encodeLoraSingle(&frame, l, .k_proj, model.wp_x_norm_bind, model.wp_k_bind, m, swa.k_proj.k, swa.k_proj.n, true);
+                            _ = try model.encodeLoraSingle(&frame, l, .v_proj, model.wp_x_norm_bind, model.wp_v_bind, m, swa.v_proj.k, swa.v_proj.n, true);
+                        }
+                        try model.hybrid_pipes.encodeG26QkNormRopeKv(&frame, .{
+                            .q = model.wp_q_bind,
+                            .k = model.wp_k_bind,
+                            .v = model.wp_v_bind,
+                            .q_norm = swa.q_norm,
+                            .k_norm = swa.k_norm,
+                            .norm_dtype = swa.qk_norm_dtype,
+                            .kv_tiles = slot_kv_bind,
+                            .num_tokens = m,
+                            .num_q_heads = swa.num_q_heads,
+                            .num_kv_heads = swa.num_kv_heads,
+                            .k_head_dim = swa.k_head_dim,
+                            .v_head_dim = swa.v_head_dim,
+                            .rotary_dim = swa.rotary_dim,
+                            .start_pos = base_pos,
+                            .mrope = eff_mrope,
+                            .yarn = model.config.yarn,
+                            .chunk_tokens = self.kv_chunk_tokens,
+                            .ring_capacity = 0,
+                            .kv_only = false,
+                            .write_to_tiles = true,
+                            .qk_norm_unit_offset = model.config.rmsnorm_unit_offset,
+                            .rms_eps = model.config.rms_norm_eps,
+                            .rope_theta = swa.rope_theta,
+                            .v_scale = model.config.attention_value_scale,
+                        }, true);
+                    }
+                    try model.hybrid_pipes.encodeG26SwaAttn(&frame, .{
+                        .q = model.wp_q_bind,
+                        .kv_tiles = slot_kv_bind,
+                        .k_extra = model.wp_k_bind,
+                        .v_extra = model.wp_v_bind,
+                        .sink_bias = swa.sink_bias,
+                        .sink_dtype = swa.sink_bias_dtype,
+                        .out = model.wp_attn_out_bind,
+                        .num_q = eff_m,
+                        .q_start_pos = if (tail_m1_last) base_pos + m - 1 else base_pos,
+                        .chunk_start_pos = kv_len_after,
+                        .kv_len = kv_len_after,
+                        .num_q_heads = swa.num_q_heads,
+                        .num_kv_heads = swa.num_kv_heads,
+                        .k_head_dim = swa.k_head_dim,
+                        .v_head_dim = swa.v_head_dim,
+                        .window_size = swa.kv_ring.window_size,
+                        .ring_capacity = 0,
+                        .chunk_tokens = self.kv_chunk_tokens,
+                        .is_prefill = true,
+                    }, true);
+                    try model.encodeLinearGemmWithTile(&frame, swa.o_proj, model.wp_attn_out_bind, model.wp_proj_out_bind, eff_m, true, true);
+                    if (model.hasActiveLora()) {
+                        _ = try model.encodeLoraSingle(&frame, l, .o_proj, model.wp_attn_out_bind, model.wp_proj_out_bind, eff_m, swa.o_proj.k, swa.o_proj.n, true);
                     }
                 },
                 .mla_csa2 => {},
@@ -13656,12 +15900,13 @@ pub const GraphBatchRuntime = struct {
                     .hidden_dim = h,
                     .eps = model.config.rms_norm_eps,
                     .w_dtype = layer.post_attention_layernorm.dtype,
+                    .unit_offset = model.config.rmsnorm_unit_offset,
                 }, true);
             } else {
                 try model.encodeResidualThenRmsNorm(&frame, eff_x_bind, model.wp_proj_out_bind, layer.post_attention_layernorm, model.wp_x_norm_bind, eff_m, true);
             }
 
-            switch (model.config.axes.ffn_kind) {
+            switch (model.config.layerFfnKind(l)) {
                 .dense_swiglu => {
                     const gu_lora_mask = lora.TargetProjection.gate_proj.bit() | lora.TargetProjection.up_proj.bit();
                     if (model.hasActiveLoraMask(l, gu_lora_mask)) {
@@ -13827,6 +16072,7 @@ pub const GraphBatchRuntime = struct {
                 .hidden_dim = h,
                 .eps = model.config.rms_norm_eps,
                 .w_dtype = model.final_norm.dtype,
+                .unit_offset = model.config.rmsnorm_unit_offset,
             }, true);
             try model.encodeLinearGemv(&frame, model.lm_head, model.wp_x_norm_bind, model.logits_bind, true);
             try model.moe_pipes.encodeArgmaxRows(&frame, .{
@@ -13935,6 +16181,7 @@ pub const GraphBatchRuntime = struct {
                 .hidden_dim = h,
                 .eps = model.config.rms_norm_eps,
                 .w_dtype = layer.input_layernorm.dtype,
+                .unit_offset = model.config.rmsnorm_unit_offset,
             }, true);
 
             switch (layer.attn) {
@@ -14145,6 +16392,9 @@ pub const GraphBatchRuntime = struct {
                     const kv_idx = self.layer_to_kv_idx[l];
                     const tree_k: metal.BufferBinding = .{ .buffer = model.scratch_buf, .offset = gqa.tree_k_off };
                     const tree_v: metal.BufferBinding = .{ .buffer = model.scratch_buf, .offset = gqa.tree_v_off };
+                    const use_g26 = model.config.usesG26GlobalGqa() or gqa.sink_bias != null or
+                        gqa.k_head_dim != gqa.v_head_dim or gqa.rotary_dim != gqa.k_head_dim or gqa.k_head_dim > 128;
+                    const eff_mrope = hybrid.MropeSection.text1d(gqa.rotary_dim);
                     try model.encodeLinearBatched(&frame, gqa.q_proj, model.x_norm_bind, model.q_bind, m, true);
                     try model.encodeLinearBatched(&frame, gqa.k_proj, model.x_norm_bind, model.k_bind, m, false);
                     try model.encodeLinearBatched(&frame, gqa.v_proj, model.x_norm_bind, model.v_bind, m, false);
@@ -14153,62 +16403,214 @@ pub const GraphBatchRuntime = struct {
                         _ = try model.encodeLoraSingle(&frame, l, .k_proj, model.x_norm_bind, model.k_bind, m, gqa.k_proj.k, gqa.k_proj.n, true);
                         _ = try model.encodeLoraSingle(&frame, l, .v_proj, model.x_norm_bind, model.v_bind, m, gqa.v_proj.k, gqa.v_proj.n, true);
                     }
-                    try model.attn_pipes.encodeTreeQkNormRope(&frame, .{
-                        .q = model.q_bind,
-                        .k = model.k_bind,
-                        .v = model.v_bind,
-                        .q_norm = gqa.q_norm,
-                        .k_norm = gqa.k_norm,
-                        .positions = model.positions_bind,
-                        .k_tree_out = tree_k,
-                        .v_tree_out = tree_v,
-                        .num_nodes = m,
-                        .num_q_heads = model.config.num_attention_heads,
-                        .num_kv_heads = model.config.num_key_value_heads,
-                        .head_dim = model.config.head_dim,
-                        .rms_eps = model.config.rms_norm_eps,
-                        .rope_theta = model.config.rope_theta,
-                        .norm_dtype = gqa.qk_norm_dtype,
-                    }, true);
-                    try model.attn_pipes.encodeGqaTreeVerifyAttn(&frame, .{
-                        .q = model.q_bind,
-                        .kv_tiles = if (base_pos > 0) self.slotKvTilesBinding(kv_idx, slot_id) else null,
-                        .base_pos = base_pos,
-                        .k_tree = tree_k,
-                        .v_tree = tree_v,
-                        .ancestor_masks = model.ancestor_masks_bind,
-                        .out = model.attn_out_bind,
-                        .scratch = model.gqa_scratch_bind,
-                        .max_splits = attention.MAX_SPLITS,
-                        .num_nodes = m,
-                        .num_q_heads = model.config.num_attention_heads,
-                        .num_kv_heads = model.config.num_key_value_heads,
-                        .head_dim = model.config.head_dim,
-                        .chunk_tokens = self.kv_chunk_tokens,
-                    }, true);
+                    if (use_g26) {
+                        try model.hybrid_pipes.encodeG26QkNormRopeKv(&frame, .{
+                            .q = model.q_bind,
+                            .k = model.k_bind,
+                            .v = model.v_bind,
+                            .q_norm = gqa.q_norm,
+                            .k_norm = gqa.k_norm,
+                            .norm_dtype = gqa.qk_norm_dtype,
+                            .positions_3d = model.pos3d_bind,
+                            .k_out = tree_k,
+                            .v_out = tree_v,
+                            .num_tokens = m,
+                            .num_q_heads = model.config.num_attention_heads,
+                            .num_kv_heads = model.config.num_key_value_heads,
+                            .k_head_dim = gqa.k_head_dim,
+                            .v_head_dim = gqa.v_head_dim,
+                            .rotary_dim = gqa.rotary_dim,
+                            .start_pos = base_pos,
+                            .mrope = eff_mrope,
+                            .yarn = model.config.yarn,
+                            .chunk_tokens = self.kv_chunk_tokens,
+                            .kv_only = false,
+                            .write_to_tiles = false,
+                            .qk_norm_unit_offset = model.config.rmsnorm_unit_offset,
+                            .rms_eps = model.config.rms_norm_eps,
+                            .rope_theta = model.config.rope_theta,
+                            .v_scale = model.config.attention_value_scale,
+                        }, true);
+                        try model.attn_pipes.encodeG26GqaAttn(&frame, .{
+                            .q = model.q_bind,
+                            .kv_tiles = if (base_pos > 0) self.slotKvTilesBinding(kv_idx, slot_id) else null,
+                            .k_tree = tree_k,
+                            .v_tree = tree_v,
+                            .ancestor_masks = model.ancestor_masks_bind,
+                            .sink_bias = gqa.sink_bias,
+                            .sink_dtype = @backingInt(gqa.sink_bias_dtype),
+                            .out = model.attn_out_bind,
+                            .scratch = model.gqa_scratch_bind,
+                            .max_splits = attention.MAX_SPLITS,
+                            .num_nodes = m,
+                            .num_q_heads = model.config.num_attention_heads,
+                            .num_kv_heads = model.config.num_key_value_heads,
+                            .k_head_dim = gqa.k_head_dim,
+                            .v_head_dim = gqa.v_head_dim,
+                            .base_pos = base_pos,
+                            .chunk_tokens = self.kv_chunk_tokens,
+                        }, true);
+                        try model.hybrid_pipes.encodeG26KvCommit(&frame, .{
+                            .k_src = tree_k,
+                            .v_src = tree_v,
+                            .kv_tiles = self.slotKvTilesBinding(kv_idx, slot_id),
+                            .num_kv_heads = model.config.num_key_value_heads,
+                            .k_head_dim = gqa.k_head_dim,
+                            .v_head_dim = gqa.v_head_dim,
+                            .start_pos = base_pos,
+                            .accepted_nodes = acc_nodes[0..m],
+                            .chunk_tokens = self.kv_chunk_tokens,
+                            .ring_capacity = 0,
+                        }, true);
+                    } else {
+                        try model.attn_pipes.encodeTreeQkNormRope(&frame, .{
+                            .q = model.q_bind,
+                            .k = model.k_bind,
+                            .v = model.v_bind,
+                            .q_norm = gqa.q_norm,
+                            .k_norm = gqa.k_norm,
+                            .positions = model.positions_bind,
+                            .k_tree_out = tree_k,
+                            .v_tree_out = tree_v,
+                            .num_nodes = m,
+                            .num_q_heads = model.config.num_attention_heads,
+                            .num_kv_heads = model.config.num_key_value_heads,
+                            .head_dim = model.config.head_dim,
+                            .rms_eps = model.config.rms_norm_eps,
+                            .rope_theta = model.config.rope_theta,
+                            .norm_dtype = gqa.qk_norm_dtype,
+                        }, true);
+                        try model.attn_pipes.encodeGqaTreeVerifyAttn(&frame, .{
+                            .q = model.q_bind,
+                            .kv_tiles = if (base_pos > 0) self.slotKvTilesBinding(kv_idx, slot_id) else null,
+                            .base_pos = base_pos,
+                            .k_tree = tree_k,
+                            .v_tree = tree_v,
+                            .ancestor_masks = model.ancestor_masks_bind,
+                            .out = model.attn_out_bind,
+                            .scratch = model.gqa_scratch_bind,
+                            .max_splits = attention.MAX_SPLITS,
+                            .num_nodes = m,
+                            .num_q_heads = model.config.num_attention_heads,
+                            .num_kv_heads = model.config.num_key_value_heads,
+                            .head_dim = model.config.head_dim,
+                            .chunk_tokens = self.kv_chunk_tokens,
+                        }, true);
 
-                    const c0: u32 = base_pos / self.kv_chunk_tokens;
-                    const c1: u32 = (base_pos + m - 1) / self.kv_chunk_tokens;
-                    const p0 = self.poolTilePair(slot.chunk_group_ids[c0], kv_idx);
-                    const p1 = if (c1 != c0) self.poolTilePair(slot.chunk_group_ids[c1], kv_idx) else null;
-                    try model.attn_pipes.encodeKvTreeCommit(&frame, .{
-                        .k_tree = tree_k,
-                        .v_tree = tree_v,
-                        .accepted_nodes = .{ .inline_u16 = acc_nodes[0..m] },
-                        .accepted_count = m,
-                        .k_tile0 = p0.k,
-                        .v_tile0 = p0.v,
-                        .k_tile1 = if (p1) |pp| pp.k else null,
-                        .v_tile1 = if (p1) |pp| pp.v else null,
-                        .num_kv_heads = model.config.num_key_value_heads,
-                        .head_dim = model.config.head_dim,
-                        .base_pos = base_pos,
-                        .chunk_tokens = self.kv_chunk_tokens,
-                    }, true);
+                        const c0: u32 = base_pos / self.kv_chunk_tokens;
+                        const c1: u32 = (base_pos + m - 1) / self.kv_chunk_tokens;
+                        const p0 = self.poolTilePair(slot.chunk_group_ids[c0], kv_idx);
+                        const p1 = if (c1 != c0) self.poolTilePair(slot.chunk_group_ids[c1], kv_idx) else null;
+                        try model.attn_pipes.encodeKvTreeCommit(&frame, .{
+                            .k_tree = tree_k,
+                            .v_tree = tree_v,
+                            .accepted_nodes = .{ .inline_u16 = acc_nodes[0..m] },
+                            .accepted_count = m,
+                            .k_tile0 = p0.k,
+                            .v_tile0 = p0.v,
+                            .k_tile1 = if (p1) |pp| pp.k else null,
+                            .v_tile1 = if (p1) |pp| pp.v else null,
+                            .num_kv_heads = model.config.num_key_value_heads,
+                            .head_dim = model.config.head_dim,
+                            .base_pos = base_pos,
+                            .chunk_tokens = self.kv_chunk_tokens,
+                        }, true);
+                    }
+                    if (gqa.q_gate_proj) |qgp| {
+                        try model.encodeLinearBatched(&frame, qgp, model.x_norm_bind, model.gdn_z_bind, m, true);
+                        if (model.hasActiveLora()) {
+                            _ = try model.encodeLoraSingle(&frame, l, .gate_attn, model.x_norm_bind, model.gdn_z_bind, m, qgp.k, qgp.n, true);
+                        }
+                        try model.attn_pipes.encodeMulSigmoidF16(&frame, .{
+                            .out = model.attn_out_bind,
+                            .gate = model.gdn_z_bind,
+                            .count = m * model.config.globalAttnOutDim(),
+                        }, true);
+                    }
 
                     try model.encodeLinearBatched(&frame, gqa.o_proj, model.attn_out_bind, model.proj_out_bind, m, true);
                     if (model.hasActiveLora()) {
                         _ = try model.encodeLoraSingle(&frame, l, .o_proj, model.attn_out_bind, model.proj_out_bind, m, gqa.o_proj.k, gqa.o_proj.n, true);
+                    }
+                },
+                .swa => |swa| {
+                    const kv_idx = self.layer_to_kv_idx[l];
+                    const tree_k: metal.BufferBinding = .{ .buffer = model.scratch_buf, .offset = swa.tree_k_off };
+                    const tree_v: metal.BufferBinding = .{ .buffer = model.scratch_buf, .offset = swa.tree_v_off };
+                    const eff_mrope = hybrid.MropeSection.text1d(swa.rotary_dim);
+                    try model.encodeLinearBatched(&frame, swa.q_proj, model.x_norm_bind, model.q_bind, m, true);
+                    try model.encodeLinearBatched(&frame, swa.k_proj, model.x_norm_bind, model.k_bind, m, false);
+                    try model.encodeLinearBatched(&frame, swa.v_proj, model.x_norm_bind, model.v_bind, m, false);
+                    if (model.hasActiveLora()) {
+                        _ = try model.encodeLoraSingle(&frame, l, .q_proj, model.x_norm_bind, model.q_bind, m, swa.q_proj.k, swa.q_proj.n, true);
+                        _ = try model.encodeLoraSingle(&frame, l, .k_proj, model.x_norm_bind, model.k_bind, m, swa.k_proj.k, swa.k_proj.n, true);
+                        _ = try model.encodeLoraSingle(&frame, l, .v_proj, model.x_norm_bind, model.v_bind, m, swa.v_proj.k, swa.v_proj.n, true);
+                    }
+                    try model.hybrid_pipes.encodeG26QkNormRopeKv(&frame, .{
+                        .q = model.q_bind,
+                        .k = model.k_bind,
+                        .v = model.v_bind,
+                        .q_norm = swa.q_norm,
+                        .k_norm = swa.k_norm,
+                        .norm_dtype = swa.qk_norm_dtype,
+                        .positions_3d = model.pos3d_bind,
+                        .k_out = tree_k,
+                        .v_out = tree_v,
+                        .num_tokens = m,
+                        .num_q_heads = swa.num_q_heads,
+                        .num_kv_heads = swa.num_kv_heads,
+                        .k_head_dim = swa.k_head_dim,
+                        .v_head_dim = swa.v_head_dim,
+                        .rotary_dim = swa.rotary_dim,
+                        .start_pos = base_pos,
+                        .mrope = eff_mrope,
+                        .yarn = model.config.yarn,
+                        .chunk_tokens = self.kv_chunk_tokens,
+                        .ring_capacity = 0,
+                        .kv_only = false,
+                        .write_to_tiles = false,
+                        .qk_norm_unit_offset = model.config.rmsnorm_unit_offset,
+                        .rms_eps = model.config.rms_norm_eps,
+                        .rope_theta = swa.rope_theta,
+                        .v_scale = model.config.attention_value_scale,
+                    }, true);
+                    try model.hybrid_pipes.encodeG26SwaAttn(&frame, .{
+                        .q = model.q_bind,
+                        .kv_tiles = if (base_pos > 0) self.slotKvTilesBinding(kv_idx, slot_id) else null,
+                        .k_extra = tree_k,
+                        .v_extra = tree_v,
+                        .ancestor_masks = model.ancestor_masks_bind,
+                        .node_positions = model.positions_bind,
+                        .sink_bias = swa.sink_bias,
+                        .sink_dtype = swa.sink_bias_dtype,
+                        .out = model.attn_out_bind,
+                        .num_q = m,
+                        .q_start_pos = base_pos,
+                        .kv_len = base_pos,
+                        .num_q_heads = swa.num_q_heads,
+                        .num_kv_heads = swa.num_kv_heads,
+                        .k_head_dim = swa.k_head_dim,
+                        .v_head_dim = swa.v_head_dim,
+                        .window_size = swa.kv_ring.window_size,
+                        .ring_capacity = 0,
+                        .chunk_tokens = self.kv_chunk_tokens,
+                        .is_prefill = false,
+                    }, true);
+                    try model.hybrid_pipes.encodeG26KvCommit(&frame, .{
+                        .k_src = tree_k,
+                        .v_src = tree_v,
+                        .kv_tiles = self.slotKvTilesBinding(kv_idx, slot_id),
+                        .num_kv_heads = swa.num_kv_heads,
+                        .k_head_dim = swa.k_head_dim,
+                        .v_head_dim = swa.v_head_dim,
+                        .start_pos = base_pos,
+                        .accepted_nodes = acc_nodes[0..m],
+                        .chunk_tokens = self.kv_chunk_tokens,
+                        .ring_capacity = 0,
+                    }, true);
+                    try model.encodeLinearBatched(&frame, swa.o_proj, model.attn_out_bind, model.proj_out_bind, m, true);
+                    if (model.hasActiveLora()) {
+                        _ = try model.encodeLoraSingle(&frame, l, .o_proj, model.attn_out_bind, model.proj_out_bind, m, swa.o_proj.k, swa.o_proj.n, true);
                     }
                 },
                 .mla_csa2 => {},
@@ -14263,6 +16665,7 @@ pub const GraphBatchRuntime = struct {
                 .hidden_dim = h,
                 .eps = model.config.rms_norm_eps,
                 .w_dtype = layer.post_attention_layernorm.dtype,
+                .unit_offset = model.config.rmsnorm_unit_offset,
             }, true);
 
             try self.encodeLayerFfnBatched(&frame, l, layer, m, null);
@@ -14292,6 +16695,7 @@ pub const GraphBatchRuntime = struct {
                 .hidden_dim = h,
                 .eps = model.config.rms_norm_eps,
                 .w_dtype = model.final_norm.dtype,
+                .unit_offset = model.config.rmsnorm_unit_offset,
             }, true);
             try model.encodeLinearBatched(&frame, model.lm_head, model.x_norm_bind, model.logits_bind, 1, true);
             try model.moe_pipes.encodeArgmaxRows(&frame, .{
@@ -14320,7 +16724,7 @@ pub const GraphBatchRuntime = struct {
     ) GraphStepError!void {
         const model = self.model;
         const h = model.config.hidden_size;
-        switch (model.config.axes.ffn_kind) {
+        switch (model.config.layerFfnKind(l)) {
             .dense_swiglu => {
                 try model.encodeLinearBatched(frame, layer.dense_gate, model.x_norm_bind, model.dense_gate_bind, m, true);
                 try model.encodeLinearBatched(frame, layer.dense_up, model.x_norm_bind, model.dense_up_bind, m, false);
@@ -14718,6 +17122,7 @@ pub const GraphBatchRuntime = struct {
                 .hidden_dim = h,
                 .eps = model.config.rms_norm_eps,
                 .w_dtype = layer.input_layernorm.dtype,
+                .unit_offset = model.config.rmsnorm_unit_offset,
             }, true) catch return error.DecodeFailed;
 
             switch (layer.attn) {
@@ -14918,6 +17323,8 @@ pub const GraphBatchRuntime = struct {
                 },
                 .gqa => |gqa| {
                     const kv_idx = self.layer_to_kv_idx[l];
+                    const use_g26 = model.config.usesG26GlobalGqa() or gqa.sink_bias != null or
+                        gqa.k_head_dim != gqa.v_head_dim or gqa.rotary_dim != gqa.k_head_dim or gqa.k_head_dim > 128;
                     model.encodeQkvProj(&frame, gqa.q_proj, gqa.k_proj, gqa.v_proj, model.x_norm_bind, model.q_bind, model.k_bind, model.v_bind, b_u32, .batched_gemv, true) catch return error.DecodeFailed;
                     if (any_batch_lora) {
                         _ = model.encodeLoraBatch(&frame, row_lora_slots, l, .q_proj, model.x_norm_bind, model.q_bind, b_u32, gqa.q_proj.k, gqa.q_proj.n, true) catch return error.DecodeFailed;
@@ -14925,41 +17332,181 @@ pub const GraphBatchRuntime = struct {
                         _ = model.encodeLoraBatch(&frame, row_lora_slots, l, .v_proj, model.x_norm_bind, model.v_bind, b_u32, gqa.v_proj.k, gqa.v_proj.n, true) catch return error.DecodeFailed;
                     }
 
-                    model.attn_pipes.encodeBatchQkNormRopeKvWrite(&frame, .{
-                        .q = model.q_bind,
-                        .k = model.k_bind,
-                        .v = model.v_bind,
-                        .q_norm = gqa.q_norm,
-                        .k_norm = gqa.k_norm,
-                        .slots = self.gqaWriteSlotsBinding(gqa.gqa_idx),
-                        .batch_size = b_u32,
-                        .num_q_heads = model.config.num_attention_heads,
-                        .num_kv_heads = model.config.num_key_value_heads,
-                        .head_dim = model.config.head_dim,
-                        .chunk_tokens = self.kv_chunk_tokens,
-                        .rms_eps = model.config.rms_norm_eps,
-                        .rope_theta = model.config.rope_theta,
-                        .norm_dtype = gqa.qk_norm_dtype,
-                    }, true) catch return error.DecodeFailed;
+                    if (use_g26) {
+                        const eff_mrope = hybrid.MropeSection.text1d(gqa.rotary_dim);
+                        const q_d: u64 = model.config.qDim();
+                        const k_d: u64 = model.config.kvDim();
+                        const v_d: u64 = model.config.globalVDim();
+                        const o_d: u64 = model.config.globalAttnOutDim();
+                        for (0..b_usize) |bi| {
+                            const sid: u32 = view.slot_ids[bi];
+                            const pos: u32 = view.seq_positions[bi];
+                            const q_row = metal.BufferBinding{ .buffer = model.q_bind.buffer, .offset = model.q_bind.offset + @as(u64, bi) * q_d * 2 };
+                            const k_row = metal.BufferBinding{ .buffer = model.k_bind.buffer, .offset = model.k_bind.offset + @as(u64, bi) * k_d * 2 };
+                            const v_row = metal.BufferBinding{ .buffer = model.v_bind.buffer, .offset = model.v_bind.offset + @as(u64, bi) * v_d * 2 };
+                            const o_row = metal.BufferBinding{ .buffer = model.attn_out_bind.buffer, .offset = model.attn_out_bind.offset + @as(u64, bi) * o_d * 2 };
+                            const slot_kv_bind = self.slotKvTilesBinding(kv_idx, sid);
+                            model.hybrid_pipes.encodeG26QkNormRopeKv(&frame, .{
+                                .q = q_row,
+                                .k = k_row,
+                                .v = v_row,
+                                .q_norm = gqa.q_norm,
+                                .k_norm = gqa.k_norm,
+                                .norm_dtype = gqa.qk_norm_dtype,
+                                .kv_tiles = slot_kv_bind,
+                                .num_tokens = 1,
+                                .num_q_heads = model.config.num_attention_heads,
+                                .num_kv_heads = model.config.num_key_value_heads,
+                                .k_head_dim = gqa.k_head_dim,
+                                .v_head_dim = gqa.v_head_dim,
+                                .rotary_dim = gqa.rotary_dim,
+                                .start_pos = pos,
+                                .mrope = eff_mrope,
+                                .yarn = model.config.yarn,
+                                .chunk_tokens = self.kv_chunk_tokens,
+                                .kv_only = false,
+                                .write_to_tiles = true,
+                                .qk_norm_unit_offset = model.config.rmsnorm_unit_offset,
+                                .rms_eps = model.config.rms_norm_eps,
+                                .rope_theta = model.config.rope_theta,
+                                .v_scale = model.config.attention_value_scale,
+                            }, true) catch return error.DecodeFailed;
+                            model.attn_pipes.encodeG26GqaAttn(&frame, .{
+                                .q = q_row,
+                                .kv_tiles = slot_kv_bind,
+                                .sink_bias = gqa.sink_bias,
+                                .sink_dtype = @backingInt(gqa.sink_bias_dtype),
+                                .out = o_row,
+                                .scratch = model.gqa_scratch_bind,
+                                .max_splits = attention.MAX_SPLITS,
+                                .num_nodes = 1,
+                                .num_q_heads = model.config.num_attention_heads,
+                                .num_kv_heads = model.config.num_key_value_heads,
+                                .k_head_dim = gqa.k_head_dim,
+                                .v_head_dim = gqa.v_head_dim,
+                                .base_pos = pos + 1,
+                                .chunk_tokens = self.kv_chunk_tokens,
+                            }, true) catch return error.DecodeFailed;
+                        }
+                    } else {
+                        model.attn_pipes.encodeBatchQkNormRopeKvWrite(&frame, .{
+                            .q = model.q_bind,
+                            .k = model.k_bind,
+                            .v = model.v_bind,
+                            .q_norm = gqa.q_norm,
+                            .k_norm = gqa.k_norm,
+                            .slots = self.gqaWriteSlotsBinding(gqa.gqa_idx),
+                            .batch_size = b_u32,
+                            .num_q_heads = model.config.num_attention_heads,
+                            .num_kv_heads = model.config.num_key_value_heads,
+                            .head_dim = model.config.head_dim,
+                            .chunk_tokens = self.kv_chunk_tokens,
+                            .rms_eps = model.config.rms_norm_eps,
+                            .rope_theta = model.config.rope_theta,
+                            .norm_dtype = gqa.qk_norm_dtype,
+                        }, true) catch return error.DecodeFailed;
 
-                    model.attn_pipes.encodeBatchGqaDecodeAttn(&frame, .{
-                        .q = model.q_bind,
-                        .kv_tiles = self.layerKvTilesBinding(kv_idx),
-                        .slots = self.gqaDescsBinding(gqa.gqa_idx),
-                        .out = model.attn_out_bind,
-                        .scratch = self.gqa_batch_scratch_bind,
-                        .max_splits = attention.MAX_SPLITS,
-                        .batch_size = b_u32,
-                        .num_q_heads = model.config.num_attention_heads,
-                        .num_kv_heads = model.config.num_key_value_heads,
-                        .head_dim = model.config.head_dim,
-                        .max_seq_len = max_seq,
-                        .chunk_tokens = self.kv_chunk_tokens,
-                    }, true) catch return error.DecodeFailed;
+                        model.attn_pipes.encodeBatchGqaDecodeAttn(&frame, .{
+                            .q = model.q_bind,
+                            .kv_tiles = self.layerKvTilesBinding(kv_idx),
+                            .slots = self.gqaDescsBinding(gqa.gqa_idx),
+                            .out = model.attn_out_bind,
+                            .scratch = self.gqa_batch_scratch_bind,
+                            .max_splits = attention.MAX_SPLITS,
+                            .batch_size = b_u32,
+                            .num_q_heads = model.config.num_attention_heads,
+                            .num_kv_heads = model.config.num_key_value_heads,
+                            .head_dim = model.config.head_dim,
+                            .max_seq_len = max_seq,
+                            .chunk_tokens = self.kv_chunk_tokens,
+                        }, true) catch return error.DecodeFailed;
+                    }
+                    if (gqa.q_gate_proj) |qgp| {
+                        model.encodeLinearBatched(&frame, qgp, model.x_norm_bind, model.gdn_z_bind, b_u32, true) catch return error.DecodeFailed;
+                        if (any_batch_lora) {
+                            _ = model.encodeLoraBatch(&frame, row_lora_slots, l, .gate_attn, model.x_norm_bind, model.gdn_z_bind, b_u32, qgp.k, qgp.n, true) catch return error.DecodeFailed;
+                        }
+                        model.attn_pipes.encodeMulSigmoidF16(&frame, .{
+                            .out = model.attn_out_bind,
+                            .gate = model.gdn_z_bind,
+                            .count = b_u32 * model.config.globalAttnOutDim(),
+                        }, true) catch return error.DecodeFailed;
+                    }
 
                     model.encodeLinearBatched(&frame, gqa.o_proj, model.attn_out_bind, model.proj_out_bind, b_u32, true) catch return error.DecodeFailed;
                     if (any_batch_lora) {
                         _ = model.encodeLoraBatch(&frame, row_lora_slots, l, .o_proj, model.attn_out_bind, model.proj_out_bind, b_u32, gqa.o_proj.k, gqa.o_proj.n, true) catch return error.DecodeFailed;
+                    }
+                },
+                .swa => |swa| {
+                    const kv_idx = self.layer_to_kv_idx[l];
+                    const eff_mrope = hybrid.MropeSection.text1d(swa.rotary_dim);
+                    const q_d: u64 = @as(u64, swa.num_q_heads) * swa.k_head_dim;
+                    const k_d: u64 = @as(u64, swa.num_kv_heads) * swa.k_head_dim;
+                    const v_d: u64 = @as(u64, swa.num_kv_heads) * swa.v_head_dim;
+                    const o_d: u64 = @as(u64, swa.num_q_heads) * swa.v_head_dim;
+                    model.encodeQkvProj(&frame, swa.q_proj, swa.k_proj, swa.v_proj, model.x_norm_bind, model.q_bind, model.k_bind, model.v_bind, b_u32, .batched_gemv, true) catch return error.DecodeFailed;
+                    if (any_batch_lora) {
+                        _ = model.encodeLoraBatch(&frame, row_lora_slots, l, .q_proj, model.x_norm_bind, model.q_bind, b_u32, swa.q_proj.k, swa.q_proj.n, true) catch return error.DecodeFailed;
+                        _ = model.encodeLoraBatch(&frame, row_lora_slots, l, .k_proj, model.x_norm_bind, model.k_bind, b_u32, swa.k_proj.k, swa.k_proj.n, true) catch return error.DecodeFailed;
+                        _ = model.encodeLoraBatch(&frame, row_lora_slots, l, .v_proj, model.x_norm_bind, model.v_bind, b_u32, swa.v_proj.k, swa.v_proj.n, true) catch return error.DecodeFailed;
+                    }
+                    for (0..b_usize) |bi| {
+                        const sid: u32 = view.slot_ids[bi];
+                        const pos: u32 = view.seq_positions[bi];
+                        const q_row = metal.BufferBinding{ .buffer = model.q_bind.buffer, .offset = model.q_bind.offset + @as(u64, bi) * q_d * 2 };
+                        const k_row = metal.BufferBinding{ .buffer = model.k_bind.buffer, .offset = model.k_bind.offset + @as(u64, bi) * k_d * 2 };
+                        const v_row = metal.BufferBinding{ .buffer = model.v_bind.buffer, .offset = model.v_bind.offset + @as(u64, bi) * v_d * 2 };
+                        const o_row = metal.BufferBinding{ .buffer = model.attn_out_bind.buffer, .offset = model.attn_out_bind.offset + @as(u64, bi) * o_d * 2 };
+                        const slot_kv_bind = self.slotKvTilesBinding(kv_idx, sid);
+                        model.hybrid_pipes.encodeG26QkNormRopeKv(&frame, .{
+                            .q = q_row,
+                            .k = k_row,
+                            .v = v_row,
+                            .q_norm = swa.q_norm,
+                            .k_norm = swa.k_norm,
+                            .norm_dtype = swa.qk_norm_dtype,
+                            .kv_tiles = slot_kv_bind,
+                            .num_tokens = 1,
+                            .num_q_heads = swa.num_q_heads,
+                            .num_kv_heads = swa.num_kv_heads,
+                            .k_head_dim = swa.k_head_dim,
+                            .v_head_dim = swa.v_head_dim,
+                            .rotary_dim = swa.rotary_dim,
+                            .start_pos = pos,
+                            .mrope = eff_mrope,
+                            .yarn = model.config.yarn,
+                            .chunk_tokens = self.kv_chunk_tokens,
+                            .ring_capacity = 0,
+                            .kv_only = false,
+                            .write_to_tiles = true,
+                            .qk_norm_unit_offset = model.config.rmsnorm_unit_offset,
+                            .rms_eps = model.config.rms_norm_eps,
+                            .rope_theta = swa.rope_theta,
+                            .v_scale = model.config.attention_value_scale,
+                        }, bi == 0) catch return error.DecodeFailed;
+                        model.hybrid_pipes.encodeG26SwaAttn(&frame, .{
+                            .q = q_row,
+                            .kv_tiles = slot_kv_bind,
+                            .sink_bias = swa.sink_bias,
+                            .sink_dtype = swa.sink_bias_dtype,
+                            .out = o_row,
+                            .num_q = 1,
+                            .q_start_pos = pos,
+                            .kv_len = pos + 1,
+                            .num_q_heads = swa.num_q_heads,
+                            .num_kv_heads = swa.num_kv_heads,
+                            .k_head_dim = swa.k_head_dim,
+                            .v_head_dim = swa.v_head_dim,
+                            .window_size = swa.kv_ring.window_size,
+                            .ring_capacity = 0,
+                            .chunk_tokens = self.kv_chunk_tokens,
+                            .is_prefill = false,
+                        }, true) catch return error.DecodeFailed;
+                    }
+                    model.encodeLinearBatched(&frame, swa.o_proj, model.attn_out_bind, model.proj_out_bind, b_u32, true) catch return error.DecodeFailed;
+                    if (any_batch_lora) {
+                        _ = model.encodeLoraBatch(&frame, row_lora_slots, l, .o_proj, model.attn_out_bind, model.proj_out_bind, b_u32, swa.o_proj.k, swa.o_proj.n, true) catch return error.DecodeFailed;
                     }
                 },
                 .mla_csa2 => {},
@@ -15005,6 +17552,7 @@ pub const GraphBatchRuntime = struct {
                     .hidden_dim = h,
                     .eps = model.config.rms_norm_eps,
                     .w_dtype = layer.post_attention_layernorm.dtype,
+                    .unit_offset = model.config.rmsnorm_unit_offset,
                 }, true) catch return error.DecodeFailed;
             } else {
                 model.encodeResidualThenRmsNorm(&frame, model.x_bind, model.proj_out_bind, layer.post_attention_layernorm, model.x_norm_bind, b_u32, true) catch return error.DecodeFailed;
@@ -15032,6 +17580,7 @@ pub const GraphBatchRuntime = struct {
             .hidden_dim = h,
             .eps = model.config.rms_norm_eps,
             .w_dtype = model.final_norm.dtype,
+            .unit_offset = model.config.rmsnorm_unit_offset,
         }, true) catch return error.DecodeFailed;
         model.encodeLinearBatched(&frame, model.lm_head, model.x_norm_bind, model.logits_bind, b_u32, true) catch return error.DecodeFailed;
         model.moe_pipes.encodeArgmaxRows(&frame, .{
@@ -19758,4 +22307,415 @@ test "M9.5 W30: GraphBatchRuntime heterogeneous multi-slot LoRA + DoRA (base + a
         }
         try std.testing.expect(max_diff < 5e-2);
     }
+}
+
+test "M9.1 G26: synthetic mimo_v2 (dense L0 + sigmoid+bias MoE L1..L4, 192/128 SWA 8KV + global 4KV, 5-tap DFlash) prefill/decode/verifyTree parity" {
+    const allocator = std.testing.allocator;
+    const mimo_cfg_json =
+        \\{
+        \\  "model_type": "mimo_v2",
+        \\  "vocab_size": 128,
+        \\  "hidden_size": 128,
+        \\  "intermediate_size": 128,
+        \\  "moe_intermediate_size": 64,
+        \\  "num_hidden_layers": 5,
+        \\  "num_attention_heads": 8,
+        \\  "num_key_value_heads": 4,
+        \\  "head_dim": 192,
+        \\  "v_head_dim": 128,
+        \\  "swa_num_attention_heads": 8,
+        \\  "swa_num_key_value_heads": 8,
+        \\  "swa_head_dim": 192,
+        \\  "swa_v_head_dim": 128,
+        \\  "sliding_window_size": 128,
+        \\  "rope_theta": 10000000.0,
+        \\  "swa_rope_theta": 10000.0,
+        \\  "partial_rotary_factor": 0.3333333333333333,
+        \\  "attention_value_scale": 0.707,
+        \\  "add_swa_attention_sink_bias": true,
+        \\  "layernorm_epsilon": 1e-6,
+        \\  "hybrid_layer_pattern": [1, 1, 0, 1, 0],
+        \\  "moe_layer_freq": [0, 1, 1, 1, 1],
+        \\  "n_routed_experts": 16,
+        \\  "num_experts_per_tok": 4,
+        \\  "scoring_func": "sigmoid",
+        \\  "norm_topk_prob": true,
+        \\  "routed_scaling_factor": 1.5
+        \\}
+    ;
+
+    var cfg = try GraphConfig.fromJson(allocator, mimo_cfg_json);
+    defer cfg.deinit(allocator);
+    try std.testing.expect(cfg.is_mimo_v2);
+    try std.testing.expectEqual(@as(u32, 8), cfg.swaKvHeads());
+    try std.testing.expectEqual(@as(u32, 4), cfg.num_key_value_heads);
+    try std.testing.expectEqual(@as(u32, 192), cfg.swaKHeadDim());
+    try std.testing.expectEqual(@as(u32, 128), cfg.swaVHeadDim());
+    try std.testing.expectEqual(@as(u32, 64), cfg.effectiveRotaryDim(192));
+    try std.testing.expectEqual(FfnKind.dense_swiglu, cfg.layerFfnKind(0));
+    try std.testing.expectEqual(FfnKind.moe_swiglu, cfg.layerFfnKind(1));
+    try std.testing.expectEqual(AttentionKind.swa_ring, cfg.axes.layer_attention_kinds[0]);
+    try std.testing.expectEqual(AttentionKind.gqa_full, cfg.axes.layer_attention_kinds[2]);
+    try std.testing.expect(cfg.moe_scoring_sigmoid);
+
+    const h: u32 = cfg.hidden_size;
+    const vocab: u32 = cfg.vocab_size;
+    var blobs: std.ArrayListUnmanaged(TestTensorBlob) = .empty;
+    var owned_names: std.ArrayListUnmanaged([]u8) = .empty;
+    defer {
+        for (blobs.items) |b| allocator.free(b.bytes);
+        blobs.deinit(allocator);
+        for (owned_names.items) |n| allocator.free(n);
+        owned_names.deinit(allocator);
+    }
+
+    const addBlob = struct {
+        fn call(
+            alloc: std.mem.Allocator,
+            list: *std.ArrayListUnmanaged(TestTensorBlob),
+            names: *std.ArrayListUnmanaged([]u8),
+            nm: []const u8,
+            kind: amf.TensorKind,
+            dt: amf.DType,
+            layer: u16,
+            expert_id: u16,
+            shape: [4]u32,
+            ndim: u8,
+            data: []u8,
+        ) !void {
+            const dup = try alloc.dupe(u8, nm);
+            try names.append(alloc, dup);
+            try list.append(alloc, .{
+                .name = dup,
+                .kind = kind,
+                .dtype = dt,
+                .layer = layer,
+                .expert = expert_id,
+                .shape = shape,
+                .ndim = ndim,
+                .bytes = data,
+            });
+        }
+    }.call;
+
+    try addBlob(allocator, &blobs, &owned_names, "embed_tokens", .embedding, .f16, amf.NO_LAYER, amf.NO_EXPERT, .{ vocab, h, 0, 0 }, 2, try fillDeterministicF16(allocator, 301, vocab * h, 0.2));
+    var nbuf: [160]u8 = undefined;
+    for (0..cfg.num_hidden_layers) |l| {
+        const sbase: u64 = 5000 + l * 200;
+        try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.input_layernorm.weight", .{l}), .norm, .bf16, @intCast(l), amf.NO_EXPERT, .{ h, 0, 0, 0 }, 1, try fillConstantBf16(allocator, h, 1.0));
+        try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.post_attention_layernorm.weight", .{l}), .norm, .bf16, @intCast(l), amf.NO_EXPERT, .{ h, 0, 0, 0 }, 1, try fillConstantBf16(allocator, h, 1.0));
+        const is_swa = (cfg.axes.layer_attention_kinds[l] == .swa_ring);
+        const q_dim = if (is_swa) cfg.swaQDim() else cfg.qDim();
+        const k_dim = if (is_swa) cfg.swaKDim() else cfg.kvDim();
+        const v_dim = if (is_swa) cfg.swaVDim() else cfg.globalVDim();
+        const o_dim = if (is_swa) cfg.swaAttnOutDim() else cfg.globalAttnOutDim();
+        try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.self_attn.q_proj", .{l}), .dense, .f16, @intCast(l), amf.NO_EXPERT, .{ q_dim, h, 0, 0 }, 2, try fillDeterministicF16(allocator, sbase + 1, q_dim * h, 0.06));
+        try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.self_attn.k_proj", .{l}), .dense, .f16, @intCast(l), amf.NO_EXPERT, .{ k_dim, h, 0, 0 }, 2, try fillDeterministicF16(allocator, sbase + 2, k_dim * h, 0.06));
+        try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.self_attn.v_proj", .{l}), .dense, .f16, @intCast(l), amf.NO_EXPERT, .{ v_dim, h, 0, 0 }, 2, try fillDeterministicF16(allocator, sbase + 3, v_dim * h, 0.06));
+        try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.self_attn.o_proj", .{l}), .dense, .f16, @intCast(l), amf.NO_EXPERT, .{ h, o_dim, 0, 0 }, 2, try fillDeterministicF16(allocator, sbase + 4, h * o_dim, 0.06));
+        if (is_swa) {
+            try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.self_attn.sink_bias", .{l}), .dense, .bf16, @intCast(l), amf.NO_EXPERT, .{ cfg.swaQHeads(), 0, 0, 0 }, 1, try fillDeterministicBf16(allocator, sbase + 5, cfg.swaQHeads(), 1.2));
+        }
+
+        if (cfg.layerFfnKind(l) == .dense_swiglu) {
+            try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.mlp.gate_proj", .{l}), .dense, .f16, @intCast(l), amf.NO_EXPERT, .{ cfg.intermediate_size, h, 0, 0 }, 2, try fillDeterministicF16(allocator, sbase + 10, cfg.intermediate_size * h, 0.06));
+            try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.mlp.up_proj", .{l}), .dense, .f16, @intCast(l), amf.NO_EXPERT, .{ cfg.intermediate_size, h, 0, 0 }, 2, try fillDeterministicF16(allocator, sbase + 11, cfg.intermediate_size * h, 0.06));
+            try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.mlp.down_proj", .{l}), .dense, .f16, @intCast(l), amf.NO_EXPERT, .{ h, cfg.intermediate_size, 0, 0 }, 2, try fillDeterministicF16(allocator, sbase + 12, h * cfg.intermediate_size, 0.06));
+        } else {
+            try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.mlp.gate.weight", .{l}), .router, .bf16, @intCast(l), amf.NO_EXPERT, .{ cfg.num_experts, h, 0, 0 }, 2, try fillDeterministicBf16(allocator, sbase + 20, cfg.num_experts * h, 0.12));
+            try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.mlp.gate.bias", .{l}), .router, .f32, @intCast(l), amf.NO_EXPERT, .{ cfg.num_experts, 0, 0, 0 }, 1, try fillDeterministicF32(allocator, sbase + 21, cfg.num_experts, -0.3, 0.3));
+            for (0..cfg.num_experts) |e| {
+                const es = sbase * 100 + e * 7;
+                try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.mlp.experts.{d}.gate_proj", .{ l, e }), .hot_expert, .f16, @intCast(l), @intCast(e), .{ cfg.moe_intermediate_size, h, 0, 0 }, 2, try fillDeterministicF16(allocator, es + 1, cfg.moe_intermediate_size * h, 0.05));
+                try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.mlp.experts.{d}.up_proj", .{ l, e }), .hot_expert, .f16, @intCast(l), @intCast(e), .{ cfg.moe_intermediate_size, h, 0, 0 }, 2, try fillDeterministicF16(allocator, es + 2, cfg.moe_intermediate_size * h, 0.05));
+                try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.mlp.experts.{d}.down_proj", .{ l, e }), .hot_expert, .f16, @intCast(l), @intCast(e), .{ h, cfg.moe_intermediate_size, 0, 0 }, 2, try fillDeterministicF16(allocator, es + 3, h * cfg.moe_intermediate_size, 0.05));
+            }
+        }
+    }
+    try addBlob(allocator, &blobs, &owned_names, "norm.weight", .norm, .bf16, amf.NO_LAYER, amf.NO_EXPERT, .{ h, 0, 0, 0 }, 1, try fillConstantBf16(allocator, h, 1.0));
+    try addBlob(allocator, &blobs, &owned_names, "lm_head", .lm_head, .f16, amf.NO_LAYER, amf.NO_EXPERT, .{ vocab, h, 0, 0 }, 2, try fillDeterministicF16(allocator, 888, vocab * h, 0.14));
+
+    const amf_bytes = try buildTestAmf(allocator, "synth-mimo-v2", blobs.items);
+    defer allocator.free(amf_bytes);
+
+    var serial_m = try GraphModel.loadFromBytes(allocator, amf_bytes, cfg, .{
+        .max_seq_len = 256,
+        .max_tree_nodes = 16,
+    });
+    defer serial_m.deinit(allocator);
+
+    var tree_m = try GraphModel.loadFromBytes(allocator, amf_bytes, cfg, .{
+        .max_seq_len = 256,
+        .max_tree_nodes = 16,
+    });
+    defer tree_m.deinit(allocator);
+
+    // Verify 5-tap pure-GraphModel DFlash configuration.
+    try std.testing.expect(serial_m.hasDFlareCtxHistory());
+    try std.testing.expectEqual(@as(usize, 5), serial_m.dflareTapCount());
+    try std.testing.expectEqualSlices(u16, &[_]u16{ 0, 1, 2, 3, 4 }, serial_m.dflareTargetLayerIds());
+
+    // Prefill 140 tokens (> 128 SWA window -> exercises wide-prefill circular wraparound!).
+    var prompt: [140]u32 = undefined;
+    for (0..prompt.len) |i| prompt[i] = @intCast((i * 13 + 5) % vocab);
+    const s_p0 = try serial_m.prefillChunk(&prompt, 0, true);
+    const t_p0 = try tree_m.prefillChunk(&prompt, 0, true);
+    try std.testing.expectEqual(s_p0, t_p0);
+
+    // Verify DFlash context history populated across all 140 prompt tokens.
+    const hist_after_p = serial_m.dflareGpuContextHistory().?;
+    try std.testing.expectEqual(@as(u32, 140), hist_after_p.len);
+    var tap_last: [128]f32 = undefined;
+    try std.testing.expect(serial_m.readDFlareCtxTapF32(139, 4, &tap_last));
+    const host_taps = serial_m.dflareTargetTaps();
+    try std.testing.expectEqual(@as(usize, 5), host_taps.len);
+    for (0..h) |d| {
+        try std.testing.expect(std.math.isFinite(tap_last[d]));
+        try std.testing.expectApproxEqAbs(tap_last[d], host_taps[4][d], 1e-5);
+    }
+
+    // Run 4 serial decodes vs 8-node branching verifyTree + commitTreeKv.
+    const branch_toks = [_]u32{ s_p0, (s_p0 + 3) % vocab, (s_p0 + 7) % vocab, (s_p0 + 11) % vocab };
+    var serial_preds: [4]u32 = undefined;
+    for (0..4) |st| {
+        serial_preds[st] = try serial_m.stepDecode(branch_toks[st], 140 + @as(u32, @intCast(st)));
+    }
+
+    // Build 8-node draft tree whose accepted branch is nodes {0, 2, 5, 7}.
+    const tree_toks = [_]u32{
+        branch_toks[0], // 0 (d0)
+        99, // 1 (d1 decoy)
+        branch_toks[1], // 2 (d1 accepted)
+        100, // 3 (d2 decoy)
+        101, // 4 (d2 decoy)
+        branch_toks[2], // 5 (d2 accepted)
+        102, // 6 (d3 decoy)
+        branch_toks[3], // 7 (d3 accepted)
+    };
+    const tree_pos = [_]u32{ 140, 141, 141, 142, 142, 142, 143, 143 };
+    const tree_masks = [_]u64{
+        0b0000_0001, // 0
+        0b0000_0011, // 1
+        0b0000_0101, // 2: {0,2}
+        0b0000_1011, // 3
+        0b0001_0101, // 4
+        0b0010_0101, // 5: {0,2,5}
+        0b0100_1011, // 6
+        0b1010_0101, // 7: {0,2,5,7}
+    };
+    const vr = try tree_m.verifyTree(&tree_toks, &tree_pos, &tree_masks, 140);
+    const acc_nodes = [_]u16{ 0, 2, 5, 7 };
+    for (acc_nodes, 0..) |nid, st| {
+        try std.testing.expectEqual(serial_preds[st], vr.argmax_tokens[nid]);
+    }
+    try tree_m.commitTreeKv(140, &acc_nodes);
+
+    // Follow-up decode after commitTreeKv must match serial decode + DFlash tap history!
+    const follow_tok: u32 = serial_preds[3];
+    const s_post = try serial_m.stepDecode(follow_tok, 144);
+    const t_post = try tree_m.stepDecode(follow_tok, 144);
+    try std.testing.expectEqual(s_post, t_post);
+    var max_logit_diff: f32 = 0.0;
+    const s_lg = serial_m.readLogitsF16();
+    const t_lg = tree_m.readLogitsF16();
+    for (0..vocab) |vi| {
+        max_logit_diff = @max(max_logit_diff, @abs(@as(f32, @floatCast(s_lg[vi])) - @as(f32, @floatCast(t_lg[vi]))));
+    }
+    try std.testing.expect(max_logit_diff < 5e-2);
+
+    // Verify DFlash context history ring parity between serial decode and verifyTree+commitTreeKv!
+    try std.testing.expectEqual(@as(u32, 145), serial_m.dflareGpuContextHistory().?.len);
+    try std.testing.expectEqual(@as(u32, 145), tree_m.dflareGpuContextHistory().?.len);
+    var s_tap: [128]f32 = undefined;
+    var t_tap: [128]f32 = undefined;
+    for (0..5) |ti| {
+        try std.testing.expect(serial_m.readDFlareCtxTapF32(143, @intCast(ti), &s_tap));
+        try std.testing.expect(tree_m.readDFlareCtxTapF32(143, @intCast(ti), &t_tap));
+        var max_td: f32 = 0.0;
+        for (0..h) |d| max_td = @max(max_td, @abs(s_tap[d] - t_tap[d]));
+        try std.testing.expect(max_td < 3e-2);
+    }
+}
+
+test "M9.1 G26: synthetic qwen3_5 (rmsnorm_unit_offset, GDN + 256-dim partial-RoPE q_gate_proj GQA) prefill/decode/verifyTree parity" {
+    const allocator = std.testing.allocator;
+    const qwen35_cfg_json =
+        \\{
+        \\  "model_type": "qwen3_5_text",
+        \\  "vocab_size": 128,
+        \\  "hidden_size": 128,
+        \\  "intermediate_size": 128,
+        \\  "num_hidden_layers": 4,
+        \\  "num_attention_heads": 4,
+        \\  "num_key_value_heads": 2,
+        \\  "head_dim": 256,
+        \\  "linear_num_key_heads": 2,
+        \\  "linear_num_value_heads": 4,
+        \\  "linear_key_head_dim": 64,
+        \\  "linear_value_head_dim": 64,
+        \\  "linear_conv_kernel_dim": 4,
+        \\  "layer_types": ["linear_attention", "linear_attention", "linear_attention", "full_attention"],
+        \\  "rope_parameters": {
+        \\    "rope_theta": 10000000.0,
+        \\    "partial_rotary_factor": 0.25,
+        \\    "mrope_section": [11, 11, 10]
+        \\  },
+        \\  "rms_norm_eps": 1e-6,
+        \\  "rmsnorm_unit_offset": true,
+        \\  "attn_output_gate": true
+        \\}
+    ;
+
+    var cfg = try GraphConfig.fromJson(allocator, qwen35_cfg_json);
+    defer cfg.deinit(allocator);
+    try std.testing.expect(cfg.is_qwen3_5);
+    try std.testing.expect(cfg.rmsnorm_unit_offset);
+    try std.testing.expect(cfg.attn_output_gate);
+    try std.testing.expectEqual(@as(u32, 256), cfg.head_dim);
+    try std.testing.expectEqual(@as(u32, 64), cfg.effectiveRotaryDim(256));
+    try std.testing.expectEqual(AttentionKind.gated_deltanet, cfg.axes.layer_attention_kinds[0]);
+    try std.testing.expectEqual(AttentionKind.gqa_full, cfg.axes.layer_attention_kinds[3]);
+
+    const h: u32 = cfg.hidden_size;
+    const vocab: u32 = cfg.vocab_size;
+    var blobs: std.ArrayListUnmanaged(TestTensorBlob) = .empty;
+    var owned_names: std.ArrayListUnmanaged([]u8) = .empty;
+    defer {
+        for (blobs.items) |b| allocator.free(b.bytes);
+        blobs.deinit(allocator);
+        for (owned_names.items) |n| allocator.free(n);
+        owned_names.deinit(allocator);
+    }
+
+    const addBlob = struct {
+        fn call(
+            alloc: std.mem.Allocator,
+            list: *std.ArrayListUnmanaged(TestTensorBlob),
+            names: *std.ArrayListUnmanaged([]u8),
+            nm: []const u8,
+            kind: amf.TensorKind,
+            dt: amf.DType,
+            layer: u16,
+            shape: [4]u32,
+            ndim: u8,
+            data: []u8,
+        ) !void {
+            const dup = try alloc.dupe(u8, nm);
+            try names.append(alloc, dup);
+            try list.append(alloc, .{
+                .name = dup,
+                .kind = kind,
+                .dtype = dt,
+                .layer = layer,
+                .expert = amf.NO_EXPERT,
+                .shape = shape,
+                .ndim = ndim,
+                .bytes = data,
+            });
+        }
+    }.call;
+
+    try addBlob(allocator, &blobs, &owned_names, "embed_tokens", .embedding, .f16, amf.NO_LAYER, .{ vocab, h, 0, 0 }, 2, try fillDeterministicF16(allocator, 701, vocab * h, 0.22));
+    var nbuf: [160]u8 = undefined;
+    for (0..cfg.num_hidden_layers) |l| {
+        const sbase: u64 = 8000 + l * 200;
+        // Zero-centered weights (around 0.05) -> `(1.0 + w)` produces ~1.05 when rmsnorm_unit_offset is active!
+        try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.input_layernorm.weight", .{l}), .norm, .bf16, @intCast(l), .{ h, 0, 0, 0 }, 1, try fillDeterministicBf16(allocator, sbase + 1, h, 0.05));
+        try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.post_attention_layernorm.weight", .{l}), .norm, .bf16, @intCast(l), .{ h, 0, 0, 0 }, 1, try fillDeterministicBf16(allocator, sbase + 2, h, 0.05));
+        if (cfg.axes.layer_attention_kinds[l] == .gated_deltanet) {
+            const qk = cfg.gdnQkDim();
+            const vd = cfg.gdnVDim();
+            try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.linear_attn.q_proj", .{l}), .dense, .f16, @intCast(l), .{ qk, h, 0, 0 }, 2, try fillDeterministicF16(allocator, sbase + 10, qk * h, 0.07));
+            try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.linear_attn.k_proj", .{l}), .dense, .f16, @intCast(l), .{ qk, h, 0, 0 }, 2, try fillDeterministicF16(allocator, sbase + 11, qk * h, 0.07));
+            try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.linear_attn.v_proj", .{l}), .dense, .f16, @intCast(l), .{ vd, h, 0, 0 }, 2, try fillDeterministicF16(allocator, sbase + 12, vd * h, 0.07));
+            try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.linear_attn.g_proj", .{l}), .dense, .f16, @intCast(l), .{ vd, h, 0, 0 }, 2, try fillDeterministicF16(allocator, sbase + 13, vd * h, 0.07));
+            try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.linear_attn.o_proj", .{l}), .dense, .f16, @intCast(l), .{ h, vd, 0, 0 }, 2, try fillDeterministicF16(allocator, sbase + 14, h * vd, 0.07));
+            try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.linear_attn.a_proj.weight", .{l}), .dense, .bf16, @intCast(l), .{ cfg.linear_num_value_heads, h, 0, 0 }, 2, try fillDeterministicBf16(allocator, sbase + 15, cfg.linear_num_value_heads * h, 0.08));
+            try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.linear_attn.b_proj.weight", .{l}), .dense, .bf16, @intCast(l), .{ cfg.linear_num_value_heads, h, 0, 0 }, 2, try fillDeterministicBf16(allocator, sbase + 16, cfg.linear_num_value_heads * h, 0.08));
+            try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.linear_attn.A_log", .{l}), .dense, .f32, @intCast(l), .{ cfg.linear_num_value_heads, 0, 0, 0 }, 1, try fillDeterministicF32(allocator, sbase + 17, cfg.linear_num_value_heads, -1.0, 0.0));
+            try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.linear_attn.dt_bias", .{l}), .dense, .f32, @intCast(l), .{ cfg.linear_num_value_heads, 0, 0, 0 }, 1, try fillDeterministicF32(allocator, sbase + 18, cfg.linear_num_value_heads, -0.2, 0.2));
+            try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.linear_attn.conv1d.weight", .{l}), .dense, .f32, @intCast(l), .{ 2 * qk + vd, 4, 0, 0 }, 2, try fillDeterministicF32(allocator, sbase + 19, (2 * qk + vd) * 4, -0.25, 0.25));
+            // Plain weight `1.0` on `linear_attn.norm.weight` (NOT +1 offset!).
+            try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.linear_attn.norm.weight", .{l}), .norm, .bf16, @intCast(l), .{ cfg.linear_value_head_dim, 0, 0, 0 }, 1, try fillConstantBf16(allocator, cfg.linear_value_head_dim, 1.0));
+        } else {
+            const qd = cfg.qDim();
+            const kvd = cfg.kvDim();
+            try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.self_attn.q_proj", .{l}), .dense, .f16, @intCast(l), .{ qd, h, 0, 0 }, 2, try fillDeterministicF16(allocator, sbase + 20, qd * h, 0.06));
+            try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.self_attn.q_gate_proj", .{l}), .dense, .f16, @intCast(l), .{ qd, h, 0, 0 }, 2, try fillDeterministicF16(allocator, sbase + 21, qd * h, 0.12));
+            try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.self_attn.k_proj", .{l}), .dense, .f16, @intCast(l), .{ kvd, h, 0, 0 }, 2, try fillDeterministicF16(allocator, sbase + 22, kvd * h, 0.06));
+            try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.self_attn.v_proj", .{l}), .dense, .f16, @intCast(l), .{ kvd, h, 0, 0 }, 2, try fillDeterministicF16(allocator, sbase + 23, kvd * h, 0.06));
+            try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.self_attn.o_proj", .{l}), .dense, .f16, @intCast(l), .{ h, qd, 0, 0 }, 2, try fillDeterministicF16(allocator, sbase + 24, h * qd, 0.06));
+            try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.self_attn.q_norm.weight", .{l}), .norm, .bf16, @intCast(l), .{ cfg.head_dim, 0, 0, 0 }, 1, try fillDeterministicBf16(allocator, sbase + 25, cfg.head_dim, 0.05));
+            try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.self_attn.k_norm.weight", .{l}), .norm, .bf16, @intCast(l), .{ cfg.head_dim, 0, 0, 0 }, 1, try fillDeterministicBf16(allocator, sbase + 26, cfg.head_dim, 0.05));
+        }
+        try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.mlp.gate_proj", .{l}), .dense, .f16, @intCast(l), .{ cfg.intermediate_size, h, 0, 0 }, 2, try fillDeterministicF16(allocator, sbase + 30, cfg.intermediate_size * h, 0.06));
+        try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.mlp.up_proj", .{l}), .dense, .f16, @intCast(l), .{ cfg.intermediate_size, h, 0, 0 }, 2, try fillDeterministicF16(allocator, sbase + 31, cfg.intermediate_size * h, 0.06));
+        try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.mlp.down_proj", .{l}), .dense, .f16, @intCast(l), .{ h, cfg.intermediate_size, 0, 0 }, 2, try fillDeterministicF16(allocator, sbase + 32, h * cfg.intermediate_size, 0.06));
+    }
+    try addBlob(allocator, &blobs, &owned_names, "norm.weight", .norm, .bf16, amf.NO_LAYER, .{ h, 0, 0, 0 }, 1, try fillDeterministicBf16(allocator, 910, h, 0.05));
+    try addBlob(allocator, &blobs, &owned_names, "lm_head", .lm_head, .f16, amf.NO_LAYER, .{ vocab, h, 0, 0 }, 2, try fillDeterministicF16(allocator, 920, vocab * h, 0.14));
+
+    const amf_bytes = try buildTestAmf(allocator, "synth-qwen3-5", blobs.items);
+    defer allocator.free(amf_bytes);
+
+    var serial_m = try GraphModel.loadFromBytes(allocator, amf_bytes, cfg, .{
+        .max_seq_len = 128,
+        .max_tree_nodes = 16,
+    });
+    defer serial_m.deinit(allocator);
+
+    var tree_m = try GraphModel.loadFromBytes(allocator, amf_bytes, cfg, .{
+        .max_seq_len = 128,
+        .max_tree_nodes = 16,
+    });
+    defer tree_m.deinit(allocator);
+
+    // Control with rmsnorm_unit_offset = false to prove (1 + w) materially shifts output logits.
+    var cfg_no_offset = cfg;
+    cfg_no_offset.rmsnorm_unit_offset = false;
+    cfg_no_offset.axes.layer_attention_kinds = try allocator.dupe(AttentionKind, cfg.axes.layer_attention_kinds);
+    defer allocator.free(cfg_no_offset.axes.layer_attention_kinds);
+    var ctrl_m = try GraphModel.loadFromBytes(allocator, amf_bytes, cfg_no_offset, .{
+        .max_seq_len = 128,
+        .max_tree_nodes = 16,
+    });
+    defer ctrl_m.deinit(allocator);
+
+    const prompt = [_]u32{ 4, 19, 37, 81, 12, 55, 7, 104 };
+    const s_p0 = try serial_m.prefillChunk(&prompt, 0, true);
+    const t_p0 = try tree_m.prefillChunk(&prompt, 0, true);
+    _ = try ctrl_m.prefillChunk(&prompt, 0, true);
+    try std.testing.expectEqual(s_p0, t_p0);
+
+    // Verify rmsnorm_unit_offset had strong non-trivial effect (weights are ~0.05 vs ~1.05).
+    var ctrl_diff: f32 = 0.0;
+    for (0..vocab) |vi| {
+        ctrl_diff = @max(ctrl_diff, @abs(@as(f32, @floatCast(serial_m.readLogitsF16()[vi])) - @as(f32, @floatCast(ctrl_m.readLogitsF16()[vi]))));
+    }
+    try std.testing.expect(ctrl_diff > 0.1);
+
+    // Verify serial decode vs branching verifyTree + commitTreeKv across GDN + 256-dim q_gate_proj GQA.
+    const step_toks = [_]u32{ s_p0, (s_p0 + 5) % vocab, (s_p0 + 9) % vocab };
+    var serial_preds: [3]u32 = undefined;
+    for (0..3) |st| {
+        serial_preds[st] = try serial_m.stepDecode(step_toks[st], 8 + @as(u32, @intCast(st)));
+    }
+    const tree_toks = [_]u32{ step_toks[0], 33, step_toks[1], 44, step_toks[2] };
+    const tree_pos = [_]u32{ 8, 9, 9, 10, 10 };
+    const tree_masks = [_]u64{ 0b00001, 0b00011, 0b00101, 0b01011, 0b10101 };
+    const vr = try tree_m.verifyTree(&tree_toks, &tree_pos, &tree_masks, 8);
+    const acc = [_]u16{ 0, 2, 4 };
+    for (acc, 0..) |nid, st| {
+        try std.testing.expectEqual(serial_preds[st], vr.argmax_tokens[nid]);
+    }
+    try tree_m.commitTreeKv(8, &acc);
+
+    const s_post = try serial_m.stepDecode(serial_preds[2], 11);
+    const t_post = try tree_m.stepDecode(serial_preds[2], 11);
+    try std.testing.expectEqual(s_post, t_post);
+    var max_diff: f32 = 0.0;
+    for (0..vocab) |vi| {
+        max_diff = @max(max_diff, @abs(@as(f32, @floatCast(serial_m.readLogitsF16()[vi])) - @as(f32, @floatCast(tree_m.readLogitsF16()[vi]))));
+    }
+    try std.testing.expect(max_diff < 5e-2);
 }

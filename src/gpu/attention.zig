@@ -71,7 +71,7 @@ pub const RmsNormParams = extern struct {
     num_rows: u32,
     hidden_dim: u32,
     eps: f32,
-    _pad: u32 = 0,
+    unit_offset: u32 = 0,
 };
 
 /// Uniform payload matching `struct QkNormRopeKvParams` in `kv_attention.metal`.
@@ -534,6 +534,8 @@ pub const RmsNormArgs = struct {
     hidden_dim: u32,
     eps: f32 = 1e-6,
     w_dtype: quant.FloatDType = .f16,
+    /// When `true` (`qwen3_5`), computes `(1.0 + float(w[i]))` in FP32.
+    unit_offset: bool = false,
 };
 
 /// Arguments for `ami_fused_residual_rmsnorm` (`G18`, ADR-0023 §1): updates
@@ -552,6 +554,8 @@ pub const FusedResidualRmsNormArgs = struct {
     hidden_dim: u32,
     eps: f32 = 1e-6,
     w_dtype: quant.FloatDType = .f16,
+    /// When `true` (`qwen3_5`), computes `(1.0 + float(w[i]))` in FP32.
+    unit_offset: bool = false,
 };
 
 pub const QkNormRopeKvArgs = struct {
@@ -1064,6 +1068,18 @@ pub const AttentionPipelines = struct {
     gqa_causal_prefill_flash_vec_d128: metal.Pipeline,
     gqa_causal_prefill_flash_nax_d64: ?metal.Pipeline = null,
     gqa_causal_prefill_flash_nax_d128: ?metal.Pipeline = null,
+    // M9.1 (`G26`): `qwen3_5` attention output sigmoid gate + asymmetric K/V
+    // (`192/128`, `256/256`, dynamic <= 256) global GQA split-KV & causal prefill.
+    mul_sigmoid_f16: metal.Pipeline,
+    g26_gqa_split_192_128: metal.Pipeline,
+    g26_gqa_split_256_256: metal.Pipeline,
+    g26_gqa_split_dyn: metal.Pipeline,
+    g26_gqa_reduce_128: metal.Pipeline,
+    g26_gqa_reduce_256: metal.Pipeline,
+    g26_gqa_reduce_dyn: metal.Pipeline,
+    g26_gqa_prefill_192_128: metal.Pipeline,
+    g26_gqa_prefill_256_256: metal.Pipeline,
+    g26_gqa_prefill_dyn: metal.Pipeline,
 
     pub fn init(device: metal.Device, library: metal.Library) metal.Error!AttentionPipelines {
         const rmsnorm = try metal.Pipeline.initSpecialized(device, library, "ami_rmsnorm", &.{
@@ -1312,6 +1328,60 @@ pub const AttentionPipelines = struct {
             }
         }
 
+        const mul_sigmoid_f16 = try metal.Pipeline.init(device, library, "ami_mul_sigmoid_f16");
+        errdefer mul_sigmoid_f16.close();
+
+        const g26_gqa_split_192_128 = try metal.Pipeline.initSpecialized(device, library, "ami_g26_gqa_split", &.{
+            .{ .index = 4, .value = .{ .u32 = 192 } },
+            .{ .index = 5, .value = .{ .u32 = 128 } },
+        });
+        errdefer g26_gqa_split_192_128.close();
+
+        const g26_gqa_split_256_256 = try metal.Pipeline.initSpecialized(device, library, "ami_g26_gqa_split", &.{
+            .{ .index = 4, .value = .{ .u32 = 256 } },
+            .{ .index = 5, .value = .{ .u32 = 256 } },
+        });
+        errdefer g26_gqa_split_256_256.close();
+
+        const g26_gqa_split_dyn = try metal.Pipeline.initSpecialized(device, library, "ami_g26_gqa_split", &.{
+            .{ .index = 4, .value = .{ .u32 = 0 } },
+            .{ .index = 5, .value = .{ .u32 = 0 } },
+        });
+        errdefer g26_gqa_split_dyn.close();
+
+        const g26_gqa_reduce_128 = try metal.Pipeline.initSpecialized(device, library, "ami_g26_gqa_reduce", &.{
+            .{ .index = 5, .value = .{ .u32 = 128 } },
+        });
+        errdefer g26_gqa_reduce_128.close();
+
+        const g26_gqa_reduce_256 = try metal.Pipeline.initSpecialized(device, library, "ami_g26_gqa_reduce", &.{
+            .{ .index = 5, .value = .{ .u32 = 256 } },
+        });
+        errdefer g26_gqa_reduce_256.close();
+
+        const g26_gqa_reduce_dyn = try metal.Pipeline.initSpecialized(device, library, "ami_g26_gqa_reduce", &.{
+            .{ .index = 5, .value = .{ .u32 = 0 } },
+        });
+        errdefer g26_gqa_reduce_dyn.close();
+
+        const g26_gqa_prefill_192_128 = try metal.Pipeline.initSpecialized(device, library, "ami_g26_gqa_prefill", &.{
+            .{ .index = 4, .value = .{ .u32 = 192 } },
+            .{ .index = 5, .value = .{ .u32 = 128 } },
+        });
+        errdefer g26_gqa_prefill_192_128.close();
+
+        const g26_gqa_prefill_256_256 = try metal.Pipeline.initSpecialized(device, library, "ami_g26_gqa_prefill", &.{
+            .{ .index = 4, .value = .{ .u32 = 256 } },
+            .{ .index = 5, .value = .{ .u32 = 256 } },
+        });
+        errdefer g26_gqa_prefill_256_256.close();
+
+        const g26_gqa_prefill_dyn = try metal.Pipeline.initSpecialized(device, library, "ami_g26_gqa_prefill", &.{
+            .{ .index = 4, .value = .{ .u32 = 0 } },
+            .{ .index = 5, .value = .{ .u32 = 0 } },
+        });
+        errdefer g26_gqa_prefill_dyn.close();
+
         return .{
             .rmsnorm = rmsnorm,
             .qknorm_rope_kv_write = qknorm_rope_kv_write,
@@ -1358,6 +1428,16 @@ pub const AttentionPipelines = struct {
             .gqa_causal_prefill_flash_vec_d128 = gqa_causal_prefill_flash_vec_d128,
             .gqa_causal_prefill_flash_nax_d64 = gqa_causal_prefill_flash_nax_d64,
             .gqa_causal_prefill_flash_nax_d128 = gqa_causal_prefill_flash_nax_d128,
+            .mul_sigmoid_f16 = mul_sigmoid_f16,
+            .g26_gqa_split_192_128 = g26_gqa_split_192_128,
+            .g26_gqa_split_256_256 = g26_gqa_split_256_256,
+            .g26_gqa_split_dyn = g26_gqa_split_dyn,
+            .g26_gqa_reduce_128 = g26_gqa_reduce_128,
+            .g26_gqa_reduce_256 = g26_gqa_reduce_256,
+            .g26_gqa_reduce_dyn = g26_gqa_reduce_dyn,
+            .g26_gqa_prefill_192_128 = g26_gqa_prefill_192_128,
+            .g26_gqa_prefill_256_256 = g26_gqa_prefill_256_256,
+            .g26_gqa_prefill_dyn = g26_gqa_prefill_dyn,
         };
     }
 
@@ -1372,6 +1452,16 @@ pub const AttentionPipelines = struct {
     }
 
     pub fn close(self: AttentionPipelines) void {
+        self.g26_gqa_prefill_dyn.close();
+        self.g26_gqa_prefill_256_256.close();
+        self.g26_gqa_prefill_192_128.close();
+        self.g26_gqa_reduce_dyn.close();
+        self.g26_gqa_reduce_256.close();
+        self.g26_gqa_reduce_128.close();
+        self.g26_gqa_split_dyn.close();
+        self.g26_gqa_split_256_256.close();
+        self.g26_gqa_split_192_128.close();
+        self.mul_sigmoid_f16.close();
         if (self.gqa_causal_prefill_flash_nax_d128) |p| p.close();
         if (self.gqa_causal_prefill_flash_nax_d64) |p| p.close();
         self.gqa_causal_prefill_flash_vec_d128.close();
@@ -1434,6 +1524,7 @@ pub const AttentionPipelines = struct {
             .num_rows = args.num_rows,
             .hidden_dim = args.hidden_dim,
             .eps = args.eps,
+            .unit_offset = if (args.unit_offset) 1 else 0,
         };
         const pipe = switch (args.w_dtype) {
             .f16 => self.rmsnorm,
@@ -1465,6 +1556,7 @@ pub const AttentionPipelines = struct {
             .num_rows = args.num_rows,
             .hidden_dim = args.hidden_dim,
             .eps = args.eps,
+            .unit_offset = if (args.unit_offset) 1 else 0,
         };
         const pipe = switch (args.w_dtype) {
             .f16 => self.fused_residual_rmsnorm,
@@ -2666,6 +2758,341 @@ pub const AttentionPipelines = struct {
             .elapsed_us = elapsed_us,
         };
     }
+
+    // -----------------------------------------------------------------------
+    // G26 Encoders: `qwen3_5` Attention Output Sigmoid Gate & Asymmetric
+    // `K/V <= 256` (`192/128`, `256/256`, dynamic) Global GQA Split-KV & Prefill
+    // -----------------------------------------------------------------------
+
+    /// Encodes `ami_mul_sigmoid_f16`: elementwise `out[i] *= sigmoid(gate[i])`
+    /// in FP32 (`qwen3_5` `attn_output_gate` before `o_proj`). Zero heap alloc.
+    pub fn encodeMulSigmoidF16(
+        self: AttentionPipelines,
+        frame: *metal.Compute.Frame,
+        args: MulSigmoidArgs,
+        insert_barrier_before: bool,
+    ) metal.Error!void {
+        if (args.count == 0) return error.InvalidArgument;
+        const params: MulSigmoidParams = .{ .count = args.count };
+        const vec_elems: u64 = (@as(u64, args.count) + 3) / 4;
+        const groups: u64 = (vec_elems + 255) / 256;
+        try frame.encodeThreadgroups(
+            self.mul_sigmoid_f16,
+            &.{ args.out, args.gate },
+            std.mem.asBytes(&params),
+            .{ groups, 1, 1 },
+            .{ 256, 1, 1 },
+            insert_barrier_before,
+        );
+    }
+
+    /// Encodes `ami_g26_gqa_split` (+ `ami_g26_gqa_reduce` when `num_splits > 1`):
+    /// asymmetric `K/V <= 256` (`192/128`, `256/256`, or dynamic) Global GQA
+    /// decode (`M = 1`) and speculative `verifyTree` (`M = 1..64`) with optional
+    /// FP32 online-softmax `sink_bias`. Zero heap allocation.
+    pub fn encodeG26GqaAttn(
+        self: AttentionPipelines,
+        frame: *metal.Compute.Frame,
+        args: G26GqaAttnArgs,
+        insert_barrier_before: bool,
+    ) metal.Error!void {
+        if (args.num_nodes == 0 or args.num_nodes > MAX_TREE_NODES or
+            args.num_q_heads == 0 or args.num_kv_heads == 0 or
+            args.k_head_dim == 0 or args.v_head_dim == 0 or
+            args.chunk_tokens == 0 or args.max_splits == 0)
+        {
+            return error.InvalidArgument;
+        }
+        if ((args.num_q_heads % args.num_kv_heads) != 0) return error.InvalidArgument;
+        if (args.k_head_dim > 256 or (args.k_head_dim % 4) != 0) return error.InvalidArgument;
+        if (args.v_head_dim > 256 or (args.v_head_dim % 4) != 0) return error.InvalidArgument;
+        const has_tree = (args.k_tree != null and args.v_tree != null and args.ancestor_masks != null);
+        if (args.base_pos > 0 and args.kv_tiles == null and args.num_retired_chunks == 0) return error.InvalidArgument;
+        if (!has_tree and args.base_pos == 0 and args.sink_bias == null) return error.InvalidArgument;
+
+        const span_len: u32 = if (args.sliding_window > 0 and args.base_pos > args.sliding_window)
+            args.sliding_window
+        else
+            args.base_pos;
+        const desired_splits: u32 = if (span_len < 256)
+            1
+        else
+            @min(args.max_splits, @min(MAX_SPLITS, (span_len + 255) / 256));
+        const num_splits: u32 = @max(1, desired_splits);
+
+        const gqa_ratio = args.num_q_heads / args.num_kv_heads;
+        const total_q = args.num_nodes * gqa_ratio;
+        const q_groups_per_kv = (total_q + 7) / 8;
+        const scale: f32 = args.scale orelse (1.0 / @sqrt(@as(f32, @floatFromInt(args.k_head_dim))));
+
+        const params: G26GqaAttnParams = .{
+            .num_nodes = args.num_nodes,
+            .num_q_heads = args.num_q_heads,
+            .num_kv_heads = args.num_kv_heads,
+            .k_head_dim = args.k_head_dim,
+            .v_head_dim = args.v_head_dim,
+            .base_pos = args.base_pos,
+            .chunk_tokens = args.chunk_tokens,
+            .num_splits = num_splits,
+            .q_groups_per_kv = q_groups_per_kv,
+            .num_retired_chunks = args.num_retired_chunks,
+            .retired_plane_stride_bytes = args.retired_plane_stride_bytes,
+            .retired_chunk_stride_bytes = args.retired_chunk_stride_bytes,
+            .tile_table_offset = args.tile_table_offset,
+            .retired_offset = args.retired_offset,
+            .has_tree = if (has_tree) 1 else 0,
+            .has_sink = if (args.sink_bias != null) 1 else 0,
+            .sink_dtype = args.sink_dtype,
+            .sliding_window = args.sliding_window,
+            .scale = scale,
+        };
+
+        const layout = gqaTreeScratchLayout(args.num_nodes, args.num_q_heads, args.v_head_dim, num_splits);
+        const partial_m: metal.BufferBinding = .{ .buffer = args.scratch.buffer, .offset = args.scratch.offset + layout.partial_m_offset };
+        const partial_l: metal.BufferBinding = .{ .buffer = args.scratch.buffer, .offset = args.scratch.offset + layout.partial_l_offset };
+        const partial_o: metal.BufferBinding = .{ .buffer = args.scratch.buffer, .offset = args.scratch.offset + layout.partial_o_offset };
+
+        const split_pipe = if (args.k_head_dim == 192 and args.v_head_dim == 128)
+            self.g26_gqa_split_192_128
+        else if (args.k_head_dim == 256 and args.v_head_dim == 256)
+            self.g26_gqa_split_256_256
+        else
+            self.g26_gqa_split_dyn;
+
+        try frame.encodeThreadgroups(
+            split_pipe,
+            &.{
+                args.q,
+                args.kv_tiles orelse args.q,
+                args.k_tree orelse args.q,
+                args.v_tree orelse args.q,
+                args.ancestor_masks orelse args.q,
+                args.sink_bias orelse args.q,
+                args.retired_pool orelse args.q,
+                args.retired_chunk_ids orelse args.q,
+                args.out,
+                partial_m,
+                partial_l,
+                partial_o,
+            },
+            std.mem.asBytes(&params),
+            .{ @as(u64, args.num_kv_heads) * q_groups_per_kv, num_splits, 1 },
+            .{ 256, 1, 1 },
+            insert_barrier_before,
+        );
+
+        if (num_splits > 1) {
+            const reduce_pipe = if (args.v_head_dim == 128)
+                self.g26_gqa_reduce_128
+            else if (args.v_head_dim == 256)
+                self.g26_gqa_reduce_256
+            else
+                self.g26_gqa_reduce_dyn;
+            try frame.encodeThreadgroups(
+                reduce_pipe,
+                &.{ partial_m, partial_l, partial_o, args.out },
+                std.mem.asBytes(&params),
+                .{ args.num_q_heads, args.num_nodes, 1 },
+                .{ 32, 1, 1 },
+                true,
+            );
+        }
+    }
+
+    /// Encodes `ami_g26_gqa_prefill`: asymmetric `K/V <= 256` (`192/128`, `256/256`,
+    /// or dynamic) causal prefill attention over committed `KvTilePair` chunks
+    /// with optional FP32 online-softmax `sink_bias` and `sliding_window`.
+    pub fn encodeG26GqaPrefill(
+        self: AttentionPipelines,
+        frame: *metal.Compute.Frame,
+        args: G26GqaPrefillArgs,
+        insert_barrier_before: bool,
+    ) metal.Error!void {
+        if (args.num_q == 0 or args.kv_len == 0 or args.num_q_heads == 0 or
+            args.num_kv_heads == 0 or args.k_head_dim == 0 or args.v_head_dim == 0 or
+            args.chunk_tokens == 0)
+        {
+            return error.InvalidArgument;
+        }
+        if ((args.num_q_heads % args.num_kv_heads) != 0) return error.InvalidArgument;
+        if (args.k_head_dim > 256 or (args.k_head_dim % 4) != 0) return error.InvalidArgument;
+        if (args.v_head_dim > 256 or (args.v_head_dim % 4) != 0) return error.InvalidArgument;
+
+        const gqa_ratio = args.num_q_heads / args.num_kv_heads;
+        const q_groups_per_kv = (gqa_ratio + 7) / 8;
+        const scale: f32 = args.scale orelse (1.0 / @sqrt(@as(f32, @floatFromInt(args.k_head_dim))));
+
+        const params: G26GqaPrefillParams = .{
+            .num_q = args.num_q,
+            .q_start_pos = args.q_start_pos,
+            .kv_len = args.kv_len,
+            .num_q_heads = args.num_q_heads,
+            .num_kv_heads = args.num_kv_heads,
+            .k_head_dim = args.k_head_dim,
+            .v_head_dim = args.v_head_dim,
+            .chunk_tokens = args.chunk_tokens,
+            .sliding_window = args.sliding_window,
+            .ring_capacity = args.ring_capacity,
+            .tile_table_offset = args.tile_table_offset,
+            .num_retired_chunks = args.num_retired_chunks,
+            .retired_offset = args.retired_offset,
+            .retired_plane_stride_bytes = args.retired_plane_stride_bytes,
+            .retired_chunk_stride_bytes = args.retired_chunk_stride_bytes,
+            .has_sink = if (args.sink_bias != null) 1 else 0,
+            .sink_dtype = args.sink_dtype,
+            .scale = scale,
+        };
+        const pipe = if (args.k_head_dim == 192 and args.v_head_dim == 128)
+            self.g26_gqa_prefill_192_128
+        else if (args.k_head_dim == 256 and args.v_head_dim == 256)
+            self.g26_gqa_prefill_256_256
+        else
+            self.g26_gqa_prefill_dyn;
+
+        try frame.encodeThreadgroups(
+            pipe,
+            &.{
+                args.q,
+                args.kv_tiles,
+                args.sink_bias orelse args.q,
+                args.retired_pool orelse args.q,
+                args.retired_chunk_ids orelse args.q,
+                args.out,
+            },
+            std.mem.asBytes(&params),
+            .{ @as(u64, args.num_kv_heads) * q_groups_per_kv, args.num_q, 1 },
+            .{ 256, 1, 1 },
+            insert_barrier_before,
+        );
+    }
+};
+
+pub const MulSigmoidParams = extern struct {
+    count: u32,
+    _pad0: u32 = 0,
+    _pad1: u32 = 0,
+    _pad2: u32 = 0,
+
+    comptime {
+        if (@sizeOf(MulSigmoidParams) != 16) @compileError("MulSigmoidParams must be 16 bytes");
+    }
+};
+
+pub const MulSigmoidArgs = struct {
+    out: metal.BufferBinding,
+    gate: metal.BufferBinding,
+    count: u32,
+};
+
+pub const G26GqaAttnParams = extern struct {
+    num_nodes: u32,
+    num_q_heads: u32,
+    num_kv_heads: u32,
+    k_head_dim: u32,
+    v_head_dim: u32,
+    base_pos: u32,
+    chunk_tokens: u32,
+    num_splits: u32,
+    q_groups_per_kv: u32,
+    num_retired_chunks: u32,
+    retired_plane_stride_bytes: u32,
+    retired_chunk_stride_bytes: u32,
+    tile_table_offset: u32,
+    retired_offset: u32,
+    has_tree: u32,
+    has_sink: u32,
+    sink_dtype: u32,
+    sliding_window: u32,
+    scale: f32,
+    _pad0: u32 = 0,
+
+    comptime {
+        if (@sizeOf(G26GqaAttnParams) != 80) @compileError("G26GqaAttnParams must be 80 bytes");
+    }
+};
+
+pub const G26GqaAttnArgs = struct {
+    q: metal.BufferBinding,
+    kv_tiles: ?metal.BufferBinding = null,
+    k_tree: ?metal.BufferBinding = null,
+    v_tree: ?metal.BufferBinding = null,
+    ancestor_masks: ?metal.BufferBinding = null,
+    sink_bias: ?metal.BufferBinding = null,
+    /// `0 = f16, 1 = bf16, 2 = f32`.
+    sink_dtype: u32 = 1,
+    retired_pool: ?metal.BufferBinding = null,
+    retired_chunk_ids: ?metal.BufferBinding = null,
+    out: metal.BufferBinding,
+    scratch: metal.BufferBinding,
+    max_splits: u32 = MAX_SPLITS,
+    num_nodes: u32,
+    num_q_heads: u32,
+    num_kv_heads: u32,
+    k_head_dim: u32,
+    v_head_dim: u32,
+    base_pos: u32,
+    chunk_tokens: u32 = DEFAULT_CHUNK_TOKENS,
+    tile_table_offset: u32 = 0,
+    num_retired_chunks: u32 = 0,
+    retired_offset: u32 = 0,
+    retired_plane_stride_bytes: u32 = 0,
+    retired_chunk_stride_bytes: u32 = 0,
+    sliding_window: u32 = 0,
+    scale: ?f32 = null,
+};
+
+pub const G26GqaPrefillParams = extern struct {
+    num_q: u32,
+    q_start_pos: u32,
+    kv_len: u32,
+    num_q_heads: u32,
+    num_kv_heads: u32,
+    k_head_dim: u32,
+    v_head_dim: u32,
+    chunk_tokens: u32,
+    sliding_window: u32,
+    ring_capacity: u32,
+    tile_table_offset: u32,
+    num_retired_chunks: u32,
+    retired_offset: u32,
+    retired_plane_stride_bytes: u32,
+    retired_chunk_stride_bytes: u32,
+    has_sink: u32,
+    sink_dtype: u32,
+    _pad0: u32 = 0,
+    scale: f32,
+    _pad1: u32 = 0,
+
+    comptime {
+        if (@sizeOf(G26GqaPrefillParams) != 80) @compileError("G26GqaPrefillParams must be 80 bytes");
+    }
+};
+
+pub const G26GqaPrefillArgs = struct {
+    q: metal.BufferBinding,
+    kv_tiles: metal.BufferBinding,
+    sink_bias: ?metal.BufferBinding = null,
+    /// `0 = f16, 1 = bf16, 2 = f32`.
+    sink_dtype: u32 = 1,
+    retired_pool: ?metal.BufferBinding = null,
+    retired_chunk_ids: ?metal.BufferBinding = null,
+    out: metal.BufferBinding,
+    num_q: u32,
+    q_start_pos: u32 = 0,
+    kv_len: u32,
+    num_q_heads: u32,
+    num_kv_heads: u32,
+    k_head_dim: u32,
+    v_head_dim: u32,
+    chunk_tokens: u32 = DEFAULT_CHUNK_TOKENS,
+    sliding_window: u32 = 0,
+    ring_capacity: u32 = 0,
+    tile_table_offset: u32 = 0,
+    num_retired_chunks: u32 = 0,
+    retired_offset: u32 = 0,
+    retired_plane_stride_bytes: u32 = 0,
+    retired_chunk_stride_bytes: u32 = 0,
+    scale: ?f32 = null,
 };
 
 // ---------------------------------------------------------------------------

@@ -1059,6 +1059,9 @@ pub const HybridKvRingSpec = struct {
     mode: HybridKvRingMode,
     num_kv_heads: u32,
     head_dim: u32,
+    /// Optional asymmetric V head dimension (`0` defaults to `head_dim`, e.g.,
+    /// `head_dim = 192, v_head_dim = 128` on `MiMo-V2.6` SWA & Global GQA).
+    v_head_dim: u32 = 0,
     /// Number of chunk tiles in the ring:
     /// - `.full_chunk_512`: `ceil(max_seq_len / 512)` tiles (`ring_capacity = 0`, `window_size = 0`).
     /// - `.sliding_window_128`: number of `128`-token tiles (`1` tile -> `128`-token circular SWA).
@@ -1068,11 +1071,13 @@ pub const HybridKvRingSpec = struct {
 };
 
 /// Resident IOSurface `RGBA16Float` `KvTile` ring supporting both `512`-token
-/// full-attention chunks and `128`-token circular sliding-window tiles (`R5`).
+/// full-attention chunks and `128`-token circular sliding-window tiles (`R5`, `G26`),
+/// including asymmetric `head_dim != v_head_dim` (`K = 192, V = 128`).
 pub const HybridKvRing = struct {
     mode: HybridKvRingMode,
     num_kv_heads: u32,
     head_dim: u32,
+    v_head_dim: u32,
     chunk_tokens: u32,
     window_size: u32,
     ring_capacity: u32,
@@ -1095,8 +1100,10 @@ pub const HybridKvRing = struct {
         arena: *arena_mod.WiredArena,
         spec: HybridKvRingSpec,
     ) InitError!HybridKvRing {
-        if (spec.num_kv_heads == 0 or spec.head_dim == 0 or spec.num_tiles == 0) return error.ZeroDimension;
+        const eff_v_head_dim: u32 = if (spec.v_head_dim > 0) spec.v_head_dim else spec.head_dim;
+        if (spec.num_kv_heads == 0 or spec.head_dim == 0 or eff_v_head_dim == 0 or spec.num_tiles == 0) return error.ZeroDimension;
         if (spec.head_dim > MAX_QSA_HEAD_DIM or (spec.head_dim % 4) != 0) return error.InvalidConfig;
+        if (eff_v_head_dim > MAX_QSA_HEAD_DIM or (eff_v_head_dim % 4) != 0) return error.InvalidConfig;
 
         const chunk_tokens: u32 = switch (spec.mode) {
             .full_chunk_512 => QSA_FULL_CHUNK_TOKENS,
@@ -1138,7 +1145,7 @@ pub const HybridKvRing = struct {
         for (0..spec.num_tiles) |i| {
             k_tiles[i] = try metal.KvTile.init(device, spec.head_dim, rows, .{});
             errdefer k_tiles[i].close();
-            v_tiles[i] = try metal.KvTile.init(device, spec.head_dim, rows, .{});
+            v_tiles[i] = try metal.KvTile.init(device, eff_v_head_dim, rows, .{});
             tile_table[i] = attention.KvTilePair.fromTiles(k_tiles[i], v_tiles[i], .rgba16f);
             created += 1;
         }
@@ -1147,6 +1154,7 @@ pub const HybridKvRing = struct {
             .mode = spec.mode,
             .num_kv_heads = spec.num_kv_heads,
             .head_dim = spec.head_dim,
+            .v_head_dim = eff_v_head_dim,
             .chunk_tokens = chunk_tokens,
             .window_size = window_size,
             .ring_capacity = ring_capacity,
@@ -2753,6 +2761,19 @@ pub const HybridPipelines = struct {
     mhc_single_pass: [2][2]metal.Pipeline,
     mhc_post_mix: [2][2]metal.Pipeline,
 
+    // M9.1 (`G26`): Asymmetric K/V (`192/128`, `256/256`, dynamic <= 256) `HybridKvRing`
+    // SWA (`128 + sink`), partial/3D-MRoPE + `(1+w)` QK-norm + `v_scale`, sigmoid MoE
+    // routing (`e_score_correction_bias`), and `DFlash` tap ring capture.
+    g26_qknorm_rope_kv_f16: metal.Pipeline,
+    g26_qknorm_rope_kv_bf16: metal.Pipeline,
+    g26_kv_commit: metal.Pipeline,
+    g26_swa_attn_192_128: metal.Pipeline,
+    g26_swa_attn_256_256: metal.Pipeline,
+    g26_swa_attn_dyn: metal.Pipeline,
+    g26_moe_route_sigmoid_f32: metal.Pipeline,
+    g26_moe_route_sigmoid_f16: metal.Pipeline,
+    g26_capture_tap_ring: metal.Pipeline,
+
     pub fn init(device: metal.Device, library: metal.Library) metal.Error!HybridPipelines {
         const gdn_decode_d64_f16 = try metal.Pipeline.initSpecialized(device, library, "ami_gdn_decode", &.{
             .{ .index = 0, .value = .{ .u32 = 64 } },
@@ -3085,6 +3106,42 @@ pub const HybridPipelines = struct {
             }
         }
 
+        const g26_qknorm_rope_kv_f16 = try metal.Pipeline.initSpecialized(device, library, "ami_g26_qknorm_rope_kv", &.{
+            .{ .index = 1, .value = .{ .bool = false } },
+        });
+        errdefer g26_qknorm_rope_kv_f16.close();
+        const g26_qknorm_rope_kv_bf16 = try metal.Pipeline.initSpecialized(device, library, "ami_g26_qknorm_rope_kv", &.{
+            .{ .index = 1, .value = .{ .bool = true } },
+        });
+        errdefer g26_qknorm_rope_kv_bf16.close();
+        const g26_kv_commit = try metal.Pipeline.init(device, library, "ami_g26_kv_commit");
+        errdefer g26_kv_commit.close();
+        const g26_swa_attn_192_128 = try metal.Pipeline.initSpecialized(device, library, "ami_g26_swa_attn", &.{
+            .{ .index = 5, .value = .{ .u32 = 192 } },
+            .{ .index = 6, .value = .{ .u32 = 128 } },
+        });
+        errdefer g26_swa_attn_192_128.close();
+        const g26_swa_attn_256_256 = try metal.Pipeline.initSpecialized(device, library, "ami_g26_swa_attn", &.{
+            .{ .index = 5, .value = .{ .u32 = 256 } },
+            .{ .index = 6, .value = .{ .u32 = 256 } },
+        });
+        errdefer g26_swa_attn_256_256.close();
+        const g26_swa_attn_dyn = try metal.Pipeline.initSpecialized(device, library, "ami_g26_swa_attn", &.{
+            .{ .index = 5, .value = .{ .u32 = 0 } },
+            .{ .index = 6, .value = .{ .u32 = 0 } },
+        });
+        errdefer g26_swa_attn_dyn.close();
+        const g26_moe_route_sigmoid_f32 = try metal.Pipeline.initSpecialized(device, library, "ami_moe_route_topk_sigmoid", &.{
+            .{ .index = 7, .value = .{ .bool = false } },
+        });
+        errdefer g26_moe_route_sigmoid_f32.close();
+        const g26_moe_route_sigmoid_f16 = try metal.Pipeline.initSpecialized(device, library, "ami_moe_route_topk_sigmoid", &.{
+            .{ .index = 7, .value = .{ .bool = true } },
+        });
+        errdefer g26_moe_route_sigmoid_f16.close();
+        const g26_capture_tap_ring = try metal.Pipeline.init(device, library, "ami_g26_capture_tap_ring");
+        errdefer g26_capture_tap_ring.close();
+
         return .{
             .gdn_decode_d64_f16 = gdn_decode_d64_f16,
             .gdn_decode_d64_bf16 = gdn_decode_d64_bf16,
@@ -3146,10 +3203,28 @@ pub const HybridPipelines = struct {
             .mla_csa2_attend_mma = mla_csa2_attend_mma,
             .mhc_single_pass = mhc_single_pass,
             .mhc_post_mix = mhc_post_mix,
+            .g26_qknorm_rope_kv_f16 = g26_qknorm_rope_kv_f16,
+            .g26_qknorm_rope_kv_bf16 = g26_qknorm_rope_kv_bf16,
+            .g26_kv_commit = g26_kv_commit,
+            .g26_swa_attn_192_128 = g26_swa_attn_192_128,
+            .g26_swa_attn_256_256 = g26_swa_attn_256_256,
+            .g26_swa_attn_dyn = g26_swa_attn_dyn,
+            .g26_moe_route_sigmoid_f32 = g26_moe_route_sigmoid_f32,
+            .g26_moe_route_sigmoid_f16 = g26_moe_route_sigmoid_f16,
+            .g26_capture_tap_ring = g26_capture_tap_ring,
         };
     }
 
     pub fn close(self: HybridPipelines) void {
+        self.g26_capture_tap_ring.close();
+        self.g26_moe_route_sigmoid_f16.close();
+        self.g26_moe_route_sigmoid_f32.close();
+        self.g26_swa_attn_dyn.close();
+        self.g26_swa_attn_256_256.close();
+        self.g26_swa_attn_192_128.close();
+        self.g26_kv_commit.close();
+        self.g26_qknorm_rope_kv_bf16.close();
+        self.g26_qknorm_rope_kv_f16.close();
         for (0..2) |sb| {
             for (0..2) |ab| {
                 self.mhc_post_mix[sb][ab].close();
@@ -5084,6 +5159,594 @@ pub const HybridPipelines = struct {
             insert_barrier_before,
         );
     }
+
+    // -----------------------------------------------------------------------
+    // G26 Encoders: Asymmetric K/V (`192/128`, `256/256`, dynamic <= 256)
+    // SWA (`128 + sink`), Partial/3D-MRoPE + `(1+w)` QK-Norm + `v_scale`,
+    // Sigmoid + `e_score_correction_bias` MoE Routing, and DFlash Tap Capture
+    // -----------------------------------------------------------------------
+
+    /// Encodes `ami_g26_qknorm_rope_kv`: asymmetric `K/V <= 256` optional QK-Norm
+    /// (supporting `qwen3_5` `(1 + w)` unit offset), partial NeoX/YaRN/3D-MRoPE,
+    /// `attention_value_scale`, and direct bindless `HybridKvRing` tile write OR
+    /// contiguous `k_out`/`v_out` staging. Zero heap allocation.
+    pub fn encodeG26QkNormRopeKv(
+        self: HybridPipelines,
+        frame: *metal.Compute.Frame,
+        args: G26QkNormRopeKvArgs,
+        insert_barrier_before: bool,
+    ) EncodeError!void {
+        if (args.num_tokens == 0 or args.num_q_heads == 0 or args.num_kv_heads == 0 or
+            args.k_head_dim == 0 or args.v_head_dim == 0 or args.chunk_tokens == 0)
+        {
+            return error.ZeroDimension;
+        }
+        if (args.k_head_dim > MAX_QSA_HEAD_DIM or (args.k_head_dim % 4) != 0) return error.InvalidHeadDim;
+        if (args.v_head_dim > MAX_QSA_HEAD_DIM or (args.v_head_dim % 4) != 0) return error.InvalidHeadDim;
+        const rotary_dim: u32 = if (args.rotary_dim == 0) args.k_head_dim else args.rotary_dim;
+        if (rotary_dim > args.k_head_dim or (rotary_dim % 2) != 0) return error.InvalidRotaryDim;
+        const pos_mode: u32 = if (args.positions_3d != null)
+            2
+        else if (args.positions_1d != null)
+            1
+        else
+            0;
+        if (pos_mode == 2) {
+            try args.mrope.validate(rotary_dim);
+        }
+        const apply_norm = (args.q_norm != null or args.k_norm != null);
+        if (apply_norm and (args.q_norm == null or args.k_norm == null)) return error.MissingNormWeights;
+        if (args.write_to_tiles and args.kv_tiles == null) return error.InvalidConfig;
+        if (args.ring_capacity == 0) {
+            const retired_tokens = std.math.mul(u64, args.num_retired_chunks, args.chunk_tokens) catch return error.InvalidConfig;
+            if (args.write_to_tiles and pos_mode == 0 and @as(u64, args.start_pos) < retired_tokens) return error.InvalidConfig;
+        } else if ((args.ring_capacity % args.chunk_tokens) != 0) {
+            return error.InvalidConfig;
+        }
+
+        const params: G26QkNormRopeKvParams = .{
+            .num_tokens = args.num_tokens,
+            .num_q_heads = args.num_q_heads,
+            .num_kv_heads = args.num_kv_heads,
+            .k_head_dim = args.k_head_dim,
+            .v_head_dim = args.v_head_dim,
+            .rotary_dim = rotary_dim,
+            .start_pos = args.start_pos,
+            .chunk_tokens = args.chunk_tokens,
+            .num_retired_chunks = args.num_retired_chunks,
+            .ring_capacity = args.ring_capacity,
+            .tile_table_offset = args.tile_table_offset,
+            .mrope_s0 = args.mrope.section[0],
+            .mrope_s1 = args.mrope.section[1],
+            .mrope_s2 = args.mrope.section[2],
+            .pos_mode = pos_mode,
+            .apply_qk_norm = if (apply_norm) 1 else 0,
+            .qk_norm_unit_offset = if (args.qk_norm_unit_offset) 1 else 0,
+            .kv_only = if (args.kv_only) 1 else 0,
+            .write_to_tiles = if (args.write_to_tiles) 1 else 0,
+            .rms_eps = args.rms_eps,
+            .rope_theta = args.rope_theta,
+            .v_scale = args.v_scale,
+            .yarn_factor = args.yarn.factor,
+            .yarn_mscale = args.yarn.effectiveMscale(),
+            .yarn_beta_fast = args.yarn.beta_fast,
+            .yarn_beta_slow = args.yarn.beta_slow,
+            .original_max_pos = args.yarn.original_max_pos,
+        };
+        const pipe = if (args.norm_dtype == .bf16) self.g26_qknorm_rope_kv_bf16 else self.g26_qknorm_rope_kv_f16;
+        const total_heads: u64 = if (args.kv_only)
+            args.num_kv_heads
+        else
+            @as(u64, args.num_q_heads) + args.num_kv_heads;
+        const pos_bind = args.positions_3d orelse args.positions_1d orelse args.q;
+        try frame.encodeThreadgroups(
+            pipe,
+            &.{
+                args.q,
+                args.k,
+                args.v,
+                args.q_norm orelse args.q,
+                args.k_norm orelse args.q,
+                pos_bind,
+                args.k_out orelse args.k,
+                args.v_out orelse args.v,
+                args.kv_tiles orelse args.q,
+            },
+            std.mem.asBytes(&params),
+            .{ total_heads, args.num_tokens, 1 },
+            .{ 32, 1, 1 },
+            insert_barrier_before,
+        );
+    }
+
+    /// Encodes `ami_g26_kv_commit`: commits asymmetric `K/V <= 256` rows from
+    /// either a prefill chunk (trailing `min(num_tokens, ring_capacity)`) or an
+    /// accepted speculative tree path (`accepted_nodes`) into bindless
+    /// `HybridKvRing` / global `KvTilePair` tiles. Zero heap allocation.
+    pub fn encodeG26KvCommit(
+        self: HybridPipelines,
+        frame: *metal.Compute.Frame,
+        args: G26KvCommitArgs,
+        insert_barrier_before: bool,
+    ) EncodeError!void {
+        if (args.num_kv_heads == 0 or args.k_head_dim == 0 or args.v_head_dim == 0 or args.chunk_tokens == 0) {
+            return error.ZeroDimension;
+        }
+        if (args.k_head_dim > MAX_QSA_HEAD_DIM or (args.k_head_dim % 4) != 0) return error.InvalidHeadDim;
+        if (args.v_head_dim > MAX_QSA_HEAD_DIM or (args.v_head_dim % 4) != 0) return error.InvalidHeadDim;
+        if (args.ring_capacity > 0 and (args.ring_capacity % args.chunk_tokens) != 0) return error.InvalidConfig;
+
+        var params: G26KvCommitParams = .{
+            .num_kv_heads = args.num_kv_heads,
+            .k_head_dim = args.k_head_dim,
+            .v_head_dim = args.v_head_dim,
+            .start_pos = args.start_pos,
+            .num_tokens = 0,
+            .chunk_tokens = args.chunk_tokens,
+            .num_retired_chunks = args.num_retired_chunks,
+            .ring_capacity = args.ring_capacity,
+            .tile_table_offset = args.tile_table_offset,
+            .use_node_list = 0,
+            .use_node_buffer = 0,
+        };
+        var commit_cnt: u32 = 0;
+        var nodes_bind = args.k_src;
+        if (args.accepted_nodes) |nodes| {
+            if (nodes.len == 0 or nodes.len > MAX_TREE_NODES) return error.InvalidNodeCount;
+            params.use_node_list = 1;
+            params.num_tokens = @intCast(nodes.len);
+            for (nodes, 0..) |nid, i| params.inline_nodes[i] = nid;
+            commit_cnt = @intCast(nodes.len);
+        } else if (args.accepted_nodes_buf) |nb| {
+            if (args.num_tokens == 0 or args.num_tokens > MAX_TREE_NODES) return error.InvalidNodeCount;
+            params.use_node_list = 1;
+            params.use_node_buffer = 1;
+            params.num_tokens = args.num_tokens;
+            nodes_bind = nb;
+            commit_cnt = args.num_tokens;
+        } else {
+            if (args.num_tokens == 0) return error.ZeroDimension;
+            params.num_tokens = args.num_tokens;
+            commit_cnt = if (args.ring_capacity > 0) @min(args.num_tokens, args.ring_capacity) else args.num_tokens;
+        }
+
+        try frame.encodeThreadgroups(
+            self.g26_kv_commit,
+            &.{ args.k_src, args.v_src, nodes_bind, args.kv_tiles },
+            std.mem.asBytes(&params),
+            .{ args.num_kv_heads, commit_cnt, 1 },
+            .{ 32, 1, 1 },
+            insert_barrier_before,
+        );
+    }
+
+    /// Encodes `ami_g26_swa_attn`: asymmetric `K/V <= 256` (`192/128`, `256/256`,
+    /// or dynamic) `HybridKvRing` SWA attention across `M = 1` decode, chunked
+    /// prefill (`is_prefill = true`), and `M = 1..64` speculative `verifyTree`
+    /// (`ancestor_masks` + per-node `node_positions`) with exact FP32 online
+    /// softmax `sink_bias`. Zero heap allocation.
+    pub fn encodeG26SwaAttn(
+        self: HybridPipelines,
+        frame: *metal.Compute.Frame,
+        args: G26SwaAttnArgs,
+        insert_barrier_before: bool,
+    ) EncodeError!void {
+        if (args.num_q == 0 or args.num_q_heads == 0 or args.num_kv_heads == 0 or
+            args.k_head_dim == 0 or args.v_head_dim == 0 or args.chunk_tokens == 0)
+        {
+            return error.ZeroDimension;
+        }
+        if ((args.num_q_heads % args.num_kv_heads) != 0) return error.InvalidConfig;
+        if (args.k_head_dim > MAX_QSA_HEAD_DIM or (args.k_head_dim % 4) != 0) return error.InvalidHeadDim;
+        if (args.v_head_dim > MAX_QSA_HEAD_DIM or (args.v_head_dim % 4) != 0) return error.InvalidHeadDim;
+        if (args.ring_capacity > 0 and (args.ring_capacity % args.chunk_tokens) != 0) return error.InvalidConfig;
+        if (args.is_prefill) {
+            if (args.k_extra == null or args.v_extra == null) return error.InvalidConfig;
+            if (args.chunk_start_pos > 0 and args.kv_tiles == null) return error.InvalidConfig;
+        } else {
+            if (args.kv_len > 0 and args.kv_tiles == null) return error.InvalidConfig;
+            const has_tree = (args.k_extra != null and args.v_extra != null and args.ancestor_masks != null);
+            if (!has_tree and args.kv_len == 0 and args.sink_bias == null) return error.InvalidConfig;
+        }
+
+        const scale: f32 = args.scale orelse (1.0 / @sqrt(@as(f32, @floatFromInt(args.k_head_dim))));
+        const gqa_ratio = args.num_q_heads / args.num_kv_heads;
+        const q_groups_per_kv = (gqa_ratio + 7) / 8;
+        const has_tree = (!args.is_prefill and args.k_extra != null and args.v_extra != null and args.ancestor_masks != null);
+
+        const params: G26SwaAttnParams = .{
+            .num_q = args.num_q,
+            .q_start_pos = args.q_start_pos,
+            .chunk_start_pos = args.chunk_start_pos,
+            .kv_len = args.kv_len,
+            .num_q_heads = args.num_q_heads,
+            .num_kv_heads = args.num_kv_heads,
+            .k_head_dim = args.k_head_dim,
+            .v_head_dim = args.v_head_dim,
+            .window_size = args.window_size,
+            .ring_capacity = args.ring_capacity,
+            .chunk_tokens = args.chunk_tokens,
+            .tile_table_offset = args.tile_table_offset,
+            .is_prefill = if (args.is_prefill) 1 else 0,
+            .has_tree = if (has_tree) 1 else 0,
+            .has_positions = if (!args.is_prefill and args.node_positions != null) 1 else 0,
+            .has_sink = if (args.sink_bias != null) 1 else 0,
+            .sink_dtype = @backingInt(args.sink_dtype),
+            .scale = scale,
+        };
+        const pipe = if (args.k_head_dim == 192 and args.v_head_dim == 128)
+            self.g26_swa_attn_192_128
+        else if (args.k_head_dim == 256 and args.v_head_dim == 256)
+            self.g26_swa_attn_256_256
+        else
+            self.g26_swa_attn_dyn;
+
+        try frame.encodeThreadgroups(
+            pipe,
+            &.{
+                args.q,
+                args.kv_tiles orelse args.q,
+                args.k_extra orelse args.q,
+                args.v_extra orelse args.q,
+                args.ancestor_masks orelse args.q,
+                args.node_positions orelse args.q,
+                args.sink_bias orelse args.q,
+                args.out,
+            },
+            std.mem.asBytes(&params),
+            .{ @as(u64, args.num_kv_heads) * q_groups_per_kv, args.num_q, 1 },
+            .{ 256, 1, 1 },
+            insert_barrier_before,
+        );
+    }
+
+    /// Encodes `ami_moe_route_topk_sigmoid`: FP32 sigmoid + optional
+    /// `e_score_correction_bias` + optional group top-k + unbiased weight renorm
+    /// + `routed_scaling_factor`, emitting exact `MoeWorkspace` CSR schedule &
+    /// G20 indirect dispatch arguments (uniform or G13 5-bucket heterogeneous).
+    pub fn encodeG26MoeRouteSigmoid(
+        self: HybridPipelines,
+        frame: *metal.Compute.Frame,
+        args: G26MoeRouteSigmoidArgs,
+        insert_barrier_before: bool,
+    ) EncodeError!void {
+        if (args.m == 0 or args.num_experts == 0 or args.top_k == 0) return error.ZeroDimension;
+        if (args.num_experts > 1024 or args.top_k > 16 or args.top_k > args.num_experts) return error.InvalidConfig;
+        if (args.is_bucketed and (args.expert_schemes == null or args.bucket_headers == null or
+            args.bucket_unique_experts == null or args.bucket_expert_token_offsets == null))
+        {
+            return error.InvalidConfig;
+        }
+        const params: G26MoeRouteSigmoidParams = .{
+            .m = args.m,
+            .num_experts = args.num_experts,
+            .top_k = args.top_k,
+            .norm_topk_prob = if (args.norm_topk_prob) 1 else 0,
+            .has_bias = if (args.bias != null) 1 else 0,
+            .bias_dtype = @backingInt(args.bias_dtype),
+            .n_group = @max(args.n_group, 1),
+            .topk_group = @max(args.topk_group, 1),
+            .is_bucketed = if (args.is_bucketed) 1 else 0,
+            .bucket_unique_stride = args.bucket_unique_stride,
+            .bucket_offsets_stride = args.bucket_offsets_stride,
+            .gate_up_groups_x_q = args.gate_up_groups_x_q,
+            .gate_up_groups_x_f = args.gate_up_groups_x_f,
+            .down_groups_x = args.down_groups_x,
+            .down_groups_x_q8 = args.down_groups_x_q8,
+            .routed_scaling_factor = args.routed_scaling_factor,
+        };
+        const pipe = if (args.logits_f16) self.g26_moe_route_sigmoid_f16 else self.g26_moe_route_sigmoid_f32;
+        try frame.encodeThreadgroups(
+            pipe,
+            &.{
+                args.logits,
+                args.bias orelse args.logits,
+                args.sched_hdr,
+                args.unique_experts,
+                args.expert_token_offsets,
+                args.token_indices,
+                args.routing_weights,
+                args.slot_k_indices,
+                args.scratch_topk_experts,
+                args.scratch_topk_weights,
+                args.expert_schemes orelse args.logits,
+                args.bucket_headers orelse args.sched_hdr,
+                args.bucket_unique_experts orelse args.unique_experts,
+                args.bucket_expert_token_offsets orelse args.expert_token_offsets,
+            },
+            std.mem.asBytes(&params),
+            .{ 1, 1, 1 },
+            .{ 256, 1, 1 },
+            insert_barrier_before,
+        );
+    }
+
+    /// Encodes `ami_g26_capture_tap_ring`: copies layer hidden states (`mode = 0`)
+    /// or accepted tree tap nodes (`mode = 1`) into a circular `[cap, num_taps, H]`
+    /// `f16` `DFlash` context history ring with zero CPU-GPU syncs.
+    pub fn encodeG26CaptureTapRing(
+        self: HybridPipelines,
+        frame: *metal.Compute.Frame,
+        args: G26TapRingCaptureArgs,
+        insert_barrier_before: bool,
+    ) EncodeError!void {
+        if (args.num_rows == 0 or args.hidden_size == 0 or args.ring_cap == 0 or args.num_taps == 0) {
+            return error.ZeroDimension;
+        }
+        var params: G26TapRingCaptureParams = .{
+            .num_rows = args.num_rows,
+            .hidden_size = args.hidden_size,
+            .base_pos = args.base_pos,
+            .ring_cap = args.ring_cap,
+            .num_taps = args.num_taps,
+            .tap_idx = args.tap_idx,
+            .src_stride_rows = args.src_stride_rows,
+            .mode = if (args.accepted_nodes != null) 1 else 0,
+        };
+        if (args.accepted_nodes) |nodes| {
+            if (nodes.len != args.num_rows or nodes.len > MAX_TREE_NODES) return error.InvalidNodeCount;
+            for (nodes, 0..) |nid, i| params.inline_nodes[i] = nid;
+        }
+        const grid_y: u64 = if (args.accepted_nodes != null) args.num_taps else 1;
+        try frame.encodeThreadgroups(
+            self.g26_capture_tap_ring,
+            &.{ args.src, args.ring },
+            std.mem.asBytes(&params),
+            .{ args.num_rows, grid_y, 1 },
+            .{ 256, 1, 1 },
+            insert_barrier_before,
+        );
+    }
+};
+
+/// Element scalar dtype tag shared by `G26` sink bias and MoE router bias buffers.
+pub const ScalarDType = enum(u32) {
+    f16 = 0,
+    bf16 = 1,
+    f32 = 2,
+};
+
+pub const G26QkNormRopeKvParams = extern struct {
+    num_tokens: u32,
+    num_q_heads: u32,
+    num_kv_heads: u32,
+    k_head_dim: u32,
+    v_head_dim: u32,
+    rotary_dim: u32,
+    start_pos: u32,
+    chunk_tokens: u32,
+    num_retired_chunks: u32,
+    ring_capacity: u32,
+    tile_table_offset: u32,
+    mrope_s0: u32,
+    mrope_s1: u32,
+    mrope_s2: u32,
+    pos_mode: u32,
+    apply_qk_norm: u32,
+    qk_norm_unit_offset: u32,
+    kv_only: u32,
+    write_to_tiles: u32,
+    _pad0: u32 = 0,
+    rms_eps: f32,
+    rope_theta: f32,
+    v_scale: f32,
+    yarn_factor: f32,
+    yarn_mscale: f32,
+    yarn_beta_fast: f32,
+    yarn_beta_slow: f32,
+    original_max_pos: u32,
+
+    comptime {
+        if (@sizeOf(G26QkNormRopeKvParams) != 112) @compileError("G26QkNormRopeKvParams must be 112 bytes");
+    }
+};
+
+pub const G26QkNormRopeKvArgs = struct {
+    q: metal.BufferBinding,
+    k: metal.BufferBinding,
+    v: metal.BufferBinding,
+    q_norm: ?metal.BufferBinding = null,
+    k_norm: ?metal.BufferBinding = null,
+    norm_dtype: quant.FloatDType = .bf16,
+    qk_norm_unit_offset: bool = false,
+    positions_1d: ?metal.BufferBinding = null,
+    positions_3d: ?metal.BufferBinding = null,
+    k_out: ?metal.BufferBinding = null,
+    v_out: ?metal.BufferBinding = null,
+    kv_tiles: ?metal.BufferBinding = null,
+    num_tokens: u32,
+    num_q_heads: u32,
+    num_kv_heads: u32,
+    k_head_dim: u32,
+    v_head_dim: u32,
+    rotary_dim: u32 = 0,
+    start_pos: u32 = 0,
+    chunk_tokens: u32 = QSA_SWA_WINDOW_TOKENS,
+    num_retired_chunks: u32 = 0,
+    ring_capacity: u32 = 0,
+    tile_table_offset: u32 = 0,
+    mrope: MropeSection = MropeSection.QWEN38_DEFAULT,
+    yarn: YarnConfig = .{},
+    kv_only: bool = false,
+    write_to_tiles: bool = false,
+    rms_eps: f32 = 1e-6,
+    rope_theta: f32 = 10_000.0,
+    v_scale: f32 = 1.0,
+};
+
+pub const G26KvCommitParams = extern struct {
+    num_kv_heads: u32,
+    k_head_dim: u32,
+    v_head_dim: u32,
+    start_pos: u32,
+    num_tokens: u32,
+    chunk_tokens: u32,
+    num_retired_chunks: u32,
+    ring_capacity: u32,
+    tile_table_offset: u32,
+    use_node_list: u32,
+    use_node_buffer: u32,
+    _pad0: u32 = 0,
+    inline_nodes: [MAX_TREE_NODES]u16 = @splat(0),
+
+    comptime {
+        if (@sizeOf(G26KvCommitParams) != 176) @compileError("G26KvCommitParams must be 176 bytes");
+    }
+};
+
+pub const G26KvCommitArgs = struct {
+    k_src: metal.BufferBinding,
+    v_src: metal.BufferBinding,
+    kv_tiles: metal.BufferBinding,
+    num_kv_heads: u32,
+    k_head_dim: u32,
+    v_head_dim: u32,
+    start_pos: u32,
+    num_tokens: u32 = 0,
+    accepted_nodes: ?[]const u16 = null,
+    accepted_nodes_buf: ?metal.BufferBinding = null,
+    chunk_tokens: u32 = QSA_SWA_WINDOW_TOKENS,
+    num_retired_chunks: u32 = 0,
+    ring_capacity: u32 = 0,
+    tile_table_offset: u32 = 0,
+};
+
+pub const G26SwaAttnParams = extern struct {
+    num_q: u32,
+    q_start_pos: u32,
+    chunk_start_pos: u32,
+    kv_len: u32,
+    num_q_heads: u32,
+    num_kv_heads: u32,
+    k_head_dim: u32,
+    v_head_dim: u32,
+    window_size: u32,
+    ring_capacity: u32,
+    chunk_tokens: u32,
+    tile_table_offset: u32,
+    is_prefill: u32,
+    has_tree: u32,
+    has_positions: u32,
+    has_sink: u32,
+    sink_dtype: u32,
+    _pad0: u32 = 0,
+    scale: f32,
+    _pad1: u32 = 0,
+
+    comptime {
+        if (@sizeOf(G26SwaAttnParams) != 80) @compileError("G26SwaAttnParams must be 80 bytes");
+    }
+};
+
+pub const G26SwaAttnArgs = struct {
+    q: metal.BufferBinding,
+    kv_tiles: ?metal.BufferBinding = null,
+    k_extra: ?metal.BufferBinding = null,
+    v_extra: ?metal.BufferBinding = null,
+    ancestor_masks: ?metal.BufferBinding = null,
+    node_positions: ?metal.BufferBinding = null,
+    sink_bias: ?metal.BufferBinding = null,
+    sink_dtype: ScalarDType = .bf16,
+    out: metal.BufferBinding,
+    num_q: u32,
+    q_start_pos: u32 = 0,
+    chunk_start_pos: u32 = 0,
+    kv_len: u32,
+    num_q_heads: u32,
+    num_kv_heads: u32,
+    k_head_dim: u32,
+    v_head_dim: u32,
+    window_size: u32 = QSA_SWA_WINDOW_TOKENS,
+    ring_capacity: u32 = QSA_SWA_WINDOW_TOKENS,
+    chunk_tokens: u32 = QSA_SWA_WINDOW_TOKENS,
+    tile_table_offset: u32 = 0,
+    is_prefill: bool = false,
+    scale: ?f32 = null,
+};
+
+pub const G26MoeRouteSigmoidParams = extern struct {
+    m: u32,
+    num_experts: u32,
+    top_k: u32,
+    norm_topk_prob: u32,
+    has_bias: u32,
+    bias_dtype: u32,
+    n_group: u32,
+    topk_group: u32,
+    is_bucketed: u32,
+    bucket_unique_stride: u32,
+    bucket_offsets_stride: u32,
+    gate_up_groups_x_q: u32,
+    gate_up_groups_x_f: u32,
+    down_groups_x: u32,
+    down_groups_x_q8: u32,
+    routed_scaling_factor: f32,
+
+    comptime {
+        if (@sizeOf(G26MoeRouteSigmoidParams) != 64) @compileError("G26MoeRouteSigmoidParams must be 64 bytes");
+    }
+};
+
+pub const G26MoeRouteSigmoidArgs = struct {
+    logits: metal.BufferBinding,
+    logits_f16: bool = false,
+    bias: ?metal.BufferBinding = null,
+    bias_dtype: ScalarDType = .f32,
+    sched_hdr: metal.BufferBinding,
+    unique_experts: metal.BufferBinding,
+    expert_token_offsets: metal.BufferBinding,
+    token_indices: metal.BufferBinding,
+    routing_weights: metal.BufferBinding,
+    slot_k_indices: metal.BufferBinding,
+    scratch_topk_experts: metal.BufferBinding,
+    scratch_topk_weights: metal.BufferBinding,
+    expert_schemes: ?metal.BufferBinding = null,
+    bucket_headers: ?metal.BufferBinding = null,
+    bucket_unique_experts: ?metal.BufferBinding = null,
+    bucket_expert_token_offsets: ?metal.BufferBinding = null,
+    is_bucketed: bool = false,
+    bucket_unique_stride: u32 = 0,
+    bucket_offsets_stride: u32 = 0,
+    m: u32,
+    num_experts: u32,
+    top_k: u32,
+    norm_topk_prob: bool = true,
+    n_group: u32 = 1,
+    topk_group: u32 = 1,
+    routed_scaling_factor: f32 = 1.0,
+    gate_up_groups_x_q: u32,
+    gate_up_groups_x_f: u32,
+    down_groups_x: u32,
+    down_groups_x_q8: u32,
+};
+
+pub const G26TapRingCaptureParams = extern struct {
+    num_rows: u32,
+    hidden_size: u32,
+    base_pos: u32,
+    ring_cap: u32,
+    num_taps: u32,
+    tap_idx: u32,
+    src_stride_rows: u32,
+    mode: u32,
+    inline_nodes: [MAX_TREE_NODES]u16 = @splat(0),
+
+    comptime {
+        if (@sizeOf(G26TapRingCaptureParams) != 160) @compileError("G26TapRingCaptureParams must be 160 bytes");
+    }
+};
+
+pub const G26TapRingCaptureArgs = struct {
+    src: metal.BufferBinding,
+    ring: metal.BufferBinding,
+    num_rows: u32,
+    hidden_size: u32,
+    base_pos: u32,
+    ring_cap: u32,
+    num_taps: u32,
+    tap_idx: u32 = 0,
+    src_stride_rows: u32 = 0,
+    accepted_nodes: ?[]const u16 = null,
 };
 
 // ===========================================================================
@@ -9831,5 +10494,811 @@ test "gpu.hybrid: G19 QSA and MLA simdgroup_half8x8 prefill parity vs scalar/vec
     _ = gpa;
     for (0..q_nope_elems) |i| {
         try std.testing.expectApproxEqAbs(@as(f32, @floatCast(out_vec_mla[i])), @as(f32, @floatCast(out_mma_mla[i])), 4e-3);
+    }
+}
+
+test "M9.1 G26: asymmetric 192/128 128+sink HybridKvRing SWA (prefill >128 wrap, decode, verifyTree+commitTreeKv) vs CPU fp32 ref" {
+    const gpa = std.testing.allocator;
+    const device = try metal.Device.open();
+    defer device.close();
+    const library = try metal.Library.openEmbedded(device);
+    defer library.close();
+    const pipes = try HybridPipelines.init(device, library);
+    defer pipes.close();
+
+    const num_q_heads: u32 = 16;
+    const num_kv_heads: u32 = 4;
+    const k_head_dim: u32 = 192;
+    const v_head_dim: u32 = 128;
+    const rotary_dim: u32 = 64;
+    const window_size: u32 = QSA_SWA_WINDOW_TOKENS; // 128
+    const rope_theta: f32 = 10000.0;
+    const v_scale: f32 = 0.707;
+    const prefix_len: u32 = 90;
+    const chunk2_len: u32 = 80; // 90 + 80 = 170 > 128 -> forces circular wraparound!
+    const prefill_total: u32 = prefix_len + chunk2_len;
+    const tree_m: u32 = 12;
+
+    const q_row_elems: usize = @as(usize, num_q_heads) * k_head_dim;
+    const k_row_elems: usize = @as(usize, num_kv_heads) * k_head_dim;
+    const v_row_elems: usize = @as(usize, num_kv_heads) * v_head_dim;
+    const o_row_elems: usize = @as(usize, num_q_heads) * v_head_dim;
+
+    const max_rows: usize = @max(@as(usize, chunk2_len), @as(usize, prefix_len));
+    const q_bytes = max_rows * q_row_elems * @sizeOf(f16);
+    const k_bytes = max_rows * k_row_elems * @sizeOf(f16);
+    const v_bytes = max_rows * v_row_elems * @sizeOf(f16);
+    const o_bytes = max_rows * o_row_elems * @sizeOf(f16);
+    const sink_bytes = @as(usize, num_q_heads) * @sizeOf(u16);
+    const table_bytes = try HybridKvRing.tableRequiredBytes(1);
+
+    const arena_cap = try page.alignUp(
+        q_bytes + 2 * k_bytes + 2 * v_bytes + o_bytes + sink_bytes + table_bytes +
+            @as(usize, tree_m) * (@sizeOf(u64) + @sizeOf(u32)) + 16384,
+    ) + page.APPLE_PAGE_SIZE;
+    const budget = budget_mod.Budget.compute(.{
+        .memory_bytes = arena_cap + 4 * page.APPLE_PAGE_SIZE,
+        .user_wire_limit = arena_cap,
+        .global_user_wire_limit = arena_cap,
+        .gpu_working_set_bytes = arena_cap,
+        .configured_cap = null,
+        .headroom_bytes = page.APPLE_PAGE_SIZE,
+    });
+    var arena = try arena_mod.WiredArena.init(arena_cap, budget);
+    defer arena.deinit();
+
+    var swa_ring = try HybridKvRing.init(gpa, device, &arena, .{
+        .mode = .sliding_window_128,
+        .num_tiles = 1,
+        .num_kv_heads = num_kv_heads,
+        .head_dim = k_head_dim,
+        .v_head_dim = v_head_dim,
+    });
+    defer swa_ring.deinit(gpa);
+    try std.testing.expectEqual(k_head_dim, swa_ring.head_dim);
+    try std.testing.expectEqual(v_head_dim, swa_ring.v_head_dim);
+
+    const q_raw = try arena.allocAligned(q_bytes, 64);
+    const k_raw = try arena.allocAligned(k_bytes, 64);
+    const v_raw = try arena.allocAligned(v_bytes, 64);
+    const k_out_raw = try arena.allocAligned(k_bytes, 64);
+    const v_out_raw = try arena.allocAligned(v_bytes, 64);
+    const o_raw = try arena.allocAligned(o_bytes, 64);
+    const sink_raw = try arena.allocAligned(sink_bytes, 64);
+    const masks_raw = try arena.allocAligned(@as(usize, tree_m) * @sizeOf(u64), 64);
+    const pos_raw = try arena.allocAligned(@as(usize, tree_m) * @sizeOf(u32), 64);
+
+    const q_h: []f16 = @alignCast(std.mem.bytesAsSlice(f16, q_raw[0..q_bytes]));
+    const k_h: []f16 = @alignCast(std.mem.bytesAsSlice(f16, k_raw[0..k_bytes]));
+    const v_h: []f16 = @alignCast(std.mem.bytesAsSlice(f16, v_raw[0..v_bytes]));
+    const o_h: []f16 = @alignCast(std.mem.bytesAsSlice(f16, o_raw[0..o_bytes]));
+    const sink_bf16: []u16 = @alignCast(std.mem.bytesAsSlice(u16, sink_raw[0..sink_bytes]));
+    const masks_h: []u64 = @alignCast(std.mem.bytesAsSlice(u64, masks_raw[0 .. @as(usize, tree_m) * @sizeOf(u64)]));
+    const pos_h: []u32 = @alignCast(std.mem.bytesAsSlice(u32, pos_raw[0 .. @as(usize, tree_m) * @sizeOf(u32)]));
+
+    var sink_f32: [num_q_heads]f32 = undefined;
+    for (0..num_q_heads) |h_idx| {
+        const s_val: f32 = if ((h_idx % 2) == 0) (1.2 + 0.25 * @as(f32, @floatFromInt(h_idx))) else (-0.8 - 0.1 * @as(f32, @floatFromInt(h_idx)));
+        const b16 = quant.f32ToBf16(s_val);
+        sink_bf16[h_idx] = b16;
+        sink_f32[h_idx] = quant.bf16ToF32(b16);
+    }
+
+    const buf = try metal.Buffer.wrap(device, arena.bytes());
+    defer buf.close();
+    var compute = try metal.Compute.initWithFrames(device, 2);
+    defer compute.close();
+    try compute.makeResident(&.{buf});
+    try swa_ring.makeResident(compute);
+    defer swa_ring.removeResident(compute) catch |err| {
+        std.debug.panic("removeResident failed: {}", .{err});
+    };
+
+    const q_bind = metal.BufferBinding{ .buffer = buf, .offset = arena.offsetOf(q_raw.ptr) };
+    const k_bind = metal.BufferBinding{ .buffer = buf, .offset = arena.offsetOf(k_raw.ptr) };
+    const v_bind = metal.BufferBinding{ .buffer = buf, .offset = arena.offsetOf(v_raw.ptr) };
+    const k_out_bind = metal.BufferBinding{ .buffer = buf, .offset = arena.offsetOf(k_out_raw.ptr) };
+    const v_out_bind = metal.BufferBinding{ .buffer = buf, .offset = arena.offsetOf(v_out_raw.ptr) };
+    const o_bind = metal.BufferBinding{ .buffer = buf, .offset = arena.offsetOf(o_raw.ptr) };
+    const sink_bind = metal.BufferBinding{ .buffer = buf, .offset = arena.offsetOf(sink_raw.ptr) };
+    const masks_bind = metal.BufferBinding{ .buffer = buf, .offset = arena.offsetOf(masks_raw.ptr) };
+    const pos_bind = metal.BufferBinding{ .buffer = buf, .offset = arena.offsetOf(pos_raw.ptr) };
+    const ring_tbl_bind = swa_ring.tileTableBinding(buf);
+
+    // CPU FP32 reference KV history (up to 200 tokens) + partial NeoX RoPE helper.
+    const max_hist: usize = 200;
+    const ref_k = try gpa.alloc(f32, max_hist * k_row_elems);
+    defer gpa.free(ref_k);
+    const ref_v = try gpa.alloc(f32, max_hist * v_row_elems);
+    defer gpa.free(ref_v);
+
+    const applyPartialRopeF32 = struct {
+        fn call(vec: []f32, pos: u32, r_dim: u32, theta: f32) void {
+            const half: usize = r_dim / 2;
+            const p_f: f32 = @floatFromInt(pos);
+            for (0..half) |i| {
+                const exp_arg = -(@as(f32, @floatFromInt(2 * i)) / @as(f32, @floatFromInt(r_dim)));
+                const freq = std.math.pow(f32, theta, exp_arg);
+                const ang = p_f * freq;
+                const c = @cos(ang);
+                const s = @sin(ang);
+                const x0 = vec[i];
+                const x1 = vec[i + half];
+                vec[i] = x0 * c - x1 * s;
+                vec[i + half] = x1 * c + x0 * s;
+            }
+            for (vec) |*v| v.* = @floatCast(@as(f16, @floatCast(v.*)));
+        }
+    }.call;
+
+    const evalSwaCpuRef = struct {
+        fn call(
+            q_rot: []const f32,
+            k_hist: []const f32,
+            v_hist: []const f32,
+            k_extra: ?[]const f32,
+            v_extra: ?[]const f32,
+            q_pos: u32,
+            prefix_kv_len: u32,
+            extra_mask: u64,
+            extra_count: u32,
+            sinks: []const f32,
+            out_row: []f32,
+        ) void {
+            const qk_scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(k_head_dim)));
+            const gqa_ratio = num_q_heads / num_kv_heads;
+            const t_lo: u32 = if (q_pos + 1 > window_size) (q_pos + 1 - window_size) else 0;
+            const t_hi: u32 = @min(prefix_kv_len, q_pos + 1);
+            for (0..num_q_heads) |qh| {
+                const kvh = qh / gqa_ratio;
+                var m_val: f32 = sinks[qh];
+                var l_val: f32 = 1.0;
+                var acc: [v_head_dim]f32 = @splat(0.0);
+
+                var t: u32 = t_lo;
+                while (t < t_hi) : (t += 1) {
+                    var dot: f32 = 0.0;
+                    const ks = k_hist[t * k_row_elems + kvh * k_head_dim ..][0..k_head_dim];
+                    const qs = q_rot[qh * k_head_dim ..][0..k_head_dim];
+                    for (0..k_head_dim) |d| dot += qs[d] * ks[d];
+                    const sc = dot * qk_scale;
+                    const new_m = @max(m_val, sc);
+                    const old_s = @exp(m_val - new_m);
+                    const cur_s = @exp(sc - new_m);
+                    l_val = l_val * old_s + cur_s;
+                    const vs = v_hist[t * v_row_elems + kvh * v_head_dim ..][0..v_head_dim];
+                    for (0..v_head_dim) |d| acc[d] = acc[d] * old_s + cur_s * vs[d];
+                    m_val = new_m;
+                }
+                if (k_extra != null and v_extra != null) {
+                    const ke = k_extra.?;
+                    const ve = v_extra.?;
+                    for (0..extra_count) |ei| {
+                        if (((extra_mask >> @intCast(ei)) & 1) == 0) continue;
+                        var dot: f32 = 0.0;
+                        const ks = ke[ei * k_row_elems + kvh * k_head_dim ..][0..k_head_dim];
+                        const qs = q_rot[qh * k_head_dim ..][0..k_head_dim];
+                        for (0..k_head_dim) |d| dot += qs[d] * ks[d];
+                        const sc = dot * qk_scale;
+                        const new_m = @max(m_val, sc);
+                        const old_s = @exp(m_val - new_m);
+                        const cur_s = @exp(sc - new_m);
+                        l_val = l_val * old_s + cur_s;
+                        const vs = ve[ei * v_row_elems + kvh * v_head_dim ..][0..v_head_dim];
+                        for (0..v_head_dim) |d| acc[d] = acc[d] * old_s + cur_s * vs[d];
+                        m_val = new_m;
+                    }
+                }
+                const inv_l: f32 = 1.0 / l_val;
+                for (0..v_head_dim) |d| out_row[qh * v_head_dim + d] = acc[d] * inv_l;
+            }
+        }
+    }.call;
+
+    // --- Phase 1a: Prefill first 90 tokens into circular 128-token HybridKvRing ---
+    for (0..prefix_len) |t| {
+        for (0..q_row_elems) |i| q_h[t * q_row_elems + i] = @floatCast(synthF32(1000 + t * 17 + i, 0.25));
+        for (0..k_row_elems) |i| k_h[t * k_row_elems + i] = @floatCast(synthF32(2000 + t * 23 + i, 0.25));
+        for (0..v_row_elems) |i| v_h[t * v_row_elems + i] = @floatCast(synthF32(3000 + t * 31 + i, 0.25));
+        for (0..num_kv_heads) |kvh| {
+            const ks = ref_k[t * k_row_elems + kvh * k_head_dim ..][0..k_head_dim];
+            for (0..k_head_dim) |d| ks[d] = @floatCast(k_h[t * k_row_elems + kvh * k_head_dim + d]);
+            applyPartialRopeF32(ks, @intCast(t), rotary_dim, rope_theta);
+            const vs = ref_v[t * v_row_elems + kvh * v_head_dim ..][0..v_head_dim];
+            for (0..v_head_dim) |d| vs[d] = @floatCast(@as(f16, @floatCast(@as(f32, @floatCast(v_h[t * v_row_elems + kvh * v_head_dim + d])) * v_scale)));
+        }
+    }
+    {
+        var frame = try compute.beginFrame(5000);
+        errdefer frame.abort();
+        try pipes.encodeG26QkNormRopeKv(&frame, .{
+            .q = q_bind,
+            .k = k_bind,
+            .v = v_bind,
+            .k_out = k_out_bind,
+            .v_out = v_out_bind,
+            .num_tokens = prefix_len,
+            .num_q_heads = num_q_heads,
+            .num_kv_heads = num_kv_heads,
+            .k_head_dim = k_head_dim,
+            .v_head_dim = v_head_dim,
+            .rotary_dim = rotary_dim,
+            .start_pos = 0,
+            .chunk_tokens = swa_ring.chunk_tokens,
+            .ring_capacity = swa_ring.ring_capacity,
+            .kv_only = true,
+            .write_to_tiles = false,
+            .rope_theta = rope_theta,
+            .v_scale = v_scale,
+        }, false);
+        try pipes.encodeG26KvCommit(&frame, .{
+            .k_src = k_out_bind,
+            .v_src = v_out_bind,
+            .kv_tiles = ring_tbl_bind,
+            .num_kv_heads = num_kv_heads,
+            .k_head_dim = k_head_dim,
+            .v_head_dim = v_head_dim,
+            .num_tokens = prefix_len,
+            .start_pos = 0,
+            .chunk_tokens = swa_ring.chunk_tokens,
+            .ring_capacity = swa_ring.ring_capacity,
+        }, true);
+        const sig = try frame.commit();
+        try compute.wait(sig, 5000);
+    }
+
+    // --- Phase 1b: Prefill next 80 tokens (pos 90..169 -> crosses 128 wrap!) ---
+    const q_rot_chunk = try gpa.alloc(f32, chunk2_len * q_row_elems);
+    defer gpa.free(q_rot_chunk);
+    for (0..chunk2_len) |ci| {
+        const t = prefix_len + @as(u32, @intCast(ci));
+        for (0..q_row_elems) |i| q_h[ci * q_row_elems + i] = @floatCast(synthF32(5000 + t * 19 + i, 0.25));
+        for (0..k_row_elems) |i| k_h[ci * k_row_elems + i] = @floatCast(synthF32(6000 + t * 29 + i, 0.25));
+        for (0..v_row_elems) |i| v_h[ci * v_row_elems + i] = @floatCast(synthF32(7000 + t * 37 + i, 0.25));
+        for (0..num_q_heads) |qh| {
+            const qs = q_rot_chunk[ci * q_row_elems + qh * k_head_dim ..][0..k_head_dim];
+            for (0..k_head_dim) |d| qs[d] = @floatCast(q_h[ci * q_row_elems + qh * k_head_dim + d]);
+            applyPartialRopeF32(qs, t, rotary_dim, rope_theta);
+        }
+        for (0..num_kv_heads) |kvh| {
+            const ks = ref_k[t * k_row_elems + kvh * k_head_dim ..][0..k_head_dim];
+            for (0..k_head_dim) |d| ks[d] = @floatCast(k_h[ci * k_row_elems + kvh * k_head_dim + d]);
+            applyPartialRopeF32(ks, t, rotary_dim, rope_theta);
+            const vs = ref_v[t * v_row_elems + kvh * v_head_dim ..][0..v_head_dim];
+            for (0..v_head_dim) |d| vs[d] = @floatCast(@as(f16, @floatCast(@as(f32, @floatCast(v_h[ci * v_row_elems + kvh * v_head_dim + d])) * v_scale)));
+        }
+    }
+    {
+        var frame = try compute.beginFrame(5000);
+        errdefer frame.abort();
+        try pipes.encodeG26QkNormRopeKv(&frame, .{
+            .q = q_bind,
+            .k = k_bind,
+            .v = v_bind,
+            .k_out = k_out_bind,
+            .v_out = v_out_bind,
+            .num_tokens = chunk2_len,
+            .num_q_heads = num_q_heads,
+            .num_kv_heads = num_kv_heads,
+            .k_head_dim = k_head_dim,
+            .v_head_dim = v_head_dim,
+            .rotary_dim = rotary_dim,
+            .start_pos = prefix_len,
+            .chunk_tokens = swa_ring.chunk_tokens,
+            .ring_capacity = swa_ring.ring_capacity,
+            .kv_only = false,
+            .write_to_tiles = false,
+            .rope_theta = rope_theta,
+            .v_scale = v_scale,
+        }, false);
+        try pipes.encodeG26SwaAttn(&frame, .{
+            .q = q_bind,
+            .kv_tiles = ring_tbl_bind,
+            .k_extra = k_out_bind,
+            .v_extra = v_out_bind,
+            .sink_bias = sink_bind,
+            .sink_dtype = .bf16,
+            .out = o_bind,
+            .num_q = chunk2_len,
+            .q_start_pos = prefix_len,
+            .chunk_start_pos = prefix_len,
+            .kv_len = prefill_total,
+            .num_q_heads = num_q_heads,
+            .num_kv_heads = num_kv_heads,
+            .k_head_dim = k_head_dim,
+            .v_head_dim = v_head_dim,
+            .window_size = window_size,
+            .ring_capacity = swa_ring.ring_capacity,
+            .chunk_tokens = swa_ring.chunk_tokens,
+            .is_prefill = true,
+        }, true);
+        try pipes.encodeG26KvCommit(&frame, .{
+            .k_src = k_out_bind,
+            .v_src = v_out_bind,
+            .kv_tiles = ring_tbl_bind,
+            .num_kv_heads = num_kv_heads,
+            .k_head_dim = k_head_dim,
+            .v_head_dim = v_head_dim,
+            .num_tokens = chunk2_len,
+            .start_pos = prefix_len,
+            .chunk_tokens = swa_ring.chunk_tokens,
+            .ring_capacity = swa_ring.ring_capacity,
+        }, true);
+        const sig = try frame.commit();
+        try compute.wait(sig, 5000);
+    }
+
+    const ref_out = try gpa.alloc(f32, o_row_elems);
+    defer gpa.free(ref_out);
+    var max_err_prefill: f32 = 0.0;
+    for (0..chunk2_len) |ci| {
+        const q_pos = prefix_len + @as(u32, @intCast(ci));
+        evalSwaCpuRef(
+            q_rot_chunk[ci * q_row_elems ..][0..q_row_elems],
+            ref_k,
+            ref_v,
+            null,
+            null,
+            q_pos,
+            q_pos + 1,
+            0,
+            0,
+            &sink_f32,
+            ref_out,
+        );
+        for (0..o_row_elems) |i| {
+            const diff = @abs(@as(f32, @floatCast(o_h[ci * o_row_elems + i])) - ref_out[i]);
+            if (diff > max_err_prefill) max_err_prefill = diff;
+        }
+    }
+    try std.testing.expect(max_err_prefill < 4e-3);
+
+    // --- Phase 2: M = 1 Decode after circular wraparound (pos = 170) ---
+    const dec_pos: u32 = prefill_total; // 170
+    const q_rot_dec = try gpa.alloc(f32, q_row_elems);
+    defer gpa.free(q_rot_dec);
+    for (0..q_row_elems) |i| q_h[i] = @floatCast(synthF32(9000 + i, 0.25));
+    for (0..k_row_elems) |i| k_h[i] = @floatCast(synthF32(9500 + i, 0.25));
+    for (0..v_row_elems) |i| v_h[i] = @floatCast(synthF32(9800 + i, 0.25));
+    for (0..num_q_heads) |qh| {
+        const qs = q_rot_dec[qh * k_head_dim ..][0..k_head_dim];
+        for (0..k_head_dim) |d| qs[d] = @floatCast(q_h[qh * k_head_dim + d]);
+        applyPartialRopeF32(qs, dec_pos, rotary_dim, rope_theta);
+    }
+    for (0..num_kv_heads) |kvh| {
+        const ks = ref_k[dec_pos * k_row_elems + kvh * k_head_dim ..][0..k_head_dim];
+        for (0..k_head_dim) |d| ks[d] = @floatCast(k_h[kvh * k_head_dim + d]);
+        applyPartialRopeF32(ks, dec_pos, rotary_dim, rope_theta);
+        const vs = ref_v[dec_pos * v_row_elems + kvh * v_head_dim ..][0..v_head_dim];
+        for (0..v_head_dim) |d| vs[d] = @floatCast(@as(f16, @floatCast(@as(f32, @floatCast(v_h[kvh * v_head_dim + d])) * v_scale)));
+    }
+    masks_h[0] = 1;
+    pos_h[0] = dec_pos;
+    {
+        var frame = try compute.beginFrame(5000);
+        errdefer frame.abort();
+        try pipes.encodeG26QkNormRopeKv(&frame, .{
+            .q = q_bind,
+            .k = k_bind,
+            .v = v_bind,
+            .positions_1d = pos_bind,
+            .k_out = k_out_bind,
+            .v_out = v_out_bind,
+            .num_tokens = 1,
+            .num_q_heads = num_q_heads,
+            .num_kv_heads = num_kv_heads,
+            .k_head_dim = k_head_dim,
+            .v_head_dim = v_head_dim,
+            .rotary_dim = rotary_dim,
+            .start_pos = dec_pos,
+            .chunk_tokens = swa_ring.chunk_tokens,
+            .ring_capacity = swa_ring.ring_capacity,
+            .kv_only = false,
+            .write_to_tiles = false,
+            .rope_theta = rope_theta,
+            .v_scale = v_scale,
+        }, false);
+        try pipes.encodeG26SwaAttn(&frame, .{
+            .q = q_bind,
+            .kv_tiles = ring_tbl_bind,
+            .k_extra = k_out_bind,
+            .v_extra = v_out_bind,
+            .ancestor_masks = masks_bind,
+            .node_positions = pos_bind,
+            .sink_bias = sink_bind,
+            .sink_dtype = .bf16,
+            .out = o_bind,
+            .num_q = 1,
+            .q_start_pos = dec_pos,
+            .kv_len = dec_pos,
+            .num_q_heads = num_q_heads,
+            .num_kv_heads = num_kv_heads,
+            .k_head_dim = k_head_dim,
+            .v_head_dim = v_head_dim,
+            .window_size = window_size,
+            .ring_capacity = swa_ring.ring_capacity,
+            .chunk_tokens = swa_ring.chunk_tokens,
+            .is_prefill = false,
+        }, true);
+        const acc0 = [_]u16{0};
+        try pipes.encodeG26KvCommit(&frame, .{
+            .k_src = k_out_bind,
+            .v_src = v_out_bind,
+            .kv_tiles = ring_tbl_bind,
+            .num_kv_heads = num_kv_heads,
+            .k_head_dim = k_head_dim,
+            .v_head_dim = v_head_dim,
+            .start_pos = dec_pos,
+            .accepted_nodes = &acc0,
+            .chunk_tokens = swa_ring.chunk_tokens,
+            .ring_capacity = swa_ring.ring_capacity,
+        }, true);
+        const sig = try frame.commit();
+        try compute.wait(sig, 5000);
+    }
+    evalSwaCpuRef(q_rot_dec, ref_k, ref_v, null, null, dec_pos, dec_pos + 1, 0, 0, &sink_f32, ref_out);
+    for (0..o_row_elems) |i| {
+        try std.testing.expectApproxEqAbs(ref_out[i], @as(f32, @floatCast(o_h[i])), 4e-3);
+    }
+
+    // --- Phase 3: M = 12 branching verifyTree + commitTreeKv + follow-up decode ---
+    const tree_base: u32 = dec_pos + 1; // 171
+    // Branching speculative tree (depth 0..4):
+    //   0(d0) -> 1(d1) -> 3(d2) -> 6(d3) -> 10(d4)
+    //                  -> 4(d2) -> 7(d3)
+    //         -> 2(d1) -> 5(d2) -> 8(d3) -> 11(d4)
+    //                           -> 9(d3)
+    const tree_depths = [tree_m]u32{ 0, 1, 1, 2, 2, 2, 3, 3, 3, 3, 4, 4 };
+    const tree_masks = [tree_m]u64{
+        0b0000_0000_0001, // 0
+        0b0000_0000_0011, // 1: {0,1}
+        0b0000_0000_0101, // 2: {0,2}
+        0b0000_0000_1011, // 3: {0,1,3}
+        0b0000_0001_0011, // 4: {0,1,4}
+        0b0000_0010_0101, // 5: {0,2,5}
+        0b0000_0100_1011, // 6: {0,1,3,6}
+        0b0000_1001_0011, // 7: {0,1,4,7}
+        0b0001_0010_0101, // 8: {0,2,5,8}
+        0b0010_0010_0101, // 9: {0,2,5,9}
+        0b0100_0100_1011, // 10: {0,1,3,6,10}
+        0b1001_0010_0101, // 11: {0,2,5,8,11}
+    };
+    const tree_q_rot = try gpa.alloc(f32, tree_m * q_row_elems);
+    defer gpa.free(tree_q_rot);
+    const tree_k_rot = try gpa.alloc(f32, tree_m * k_row_elems);
+    defer gpa.free(tree_k_rot);
+    const tree_v_scaled = try gpa.alloc(f32, tree_m * v_row_elems);
+    defer gpa.free(tree_v_scaled);
+    for (0..tree_m) |ni| {
+        const np = tree_base + tree_depths[ni];
+        pos_h[ni] = np;
+        masks_h[ni] = tree_masks[ni];
+        for (0..q_row_elems) |i| q_h[ni * q_row_elems + i] = @floatCast(synthF32(12000 + ni * 41 + i, 0.25));
+        for (0..k_row_elems) |i| k_h[ni * k_row_elems + i] = @floatCast(synthF32(13000 + ni * 43 + i, 0.25));
+        for (0..v_row_elems) |i| v_h[ni * v_row_elems + i] = @floatCast(synthF32(14000 + ni * 47 + i, 0.25));
+        for (0..num_q_heads) |qh| {
+            const qs = tree_q_rot[ni * q_row_elems + qh * k_head_dim ..][0..k_head_dim];
+            for (0..k_head_dim) |d| qs[d] = @floatCast(q_h[ni * q_row_elems + qh * k_head_dim + d]);
+            applyPartialRopeF32(qs, np, rotary_dim, rope_theta);
+        }
+        for (0..num_kv_heads) |kvh| {
+            const ks = tree_k_rot[ni * k_row_elems + kvh * k_head_dim ..][0..k_head_dim];
+            for (0..k_head_dim) |d| ks[d] = @floatCast(k_h[ni * k_row_elems + kvh * k_head_dim + d]);
+            applyPartialRopeF32(ks, np, rotary_dim, rope_theta);
+            const vs = tree_v_scaled[ni * v_row_elems + kvh * v_head_dim ..][0..v_head_dim];
+            for (0..v_head_dim) |d| vs[d] = @floatCast(@as(f16, @floatCast(@as(f32, @floatCast(v_h[ni * v_row_elems + kvh * v_head_dim + d])) * v_scale)));
+        }
+    }
+    const accepted_branch = [_]u16{ 0, 2, 5, 8, 11 };
+    {
+        var frame = try compute.beginFrame(5000);
+        errdefer frame.abort();
+        try pipes.encodeG26QkNormRopeKv(&frame, .{
+            .q = q_bind,
+            .k = k_bind,
+            .v = v_bind,
+            .positions_1d = pos_bind,
+            .k_out = k_out_bind,
+            .v_out = v_out_bind,
+            .num_tokens = tree_m,
+            .num_q_heads = num_q_heads,
+            .num_kv_heads = num_kv_heads,
+            .k_head_dim = k_head_dim,
+            .v_head_dim = v_head_dim,
+            .rotary_dim = rotary_dim,
+            .start_pos = tree_base,
+            .chunk_tokens = swa_ring.chunk_tokens,
+            .ring_capacity = swa_ring.ring_capacity,
+            .kv_only = false,
+            .write_to_tiles = false,
+            .rope_theta = rope_theta,
+            .v_scale = v_scale,
+        }, false);
+        try pipes.encodeG26SwaAttn(&frame, .{
+            .q = q_bind,
+            .kv_tiles = ring_tbl_bind,
+            .k_extra = k_out_bind,
+            .v_extra = v_out_bind,
+            .ancestor_masks = masks_bind,
+            .node_positions = pos_bind,
+            .sink_bias = sink_bind,
+            .sink_dtype = .bf16,
+            .out = o_bind,
+            .num_q = tree_m,
+            .q_start_pos = tree_base,
+            .kv_len = tree_base,
+            .num_q_heads = num_q_heads,
+            .num_kv_heads = num_kv_heads,
+            .k_head_dim = k_head_dim,
+            .v_head_dim = v_head_dim,
+            .window_size = window_size,
+            .ring_capacity = swa_ring.ring_capacity,
+            .chunk_tokens = swa_ring.chunk_tokens,
+            .is_prefill = false,
+        }, true);
+        try pipes.encodeG26KvCommit(&frame, .{
+            .k_src = k_out_bind,
+            .v_src = v_out_bind,
+            .kv_tiles = ring_tbl_bind,
+            .num_kv_heads = num_kv_heads,
+            .k_head_dim = k_head_dim,
+            .v_head_dim = v_head_dim,
+            .start_pos = tree_base,
+            .accepted_nodes = &accepted_branch,
+            .chunk_tokens = swa_ring.chunk_tokens,
+            .ring_capacity = swa_ring.ring_capacity,
+        }, true);
+        const sig = try frame.commit();
+        try compute.wait(sig, 5000);
+    }
+
+    var max_err_tree: f32 = 0.0;
+    for (0..tree_m) |ni| {
+        evalSwaCpuRef(
+            tree_q_rot[ni * q_row_elems ..][0..q_row_elems],
+            ref_k,
+            ref_v,
+            tree_k_rot,
+            tree_v_scaled,
+            pos_h[ni],
+            tree_base,
+            tree_masks[ni],
+            tree_m,
+            &sink_f32,
+            ref_out,
+        );
+        for (0..o_row_elems) |i| {
+            const diff = @abs(@as(f32, @floatCast(o_h[ni * o_row_elems + i])) - ref_out[i]);
+            if (diff > max_err_tree) max_err_tree = diff;
+        }
+    }
+    try std.testing.expect(max_err_tree < 4e-3);
+
+    // Commit accepted branch in CPU ref, run one follow-up M=1 decode at pos = 176.
+    for (accepted_branch, 0..) |nid, step| {
+        const p = tree_base + @as(u32, @intCast(step));
+        @memcpy(ref_k[p * k_row_elems ..][0..k_row_elems], tree_k_rot[@as(usize, nid) * k_row_elems ..][0..k_row_elems]);
+        @memcpy(ref_v[p * v_row_elems ..][0..v_row_elems], tree_v_scaled[@as(usize, nid) * v_row_elems ..][0..v_row_elems]);
+    }
+    const post_pos: u32 = tree_base + @as(u32, accepted_branch.len); // 176
+    for (0..q_row_elems) |i| q_h[i] = @floatCast(synthF32(19000 + i, 0.25));
+    for (0..k_row_elems) |i| k_h[i] = @floatCast(synthF32(19500 + i, 0.25));
+    for (0..v_row_elems) |i| v_h[i] = @floatCast(synthF32(19800 + i, 0.25));
+    for (0..num_q_heads) |qh| {
+        const qs = q_rot_dec[qh * k_head_dim ..][0..k_head_dim];
+        for (0..k_head_dim) |d| qs[d] = @floatCast(q_h[qh * k_head_dim + d]);
+        applyPartialRopeF32(qs, post_pos, rotary_dim, rope_theta);
+    }
+    for (0..num_kv_heads) |kvh| {
+        const ks = ref_k[post_pos * k_row_elems + kvh * k_head_dim ..][0..k_head_dim];
+        for (0..k_head_dim) |d| ks[d] = @floatCast(k_h[kvh * k_head_dim + d]);
+        applyPartialRopeF32(ks, post_pos, rotary_dim, rope_theta);
+        const vs = ref_v[post_pos * v_row_elems + kvh * v_head_dim ..][0..v_head_dim];
+        for (0..v_head_dim) |d| vs[d] = @floatCast(@as(f16, @floatCast(@as(f32, @floatCast(v_h[kvh * v_head_dim + d])) * v_scale)));
+    }
+    masks_h[0] = 1;
+    pos_h[0] = post_pos;
+    {
+        var frame = try compute.beginFrame(5000);
+        errdefer frame.abort();
+        try pipes.encodeG26QkNormRopeKv(&frame, .{
+            .q = q_bind,
+            .k = k_bind,
+            .v = v_bind,
+            .positions_1d = pos_bind,
+            .k_out = k_out_bind,
+            .v_out = v_out_bind,
+            .num_tokens = 1,
+            .num_q_heads = num_q_heads,
+            .num_kv_heads = num_kv_heads,
+            .k_head_dim = k_head_dim,
+            .v_head_dim = v_head_dim,
+            .rotary_dim = rotary_dim,
+            .start_pos = post_pos,
+            .chunk_tokens = swa_ring.chunk_tokens,
+            .ring_capacity = swa_ring.ring_capacity,
+            .kv_only = false,
+            .write_to_tiles = false,
+            .rope_theta = rope_theta,
+            .v_scale = v_scale,
+        }, false);
+        try pipes.encodeG26SwaAttn(&frame, .{
+            .q = q_bind,
+            .kv_tiles = ring_tbl_bind,
+            .k_extra = k_out_bind,
+            .v_extra = v_out_bind,
+            .ancestor_masks = masks_bind,
+            .node_positions = pos_bind,
+            .sink_bias = sink_bind,
+            .sink_dtype = .bf16,
+            .out = o_bind,
+            .num_q = 1,
+            .q_start_pos = post_pos,
+            .kv_len = post_pos,
+            .num_q_heads = num_q_heads,
+            .num_kv_heads = num_kv_heads,
+            .k_head_dim = k_head_dim,
+            .v_head_dim = v_head_dim,
+            .window_size = window_size,
+            .ring_capacity = swa_ring.ring_capacity,
+            .chunk_tokens = swa_ring.chunk_tokens,
+            .is_prefill = false,
+        }, true);
+        const sig = try frame.commit();
+        try compute.wait(sig, 5000);
+    }
+    evalSwaCpuRef(q_rot_dec, ref_k, ref_v, null, null, post_pos, post_pos + 1, 0, 0, &sink_f32, ref_out);
+    for (0..o_row_elems) |i| {
+        try std.testing.expectApproxEqAbs(ref_out[i], @as(f32, @floatCast(o_h[i])), 4e-3);
+    }
+}
+
+test "M9.1 G26: ami_moe_route_topk_sigmoid (E=256 and E=384, top-8, e_score_correction_bias, scaling) vs CPU fp32 ref" {
+    const device = try metal.Device.open();
+    defer device.close();
+    const library = try metal.Library.openEmbedded(device);
+    defer library.close();
+    const pipes = try HybridPipelines.init(device, library);
+    defer pipes.close();
+
+    const cases = [_]struct { e: u32, m: u32, top_k: u32, scale: f32 }{
+        .{ .e = 256, .m = 4, .top_k = 8, .scale = 1.0 },
+        .{ .e = 384, .m = 2, .top_k = 8, .scale = 2.5 },
+    };
+
+    const arena_cap = try page.alignUp(256 * 1024);
+    const budget = budget_mod.Budget.compute(.{
+        .memory_bytes = arena_cap + 4 * page.APPLE_PAGE_SIZE,
+        .user_wire_limit = arena_cap,
+        .global_user_wire_limit = arena_cap,
+        .gpu_working_set_bytes = arena_cap,
+        .configured_cap = null,
+        .headroom_bytes = page.APPLE_PAGE_SIZE,
+    });
+    var arena = try arena_mod.WiredArena.init(arena_cap, budget);
+    defer arena.deinit();
+
+    const logits_raw = try arena.allocAligned(4 * 384 * @sizeOf(f32), 64);
+    const bias_raw = try arena.allocAligned(384 * @sizeOf(f32), 64);
+    const hdr_raw = try arena.allocAligned(64, 64);
+    const uniq_raw = try arena.allocAligned(384 * @sizeOf(u32), 64);
+    const offs_raw = try arena.allocAligned(385 * @sizeOf(u32), 64);
+    const toks_raw = try arena.allocAligned(4 * 8 * @sizeOf(u32), 64);
+    const wts_raw = try arena.allocAligned(4 * 8 * @sizeOf(f32), 64);
+    const slots_raw = try arena.allocAligned(4 * 8 * @sizeOf(u32), 64);
+    const sk_e_raw = try arena.allocAligned(4 * 8 * @sizeOf(u32), 64);
+    const sk_w_raw = try arena.allocAligned(4 * 8 * @sizeOf(f32), 64);
+
+    const logits_f32: []f32 = @alignCast(std.mem.bytesAsSlice(f32, logits_raw[0 .. 4 * 384 * 4]));
+    const bias_f32: []f32 = @alignCast(std.mem.bytesAsSlice(f32, bias_raw[0 .. 384 * 4]));
+    const hdr_u32: []u32 = @alignCast(std.mem.bytesAsSlice(u32, hdr_raw[0..64]));
+    const uniq_u32: []u32 = @alignCast(std.mem.bytesAsSlice(u32, uniq_raw[0 .. 384 * 4]));
+    const offs_u32: []u32 = @alignCast(std.mem.bytesAsSlice(u32, offs_raw[0 .. 385 * 4]));
+    const toks_u32: []u32 = @alignCast(std.mem.bytesAsSlice(u32, toks_raw[0 .. 32 * 4]));
+    const wts_f32: []f32 = @alignCast(std.mem.bytesAsSlice(f32, wts_raw[0 .. 32 * 4]));
+    const sk_e_u32: []u32 = @alignCast(std.mem.bytesAsSlice(u32, sk_e_raw[0 .. 32 * 4]));
+    const sk_w_f32: []f32 = @alignCast(std.mem.bytesAsSlice(f32, sk_w_raw[0 .. 32 * 4]));
+
+    const buf = try metal.Buffer.wrap(device, arena.bytes());
+    defer buf.close();
+    var compute = try metal.Compute.initWithFrames(device, 2);
+    defer compute.close();
+    try compute.makeResident(&.{buf});
+
+    for (cases, 0..) |tc, ci| {
+        for (0..tc.e) |ei| {
+            bias_f32[ei] = synthF32(500 + ci * 1000 + ei, 0.35);
+        }
+        for (0..tc.m) |ti| {
+            for (0..tc.e) |ei| {
+                logits_f32[ti * tc.e + ei] = synthF32(2000 + ci * 5000 + ti * 401 + ei, 1.8);
+            }
+            // Cold-mask one expert with -inf to verify masking safety.
+            logits_f32[ti * tc.e + (ti * 7 + 3) % tc.e] = -std.math.inf(f32);
+        }
+
+        var frame = try compute.beginFrame(5000);
+        errdefer frame.abort();
+        try pipes.encodeG26MoeRouteSigmoid(&frame, .{
+            .logits = .{ .buffer = buf, .offset = arena.offsetOf(logits_raw.ptr) },
+            .logits_f16 = false,
+            .bias = .{ .buffer = buf, .offset = arena.offsetOf(bias_raw.ptr) },
+            .bias_dtype = .f32,
+            .sched_hdr = .{ .buffer = buf, .offset = arena.offsetOf(hdr_raw.ptr) },
+            .unique_experts = .{ .buffer = buf, .offset = arena.offsetOf(uniq_raw.ptr) },
+            .expert_token_offsets = .{ .buffer = buf, .offset = arena.offsetOf(offs_raw.ptr) },
+            .token_indices = .{ .buffer = buf, .offset = arena.offsetOf(toks_raw.ptr) },
+            .routing_weights = .{ .buffer = buf, .offset = arena.offsetOf(wts_raw.ptr) },
+            .slot_k_indices = .{ .buffer = buf, .offset = arena.offsetOf(slots_raw.ptr) },
+            .scratch_topk_experts = .{ .buffer = buf, .offset = arena.offsetOf(sk_e_raw.ptr) },
+            .scratch_topk_weights = .{ .buffer = buf, .offset = arena.offsetOf(sk_w_raw.ptr) },
+            .m = tc.m,
+            .num_experts = tc.e,
+            .top_k = tc.top_k,
+            .norm_topk_prob = true,
+            .routed_scaling_factor = tc.scale,
+            .gate_up_groups_x_q = 8,
+            .gate_up_groups_x_f = 4,
+            .down_groups_x = 8,
+            .down_groups_x_q8 = 16,
+        }, false);
+        const sig = try frame.commit();
+        try compute.wait(sig, 5000);
+
+        // Compare against exact CPU FP32 MiMoV2MoEGate reference.
+        for (0..tc.m) |ti| {
+            var chosen_e: [8]u32 = undefined;
+            var chosen_w: [8]f32 = undefined;
+            var used: [384]bool = @splat(false);
+            var sum_w: f32 = 0.0;
+            for (0..tc.top_k) |ki| {
+                var best_e: u32 = 0;
+                var best_choice: f32 = -std.math.inf(f32);
+                var best_unbiased: f32 = 0.0;
+                for (0..tc.e) |ei| {
+                    if (used[ei]) continue;
+                    const lg = logits_f32[ti * tc.e + ei];
+                    const sig_v: f32 = if (std.math.isNegativeInf(lg)) 0.0 else sigmoidF32(lg);
+                    const ch: f32 = if (std.math.isNegativeInf(lg)) -std.math.inf(f32) else sig_v + bias_f32[ei];
+                    if (ch > best_choice) {
+                        best_choice = ch;
+                        best_e = @intCast(ei);
+                        best_unbiased = sig_v;
+                    }
+                }
+                used[best_e] = true;
+                chosen_e[ki] = best_e;
+                chosen_w[ki] = best_unbiased;
+                sum_w += best_unbiased;
+            }
+            for (0..tc.top_k) |ki| {
+                chosen_w[ki] = (chosen_w[ki] / (sum_w + 1e-20)) * tc.scale;
+                try std.testing.expectEqual(chosen_e[ki], sk_e_u32[ti * tc.top_k + ki]);
+                try std.testing.expectApproxEqAbs(chosen_w[ki], sk_w_f32[ti * tc.top_k + ki], 1e-5);
+            }
+        }
+        // Verify CSR schedule consistency (`num_unique_experts`, total assignments == m * top_k).
+        const num_uniq = hdr_u32[0];
+        try std.testing.expect(num_uniq >= tc.top_k and num_uniq <= tc.m * tc.top_k);
+        try std.testing.expectEqual(tc.m * tc.top_k, offs_u32[num_uniq]);
+        for (0..num_uniq) |ui| {
+            const eid = uniq_u32[ui];
+            const s0 = offs_u32[ui];
+            const s1 = offs_u32[ui + 1];
+            try std.testing.expect(s1 > s0);
+            for (s0..s1) |si| {
+                const tok = toks_u32[si];
+                try std.testing.expect(tok < tc.m);
+                var found = false;
+                for (0..tc.top_k) |ki| {
+                    if (sk_e_u32[tok * tc.top_k + ki] == eid) {
+                        try std.testing.expectApproxEqAbs(sk_w_f32[tok * tc.top_k + ki], wts_f32[si], 1e-5);
+                        found = true;
+                        break;
+                    }
+                }
+                try std.testing.expect(found);
+            }
+        }
     }
 }

@@ -110,6 +110,8 @@ pub const TargetProjection = enum(u8) {
         if (std.mem.eql(u8, name, "q_proj") or
             std.mem.eql(u8, name, "self_attn.q_proj") or
             std.mem.eql(u8, name, "self_attn.q_proj.linear") or
+            std.mem.eql(u8, name, "linear_attn.q_proj") or
+            std.mem.eql(u8, name, "linear_attn.q_proj.linear") or
             std.mem.eql(u8, name, "attn.wq") or
             std.mem.eql(u8, name, "attn.wq_du") or
             std.mem.eql(u8, name, "wq") or
@@ -117,6 +119,8 @@ pub const TargetProjection = enum(u8) {
         if (std.mem.eql(u8, name, "k_proj") or
             std.mem.eql(u8, name, "self_attn.k_proj") or
             std.mem.eql(u8, name, "self_attn.k_proj.linear") or
+            std.mem.eql(u8, name, "linear_attn.k_proj") or
+            std.mem.eql(u8, name, "linear_attn.k_proj.linear") or
             std.mem.eql(u8, name, "attn.wk") or
             std.mem.eql(u8, name, "attn.wk_dv") or
             std.mem.eql(u8, name, "wk") or
@@ -124,6 +128,8 @@ pub const TargetProjection = enum(u8) {
         if (std.mem.eql(u8, name, "v_proj") or
             std.mem.eql(u8, name, "self_attn.v_proj") or
             std.mem.eql(u8, name, "self_attn.v_proj.linear") or
+            std.mem.eql(u8, name, "linear_attn.v_proj") or
+            std.mem.eql(u8, name, "linear_attn.v_proj.linear") or
             std.mem.eql(u8, name, "attn.wv") or
             std.mem.eql(u8, name, "attn.wv_dv") or
             std.mem.eql(u8, name, "wv") or
@@ -131,6 +137,9 @@ pub const TargetProjection = enum(u8) {
         if (std.mem.eql(u8, name, "o_proj") or
             std.mem.eql(u8, name, "self_attn.o_proj") or
             std.mem.eql(u8, name, "self_attn.o_proj.linear") or
+            std.mem.eql(u8, name, "linear_attn.o_proj") or
+            std.mem.eql(u8, name, "linear_attn.out_proj") or
+            std.mem.eql(u8, name, "out_proj") or
             std.mem.eql(u8, name, "attn.wo") or
             std.mem.eql(u8, name, "attn.wo_ud") or
             std.mem.eql(u8, name, "wo") or
@@ -150,6 +159,12 @@ pub const TargetProjection = enum(u8) {
         if (std.mem.eql(u8, name, "gate_attn") or
             std.mem.eql(u8, name, "self_attn.gate_attn") or
             std.mem.eql(u8, name, "attn.gate_attn") or
+            std.mem.eql(u8, name, "q_gate_proj") or
+            std.mem.eql(u8, name, "self_attn.q_gate_proj") or
+            std.mem.eql(u8, name, "linear_attn.g_proj") or
+            std.mem.eql(u8, name, "g_proj") or
+            std.mem.eql(u8, name, "linear_attn.in_proj_z") or
+            std.mem.eql(u8, name, "in_proj_z") or
             std.mem.eql(u8, name, "self_attn.o_proj.gate_proj") or
             std.mem.eql(u8, name, "o_proj.gate_proj")) return .gate_attn;
         if (std.mem.eql(u8, name, "wr_du") or
@@ -159,6 +174,8 @@ pub const TargetProjection = enum(u8) {
             std.mem.eql(u8, name, "wr")) return .wr_du;
         if (std.mem.eql(u8, name, "qkv_proj") or
             std.mem.eql(u8, name, "self_attn.qkv_proj") or
+            std.mem.eql(u8, name, "linear_attn.in_proj_qkv") or
+            std.mem.eql(u8, name, "in_proj_qkv") or
             std.mem.eql(u8, name, "attn.wqkv") or
             std.mem.eql(u8, name, "wqkv")) return .qkv_proj;
         if (std.mem.eql(u8, name, "gate_up_proj") or
@@ -2452,6 +2469,16 @@ test "W30 universal projections, Inkling-2 aliases, 32 MiB R9 pool, and exact Do
     try std.testing.expectEqual(@as(?TargetProjection, .kv_a_proj), TargetProjection.parseModuleName("self_attn.kv_a_proj_with_mqa"));
     try std.testing.expectEqual(@as(?TargetProjection, .eh_proj), TargetProjection.parseModuleName("eh_proj"));
     try std.testing.expectEqual(@as(u16, 1 << 15), TargetProjection.eh_proj.bit());
+    // M9.1 mimo_v2 & qwen3_5 aliases (q_gate_proj + linear_attn GDN projections)
+    try std.testing.expectEqual(@as(?TargetProjection, .gate_attn), TargetProjection.parseModuleName("self_attn.q_gate_proj"));
+    try std.testing.expectEqual(@as(?TargetProjection, .gate_attn), TargetProjection.parseModuleName("q_gate_proj"));
+    try std.testing.expectEqual(@as(?TargetProjection, .q_proj), TargetProjection.parseModuleName("linear_attn.q_proj"));
+    try std.testing.expectEqual(@as(?TargetProjection, .k_proj), TargetProjection.parseModuleName("linear_attn.k_proj"));
+    try std.testing.expectEqual(@as(?TargetProjection, .v_proj), TargetProjection.parseModuleName("linear_attn.v_proj"));
+    try std.testing.expectEqual(@as(?TargetProjection, .gate_attn), TargetProjection.parseModuleName("linear_attn.g_proj"));
+    try std.testing.expectEqual(@as(?TargetProjection, .o_proj), TargetProjection.parseModuleName("linear_attn.o_proj"));
+    try std.testing.expectEqual(@as(?TargetProjection, .o_proj), TargetProjection.parseModuleName("linear_attn.out_proj"));
+    try std.testing.expectEqual(@as(?TargetProjection, .qkv_proj), TargetProjection.parseModuleName("linear_attn.in_proj_qkv"));
 
     // 2. parseAdapterConfigJson parses use_dora and widened u16 target_mask
     const cfg_meta = try parseAdapterConfigJson(

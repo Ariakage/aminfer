@@ -17,6 +17,7 @@
 //
 // Compiled with `-std=metal4.0 -Wall -Werror -mmacosx-version-min=26.0`.
 #include <metal_stdlib>
+#include <metal_atomic>
 #include <metal_simdgroup_matrix>
 using namespace metal;
 
@@ -25,6 +26,9 @@ constant bool HYBRID_NORM_W_BF16 [[function_constant(1)]];
 constant uint QSA_HEAD_DIM [[function_constant(2)]];
 constant bool GR_STREAM_BF16 [[function_constant(3)]];
 constant bool GR_ACT_BF16 [[function_constant(4)]];
+constant uint G26_K_DIM [[function_constant(5)]];
+constant uint G26_V_DIM [[function_constant(6)]];
+constant bool G26_LOGITS_F16 [[function_constant(7)]];
 
 static inline float hybrid_fast_silu(float x) {
     return x / (1.0f + exp(-x));
@@ -5285,6 +5289,942 @@ kernel void ami_mhc_post_mix(device uchar *streams [[buffer(0)]],
             const float out_val = fma(tg_hpost[o], y_val, base_val);
             hybrid_store_f16_or_bf16(
                 streams, tok_stream_base + ulong(o) * p.hidden_size + d, out_val, GR_STREAM_BF16);
+        }
+    }
+}
+
+// ===========================================================================
+// Section E: G26 Asymmetric K/V (`192/128`, `256/256`, dynamic <= 256) SWA
+// (`128 + sink`), Value Scaling, Partial/3D-MRoPE + Optional `(1 + w)` QK-Norm,
+// Sigmoid + `e_score_correction_bias` MoE Router, and DFlash Tap Ring Capture
+// ===========================================================================
+
+static inline float g26_hybrid_load_scalar_f32(const device uchar *buf, uint idx, uint dtype) {
+    if (dtype == 2u) {
+        return ((const device float *)buf)[idx];
+    }
+    if (dtype == 1u) {
+        return float(((const device bfloat *)buf)[idx]);
+    }
+    return float(((const device half *)buf)[idx]);
+}
+
+struct G26QkNormRopeKvParams {
+    uint num_tokens;
+    uint num_q_heads;
+    uint num_kv_heads;
+    uint k_head_dim;
+    uint v_head_dim;
+    uint rotary_dim;
+    uint start_pos;
+    uint chunk_tokens;
+    uint num_retired_chunks;
+    uint ring_capacity;
+    uint tile_table_offset;
+    uint mrope_s0;
+    uint mrope_s1;
+    uint mrope_s2;
+    uint pos_mode;             // 0 = linear (start_pos + tok), 1 = positions_1d[tok], 2 = positions_3d[tok*3 + axis]
+    uint apply_qk_norm;
+    uint qk_norm_unit_offset;  // 1 = (1.0 + w) for qwen3_5, 0 = plain w
+    uint kv_only;
+    uint write_to_tiles;       // 1 = write into bindless kv_tiles, 0 = write into k_out/v_out
+    uint _pad0;
+    float rms_eps;
+    float rope_theta;
+    float v_scale;
+    float yarn_factor;
+    float yarn_mscale;
+    float yarn_beta_fast;
+    float yarn_beta_slow;
+    uint original_max_pos;
+};
+
+static_assert(sizeof(G26QkNormRopeKvParams) == 112, "G26QkNormRopeKvParams must be 112 bytes");
+
+// Asymmetric K/V QK-Norm (optional `(1 + w)`) + Partial NeoX/YaRN/3D-MRoPE +
+// `attention_value_scale` + either bindless `HybridKvRing` tile write or
+// contiguous `k_out`/`v_out` staging (zero spills).
+// Specialized on HYBRID_NORM_W_BF16 (`function_constant(1)`).
+// Grid: ((kv_only ? num_kv_heads : num_q_heads + num_kv_heads), num_tokens, 1), 32 threads.
+kernel void ami_g26_qknorm_rope_kv(device half *q [[buffer(0)]],
+                                   const device half *k [[buffer(1)]],
+                                   const device half *v [[buffer(2)]],
+                                   const device uchar *q_norm [[buffer(3)]],
+                                   const device uchar *k_norm [[buffer(4)]],
+                                   const device uint *positions [[buffer(5)]],
+                                   device half *k_out [[buffer(6)]],
+                                   device half *v_out [[buffer(7)]],
+                                   const device QsaKvTileWritePair *kv_tiles [[buffer(8)]],
+                                   constant G26QkNormRopeKvParams &p [[buffer(9)]],
+                                   uint2 tg_pos [[threadgroup_position_in_grid]],
+                                   uint lane [[thread_index_in_simdgroup]]) {
+    const uint total_heads = (p.kv_only != 0u) ? p.num_kv_heads : (p.num_q_heads + p.num_kv_heads);
+    const uint tok = tg_pos.y;
+    if (tg_pos.x >= total_heads || tok >= p.num_tokens) {
+        return;
+    }
+
+    const bool is_q = (p.kv_only == 0u) && (tg_pos.x < p.num_q_heads);
+    const uint head_idx = is_q ? tg_pos.x : (tg_pos.x - ((p.kv_only != 0u) ? 0u : p.num_q_heads));
+
+    if (!is_q && p.write_to_tiles != 0u && p.ring_capacity > 0u && (tok + p.ring_capacity < p.num_tokens)) {
+        return;
+    }
+
+    threadgroup float vec[256];
+    const uint k_dim = p.k_head_dim;
+    const uint v_dim = p.v_head_dim;
+    const uint rot_dim = (p.rotary_dim > 0u) ? p.rotary_dim : k_dim;
+    const uint half_rot = rot_dim >> 1;
+
+    const ulong q_off = (ulong(tok) * p.num_q_heads + head_idx) * k_dim;
+    const ulong k_off = (ulong(tok) * p.num_kv_heads + head_idx) * k_dim;
+    const ulong v_off = (ulong(tok) * p.num_kv_heads + head_idx) * v_dim;
+    const device half *src = is_q ? (q + q_off) : (k + k_off);
+
+    float sum_sq = 0.0f;
+    for (uint d = lane; d < k_dim; d += 32u) {
+        const float val = float(src[d]);
+        vec[d] = val;
+        sum_sq = fma(val, val, sum_sq);
+    }
+
+    if (p.apply_qk_norm != 0u) {
+        const float total_sq = simd_sum(sum_sq);
+        const float inv_rms = rsqrt(total_sq / float(k_dim) + p.rms_eps);
+        const device uchar *nw = is_q ? q_norm : k_norm;
+        const float w_add = (p.qk_norm_unit_offset != 0u) ? 1.0f : 0.0f;
+        for (uint d = lane; d < k_dim; d += 32u) {
+            vec[d] = (vec[d] * inv_rms) * (hybrid_load_norm_w(nw, d, HYBRID_NORM_W_BF16) + w_add);
+        }
+    }
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+
+    const uint lin_pos = (p.pos_mode == 1u)
+        ? positions[tok]
+        : ((p.pos_mode == 2u) ? positions[ulong(tok) * 3ul + 0ul] : (p.start_pos + tok));
+    const uint pos_t = (p.pos_mode == 2u) ? positions[ulong(tok) * 3ul + 0ul] : lin_pos;
+    const uint pos_h = (p.pos_mode == 2u) ? positions[ulong(tok) * 3ul + 1ul] : lin_pos;
+    const uint pos_w = (p.pos_mode == 2u) ? positions[ulong(tok) * 3ul + 2ul] : lin_pos;
+
+    for (uint j = lane; j < half_rot; j += 32u) {
+        uint axis_pos = lin_pos;
+        if (p.pos_mode == 2u) {
+            const uint axis = mrope_interleaved_axis(j, p.mrope_s0, p.mrope_s1, p.mrope_s2);
+            axis_pos = (axis == 0u) ? pos_t : ((axis == 1u) ? pos_h : pos_w);
+        }
+        const float inv_f = yarn_inv_freq(
+            j, rot_dim, p.rope_theta, p.yarn_factor,
+            p.yarn_beta_fast, p.yarn_beta_slow, p.original_max_pos);
+        const float angle = float(axis_pos) * inv_f;
+        const float c = cos(angle) * p.yarn_mscale;
+        const float s = sin(angle) * p.yarn_mscale;
+        const float x0 = vec[j];
+        const float x1 = vec[j + half_rot];
+        vec[j] = fma(x0, c, -x1 * s);
+        vec[j + half_rot] = fma(x1, c, x0 * s);
+    }
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (is_q) {
+        device half *dst = q + q_off;
+        for (uint d = lane; d < k_dim; d += 32u) {
+            dst[d] = half(vec[d]);
+        }
+        return;
+    }
+
+    const uint k_cols = k_dim >> 2;
+    const uint v_cols = v_dim >> 2;
+    const device half4 *v_src = (const device half4 *)(v + v_off);
+    const bool do_v_scale = (p.v_scale != 1.0f);
+
+    if (p.write_to_tiles != 0u) {
+        const uint phys_pos = (p.ring_capacity > 0u) ? (lin_pos % p.ring_capacity) : lin_pos;
+        const uint chunk = phys_pos / p.chunk_tokens;
+        const uint slot = phys_pos - chunk * p.chunk_tokens;
+        const uint active_chunk = (p.ring_capacity == 0u) ? (chunk - p.num_retired_chunks) : chunk;
+        const uint row = head_idx * p.chunk_tokens + slot;
+        const QsaKvTileWritePair tile = kv_tiles[p.tile_table_offset + active_chunk];
+        for (uint col = lane; col < k_cols; col += 32u) {
+            const uint base = col * 4u;
+            const half4 k4 = half4(half(vec[base + 0u]),
+                                   half(vec[base + 1u]),
+                                   half(vec[base + 2u]),
+                                   half(vec[base + 3u]));
+            tile.k_tex.write(k4, uint2(col, row));
+        }
+        for (uint col = lane; col < v_cols; col += 32u) {
+            const half4 raw_v = v_src[col];
+            const half4 out_v = do_v_scale ? half4(float4(raw_v) * p.v_scale) : raw_v;
+            tile.v_tex.write(out_v, uint2(col, row));
+        }
+    } else {
+        device half *k_dst = k_out + k_off;
+        for (uint d = lane; d < k_dim; d += 32u) {
+            k_dst[d] = half(vec[d]);
+        }
+        device half4 *v_dst = (device half4 *)(v_out + v_off);
+        for (uint col = lane; col < v_cols; col += 32u) {
+            const half4 raw_v = v_src[col];
+            v_dst[col] = do_v_scale ? half4(float4(raw_v) * p.v_scale) : raw_v;
+        }
+    }
+}
+
+struct G26KvCommitParams {
+    uint num_kv_heads;
+    uint k_head_dim;
+    uint v_head_dim;
+    uint start_pos;
+    uint num_tokens;
+    uint chunk_tokens;
+    uint num_retired_chunks;
+    uint ring_capacity;
+    uint tile_table_offset;
+    uint use_node_list;    // 0 = trailing min(num_tokens, ring_capacity) prefill chunk, 1 = accepted tree nodes
+    uint use_node_buffer;  // 0 = inline_nodes[64], 1 = accepted_nodes buffer
+    uint _pad0;
+    ushort inline_nodes[64];
+};
+
+static_assert(sizeof(G26KvCommitParams) == 176, "G26KvCommitParams must be 176 bytes");
+
+// Asymmetric K/V commit from prefill chunk OR accepted speculative tree nodes
+// into bindless `HybridKvRing` / global `KvTileWritePair` tiles (zero spills).
+// Grid: (num_kv_heads, commit_count, 1) threadgroups, 32 threads.
+kernel void ami_g26_kv_commit(const device half *k_src [[buffer(0)]],
+                              const device half *v_src [[buffer(1)]],
+                              const device uint *accepted_nodes [[buffer(2)]],
+                              const device QsaKvTileWritePair *kv_tiles [[buffer(3)]],
+                              constant G26KvCommitParams &p [[buffer(4)]],
+                              uint2 tg_pos [[threadgroup_position_in_grid]],
+                              uint lane [[thread_index_in_simdgroup]]) {
+    const uint kvh = tg_pos.x;
+    const uint ci = tg_pos.y;
+    const uint commit_cnt = (p.use_node_list == 0u && p.ring_capacity > 0u)
+        ? min(p.num_tokens, p.ring_capacity)
+        : p.num_tokens;
+    if (kvh >= p.num_kv_heads || ci >= commit_cnt) {
+        return;
+    }
+
+    uint src_tok;
+    uint dst_pos;
+    if (p.use_node_list != 0u) {
+        src_tok = (p.use_node_buffer != 0u) ? accepted_nodes[ci] : uint(p.inline_nodes[ci]);
+        dst_pos = p.start_pos + ci;
+    } else {
+        src_tok = (p.num_tokens - commit_cnt) + ci;
+        dst_pos = p.start_pos + src_tok;
+    }
+
+    const uint phys_pos = (p.ring_capacity > 0u) ? (dst_pos % p.ring_capacity) : dst_pos;
+    const uint chunk = phys_pos / p.chunk_tokens;
+    const uint slot = phys_pos - chunk * p.chunk_tokens;
+    const uint active_chunk = (p.ring_capacity == 0u) ? (chunk - p.num_retired_chunks) : chunk;
+    const uint row = kvh * p.chunk_tokens + slot;
+    const QsaKvTileWritePair tile = kv_tiles[p.tile_table_offset + active_chunk];
+
+    const uint k_cols = p.k_head_dim >> 2;
+    const uint v_cols = p.v_head_dim >> 2;
+    const device half4 *k4 = (const device half4 *)(k_src + (ulong(src_tok) * p.num_kv_heads + kvh) * p.k_head_dim);
+    const device half4 *v4 = (const device half4 *)(v_src + (ulong(src_tok) * p.num_kv_heads + kvh) * p.v_head_dim);
+
+    for (uint col = lane; col < k_cols; col += 32u) {
+        tile.k_tex.write(k4[col], uint2(col, row));
+    }
+    for (uint col = lane; col < v_cols; col += 32u) {
+        tile.v_tex.write(v4[col], uint2(col, row));
+    }
+}
+
+struct G26SwaAttnParams {
+    uint num_q;
+    uint q_start_pos;      // prefill: first query pos; decode/tree: base_pos
+    uint chunk_start_pos;  // prefill: start pos of k_extra/v_extra chunk; decode/tree: base_pos
+    uint kv_len;           // prefill: total kv_len including chunk; decode/tree: base_pos
+    uint num_q_heads;
+    uint num_kv_heads;
+    uint k_head_dim;
+    uint v_head_dim;
+    uint window_size;      // e.g. 128 (0 = full causal)
+    uint ring_capacity;    // e.g. 128 (0 = linear)
+    uint chunk_tokens;     // e.g. 128 for SWA, 512 for linear
+    uint tile_table_offset;
+    uint is_prefill;       // 1 = prefill (ring prefix + contiguous chunk), 0 = decode/tree (ring prefix + ancestor_masks tree)
+    uint has_tree;         // when is_prefill == 0: 1 = include tree k_extra/v_extra with ancestor_masks
+    uint has_positions;    // when is_prefill == 0: 1 = read node_positions[qi] for exact per-node SWA window
+    uint has_sink;
+    uint sink_dtype;       // 0 = f16, 1 = bf16, 2 = f32
+    uint _pad0;
+    float scale;
+    uint _pad1;
+};
+
+static_assert(sizeof(G26SwaAttnParams) == 80, "G26SwaAttnParams must be 80 bytes");
+
+// Asymmetric K/V (`192/128`, `256/256`, dynamic <= 256) `HybridKvRing` SWA
+// Attention across ALL 3 modes (`M = 1` decode, chunked prefill, and `M = 1..64`
+// speculative `verifyTree` with 64-bit ancestor masks + per-node SWA window)
+// with exact FP32 online-softmax `sink_bias` (0 stack spills).
+// Specialized on G26_K_DIM (`function_constant(5)`) & G26_V_DIM (`function_constant(6)`).
+// Grid: (num_kv_heads * q_groups_per_kv, num_q, 1) threadgroups, 256 threads.
+kernel void ami_g26_swa_attn(const device half *q [[buffer(0)]],
+                             const device QsaKvTilePair *kv_tiles [[buffer(1)]],
+                             const device half *k_extra [[buffer(2)]],
+                             const device half *v_extra [[buffer(3)]],
+                             const device ulong *ancestor_masks [[buffer(4)]],
+                             const device uint *node_positions [[buffer(5)]],
+                             const device uchar *sink_bias [[buffer(6)]],
+                             device half *out [[buffer(7)]],
+                             constant G26SwaAttnParams &p [[buffer(8)]],
+                             uint2 tg_pos [[threadgroup_position_in_grid]],
+                             uint tid [[thread_index_in_threadgroup]],
+                             uint sg_id [[simdgroup_index_in_threadgroup]],
+                             uint lane [[thread_index_in_simdgroup]]) {
+    constexpr uint Q_TILE = 8u;
+    constexpr float LOG2E = 1.4426950408889634f;
+
+    const uint gqa_ratio = p.num_q_heads / p.num_kv_heads;
+    const uint q_groups_per_kv = (gqa_ratio + Q_TILE - 1u) / Q_TILE;
+    const uint kv_head = tg_pos.x / q_groups_per_kv;
+    const uint q_grp = tg_pos.x % q_groups_per_kv;
+    const uint qi = tg_pos.y;
+    if (kv_head >= p.num_kv_heads || qi >= p.num_q) {
+        return;
+    }
+
+    const uint q_start = kv_head * gqa_ratio + q_grp * Q_TILE;
+    const uint q_end = min(q_start + Q_TILE, (kv_head + 1u) * gqa_ratio);
+    const uint q_cnt = q_end - q_start;
+    const bool active_q = (sg_id < q_cnt);
+    const uint qh = q_start + min(sg_id, q_cnt - 1u);
+
+    const uint k_dim = (G26_K_DIM > 0u) ? G26_K_DIM : p.k_head_dim;
+    const uint v_dim = (G26_V_DIM > 0u) ? G26_V_DIM : p.v_head_dim;
+    const uint k_cols = k_dim >> 2;
+    const uint v_cols = v_dim >> 2;
+    const float scale_log2e = p.scale * LOG2E;
+
+    const uint q_pos = (p.is_prefill != 0u)
+        ? (p.q_start_pos + qi)
+        : ((p.has_positions != 0u) ? node_positions[qi] : p.q_start_pos);
+    const uint t_hi = (p.is_prefill != 0u) ? min(p.kv_len, q_pos + 1u) : p.kv_len;
+    const uint t_lo = (p.window_size > 0u && (q_pos + 1u) > p.window_size)
+        ? min(t_hi, (q_pos + 1u) - p.window_size)
+        : 0u;
+
+    const ulong q_row_off = (ulong(qi) * p.num_q_heads + qh) * k_dim;
+    const float4 q0 = (active_q && lane < k_cols)
+        ? float4(*(const device half4 *)(q + q_row_off + lane * 4u))
+        : float4(0.0f);
+    const float4 q1 = (active_q && (lane + 32u) < k_cols)
+        ? float4(*(const device half4 *)(q + q_row_off + (lane + 32u) * 4u))
+        : float4(0.0f);
+
+    float m_val = -INFINITY;
+    float l_val = 0.0f;
+    if (p.has_sink != 0u && active_q) {
+        m_val = g26_hybrid_load_scalar_f32(sink_bias, qh, p.sink_dtype) * LOG2E;
+        l_val = 1.0f;
+    }
+    float4 acc0 = float4(0.0f);
+    float4 acc1 = float4(0.0f);
+
+    threadgroup half4 tg_k[256];
+    threadgroup half4 tg_v[256];
+    const uint load_tok = tid >> 6;  // 0..3
+    const uint load_col = tid & 63u; // 0..63
+    const uint head_row_base = kv_head * p.chunk_tokens;
+
+    for (uint tile_t = t_lo; tile_t < t_hi; tile_t += 4u) {
+        const uint tile_len = min(4u, t_hi - tile_t);
+        if (load_tok < tile_len) {
+            const uint t = tile_t + load_tok;
+            if (p.is_prefill != 0u && t >= p.chunk_start_pos) {
+                const uint c_tok = t - p.chunk_start_pos;
+                if (load_col < k_cols) {
+                    const ulong ck_off = (ulong(c_tok) * p.num_kv_heads + kv_head) * k_dim + load_col * 4u;
+                    tg_k[tid] = *(const device half4 *)(k_extra + ck_off);
+                }
+                if (load_col < v_cols) {
+                    const ulong cv_off = (ulong(c_tok) * p.num_kv_heads + kv_head) * v_dim + load_col * 4u;
+                    tg_v[tid] = *(const device half4 *)(v_extra + cv_off);
+                }
+            } else {
+                const uint phys_t = (p.ring_capacity > 0u) ? (t % p.ring_capacity) : t;
+                const uint chunk = phys_t / p.chunk_tokens;
+                const uint slot = phys_t - chunk * p.chunk_tokens;
+                const uint row = head_row_base + slot;
+                const QsaKvTilePair pair = kv_tiles[p.tile_table_offset + chunk];
+                if (load_col < k_cols) {
+                    tg_k[tid] = pair.k_tex.read(uint2(load_col, row));
+                }
+                if (load_col < v_cols) {
+                    tg_v[tid] = pair.v_tex.read(uint2(load_col, row));
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (active_q) {
+            for (uint dt = 0u; dt < tile_len; dt++) {
+                const uint base_idx = dt * 64u;
+                float partial = (lane < k_cols) ? dot(q0, float4(tg_k[base_idx + lane])) : 0.0f;
+                if ((lane + 32u) < k_cols) {
+                    partial += dot(q1, float4(tg_k[base_idx + lane + 32u]));
+                }
+                const float score = simd_sum(partial) * scale_log2e;
+                const float new_m = max(m_val, score);
+                const float corr = (l_val > 0.0f) ? exp2(m_val - new_m) : 0.0f;
+                const float p_w = exp2(score - new_m);
+                l_val = fma(l_val, corr, p_w);
+                if (lane < v_cols) {
+                    acc0 = fma(acc0, float4(corr), float4(tg_v[base_idx + lane]) * p_w);
+                }
+                if ((lane + 32u) < v_cols) {
+                    acc1 = fma(acc1, float4(corr), float4(tg_v[base_idx + lane + 32u]) * p_w);
+                }
+                m_val = new_m;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (p.is_prefill == 0u && p.has_tree != 0u && active_q) {
+        ulong rem = ancestor_masks[qi];
+        while (rem != 0ul) {
+            const uint j = uint(ctz(rem));
+            rem &= (rem - 1ul);
+            if (j < p.num_q) {
+                const uint j_pos = (p.has_positions != 0u) ? node_positions[j] : q_pos;
+                if (p.window_size == 0u || (j_pos <= q_pos && (q_pos - j_pos) < p.window_size)) {
+                    const ulong k_off = (ulong(j) * p.num_kv_heads + kv_head) * k_dim;
+                    const ulong v_off = (ulong(j) * p.num_kv_heads + kv_head) * v_dim;
+                    float partial = 0.0f;
+                    if (lane < k_cols) {
+                        partial = dot(q0, float4(*(const device half4 *)(k_extra + k_off + lane * 4u)));
+                    }
+                    if ((lane + 32u) < k_cols) {
+                        partial += dot(q1, float4(*(const device half4 *)(k_extra + k_off + (lane + 32u) * 4u)));
+                    }
+                    const float score = simd_sum(partial) * scale_log2e;
+                    const float new_m = max(m_val, score);
+                    const float corr = (l_val > 0.0f) ? exp2(m_val - new_m) : 0.0f;
+                    const float p_w = exp2(score - new_m);
+                    l_val = fma(l_val, corr, p_w);
+                    if (lane < v_cols) {
+                        const float4 v0 = float4(*(const device half4 *)(v_extra + v_off + lane * 4u));
+                        acc0 = fma(acc0, float4(corr), v0 * p_w);
+                    }
+                    if ((lane + 32u) < v_cols) {
+                        const float4 v1 = float4(*(const device half4 *)(v_extra + v_off + (lane + 32u) * 4u));
+                        acc1 = fma(acc1, float4(corr), v1 * p_w);
+                    }
+                    m_val = new_m;
+                }
+            }
+        }
+    }
+
+    if (active_q) {
+        const float inv_l = (l_val > 0.0f) ? (1.0f / l_val) : 0.0f;
+        const ulong out_off = (ulong(qi) * p.num_q_heads + qh) * v_dim;
+        if (lane < v_cols) {
+            *(device half4 *)(out + out_off + lane * 4u) = half4(acc0 * inv_l);
+        }
+        if ((lane + 32u) < v_cols) {
+            *(device half4 *)(out + out_off + (lane + 32u) * 4u) = half4(acc1 * inv_l);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// G26 MoE Sigmoid + `e_score_correction_bias` + Group Top-K + CSR Schedule
+// Writes exact `MoeWorkspace` CSR & G20 indirect dispatch structures (uniform
+// or G13 scheme-bucketed) with 0 thread-local arrays (0 stack spills).
+// ---------------------------------------------------------------------------
+
+struct G26MoeScheduleHeader {
+    uint num_unique_experts;
+    uint total_assignments;
+    uint m;
+    uint top_k;
+};
+
+struct G26MoeIndirectArgs {
+    uint threadgroups_per_grid[3];
+};
+
+static inline void g26_write_schedule_indirect(device uchar *slot_base,
+                                               uint active_experts,
+                                               uint gate_up_groups_x_q,
+                                               uint gate_up_groups_x_f,
+                                               uint down_groups_x,
+                                               uint down_groups_x_q8) {
+    device G26MoeIndirectArgs *gu_q = (device G26MoeIndirectArgs *)(slot_base + 16ul);
+    device G26MoeIndirectArgs *gu_f = (device G26MoeIndirectArgs *)(slot_base + 28ul);
+    device G26MoeIndirectArgs *dn   = (device G26MoeIndirectArgs *)(slot_base + 40ul);
+    device G26MoeIndirectArgs *dn8  = (device G26MoeIndirectArgs *)(slot_base + 52ul);
+    gu_q->threadgroups_per_grid[0] = gate_up_groups_x_q;
+    gu_q->threadgroups_per_grid[1] = active_experts;
+    gu_q->threadgroups_per_grid[2] = 1u;
+    gu_f->threadgroups_per_grid[0] = gate_up_groups_x_f;
+    gu_f->threadgroups_per_grid[1] = active_experts;
+    gu_f->threadgroups_per_grid[2] = 1u;
+    dn->threadgroups_per_grid[0]   = down_groups_x;
+    dn->threadgroups_per_grid[1]   = active_experts;
+    dn->threadgroups_per_grid[2]   = 1u;
+    dn8->threadgroups_per_grid[0]  = down_groups_x_q8;
+    dn8->threadgroups_per_grid[1]  = active_experts;
+    dn8->threadgroups_per_grid[2]  = 1u;
+}
+
+struct G26MoeRouteSigmoidParams {
+    uint m;
+    uint num_experts;
+    uint top_k;
+    uint norm_topk_prob;
+    uint has_bias;
+    uint bias_dtype;       // 0 = f16, 1 = bf16, 2 = f32
+    uint n_group;          // >= 1
+    uint topk_group;       // >= 1
+    uint is_bucketed;      // 0 = uniform, 1 = heterogeneous 5-bucket CSR
+    uint bucket_unique_stride;
+    uint bucket_offsets_stride;
+    uint gate_up_groups_x_q;
+    uint gate_up_groups_x_f;
+    uint down_groups_x;
+    uint down_groups_x_q8;
+    float routed_scaling_factor;
+};
+
+static_assert(sizeof(G26MoeRouteSigmoidParams) == 64, "G26MoeRouteSigmoidParams must be 64 bytes");
+
+// Single threadgroup (256 threads / 8 simdgroups). Supports num_experts <= 1024,
+// top_k <= 16, n_group <= 32. Zero stack spills (`-Wframe-larger-than=0`).
+// Specialized on G26_LOGITS_F16 (`function_constant(7)`).
+kernel void ami_moe_route_topk_sigmoid(const device uchar *logits_raw [[buffer(0)]],
+                                       const device uchar *bias_raw [[buffer(1)]],
+                                       device G26MoeScheduleHeader *sched_hdr [[buffer(2)]],
+                                       device uint *unique_experts [[buffer(3)]],
+                                       device uint *expert_token_offsets [[buffer(4)]],
+                                       device uint *token_indices [[buffer(5)]],
+                                       device float *routing_weights [[buffer(6)]],
+                                       device uint *slot_k_indices [[buffer(7)]],
+                                       device uint *scratch_topk_experts [[buffer(8)]],
+                                       device float *scratch_topk_weights [[buffer(9)]],
+                                       const device uchar *expert_schemes [[buffer(10)]],
+                                       device uchar *bucket_headers [[buffer(11)]],
+                                       device uint *bucket_unique_experts [[buffer(12)]],
+                                       device uint *bucket_expert_token_offsets [[buffer(13)]],
+                                       constant G26MoeRouteSigmoidParams &p [[buffer(14)]],
+                                       uint tid [[thread_index_in_threadgroup]],
+                                       uint sg_id [[simdgroup_index_in_threadgroup]],
+                                       uint lane [[thread_index_in_simdgroup]]) {
+    constexpr uint NUM_SCHEMES = 5u;
+    threadgroup atomic_uint s_counts[1024];
+    threadgroup atomic_uint s_cursors[1024];
+    threadgroup uint s_sel_e[8][16];
+    threadgroup float s_sel_w[8][16];
+    threadgroup uint s_picked[8][32];
+    threadgroup uint s_prefix_tmp[8];
+    threadgroup uint s_u_cnt;
+    threadgroup uint s_a_cnt;
+
+    const uint top_k = min(p.top_k, 16u);
+    const uint chunks = (p.num_experts + 31u) >> 5;
+
+    for (uint e = tid; e < p.num_experts; e += 256u) {
+        atomic_store_explicit(&s_counts[e], 0u, memory_order_relaxed);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const bool use_groups = (p.n_group > 1u && p.topk_group < p.n_group && (p.num_experts % p.n_group) == 0u);
+    const uint group_size = use_groups ? (p.num_experts / p.n_group) : p.num_experts;
+
+    for (uint tok = sg_id; tok < p.m; tok += 8u) {
+        const ulong row_base = ulong(tok) * p.num_experts;
+        if (lane < chunks) {
+            s_picked[sg_id][lane] = 0u;
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Optional DeepSeek/MiMo group top-k masking (`n_group <= 32`).
+        uint group_allow_mask = 0xFFFFFFFFu;
+        if (use_groups && p.n_group <= 32u) {
+            uint picked_g = 0u;
+            for (uint gk = 0u; gk < p.topk_group; gk++) {
+                float best_gs = -INFINITY;
+                uint best_g = 0xFFFFFFFFu;
+                for (uint g = 0u; g < p.n_group; g++) {
+                    if (((picked_g >> g) & 1u) != 0u) {
+                        continue;
+                    }
+                    const uint g_start = g * group_size;
+                    float top1 = -INFINITY;
+                    float top2 = -INFINITY;
+                    for (uint off = lane; off < group_size; off += 32u) {
+                        const uint e = g_start + off;
+                        const float raw = G26_LOGITS_F16
+                            ? float(((const device half *)logits_raw)[row_base + e])
+                            : ((const device float *)logits_raw)[row_base + e];
+                        float c_val = -INFINITY;
+                        if (isfinite(raw) && raw > -1.0e29f) {
+                            const float sc = hybrid_sigmoid(raw);
+                            const float b = (p.has_bias != 0u) ? g26_hybrid_load_scalar_f32(bias_raw, e, p.bias_dtype) : 0.0f;
+                            c_val = sc + b;
+                        }
+                        if (c_val >= top1) {
+                            top2 = top1;
+                            top1 = c_val;
+                        } else if (c_val > top2) {
+                            top2 = c_val;
+                        }
+                    }
+                    // Reduce top-2 across 32 lanes.
+                    for (ushort step = 16u; step > 0u; step >>= 1u) {
+                        const float o1 = simd_shuffle_down(top1, step);
+                        const float o2 = simd_shuffle_down(top2, step);
+                        if (o1 >= top1) {
+                            top2 = max(top1, o2);
+                            top1 = o1;
+                        } else if (o1 > top2) {
+                            top2 = o1;
+                        }
+                    }
+                    const float g_score = simd_broadcast_first(top1 + ((top2 > -1.0e30f) ? top2 : 0.0f));
+                    if (g_score > best_gs || (g_score == best_gs && g < best_g)) {
+                        best_gs = g_score;
+                        best_g = g;
+                    }
+                }
+                if (best_g < p.n_group) {
+                    picked_g |= (1u << best_g);
+                }
+            }
+            group_allow_mask = picked_g;
+        }
+
+        float w_sum = 0.0f;
+        for (uint k = 0u; k < top_k; k++) {
+            float best_choice = -INFINITY;
+            float best_score = 0.0f;
+            uint best_e = 0xFFFFFFFFu;
+            for (uint r = 0u; r < chunks; r++) {
+                const uint e = lane + r * 32u;
+                if (e < p.num_experts && ((s_picked[sg_id][r] >> lane) & 1u) == 0u) {
+                    const uint g_idx = use_groups ? (e / group_size) : 0u;
+                    if (!use_groups || ((group_allow_mask >> g_idx) & 1u) != 0u) {
+                        const float raw = G26_LOGITS_F16
+                            ? float(((const device half *)logits_raw)[row_base + e])
+                            : ((const device float *)logits_raw)[row_base + e];
+                        float sc = 0.0f;
+                        float ch = -INFINITY;
+                        if (isfinite(raw) && raw > -1.0e29f) {
+                            sc = hybrid_sigmoid(raw);
+                            const float b = (p.has_bias != 0u)
+                                ? g26_hybrid_load_scalar_f32(bias_raw, e, p.bias_dtype)
+                                : 0.0f;
+                            ch = sc + b;
+                        }
+                        if (ch > best_choice || (ch == best_choice && e < best_e)) {
+                            best_choice = ch;
+                            best_score = sc;
+                            best_e = e;
+                        }
+                    }
+                }
+            }
+            for (ushort offset = 16u; offset > 0u; offset >>= 1u) {
+                const float oc = simd_shuffle_down(best_choice, offset);
+                const float os = simd_shuffle_down(best_score, offset);
+                const uint oe = simd_shuffle_down(best_e, offset);
+                if (oc > best_choice || (oc == best_choice && oe < best_e)) {
+                    best_choice = oc;
+                    best_score = os;
+                    best_e = oe;
+                }
+            }
+            const uint raw_win_e = simd_broadcast_first(best_e);
+            const uint win_e = (raw_win_e < p.num_experts) ? raw_win_e : 0u;
+            const float win_s = simd_broadcast_first(best_score);
+            if (lane == 0u) {
+                s_picked[sg_id][win_e >> 5] |= (1u << (win_e & 31u));
+                s_sel_e[sg_id][k] = win_e;
+                s_sel_w[sg_id][k] = win_s;
+                w_sum += win_s;
+            }
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        if (lane == 0u) {
+            const float renorm = (p.norm_topk_prob != 0u && top_k > 1u)
+                ? (p.routed_scaling_factor / (w_sum + 1.0e-20f))
+                : p.routed_scaling_factor;
+            const ulong base = ulong(tok) * top_k;
+            for (uint k = 0u; k < top_k; k++) {
+                const uint e = s_sel_e[sg_id][k];
+                scratch_topk_experts[base + k] = e;
+                scratch_topk_weights[base + k] = s_sel_w[sg_id][k] * renorm;
+                atomic_fetch_add_explicit(&s_counts[e], 1u, memory_order_relaxed);
+            }
+        }
+    }
+
+    threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
+
+    if (p.is_bucketed == 0u) {
+        uint u_base = 0u;
+        uint tok_base = 0u;
+        for (uint blk_base = 0u; blk_base < p.num_experts; blk_base += 256u) {
+            const uint e = blk_base + tid;
+            const uint cnt = (e < p.num_experts)
+                ? atomic_load_explicit(&s_counts[e], memory_order_relaxed)
+                : 0u;
+            const uint is_active = (cnt > 0u) ? 1u : 0u;
+
+            const uint sg_act_excl = simd_prefix_exclusive_sum(is_active);
+            if (lane == 31u) {
+                s_prefix_tmp[sg_id] = sg_act_excl + is_active;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (sg_id == 0u) {
+                const uint v = (lane < 8u) ? s_prefix_tmp[lane] : 0u;
+                const uint ex = simd_prefix_exclusive_sum(v);
+                if (lane < 8u) {
+                    s_prefix_tmp[lane] = ex;
+                }
+                if (lane == 7u) {
+                    s_u_cnt = ex + v;
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            const uint u_idx = u_base + s_prefix_tmp[sg_id] + sg_act_excl;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            const uint sg_cnt_excl = simd_prefix_exclusive_sum(cnt);
+            if (lane == 31u) {
+                s_prefix_tmp[sg_id] = sg_cnt_excl + cnt;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (sg_id == 0u) {
+                const uint v = (lane < 8u) ? s_prefix_tmp[lane] : 0u;
+                const uint ex = simd_prefix_exclusive_sum(v);
+                if (lane < 8u) {
+                    s_prefix_tmp[lane] = ex;
+                }
+                if (lane == 7u) {
+                    s_a_cnt = ex + v;
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            const uint tok_off = tok_base + s_prefix_tmp[sg_id] + sg_cnt_excl;
+
+            if (e < p.num_experts) {
+                atomic_store_explicit(&s_cursors[e], tok_off, memory_order_relaxed);
+            }
+            if (is_active != 0u) {
+                unique_experts[u_idx] = e;
+                expert_token_offsets[u_idx] = tok_off;
+            }
+            u_base += s_u_cnt;
+            tok_base += s_a_cnt;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        if (tid == 0u) {
+            const uint total_assign = p.m * top_k;
+            expert_token_offsets[u_base] = total_assign;
+            sched_hdr->num_unique_experts = u_base;
+            sched_hdr->total_assignments = total_assign;
+            sched_hdr->m = p.m;
+            sched_hdr->top_k = top_k;
+            g26_write_schedule_indirect((device uchar *)sched_hdr,
+                                        u_base,
+                                        p.gate_up_groups_x_q,
+                                        p.gate_up_groups_x_f,
+                                        p.down_groups_x,
+                                        p.down_groups_x_q8);
+        }
+    } else {
+        uint running_u_base = 0u;
+        uint running_a_base = 0u;
+        for (uint s = 0u; s < NUM_SCHEMES; s++) {
+            const ulong u_base_off = ulong(s) * p.bucket_unique_stride;
+            const ulong o_base_off = ulong(s) * p.bucket_offsets_stride;
+            uint u_cnt_s = 0u;
+            uint a_cnt_s = 0u;
+
+            for (uint blk_base = 0u; blk_base < p.num_experts; blk_base += 256u) {
+                const uint e = blk_base + tid;
+                const uint cnt = (e < p.num_experts)
+                    ? atomic_load_explicit(&s_counts[e], memory_order_relaxed)
+                    : 0u;
+                const uint my_scheme = (e < p.num_experts)
+                    ? min(uint(expert_schemes[e]), NUM_SCHEMES - 1u)
+                    : NUM_SCHEMES;
+                const uint in_s = (cnt > 0u && my_scheme == s) ? 1u : 0u;
+                const uint cnt_s = (my_scheme == s) ? cnt : 0u;
+
+                const uint sg_act_excl = simd_prefix_exclusive_sum(in_s);
+                if (lane == 31u) {
+                    s_prefix_tmp[sg_id] = sg_act_excl + in_s;
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                if (sg_id == 0u) {
+                    const uint v = (lane < 8u) ? s_prefix_tmp[lane] : 0u;
+                    const uint ex = simd_prefix_exclusive_sum(v);
+                    if (lane < 8u) {
+                        s_prefix_tmp[lane] = ex;
+                    }
+                    if (lane == 7u) {
+                        s_u_cnt = ex + v;
+                    }
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                const uint u_in_blk = s_prefix_tmp[sg_id] + sg_act_excl;
+                const uint blk_u_cnt = s_u_cnt;
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+
+                const uint sg_cnt_excl = simd_prefix_exclusive_sum(cnt_s);
+                if (lane == 31u) {
+                    s_prefix_tmp[sg_id] = sg_cnt_excl + cnt_s;
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                if (sg_id == 0u) {
+                    const uint v = (lane < 8u) ? s_prefix_tmp[lane] : 0u;
+                    const uint ex = simd_prefix_exclusive_sum(v);
+                    if (lane < 8u) {
+                        s_prefix_tmp[lane] = ex;
+                    }
+                    if (lane == 7u) {
+                        s_a_cnt = ex + v;
+                    }
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                const uint a_in_blk = s_prefix_tmp[sg_id] + sg_cnt_excl;
+                const uint blk_a_cnt = s_a_cnt;
+
+                if (in_s != 0u) {
+                    const uint slot_off = running_a_base + a_cnt_s + a_in_blk;
+                    atomic_store_explicit(&s_cursors[e], slot_off, memory_order_relaxed);
+                    bucket_unique_experts[u_base_off + u_cnt_s + u_in_blk] = e;
+                    bucket_expert_token_offsets[o_base_off + u_cnt_s + u_in_blk] = slot_off;
+                    unique_experts[running_u_base + u_cnt_s + u_in_blk] = e;
+                    expert_token_offsets[running_u_base + u_cnt_s + u_in_blk] = slot_off;
+                }
+                u_cnt_s += blk_u_cnt;
+                a_cnt_s += blk_a_cnt;
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+
+            if (tid == 0u) {
+                bucket_expert_token_offsets[o_base_off + u_cnt_s] = running_a_base + a_cnt_s;
+                device uchar *slot_ptr = bucket_headers + ulong(s) * 64ul;
+                device G26MoeScheduleHeader *bhdr = (device G26MoeScheduleHeader *)slot_ptr;
+                bhdr->num_unique_experts = u_cnt_s;
+                bhdr->total_assignments = a_cnt_s;
+                bhdr->m = p.m;
+                bhdr->top_k = top_k;
+                g26_write_schedule_indirect(slot_ptr,
+                                            u_cnt_s,
+                                            p.gate_up_groups_x_q,
+                                            p.gate_up_groups_x_f,
+                                            p.down_groups_x,
+                                            p.down_groups_x_q8);
+            }
+            running_u_base += u_cnt_s;
+            running_a_base += a_cnt_s;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        if (tid == 0u) {
+            expert_token_offsets[running_u_base] = running_a_base;
+            sched_hdr->num_unique_experts = running_u_base;
+            sched_hdr->total_assignments = running_a_base;
+            sched_hdr->m = p.m;
+            sched_hdr->top_k = top_k;
+            g26_write_schedule_indirect((device uchar *)sched_hdr,
+                                        running_u_base,
+                                        p.gate_up_groups_x_q,
+                                        p.gate_up_groups_x_f,
+                                        p.down_groups_x,
+                                        p.down_groups_x_q8);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const uint total_assign = p.m * top_k;
+    for (uint idx = tid; idx < total_assign; idx += 256u) {
+        const uint tok = idx / top_k;
+        const uint k_idx = idx - tok * top_k;
+        const uint e = scratch_topk_experts[idx];
+        const float w = scratch_topk_weights[idx];
+        const uint dst = atomic_fetch_add_explicit(&s_cursors[e], 1u, memory_order_relaxed);
+        token_indices[dst] = tok;
+        routing_weights[dst] = w;
+        slot_k_indices[dst] = k_idx;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// G26 DFlash Target Hidden Tap Ring Capture (`[cap, num_taps, H]` f16 ring).
+// Copies either contiguous `[num_rows, H]` rows at one `tap_idx` (prefill/decode)
+// or accepted tree nodes across all `num_taps` from `[num_taps, src_stride_rows, H]`
+// into the circular `GpuContextHistory` ring with zero CPU-GPU syncs.
+// ---------------------------------------------------------------------------
+
+struct G26TapRingCaptureParams {
+    uint num_rows;
+    uint hidden_size;
+    uint base_pos;
+    uint ring_cap;
+    uint num_taps;
+    uint tap_idx;         // used when mode == 0 (single tap from layer output)
+    uint src_stride_rows; // used when mode == 1 (tree commit across all taps)
+    uint mode;            // 0 = single tap [num_rows, H], 1 = gather inline_nodes[0..num_rows) across all taps
+    ushort inline_nodes[64];
+};
+
+static_assert(sizeof(G26TapRingCaptureParams) == 160, "G26TapRingCaptureParams must be 160 bytes");
+
+// Grid: (num_rows, (mode == 1 ? num_taps : 1), 1) threadgroups, 256 threads.
+kernel void ami_g26_capture_tap_ring(const device half *src [[buffer(0)]],
+                                     device half *ring [[buffer(1)]],
+                                     constant G26TapRingCaptureParams &p [[buffer(2)]],
+                                     uint2 tg_pos [[threadgroup_position_in_grid]],
+                                     uint tid [[thread_index_in_threadgroup]]) {
+    const uint ri = tg_pos.x;
+    const uint ti = (p.mode != 0u) ? tg_pos.y : p.tap_idx;
+    if (ri >= p.num_rows || ti >= p.num_taps || p.ring_cap == 0u) {
+        return;
+    }
+
+    const uint dst_slot = (p.base_pos + ri) % p.ring_cap;
+    const ulong dst_off = (ulong(dst_slot) * p.num_taps + ti) * p.hidden_size;
+    ulong src_off;
+    if (p.mode != 0u) {
+        const uint node = uint(p.inline_nodes[ri]);
+        src_off = (ulong(ti) * p.src_stride_rows + node) * p.hidden_size;
+    } else {
+        src_off = ulong(ri) * p.hidden_size;
+    }
+
+    const device half *s = src + src_off;
+    device half *d = ring + dst_off;
+    if ((p.hidden_size & 3u) == 0u) {
+        const uint vec_len = p.hidden_size >> 2;
+        const device half4 *s4 = (const device half4 *)s;
+        device half4 *d4 = (device half4 *)d;
+        for (uint i = tid; i < vec_len; i += 256u) {
+            d4[i] = s4[i];
+        }
+    } else {
+        for (uint i = tid; i < p.hidden_size; i += 256u) {
+            d[i] = s[i];
         }
     }
 }

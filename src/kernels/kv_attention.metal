@@ -10,6 +10,9 @@ constant uint S1_ACCESS_MODE [[function_constant(1)]];
 constant bool NORM_W_BF16 [[function_constant(2)]];
 // Compile-time speculative tree width cap: 16, 32, or 64 (ADR-0014).
 constant uint TREE_MAX_NODES [[function_constant(3)]];
+// G26 asymmetric K/V head dimensions (`0` = dynamic <= 256, `192`/`128`, `256`/`256`).
+constant uint G26_GQA_K_DIM [[function_constant(4)]];
+constant uint G26_GQA_V_DIM [[function_constant(5)]];
 
 // `bf16` is always a compile-time constant at every call site (a function
 // constant or a literal), so the untaken branch is eliminated.
@@ -46,7 +49,7 @@ struct RmsNormParams {
     uint num_rows;
     uint hidden_dim;
     float eps;
-    uint _pad;
+    uint unit_offset;
 };
 
 struct QkNormRopeKvParams {
@@ -167,17 +170,19 @@ kernel void ami_rmsnorm(const device half *x [[buffer(0)]],
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     const float inv_rms = sg_sums[0];
+    const float w_add1 = (p.unit_offset != 0u) ? 1.0f : 0.0f;
     if ((p.hidden_dim & 3u) == 0u) {
+        const float4 w_add4 = float4(w_add1);
         const uint vec_len = p.hidden_dim >> 2;
         const device half4 *x4 = (const device half4 *)x_row;
         device half4 *y4 = (device half4 *)y_row;
         for (uint i = tid; i < vec_len; i += 256u) {
-            const float4 v = (float4(x4[i]) * inv_rms) * norm_w4(w, i, NORM_W_BF16);
+            const float4 v = (float4(x4[i]) * inv_rms) * (norm_w4(w, i, NORM_W_BF16) + w_add4);
             y4[i] = half4(v);
         }
     } else {
         for (uint i = tid; i < p.hidden_dim; i += 256u) {
-            const float v = (float(x_row[i]) * inv_rms) * norm_w1(w, i, NORM_W_BF16);
+            const float v = (float(x_row[i]) * inv_rms) * (norm_w1(w, i, NORM_W_BF16) + w_add1);
             y_row[i] = half(v);
         }
     }
@@ -258,16 +263,17 @@ kernel void ami_fused_residual_rmsnorm(device half *x [[buffer(0)]],
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         const float inv_rms = sg_sums[0];
+        const float4 w_add4 = float4((p.unit_offset != 0u) ? 1.0f : 0.0f);
         #pragma clang loop unroll(full)
         for (uint c = 0u; c < 8u; c++) {
             const uint i = tid + c * 256u;
             if (i < vec_len) {
-                const float4 v = (float4(reg_x[c]) * inv_rms) * norm_w4(w, i, NORM_W_BF16);
+                const float4 v = (float4(reg_x[c]) * inv_rms) * (norm_w4(w, i, NORM_W_BF16) + w_add4);
                 y4[i] = half4(v);
             }
         }
         for (uint i = tid + 8u * 256u; i < vec_len; i += 256u) {
-            const float4 v = (float4(x4[i]) * inv_rms) * norm_w4(w, i, NORM_W_BF16);
+            const float4 v = (float4(x4[i]) * inv_rms) * (norm_w4(w, i, NORM_W_BF16) + w_add4);
             y4[i] = half4(v);
         }
     } else {
@@ -309,16 +315,17 @@ kernel void ami_fused_residual_rmsnorm(device half *x [[buffer(0)]],
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         const float inv_rms = sg_sums[0];
+        const float w_add1 = (p.unit_offset != 0u) ? 1.0f : 0.0f;
         #pragma clang loop unroll(full)
         for (uint c = 0u; c < 8u; c++) {
             const uint i = tid + c * 256u;
             if (i < p.hidden_dim) {
-                const float v = (float(reg_s[c]) * inv_rms) * norm_w1(w, i, NORM_W_BF16);
+                const float v = (float(reg_s[c]) * inv_rms) * (norm_w1(w, i, NORM_W_BF16) + w_add1);
                 y_row[i] = half(v);
             }
         }
         for (uint i = tid + 8u * 256u; i < p.hidden_dim; i += 256u) {
-            const float v = (float(x_row[i]) * inv_rms) * norm_w1(w, i, NORM_W_BF16);
+            const float v = (float(x_row[i]) * inv_rms) * (norm_w1(w, i, NORM_W_BF16) + w_add1);
             y_row[i] = half(v);
         }
     }
@@ -3770,5 +3777,516 @@ kernel void ami_gqa_causal_prefill_flash_attn(const device half *q [[buffer(0)]]
         flash_prefill_exec_d64_bk64(
             q, kv_tiles, retired_pool, retired_chunk_ids, out, p,
             smem.d64.u, smem.d64.Ps, smem.d64.Os, tg_pos, tid, sg_id, lane);
+    }
+}
+
+// ===========================================================================
+// G26: Attention Output Sigmoid Gate (`qwen3_5` `q_gate_proj`) & Asymmetric
+// `K/V <= 256` (`192/128`, `256/256`, dynamic) Global GQA Split-KV & Prefill
+// with FP32 Online Softmax Sink Bias (`mimo_v2` & `qwen3_5`).
+// ===========================================================================
+
+static inline float g26_load_scalar_f32(const device uchar *buf, uint idx, uint dtype) {
+    if (dtype == 2u) {
+        return ((const device float *)buf)[idx];
+    }
+    if (dtype == 1u) {
+        return float(((const device bfloat *)buf)[idx]);
+    }
+    return float(((const device half *)buf)[idx]);
+}
+
+struct MulSigmoidParams {
+    uint count;
+    uint _pad0;
+    uint _pad1;
+    uint _pad2;
+};
+
+static_assert(sizeof(MulSigmoidParams) == 16, "MulSigmoidParams must be 16 bytes");
+
+// Elementwise `out[i] *= sigmoid(gate[i])` in FP32 (`qwen3_5` `attn_output_gate`).
+// Grid: (ceil(count / 1024), 1, 1) threadgroups, 256 threads.
+kernel void ami_mul_sigmoid_f16(device half *out [[buffer(0)]],
+                                const device half *gate [[buffer(1)]],
+                                constant MulSigmoidParams &p [[buffer(2)]],
+                                uint gid [[thread_position_in_grid]]) {
+    const uint base = gid * 4u;
+    if (base + 4u <= p.count) {
+        const float4 x = float4(*(const device half4 *)(out + base));
+        const float4 g = float4(*(const device half4 *)(gate + base));
+        const float4 sig = 1.0f / (1.0f + exp(-g));
+        *(device half4 *)(out + base) = half4(x * sig);
+        return;
+    }
+    for (uint i = base; i < p.count; i++) {
+        const float x = float(out[i]);
+        const float g = float(gate[i]);
+        out[i] = half(x / (1.0f + exp(-g)));
+    }
+}
+
+struct G26GqaAttnParams {
+    uint num_nodes;
+    uint num_q_heads;
+    uint num_kv_heads;
+    uint k_head_dim;
+    uint v_head_dim;
+    uint base_pos;
+    uint chunk_tokens;
+    uint num_splits;
+    uint q_groups_per_kv;
+    uint num_retired_chunks;
+    uint retired_plane_stride_bytes;
+    uint retired_chunk_stride_bytes;
+    uint tile_table_offset;
+    uint retired_offset;
+    uint has_tree;
+    uint has_sink;
+    uint sink_dtype;     // 0 = f16, 1 = bf16, 2 = f32
+    uint sliding_window; // 0 = global full attention, >0 = sliding window
+    float scale;
+    uint _pad0;
+};
+
+static_assert(sizeof(G26GqaAttnParams) == 80, "G26GqaAttnParams must be 80 bytes");
+
+// Asymmetric K/V (`K <= 256, V <= 256`, specialized on `(192,128)`, `(256,256)`,
+// or dynamic `(0,0)`) Split-KV Global GQA Decode (`M = 1`) and Speculative Tree
+// Verification (`M = 1..64`) with optional FP32 online-softmax sink bias.
+// Grid: (num_kv_heads * q_groups_per_kv, num_splits, 1) threadgroups, 256 threads.
+kernel void ami_g26_gqa_split(const device half *q [[buffer(0)]],
+                              const device KvTilePair *kv_tiles [[buffer(1)]],
+                              const device half *k_tree [[buffer(2)]],
+                              const device half *v_tree [[buffer(3)]],
+                              const device ulong *ancestor_masks [[buffer(4)]],
+                              const device uchar *sink_bias [[buffer(5)]],
+                              const device uchar *retired_pool [[buffer(6)]],
+                              const device uint *retired_chunk_ids [[buffer(7)]],
+                              device half *out [[buffer(8)]],
+                              device float *partial_m [[buffer(9)]],
+                              device float *partial_l [[buffer(10)]],
+                              device float *partial_o [[buffer(11)]],
+                              constant G26GqaAttnParams &p [[buffer(12)]],
+                              uint2 tg_pos [[threadgroup_position_in_grid]],
+                              uint tid [[thread_index_in_threadgroup]],
+                              uint sg_id [[simdgroup_index_in_threadgroup]],
+                              uint lane [[thread_index_in_simdgroup]]) {
+    constexpr uint Q_TILE = 8u;
+    constexpr float LOG2E = 1.4426950408889634f;
+
+    const uint kv_head = tg_pos.x / p.q_groups_per_kv;
+    const uint q_grp = tg_pos.x % p.q_groups_per_kv;
+    const uint split_idx = tg_pos.y;
+    if (kv_head >= p.num_kv_heads || split_idx >= p.num_splits) {
+        return;
+    }
+
+    const uint gqa_ratio = p.num_q_heads / p.num_kv_heads;
+    const uint total_q = p.num_nodes * gqa_ratio;
+    const uint q_start_flat = q_grp * Q_TILE;
+    if (q_start_flat >= total_q) {
+        return;
+    }
+    const uint q_cnt = min(Q_TILE, total_q - q_start_flat);
+
+    const uint win_lo = (p.sliding_window > 0u && p.base_pos > p.sliding_window)
+        ? (p.base_pos - p.sliding_window)
+        : 0u;
+    const uint span_len = p.base_pos - win_lo;
+    uint t_start = win_lo;
+    uint t_end = win_lo;
+    if (span_len > 0u) {
+        const uint tokens_per_split = (span_len + p.num_splits - 1u) / p.num_splits;
+        t_start = min(win_lo + split_idx * tokens_per_split, p.base_pos);
+        t_end = min(t_start + tokens_per_split, p.base_pos);
+    }
+
+    const bool do_prefix = (t_start < t_end);
+    const bool do_tree = (split_idx == 0u && p.has_tree != 0u);
+    const bool do_sink = (split_idx == 0u && p.has_sink != 0u);
+    if (!do_prefix && !do_tree && !do_sink) {
+        if (p.num_splits > 1u && tid < q_cnt) {
+            const uint flat_q = q_start_flat + tid;
+            const uint node = flat_q / gqa_ratio;
+            const uint qh = kv_head * gqa_ratio + (flat_q - node * gqa_ratio);
+            const ulong ps = (ulong(node) * p.num_q_heads + qh) * p.num_splits + split_idx;
+            partial_m[ps] = -INFINITY;
+            partial_l[ps] = 0.0f;
+        }
+        return;
+    }
+
+    const uint k_dim = (G26_GQA_K_DIM > 0u) ? G26_GQA_K_DIM : p.k_head_dim;
+    const uint v_dim = (G26_GQA_V_DIM > 0u) ? G26_GQA_V_DIM : p.v_head_dim;
+    const uint k_cols = k_dim >> 2;
+    const uint v_cols = v_dim >> 2;
+    const bool can_retire_q8 = (p.num_retired_chunks > 0u && k_dim == v_dim && (k_dim & 63u) == 0u);
+    const uint q8_groups = k_dim >> 6;
+
+    const bool active_q = (sg_id < q_cnt);
+    const uint safe_flat = q_start_flat + min(sg_id, q_cnt - 1u);
+    const uint node = safe_flat / gqa_ratio;
+    const uint qh = kv_head * gqa_ratio + (safe_flat - node * gqa_ratio);
+    const ulong q_row_off = (ulong(node) * p.num_q_heads + qh) * k_dim;
+    const float scale_log2e = p.scale * LOG2E;
+
+    const float4 q0 = (active_q && lane < k_cols)
+        ? float4(*(const device half4 *)(q + q_row_off + lane * 4u))
+        : float4(0.0f);
+    const float4 q1 = (active_q && (lane + 32u) < k_cols)
+        ? float4(*(const device half4 *)(q + q_row_off + (lane + 32u) * 4u))
+        : float4(0.0f);
+
+    float m_val = -INFINITY;
+    float l_val = 0.0f;
+    if (do_sink && active_q) {
+        m_val = g26_load_scalar_f32(sink_bias, qh, p.sink_dtype) * LOG2E;
+        l_val = 1.0f;
+    }
+    float4 acc0 = float4(0.0f);
+    float4 acc1 = float4(0.0f);
+
+    // 4-token cooperative staging (4 x 64 half4 = 256 half4 each = 4 KiB total TG SRAM).
+    threadgroup half4 tg_k[256];
+    threadgroup half4 tg_v[256];
+
+    if (do_prefix) {
+        const uint load_tok = tid >> 6;  // 0..3
+        const uint load_col = tid & 63u; // 0..63
+        const uint head_row_base = kv_head * p.chunk_tokens;
+
+        for (uint tile_t = t_start; tile_t < t_end; tile_t += 4u) {
+            const uint tile_len = min(4u, t_end - tile_t);
+            if (load_tok < tile_len) {
+                const uint t = tile_t + load_tok;
+                const uint chunk = t / p.chunk_tokens;
+                const uint slot = t - chunk * p.chunk_tokens;
+                const uint row = head_row_base + slot;
+                if (can_retire_q8 && chunk < p.num_retired_chunks) {
+                    const uint phys_slot = retired_chunk_ids[p.retired_offset + chunk];
+                    const device uchar *k_plane = retired_pool + ulong(phys_slot) * p.retired_chunk_stride_bytes;
+                    const device uchar *v_plane = k_plane + p.retired_plane_stride_bytes;
+                    if (load_col < k_cols) {
+                        tg_k[tid] = load_q8_half4(k_plane, row, q8_groups, load_col);
+                    }
+                    if (load_col < v_cols) {
+                        tg_v[tid] = load_q8_half4(v_plane, row, q8_groups, load_col);
+                    }
+                } else {
+                    const uint active_chunk = chunk - p.num_retired_chunks;
+                    const KvTilePair pair = kv_tiles[p.tile_table_offset + active_chunk];
+                    if (load_col < k_cols) {
+                        tg_k[tid] = pair.k_tex.read(uint2(load_col, row));
+                    }
+                    if (load_col < v_cols) {
+                        tg_v[tid] = pair.v_tex.read(uint2(load_col, row));
+                    }
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            if (active_q) {
+                for (uint dt = 0u; dt < tile_len; dt++) {
+                    const uint base_idx = dt * 64u;
+                    float partial = (lane < k_cols) ? dot(q0, float4(tg_k[base_idx + lane])) : 0.0f;
+                    if ((lane + 32u) < k_cols) {
+                        partial += dot(q1, float4(tg_k[base_idx + lane + 32u]));
+                    }
+                    const float score = simd_sum(partial) * scale_log2e;
+                    const float new_m = max(m_val, score);
+                    const float corr = (l_val > 0.0f) ? exp2(m_val - new_m) : 0.0f;
+                    const float p_w = exp2(score - new_m);
+                    l_val = fma(l_val, corr, p_w);
+                    if (lane < v_cols) {
+                        acc0 = fma(acc0, float4(corr), float4(tg_v[base_idx + lane]) * p_w);
+                    }
+                    if ((lane + 32u) < v_cols) {
+                        acc1 = fma(acc1, float4(corr), float4(tg_v[base_idx + lane + 32u]) * p_w);
+                    }
+                    m_val = new_m;
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+
+    if (do_tree && active_q) {
+        ulong rem = ancestor_masks[node];
+        while (rem != 0ul) {
+            const uint j = uint(ctz(rem));
+            rem &= (rem - 1ul);
+            if (j < p.num_nodes) {
+                const ulong k_off = (ulong(j) * p.num_kv_heads + kv_head) * k_dim;
+                const ulong v_off = (ulong(j) * p.num_kv_heads + kv_head) * v_dim;
+                float partial = 0.0f;
+                if (lane < k_cols) {
+                    partial = dot(q0, float4(*(const device half4 *)(k_tree + k_off + lane * 4u)));
+                }
+                if ((lane + 32u) < k_cols) {
+                    partial += dot(q1, float4(*(const device half4 *)(k_tree + k_off + (lane + 32u) * 4u)));
+                }
+                const float score = simd_sum(partial) * scale_log2e;
+                const float new_m = max(m_val, score);
+                const float corr = (l_val > 0.0f) ? exp2(m_val - new_m) : 0.0f;
+                const float p_w = exp2(score - new_m);
+                l_val = fma(l_val, corr, p_w);
+                if (lane < v_cols) {
+                    const float4 v0 = float4(*(const device half4 *)(v_tree + v_off + lane * 4u));
+                    acc0 = fma(acc0, float4(corr), v0 * p_w);
+                }
+                if ((lane + 32u) < v_cols) {
+                    const float4 v1 = float4(*(const device half4 *)(v_tree + v_off + (lane + 32u) * 4u));
+                    acc1 = fma(acc1, float4(corr), v1 * p_w);
+                }
+                m_val = new_m;
+            }
+        }
+    }
+
+    if (!active_q) {
+        return;
+    }
+
+    if (p.num_splits == 1u) {
+        const float inv_l = (l_val > 0.0f) ? (1.0f / l_val) : 0.0f;
+        const ulong out_off = (ulong(node) * p.num_q_heads + qh) * v_dim;
+        if (lane < v_cols) {
+            *(device half4 *)(out + out_off + lane * 4u) = half4(acc0 * inv_l);
+        }
+        if ((lane + 32u) < v_cols) {
+            *(device half4 *)(out + out_off + (lane + 32u) * 4u) = half4(acc1 * inv_l);
+        }
+    } else {
+        const ulong ps = (ulong(node) * p.num_q_heads + qh) * p.num_splits + split_idx;
+        if (lane == 0u) {
+            partial_m[ps] = m_val;
+            partial_l[ps] = l_val;
+        }
+        device float4 *po4 = (device float4 *)(partial_o + ps * v_dim);
+        if (lane < v_cols) {
+            po4[lane] = acc0;
+        }
+        if ((lane + 32u) < v_cols) {
+            po4[lane + 32u] = acc1;
+        }
+    }
+}
+
+// Split-KV reduction for `ami_g26_gqa_split` (`num_splits > 1`, `v_head_dim <= 256`).
+// Grid: (num_q_heads, num_nodes, 1) threadgroups, 32 threads (1 simdgroup).
+kernel void ami_g26_gqa_reduce(const device float *partial_m [[buffer(0)]],
+                               const device float *partial_l [[buffer(1)]],
+                               const device float *partial_o [[buffer(2)]],
+                               device half *out [[buffer(3)]],
+                               constant G26GqaAttnParams &p [[buffer(4)]],
+                               uint2 tg_pos [[threadgroup_position_in_grid]],
+                               uint lane [[thread_index_in_simdgroup]]) {
+    const uint qh = tg_pos.x;
+    const uint node = tg_pos.y;
+    if (qh >= p.num_q_heads || node >= p.num_nodes) {
+        return;
+    }
+
+    const uint v_dim = (G26_GQA_V_DIM > 0u) ? G26_GQA_V_DIM : p.v_head_dim;
+    const uint v_cols = v_dim >> 2;
+    const ulong base_s = (ulong(node) * p.num_q_heads + qh) * p.num_splits;
+
+    float global_m = -INFINITY;
+    for (uint s = 0u; s < p.num_splits; s++) {
+        const float pl = partial_l[base_s + s];
+        if (pl > 0.0f) {
+            global_m = max(global_m, partial_m[base_s + s]);
+        }
+    }
+
+    float global_l = 0.0f;
+    float4 acc0 = float4(0.0f);
+    float4 acc1 = float4(0.0f);
+    for (uint s = 0u; s < p.num_splits; s++) {
+        const float pl = partial_l[base_s + s];
+        if (pl <= 0.0f) {
+            continue;
+        }
+        const float scale_s = exp2(partial_m[base_s + s] - global_m);
+        global_l = fma(pl, scale_s, global_l);
+        const device float4 *po4 = (const device float4 *)(partial_o + (base_s + s) * v_dim);
+        if (lane < v_cols) {
+            acc0 = fma(po4[lane], float4(scale_s), acc0);
+        }
+        if ((lane + 32u) < v_cols) {
+            acc1 = fma(po4[lane + 32u], float4(scale_s), acc1);
+        }
+    }
+
+    const float inv_l = (global_l > 0.0f) ? (1.0f / global_l) : 0.0f;
+    const ulong out_off = (ulong(node) * p.num_q_heads + qh) * v_dim;
+    if (lane < v_cols) {
+        *(device half4 *)(out + out_off + lane * 4u) = half4(acc0 * inv_l);
+    }
+    if ((lane + 32u) < v_cols) {
+        *(device half4 *)(out + out_off + (lane + 32u) * 4u) = half4(acc1 * inv_l);
+    }
+}
+
+struct G26GqaPrefillParams {
+    uint num_q;
+    uint q_start_pos;
+    uint kv_len;
+    uint num_q_heads;
+    uint num_kv_heads;
+    uint k_head_dim;
+    uint v_head_dim;
+    uint chunk_tokens;
+    uint sliding_window;
+    uint ring_capacity;
+    uint tile_table_offset;
+    uint num_retired_chunks;
+    uint retired_offset;
+    uint retired_plane_stride_bytes;
+    uint retired_chunk_stride_bytes;
+    uint has_sink;
+    uint sink_dtype;
+    uint _pad0;
+    float scale;
+    uint _pad1;
+};
+
+static_assert(sizeof(G26GqaPrefillParams) == 80, "G26GqaPrefillParams must be 80 bytes");
+
+// Asymmetric K/V (`K <= 256, V <= 256`) Causal Prefill Attention over committed
+// `KvTilePair` chunks with optional FP32 online-softmax sink bias.
+// Grid: (num_kv_heads * q_groups_per_kv, num_q, 1) threadgroups, 256 threads.
+kernel void ami_g26_gqa_prefill(const device half *q [[buffer(0)]],
+                                const device KvTilePair *kv_tiles [[buffer(1)]],
+                                const device uchar *sink_bias [[buffer(2)]],
+                                const device uchar *retired_pool [[buffer(3)]],
+                                const device uint *retired_chunk_ids [[buffer(4)]],
+                                device half *out [[buffer(5)]],
+                                constant G26GqaPrefillParams &p [[buffer(6)]],
+                                uint2 tg_pos [[threadgroup_position_in_grid]],
+                                uint tid [[thread_index_in_threadgroup]],
+                                uint sg_id [[simdgroup_index_in_threadgroup]],
+                                uint lane [[thread_index_in_simdgroup]]) {
+    constexpr uint Q_TILE = 8u;
+    constexpr float LOG2E = 1.4426950408889634f;
+
+    const uint gqa_ratio = p.num_q_heads / p.num_kv_heads;
+    const uint q_groups_per_kv = (gqa_ratio + Q_TILE - 1u) / Q_TILE;
+    const uint kv_head = tg_pos.x / q_groups_per_kv;
+    const uint q_grp = tg_pos.x % q_groups_per_kv;
+    const uint qi = tg_pos.y;
+    if (kv_head >= p.num_kv_heads || qi >= p.num_q) {
+        return;
+    }
+
+    const uint q_start = kv_head * gqa_ratio + q_grp * Q_TILE;
+    const uint q_end = min(q_start + Q_TILE, (kv_head + 1u) * gqa_ratio);
+    const uint q_cnt = q_end - q_start;
+    const bool active_q = (sg_id < q_cnt);
+    const uint qh = q_start + min(sg_id, q_cnt - 1u);
+
+    const uint k_dim = (G26_GQA_K_DIM > 0u) ? G26_GQA_K_DIM : p.k_head_dim;
+    const uint v_dim = (G26_GQA_V_DIM > 0u) ? G26_GQA_V_DIM : p.v_head_dim;
+    const uint k_cols = k_dim >> 2;
+    const uint v_cols = v_dim >> 2;
+    const bool can_retire_q8 = (p.ring_capacity == 0u && p.num_retired_chunks > 0u &&
+                                k_dim == v_dim && (k_dim & 63u) == 0u);
+    const uint q8_groups = k_dim >> 6;
+    const float scale_log2e = p.scale * LOG2E;
+
+    const uint q_pos = p.q_start_pos + qi;
+    const uint t_hi = min(p.kv_len, q_pos + 1u);
+    const uint t_lo = (p.sliding_window > 0u && t_hi > p.sliding_window)
+        ? (t_hi - p.sliding_window)
+        : 0u;
+
+    const ulong q_row_off = (ulong(qi) * p.num_q_heads + qh) * k_dim;
+    const float4 q0 = (active_q && lane < k_cols)
+        ? float4(*(const device half4 *)(q + q_row_off + lane * 4u))
+        : float4(0.0f);
+    const float4 q1 = (active_q && (lane + 32u) < k_cols)
+        ? float4(*(const device half4 *)(q + q_row_off + (lane + 32u) * 4u))
+        : float4(0.0f);
+
+    float m_val = -INFINITY;
+    float l_val = 0.0f;
+    if (p.has_sink != 0u && active_q) {
+        m_val = g26_load_scalar_f32(sink_bias, qh, p.sink_dtype) * LOG2E;
+        l_val = 1.0f;
+    }
+    float4 acc0 = float4(0.0f);
+    float4 acc1 = float4(0.0f);
+
+    threadgroup half4 tg_k[256];
+    threadgroup half4 tg_v[256];
+    const uint load_tok = tid >> 6;  // 0..3
+    const uint load_col = tid & 63u; // 0..63
+    const uint head_row_base = kv_head * p.chunk_tokens;
+
+    for (uint tile_t = t_lo; tile_t < t_hi; tile_t += 4u) {
+        const uint tile_len = min(4u, t_hi - tile_t);
+        if (load_tok < tile_len) {
+            const uint t = tile_t + load_tok;
+            const uint phys_t = (p.ring_capacity > 0u) ? (t % p.ring_capacity) : t;
+            const uint chunk = phys_t / p.chunk_tokens;
+            const uint slot = phys_t - chunk * p.chunk_tokens;
+            const uint row = head_row_base + slot;
+            if (can_retire_q8 && chunk < p.num_retired_chunks) {
+                const uint phys_slot = retired_chunk_ids[p.retired_offset + chunk];
+                const device uchar *k_plane = retired_pool + ulong(phys_slot) * p.retired_chunk_stride_bytes;
+                const device uchar *v_plane = k_plane + p.retired_plane_stride_bytes;
+                if (load_col < k_cols) {
+                    tg_k[tid] = load_q8_half4(k_plane, row, q8_groups, load_col);
+                }
+                if (load_col < v_cols) {
+                    tg_v[tid] = load_q8_half4(v_plane, row, q8_groups, load_col);
+                }
+            } else {
+                const uint active_chunk = (p.ring_capacity == 0u) ? (chunk - p.num_retired_chunks) : chunk;
+                const KvTilePair pair = kv_tiles[p.tile_table_offset + active_chunk];
+                if (load_col < k_cols) {
+                    tg_k[tid] = pair.k_tex.read(uint2(load_col, row));
+                }
+                if (load_col < v_cols) {
+                    tg_v[tid] = pair.v_tex.read(uint2(load_col, row));
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (active_q) {
+            for (uint dt = 0u; dt < tile_len; dt++) {
+                const uint base_idx = dt * 64u;
+                float partial = (lane < k_cols) ? dot(q0, float4(tg_k[base_idx + lane])) : 0.0f;
+                if ((lane + 32u) < k_cols) {
+                    partial += dot(q1, float4(tg_k[base_idx + lane + 32u]));
+                }
+                const float score = simd_sum(partial) * scale_log2e;
+                const float new_m = max(m_val, score);
+                const float corr = (l_val > 0.0f) ? exp2(m_val - new_m) : 0.0f;
+                const float p_w = exp2(score - new_m);
+                l_val = fma(l_val, corr, p_w);
+                if (lane < v_cols) {
+                    acc0 = fma(acc0, float4(corr), float4(tg_v[base_idx + lane]) * p_w);
+                }
+                if ((lane + 32u) < v_cols) {
+                    acc1 = fma(acc1, float4(corr), float4(tg_v[base_idx + lane + 32u]) * p_w);
+                }
+                m_val = new_m;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (active_q) {
+        const float inv_l = (l_val > 0.0f) ? (1.0f / l_val) : 0.0f;
+        const ulong out_off = (ulong(qi) * p.num_q_heads + qh) * v_dim;
+        if (lane < v_cols) {
+            *(device half4 *)(out + out_off + lane * 4u) = half4(acc0 * inv_l);
+        }
+        if ((lane + 32u) < v_cols) {
+            *(device half4 *)(out + out_off + (lane + 32u) * 4u) = half4(acc1 * inv_l);
+        }
     }
 }
