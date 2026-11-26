@@ -2017,9 +2017,13 @@ def _role_of_tensor(name: str, kind: TensorKind) -> str:
         or "_mgate" in lower
         or ".linear_attn.a_proj" in lower
         or ".linear_attn.b_proj" in lower
+        or ".linear_attn.f_a_proj" in lower
+        or ".linear_attn.g_a_proj" in lower
         or is_inkling2_controller_tensor(name)
     ):
         return "controller"
+    if ".attn.idx." in lower or ".indexer." in lower or "kpool_" in lower:
+        return "indexer"
     if "sconv" in lower or "conv1d" in lower or "convolution" in lower or "a_log" in lower or "dt_bias" in lower:
         return "sconv"
     if (
@@ -2034,12 +2038,14 @@ def _role_of_tensor(name: str, kind: TensorKind) -> str:
     ):
         return "ihc"
     if (
-        lower.startswith(("mtp.", "mtp_layers.", "dflash.", "dflare.", "dfly.", "dfly_layers."))
+        lower.startswith(("mtp.", "mtp_layers.", "dflash.", "dflare.", "dfly.", "dfly_layers.", "candidate_selector."))
         or lower in ("fc.weight", "hidden_norm.weight")
         or ".mtp" in lower
         or ".eh_proj." in lower
         or ".enorm." in lower
         or ".hnorm." in lower
+        or ".attn_conv." in lower
+        or ".mlp_conv." in lower
         or "dflare" in lower
         or "dflash" in lower
         or "dfly" in lower
@@ -2076,6 +2082,7 @@ _ROLE_WEIGHT = {
     "router": 10.0,
     "loop_adapter": 8.0,
     "controller": 8.0,
+    "indexer": 8.0,
     "sconv": 8.0,
     "ihc": 8.0,
     "mtp_dflare": 7.0,
@@ -2100,6 +2107,7 @@ _PROTECTED_HIGH_PRECISION_ROLES = frozenset(
     {
         "router",
         "controller",
+        "indexer",
         "sconv",
         "ihc",
         "mtp_dflare",
@@ -2130,6 +2138,7 @@ _BACKBONE_PROTECTED_ROLES = _PROTECTED_HIGH_PRECISION_ROLES | frozenset(
 _STRICT_Q4_FLOOR_ROLES = frozenset(
     {
         "controller",
+        "indexer",
         "sconv",
         "ihc",
         "mtp_dflare",
@@ -3013,7 +3022,9 @@ class _UnifiedSource:
             eff_mimo_cfg = None
             eff_mimo_tp = 1
             eff_qwen35_cfg = None
+            eff_glm5_cfg = None
             if resolved.config_path is not None and resolved.config_path.is_file():
+                from aminfer_tools.glm5 import is_glm5_config
                 from aminfer_tools.mimo_v2 import (
                     _effective_mimo_cfg,
                     infer_mimo_qkv_tp_degree,
@@ -3023,7 +3034,9 @@ class _UnifiedSource:
 
                 probe_cfg = json.loads(resolved.config_path.read_text(encoding="utf-8"))
                 if isinstance(probe_cfg, dict):
-                    if is_mimo_v2_config(probe_cfg):
+                    if is_glm5_config(probe_cfg):
+                        eff_glm5_cfg = probe_cfg
+                    elif is_mimo_v2_config(probe_cfg):
                         eff_mimo_cfg = _effective_mimo_cfg(probe_cfg)
                         eff_mimo_tp = infer_mimo_qkv_tp_degree(probe_cfg, raw_tensors)
                     elif is_qwen35_config(probe_cfg):
@@ -3042,6 +3055,7 @@ class _UnifiedSource:
                 mimo_config=eff_mimo_cfg,
                 mimo_qkv_tp_degree=eff_mimo_tp,
                 qwen35_config=eff_qwen35_cfg,
+                glm5_config=eff_glm5_cfg,
             )
             self._sf_readers = _ShardReaders()
             self.model_id = model_id_override or self.input_path.stem
@@ -4498,7 +4512,24 @@ def gsq_convert(
                 (".q_l2_clip.scale", ".rel_l2_clip.scale", ".rel_logits_proj.proj", ".static_w")
             )
             is_pinned_gdn_gate = t.name.endswith(
-                (".linear_attn.a_proj.weight", ".linear_attn.a_proj", ".linear_attn.b_proj.weight", ".linear_attn.b_proj")
+                (
+                    ".linear_attn.a_proj.weight",
+                    ".linear_attn.a_proj",
+                    ".linear_attn.b_proj.weight",
+                    ".linear_attn.b_proj",
+                    ".linear_attn.f_a_proj.weight",
+                    ".linear_attn.f_a_proj",
+                    ".linear_attn.g_a_proj.weight",
+                    ".linear_attn.g_a_proj",
+                    ".hc_attn_fn",
+                    ".hc_attn_fn.weight",
+                    ".hc_ffn_fn",
+                    ".hc_ffn_fn.weight",
+                    ".attn.idx.kpool_gate",
+                    ".attn.idx.kpool_gate.weight",
+                    ".attn.idx.weights_proj",
+                    ".attn.idx.weights_proj.weight",
+                )
             )
             is_ctrl = is_inkling2_controller_tensor(t.name) and t.layer != NO_LAYER
             is_quantizable = (

@@ -1520,13 +1520,21 @@ def _make_entry(
     else:
         layout = TensorLayout.ROW_MAJOR
         param_kind = QuantParamKind.AFFINE_SCALE_BIAS
-        if data_convert == "d2t_i64_to_u32":
+        if row_gather_runs is not None:
+            eff_src_rows = src_total_rows or shape[0]
+            data_bytes = shape[0] * (data.length // eff_src_rows)
+            if data_convert in ("bf16_to_f32", "f16_to_f32"):
+                data_bytes *= 2
+        elif data_convert == "d2t_i64_to_u32":
             data_bytes = (data.length // 8) * 4
         elif data_convert in ("bf16_to_f32", "f16_to_f32"):
             data_bytes = data.length * 2
         elif data_convert == "hf_mxfp4_to_gguf_mxfp4":
             data_bytes = (data.length // 16) * 17
-        elif data_convert is not None and data_convert.startswith("affine") and data_convert.endswith("_to_bf16"):
+        elif data_convert is not None and (
+            (data_convert.startswith("affine") and data_convert.endswith("_to_bf16"))
+            or data_convert == "fp8_block_to_bf16"
+        ):
             data_bytes = shape[0] * shape[1] * 2
         elif mimo_qkv_slice is not None:
             _spec, _out_s, out_cnt = mimo_qkv_slice
@@ -1536,9 +1544,6 @@ def _make_entry(
                 data_bytes = out_cnt * _spec.k_cols * 4
             else:
                 data_bytes = out_cnt * _spec.k_cols * 2
-        elif row_gather_runs is not None:
-            eff_src_rows = src_total_rows or shape[0]
-            data_bytes = shape[0] * (data.length // eff_src_rows)
         else:
             data_bytes = data.length  # f16<->bf16, i32->u32, packed nibbles and raw copies preserve length
         if params_bytes_override is not None:
@@ -1823,6 +1828,31 @@ def _plan_fp8_or_mxfp8_slice(
             params_mode="fp8_block",
             params_bytes_override=nb128 * kb128 * 4,
         )
+    if (
+        len(s_slice_shape) == 2
+        and s_slice_shape[0] > 0
+        and s_slice_shape[1] > 0
+        and s_slice_shape[0] <= n_rows
+        and s_slice_shape[1] <= k
+        and s_slice_shape != (n_rows, 1)
+    ):
+        return _make_entry(
+            name,
+            kind,
+            DType.BF16,
+            0,
+            0,
+            layer,
+            expert,
+            (n_rows, k),
+            w_range,
+            "fp8_block_to_bf16",
+            s_range,
+            None,
+            sme2_pack="none",
+            params_bytes_override=0,
+            scale_tile_shape=(int(s_slice_shape[0]), int(s_slice_shape[1])),
+        )
     raise ValueError(
         f"FP8 scale shape {list(s_slice_shape)} does not match tensor/row/128x128-block for {prefix_desc} {(n_rows, k)}"
     )
@@ -1848,6 +1878,10 @@ def plan_amf_entries(
     mimo_mtp_standalone: bool = False,
     mimo_dflash_mode: bool = False,
     qwen35_config: Mapping[str, Any] | None = None,
+    glm5_config: Mapping[str, Any] | None = None,
+    glm5_mtp_standalone: bool = False,
+    glm5_mtp_source_layer: int | None = None,
+    glm5_dflash2_mode: bool = False,
 ) -> list[_PlannedEntry]:
     """Pass 1: plan every output entry from shard headers alone."""
     if group_size not in AFFINE_GROUP_SIZES:
@@ -1864,6 +1898,24 @@ def plan_amf_entries(
             excluded.add(tok)
             excluded.add(_normalize_lenient(tok))
 
+    glm5_backbone_layers: int | None = None
+    glm5_model_type = "glm_moe_dsa"
+    glm5_layer_types: list[str] | None = None
+    if glm5_config is not None:
+        from aminfer_tools.glm5 import (
+            _effective_glm5_cfg,
+            is_glm5_next_config,
+            resolve_glm5_next_layer_types,
+        )
+
+        eff_g5 = _effective_glm5_cfg(glm5_config)
+        n_hl = eff_g5.get("num_hidden_layers")
+        if isinstance(n_hl, int) and n_hl > 0:
+            glm5_backbone_layers = n_hl
+        if is_glm5_next_config(glm5_config):
+            glm5_model_type = "glm5_next"
+            glm5_layer_types = resolve_glm5_next_layer_types(eff_g5)
+
     def is_excluded(raw_name: str) -> bool:
         if raw_name in excluded or _normalize_lenient(raw_name) in excluded:
             return True
@@ -1874,10 +1926,29 @@ def plan_amf_entries(
                 return True
             if not mimo_mtp_standalone and is_mimo_mtp_tensor(raw_name):
                 return True
+        if glm5_config is not None and not glm5_mtp_standalone and glm5_backbone_layers is not None:
+            from aminfer_tools.glm5 import is_glm5_mtp_tensor
+
+            if is_glm5_mtp_tensor(raw_name, glm5_backbone_layers):
+                return True
         return False
 
     def _plan_out_name(raw_name: str) -> str:
-        if mimo_dflash_mode:
+        if glm5_dflash2_mode:
+            from aminfer_tools.glm5 import normalize_glm5_dflash2_tensor_name
+
+            nm = normalize_glm5_dflash2_tensor_name(raw_name)
+        elif glm5_config is not None or glm5_mtp_standalone:
+            from aminfer_tools.glm5 import normalize_glm5_tensor_name
+
+            nm = normalize_glm5_tensor_name(
+                raw_name,
+                model_type=glm5_model_type,
+                layer_types=glm5_layer_types,
+                mtp_source_layer=glm5_mtp_source_layer,
+                mtp_standalone=glm5_mtp_standalone,
+            )
+        elif mimo_dflash_mode:
             from aminfer_tools.mimo_v2 import normalize_mimo_dflash_tensor_name
 
             nm = normalize_mimo_dflash_tensor_name(raw_name)
@@ -1895,6 +1966,23 @@ def plan_amf_entries(
         if len(enc) == 0 or len(enc) > 47:
             raise ValueError(f"AMF tensor name must be 1..47 UTF-8 bytes, got {len(enc)}: {nm!r}")
         return nm
+
+    def _glm5_split_specs(out_base: str, shape: Sequence[int]):
+        if glm5_config is None or is_vision_tensor(out_base):
+            return None
+        from aminfer_tools.glm5 import resolve_glm5_next_split_specs
+
+        return resolve_glm5_next_split_specs(out_base, shape, glm5_config)
+
+    is_mimo_or_q35 = (
+        mimo_config is not None
+        or qwen35_config is not None
+        or glm5_config is not None
+        or mimo_dflash_mode
+        or mimo_mtp_standalone
+        or glm5_dflash2_mode
+        or glm5_mtp_standalone
+    )
 
     def _qwen35_split_specs(out_base: str, n_rows: int) -> list[tuple[str, tuple[tuple[int, int], ...]]] | None:
         if qwen35_config is None or is_vision_tensor(out_base):
@@ -2102,15 +2190,11 @@ def plan_amf_entries(
         n, packed = w.shape
         groups = s.shape[1]
         bits, amf_dtype = _quant_bits_for(prefix, packed, groups, group_size)
-        is_mimo_or_q35 = (
-            mimo_config is not None
-            or qwen35_config is not None
-            or mimo_dflash_mode
-            or mimo_mtp_standalone
-        )
         norm_name = _plan_out_name(f"{prefix}.weight") if is_mimo_or_q35 else _normalize_name(prefix)
         k_full = groups * group_size
-        if qwen35_config is not None and norm_name.endswith((".linear_attn.a_proj.weight", ".linear_attn.b_proj.weight")):
+        if (qwen35_config is not None or glm5_config is not None) and norm_name.endswith(
+            (".linear_attn.a_proj.weight", ".linear_attn.b_proj.weight", ".linear_attn.f_a_proj.weight", ".linear_attn.g_a_proj.weight")
+        ):
             kind, layer, expert = _classify_tensor(norm_name, cold_set, all_experts_cold)
             entries.append(
                 _make_entry(
@@ -2131,6 +2215,34 @@ def plan_amf_entries(
                     name_already_normalized=True,
                 )
             )
+            continue
+        g5_splits = _glm5_split_specs(norm_name, (n, k_full))
+        if g5_splits is not None:
+            for split_nm, runs, opt_shp in g5_splits:
+                split_rows = sum(rc for _, rc in runs)
+                eff_shp = opt_shp if opt_shp is not None else (split_rows, k_full)
+                kind, layer, expert = _classify_tensor(split_nm, cold_set, all_experts_cold)
+                entries.append(
+                    _make_entry(
+                        split_nm,
+                        kind,
+                        amf_dtype,
+                        bits,
+                        group_size,
+                        layer,
+                        expert,
+                        eff_shp,
+                        _full_range(w),
+                        None,
+                        _full_range(s),
+                        _full_range(b),
+                        sme2_pack=sme2_pack,
+                        sme2_pack_loop_adapters=sme2_pack_loop_adapters,
+                        src_total_rows=n,
+                        row_gather_runs=runs,
+                        name_already_normalized=True,
+                    )
+                )
             continue
         q35_splits = _qwen35_split_specs(norm_name, n)
         if q35_splits is not None:
@@ -2234,7 +2346,7 @@ def plan_amf_entries(
             continue
         if len(w.shape) != 2:
             raise ValueError(f"expected 2D MLX nvfp4 tensor for {prefix}, got {list(w.shape)}")
-        norm_name = _normalize_name(prefix)
+        norm_name = _plan_out_name(f"{prefix}.weight") if is_mimo_or_q35 else _normalize_name(prefix)
         kind, layer, expert = _classify_tensor(norm_name, cold_set, all_experts_cold)
         entries.append(
             _plan_nvfp4_slice(
@@ -2285,6 +2397,7 @@ def plan_amf_entries(
             denom_t = _pick_companion(
                 tensors, (f"{base}.weight_outer_scale_denominator", f"{base}.outer_scale_denominator")
             )
+            inp_s = _pick_companion(tensors, (f"{base}.input_scale", f"{base}.input_global_scale"))
         else:
             s = _pick_companion(
                 tensors,
@@ -2301,13 +2414,14 @@ def plan_amf_entries(
             denom_t = _pick_companion(
                 tensors, (f"{base}_weight_outer_scale_denominator", f"{base}_outer_scale_denominator")
             )
+            inp_s = _pick_companion(tensors, (f"{base}_input_scale", f"{base}_input_global_scale"))
 
         if s is None and w.dtype in ("U8", "U32", "I32"):
             # Unpaired U32/I32/U8 tensors (e.g. token tables) fall through to unquantized handling.
             continue
 
         consumed.add(w_name)
-        for aux in (s, s2, gscale, amax_t, denom_t):
+        for aux in (s, s2, gscale, amax_t, denom_t, inp_s):
             if aux is not None:
                 consumed.add(aux.name)
 
@@ -2419,7 +2533,7 @@ def plan_amf_entries(
 
             if len(w.shape) != 2:
                 raise ValueError(f"NVFP4 weight {w_name} must be 2D or 3D expert stack, got {list(w.shape)}")
-            out_name = _normalize_name(w_name if style == "underscore_weight" else base)
+            out_name = _plan_out_name(w_name if style == "underscore_weight" else base)
             kind, layer, expert = _classify_tensor(out_name, cold_set, all_experts_cold)
             entries.append(
                 _plan_nvfp4_slice(
@@ -2522,7 +2636,7 @@ def plan_amf_entries(
             amf_dtype = DType.U32
             convert: str | None = "d2t_i64_to_u32" if t.dtype == "I64" else "d2t_i32_to_u32"
         elif t.dtype == "F8_E4M3":
-            norm_name = _normalize_name(name)
+            norm_name = _plan_out_name(name)
             kind, layer, expert = _classify_tensor(norm_name, cold_set, all_experts_cold)
             entries.append(
                 _make_entry(
@@ -2576,6 +2690,44 @@ def plan_amf_entries(
         norm_name = _plan_out_name(name)
         if len(t.shape) == 2 and _emit_mimo_qkv_entries(name, norm_name, t, None):
             continue
+        if len(t.shape) in (2, 3):
+            g5_splits = _glm5_split_specs(norm_name, t.shape)
+            if g5_splits is not None:
+                for split_nm, runs, opt_shp in g5_splits:
+                    split_rows = sum(rc for _, rc in runs)
+                    eff_shp = opt_shp if opt_shp is not None else (split_rows, t.shape[1])
+                    eff_dt = amf_dtype
+                    eff_conv = convert
+                    if split_nm.endswith(
+                        (".linear_attn.q_conv1d.weight", ".linear_attn.k_conv1d.weight", ".linear_attn.v_conv1d.weight")
+                    ):
+                        if t.dtype == "BF16":
+                            eff_dt = DType.F32
+                            eff_conv = "bf16_to_f32"
+                        elif t.dtype == "F16":
+                            eff_dt = DType.F32
+                            eff_conv = "f16_to_f32"
+                    kind, layer, expert = _classify_tensor(split_nm, cold_set, all_experts_cold)
+                    entries.append(
+                        _make_entry(
+                            split_nm,
+                            kind,
+                            eff_dt,
+                            0,
+                            0,
+                            layer,
+                            expert,
+                            eff_shp,
+                            _full_range(t),
+                            eff_conv,
+                            sme2_pack=sme2_pack,
+                            sme2_pack_loop_adapters=sme2_pack_loop_adapters,
+                            src_total_rows=t.shape[0],
+                            row_gather_runs=runs,
+                            name_already_normalized=True,
+                        )
+                    )
+                continue
         if len(t.shape) == 2:
             q35_splits = _qwen35_split_specs(norm_name, t.shape[0])
             if q35_splits is not None:
@@ -2611,15 +2763,35 @@ def plan_amf_entries(
             flat_in = eff_shape[1] * eff_shape[2] * eff_shape[3] * eff_shape[4]
             eff_shape = (eff_shape[0], flat_in)
         elif (
-            qwen35_config is not None
-            and norm_name.endswith(".linear_attn.conv1d.weight")
+            (qwen35_config is not None or glm5_config is not None)
+            and norm_name.endswith(
+                (
+                    ".linear_attn.conv1d.weight",
+                    ".linear_attn.q_conv1d.weight",
+                    ".linear_attn.k_conv1d.weight",
+                    ".linear_attn.v_conv1d.weight",
+                )
+            )
             and len(eff_shape) == 3
             and (eff_shape[1] == 1 or eff_shape[2] == 1)
         ):
             kern = eff_shape[2] if eff_shape[1] == 1 else eff_shape[1]
             eff_shape = (eff_shape[0], kern)
-        if norm_name.endswith((".linear_attn.A_log", ".linear_attn.dt_bias", ".linear_attn.conv1d.weight")):
-            # GDN kernels (`ami_gdn_compute_gates` / `ami_gdn_conv1d_silu`) bind float32 buffers.
+        if norm_name.endswith(
+            (
+                ".linear_attn.A_log",
+                ".linear_attn.dt_bias",
+                ".linear_attn.conv1d.weight",
+                ".linear_attn.q_conv1d.weight",
+                ".linear_attn.k_conv1d.weight",
+                ".linear_attn.v_conv1d.weight",
+                ".hc_attn_base",
+                ".hc_attn_scale",
+                ".hc_ffn_base",
+                ".hc_ffn_scale",
+            )
+        ) or (glm5_config is not None and norm_name.endswith(".mlp.gate.bias")):
+            # GDN/KDA, Sinkhorn mHC scalar/base tables, and GLM-5 router biases bind float32 buffers.
             if t.dtype == "BF16":
                 amf_dtype = DType.F32
                 convert = "bf16_to_f32"
@@ -2967,6 +3139,10 @@ def _stream_mimo_qkv_entry(entry: _PlannedEntry, readers: _ShardReaders, w: _Blo
                 w.write(bf16_bytes_to_f16_bytes(raw, what=entry.name))
             elif entry.data_convert == "f16_to_bf16":
                 w.write(f16_bytes_to_bf16_bytes(raw))
+            elif entry.data_convert == "bf16_to_f32":
+                w.write(_bf16_to_f32_bytes(raw))
+            elif entry.data_convert == "f16_to_f32":
+                w.write(_f16_to_f32_bytes(raw))
             else:
                 raise ValueError(f"unsupported float qkv conversion {entry.data_convert!r}")
             done += take
@@ -3044,6 +3220,10 @@ def _stream_row_gathered_entry(entry: _PlannedEntry, readers: _ShardReaders, w: 
                 w.write(bf16_bytes_to_f16_bytes(raw, what=entry.name))
             elif entry.data_convert == "f16_to_bf16":
                 w.write(f16_bytes_to_bf16_bytes(raw))
+            elif entry.data_convert == "bf16_to_f32":
+                w.write(_bf16_to_f32_bytes(raw))
+            elif entry.data_convert == "f16_to_f32":
+                w.write(_f16_to_f32_bytes(raw))
             else:
                 raise ValueError(f"unknown conversion {entry.data_convert!r}")
             done += take
@@ -3069,6 +3249,31 @@ def _stream_row_gathered_entry(entry: _PlannedEntry, readers: _ShardReaders, w: 
     w.zeros(entry.blob_bytes - content)
 
 
+def _stream_fp8_block_to_bf16_entry(entry: _PlannedEntry, readers: _ShardReaders, w: _BlobWriter) -> None:
+    """Dequantize non-128x128 FP8 block tensors (e.g. tiny `[32, 32]` HF fixtures) to `BF16`."""
+    assert entry.scales is not None and entry.scale_tile_shape is not None
+    n_rows, k = entry.shape
+    nb, kb = int(entry.scale_tile_shape[0]), int(entry.scale_tile_shape[1])
+    bh, bw = ((n_rows + nb - 1) // nb, (k + kb - 1) // kb)
+    for cand in (32, 64, 16):
+        if (n_rows + cand - 1) // cand == nb and (k + cand - 1) // cand == kb:
+            bh, bw = cand, cand
+            break
+    s_raw = _read_exact(readers.get(entry.scales.path), entry.scales.offset, entry.scales.length)
+    s_f = (
+        f32_bytes_to_f32_list(s_raw)
+        if entry.scales.dtype == "F32"
+        else (bf16_bytes_to_f32_list(s_raw) if entry.scales.dtype == "BF16" else f16_bytes_to_f32_list(s_raw))
+    )
+    src_fh = readers.get(entry.data.path)
+    for r in range(n_rows):
+        row_u8 = _read_exact(src_fh, entry.data.offset + r * k, k)
+        s_row = (r // bh) * kb
+        vals = [e4m3_byte_to_f32(b_u8) * s_f[s_row + (c // bw)] for c, b_u8 in enumerate(row_u8)]
+        w.write(f32_to_bf16_bytes(vals))
+    w.zeros(entry.blob_bytes - entry.data_bytes)
+
+
 def _stream_entry(entry: _PlannedEntry, readers: _ShardReaders, w: _BlobWriter) -> None:
     if entry.layout == TensorLayout.SME2_PANEL64:
         _stream_sme2_entry(entry, readers, w)
@@ -3078,6 +3283,9 @@ def _stream_entry(entry: _PlannedEntry, readers: _ShardReaders, w: _BlobWriter) 
         return
     if entry.data_convert == "hf_mxfp4_to_gguf_mxfp4":
         _stream_hf_mxfp4_entry(entry, readers, w)
+        return
+    if entry.data_convert == "fp8_block_to_bf16":
+        _stream_fp8_block_to_bf16_entry(entry, readers, w)
         return
     if entry.data_convert is not None and entry.data_convert.startswith("affine") and entry.data_convert.endswith("_to_bf16"):
         _stream_affine_to_bf16_entry(entry, readers, w)
@@ -3533,6 +3741,10 @@ def pack_amf_from_safetensors(
     mimo_mtp_standalone: bool = False,
     mimo_dflash_mode: bool = False,
     qwen35_config: Mapping[str, Any] | None = None,
+    glm5_config: Mapping[str, Any] | None = None,
+    glm5_mtp_standalone: bool = False,
+    glm5_mtp_source_layer: int | None = None,
+    glm5_dflash2_mode: bool = False,
 ) -> list[PackedTensorMeta]:
     """Convert a safetensors checkpoint into a 16 KiB-aligned `.amf` v0 file.
 
@@ -3646,9 +3858,33 @@ def pack_amf_from_safetensors(
                 config_path=config_path,
                 tokenizer_path=tokenizer_path,
             )
+            eff_cfg_bytes: bytes | None = cfg_p.read_bytes() if cfg_p is not None else None
+            if cfg_p is not None and not glm5_dflash2_mode and not glm5_mtp_standalone:
+                try:
+                    raw_g5_obj = json.loads(cfg_p.read_text(encoding="utf-8"))
+                except ValueError:
+                    raw_g5_obj = None
+                if isinstance(raw_g5_obj, dict):
+                    from aminfer_tools.glm5 import (
+                        build_glm5_next_config_json,
+                        build_glm_moe_dsa_config_json,
+                        is_glm5_config,
+                        is_glm5_next_config,
+                    )
+
+                    if is_glm5_config(raw_g5_obj):
+                        rt_g5 = (
+                            build_glm5_next_config_json(
+                                raw_g5_obj,
+                                include_vision=not eff_strip_for_backbone,
+                            )
+                            if is_glm5_next_config(raw_g5_obj)
+                            else build_glm_moe_dsa_config_json(raw_g5_obj)
+                        )
+                        eff_cfg_bytes = json.dumps(rt_g5, ensure_ascii=False, indent=2).encode("utf-8") + b"\n"
             return embed_metadata_into_amf(
                 output_path,
-                config_bytes=cfg_p.read_bytes() if cfg_p is not None else None,
+                config_bytes=eff_cfg_bytes,
                 tokenizer_bytes=tok_p.read_bytes() if tok_p is not None else None,
                 chat_template_bytes=ct_bytes,
                 output_path=output_path,
@@ -3700,10 +3936,12 @@ def pack_amf_from_safetensors(
     eff_mimo_cfg = mimo_config
     eff_mimo_tp = 1 if mimo_qkv_tp_degree is None else mimo_qkv_tp_degree
     eff_qwen35_cfg = qwen35_config
+    eff_glm5_cfg = glm5_config
     cfg_probe_p = config_path or resolved.config_path
-    if eff_mimo_cfg is None and eff_qwen35_cfg is None and cfg_probe_p is not None and cfg_probe_p.is_file():
+    if eff_mimo_cfg is None and eff_qwen35_cfg is None and eff_glm5_cfg is None and cfg_probe_p is not None and cfg_probe_p.is_file():
         probe_cfg_obj = json.loads(cfg_probe_p.read_text(encoding="utf-8"))
         if isinstance(probe_cfg_obj, dict):
+            from aminfer_tools.glm5 import _effective_glm5_cfg, is_glm5_config
             from aminfer_tools.mimo_v2 import (
                 _effective_mimo_cfg,
                 infer_mimo_qkv_tp_degree,
@@ -3711,7 +3949,9 @@ def pack_amf_from_safetensors(
                 is_qwen35_config,
             )
 
-            if is_mimo_v2_config(probe_cfg_obj) and not mimo_dflash_mode:
+            if is_glm5_config(probe_cfg_obj) and not glm5_dflash2_mode:
+                eff_glm5_cfg = probe_cfg_obj
+            elif is_mimo_v2_config(probe_cfg_obj) and not mimo_dflash_mode:
                 eff_mimo_cfg = _effective_mimo_cfg(probe_cfg_obj)
                 if mimo_qkv_tp_degree is None:
                     eff_mimo_tp = infer_mimo_qkv_tp_degree(probe_cfg_obj, probe_tensors)
@@ -3736,6 +3976,10 @@ def pack_amf_from_safetensors(
         mimo_mtp_standalone=mimo_mtp_standalone,
         mimo_dflash_mode=mimo_dflash_mode,
         qwen35_config=eff_qwen35_cfg,
+        glm5_config=eff_glm5_cfg,
+        glm5_mtp_standalone=glm5_mtp_standalone,
+        glm5_mtp_source_layer=glm5_mtp_source_layer,
+        glm5_dflash2_mode=glm5_dflash2_mode,
     )
 
     meta_blobs: list[tuple[str, bytes]] = []
@@ -3747,7 +3991,31 @@ def pack_amf_from_safetensors(
             tokenizer_path=tokenizer_path,
         )
         if cfg_p is not None:
-            if eff_mimo_cfg is not None:
+            if eff_glm5_cfg is not None and not glm5_dflash2_mode:
+                from aminfer_tools.glm5 import (
+                    build_glm5_mtp_config_dict,
+                    build_glm5_next_config_json,
+                    build_glm_moe_dsa_config_json,
+                    is_glm5_next_config,
+                )
+
+                is_g5_next = is_glm5_next_config(eff_glm5_cfg)
+                if glm5_mtp_standalone:
+                    rt_g5 = build_glm5_mtp_config_dict(eff_glm5_cfg, is_glm5_next=is_g5_next)
+                elif is_g5_next:
+                    rt_g5 = build_glm5_next_config_json(
+                        eff_glm5_cfg,
+                        cold_experts_count=len({e for (_, e) in effective_cold}),
+                        include_vision=not eff_strip_for_backbone,
+                    )
+                else:
+                    rt_g5 = build_glm_moe_dsa_config_json(
+                        eff_glm5_cfg,
+                        cold_experts_count=len({e for (_, e) in effective_cold}),
+                    )
+                cfg_b = json.dumps(rt_g5, ensure_ascii=False, indent=2).encode("utf-8") + b"\n"
+                meta_blobs.append((META_CONFIG_JSON, cfg_b))
+            elif eff_mimo_cfg is not None:
                 from aminfer_tools.mimo_v2 import build_mimo_v2_config_json
 
                 cfg_b = json.dumps(build_mimo_v2_config_json(eff_mimo_cfg), ensure_ascii=False, indent=2).encode("utf-8") + b"\n"
@@ -6400,6 +6668,10 @@ def gsq_convert_with_vision(
     mimo_mtp_standalone: bool = False,
     mimo_dflash_mode: bool = False,
     qwen35_config: Mapping[str, Any] | None = None,
+    glm5_config: Mapping[str, Any] | None = None,
+    glm5_mtp_standalone: bool = False,
+    glm5_mtp_source_layer: int | None = None,
+    glm5_dflash2_mode: bool = False,
 ) -> list[PackedTensorMeta]:
     """Run W14 GSQ+RCO with W20 vision-tower precision policy.
 

@@ -535,6 +535,256 @@ class MimoAndQwen35MetadataValidationTests(unittest.TestCase):
                 self.assertTrue(rep.attn_output_gate)
                 self.assertEqual(rep.long_backbone_names, 0)
 
+    def test_synthetic_glm5_metadata_validation(self) -> None:
+        from aminfer_tools.glm5 import (
+            validate_glm5_dflash2_metadata_dir,
+            validate_glm5_next_metadata_dir,
+            validate_glm_moe_dsa_metadata_dir,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            dsa_dir = root / "glm_dsa"
+            dsa_dir.mkdir()
+            (dsa_dir / "config.json").write_text(
+                json.dumps(
+                    {
+                        "model_type": "glm_moe_dsa",
+                        "architectures": ["GlmMoeDsaForCausalLM"],
+                        "hidden_size": 6144,
+                        "intermediate_size": 12288,
+                        "moe_intermediate_size": 2048,
+                        "num_hidden_layers": 78,
+                        "first_k_dense_replace": 3,
+                        "vocab_size": 154880,
+                        "num_attention_heads": 64,
+                        "num_key_value_heads": 64,
+                        "q_lora_rank": 2048,
+                        "kv_lora_rank": 512,
+                        "qk_nope_head_dim": 192,
+                        "qk_rope_head_dim": 64,
+                        "v_head_dim": 256,
+                        "index_n_heads": 32,
+                        "index_head_dim": 128,
+                        "index_topk": 2048,
+                        "index_topk_freq": 4,
+                        "index_skip_topk_offset": 3,
+                        "index_share_for_mtp_iteration": True,
+                        "n_routed_experts": 256,
+                        "n_shared_experts": 1,
+                        "num_experts_per_tok": 8,
+                        "num_nextn_predict_layers": 1,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            wm_dsa: dict[str, str] = {
+                "model.embed_tokens.weight": "s.safetensors",
+                "lm_head.weight": "s.safetensors",
+                "model.norm.weight": "s.safetensors",
+                "model.layers.78.eh_proj.weight": "s.safetensors",
+                "model.layers.78.shared_head.norm.weight": "s.safetensors",
+            }
+            for li in range(78):
+                wm_dsa[f"model.layers.{li}.self_attn.q_a_proj.weight"] = "s.safetensors"
+                if li < 3 or (li - 2) % 4 == 0:
+                    wm_dsa[f"model.layers.{li}.self_attn.indexer.weights_proj.weight"] = "s.safetensors"
+                    wm_dsa[f"model.layers.{li}.self_attn.indexer.wk.weight"] = "s.safetensors"
+                if li >= 3:
+                    wm_dsa[f"model.layers.{li}.mlp.gate.e_score_correction_bias"] = "s.safetensors"
+                    wm_dsa[f"model.layers.{li}.mlp.experts.0.gate_proj.weight"] = "s.safetensors"
+            (dsa_dir / "model.safetensors.index.json").write_text(json.dumps({"weight_map": wm_dsa}), encoding="utf-8")
+            dsa_rep = validate_glm_moe_dsa_metadata_dir(dsa_dir)
+            self.assertEqual(dsa_rep.errors, ())
+            self.assertEqual(dsa_rep.full_indexer_layers, 21)
+            self.assertEqual(dsa_rep.shared_indexer_layers, 57)
+            self.assertEqual(dsa_rep.dense_layers, 3)
+            self.assertEqual(dsa_rep.moe_layers, 75)
+            self.assertEqual(dsa_rep.long_backbone_names, 0)
+            self.assertTrue(dsa_rep.tier_admission["512gb-ultra"]["fits_all_wired"])
+            self.assertFalse(dsa_rep.tier_admission["128gb-max"]["fits_all_wired"])
+
+            next_dir = root / "glm5_next"
+            next_dir.mkdir()
+            (next_dir / "config.json").write_text(
+                json.dumps(
+                    {
+                        "model_type": "glm5_next",
+                        "architectures": ["Glm5NextForConditionalGeneration"],
+                        "text_config": {
+                            "model_type": "glm5_next_text",
+                            "hidden_size": 4096,
+                            "intermediate_size": 12288,
+                            "moe_intermediate_size": 2048,
+                            "num_hidden_layers": 45,
+                            "first_k_dense_replace": 3,
+                            "vocab_size": 154880,
+                            "hc_mult": 4,
+                            "hc_sinkhorn_iters": 20,
+                            "hc_eps": 1e-6,
+                            "linear_num_heads": 64,
+                            "linear_head_dim": 128,
+                            "linear_conv_kernel_dim": 4,
+                            "linear_lower_bound": -5.0,
+                            "num_attention_heads": 64,
+                            "q_lora_rank": 1536,
+                            "kv_lora_rank": 512,
+                            "qk_nope_head_dim": 256,
+                            "qk_rope_head_dim": 0,
+                            "v_head_dim": 256,
+                            "index_n_heads": 32,
+                            "index_head_dim": 128,
+                            "index_topk": 2048,
+                            "index_kpool": 4,
+                            "n_routed_experts": 288,
+                            "n_shared_experts": 1,
+                            "num_experts_per_tok": 8,
+                            "swiglu_limit": 10.0,
+                            "num_nextn_predict_layers": 1,
+                        },
+                        "vision_config": {"depth": 24, "hidden_size": 1024},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            wm_next: dict[str, str] = {
+                "model.language_model.embed_tokens.weight": "s.safetensors",
+                "lm_head.weight": "s.safetensors",
+                "model.language_model.layers.45.eh_proj.weight": "s.safetensors",
+                "model.visual.blocks.23.attn.qkv.weight": "s.safetensors",
+            }
+            for li in range(45):
+                wm_next[f"model.language_model.layers.{li}.hc_attn_fn"] = "s.safetensors"
+                if li % 4 == 3:
+                    wm_next[f"model.language_model.layers.{li}.self_attn.kv_a_proj_with_mqa.weight"] = "s.safetensors"
+                    wm_next[f"model.language_model.layers.{li}.self_attn.indexer.index_kpool_compress_ape"] = "s.safetensors"
+                else:
+                    wm_next[f"model.language_model.layers.{li}.self_attn.f_a_proj.weight"] = "s.safetensors"
+                    wm_next[f"model.language_model.layers.{li}.self_attn.A_log"] = "s.safetensors"
+            (next_dir / "model.safetensors.index.json").write_text(json.dumps({"weight_map": wm_next}), encoding="utf-8")
+            next_rep = validate_glm5_next_metadata_dir(next_dir)
+            self.assertEqual(next_rep.errors, ())
+            self.assertEqual(next_rep.linear_attention_layers, 34)
+            self.assertEqual(next_rep.nope_mla_layers, 11)
+            self.assertEqual(next_rep.hc_mult, 4)
+            self.assertEqual(next_rep.hc_sinkhorn_iters, 20)
+            self.assertEqual(next_rep.vision_layers, 24)
+            self.assertEqual(next_rep.long_backbone_names, 0)
+            self.assertTrue(next_rep.tier_admission["128gb-max"]["fits_all_wired"])
+
+            df2_dir = root / "dflash2"
+            df2_dir.mkdir()
+            (df2_dir / "config.json").write_text(
+                json.dumps(
+                    {
+                        "architectures": ["DFlash2DraftModel"],
+                        "hidden_size": 4096,
+                        "intermediate_size": 12288,
+                        "num_hidden_layers": 5,
+                        "num_attention_heads": 32,
+                        "num_key_value_heads": 8,
+                        "head_dim": 128,
+                        "vocab_size": 154880,
+                        "dflash_config": {
+                            "block_size": 8,
+                            "mask_token_id": 154856,
+                            "conv_kernel_size": 2,
+                            "conv_group_size": 16,
+                            "selector_rank": 256,
+                            "selector_top_k": 16,
+                            "target_layer_ids": [5, 14, 24, 33, 42],
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (df2_dir / "model.safetensors.index.json").write_text(
+                json.dumps(
+                    {
+                        "weight_map": {
+                            "fc.weight": "m.safetensors",
+                            "layers.4.attention_conv.kernel_projection.weight": "m.safetensors",
+                            "candidate_selector.hidden_projection.weight": "m.safetensors",
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            df2_rep = validate_glm5_dflash2_metadata_dir(df2_dir)
+            self.assertEqual(df2_rep.errors, ())
+            self.assertEqual(df2_rep.long_names, 0)
+
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                rc = cli_main(["inspect-metadata", "--input", str(next_dir), "--json"])
+            self.assertEqual(rc, 0)
+            self.assertEqual(json.loads(buf.getvalue())["linear_attention_layers"], 34)
+
+    def test_opportunistic_live_staged_glm5_metadata(self) -> None:
+        from aminfer_tools.glm5 import (
+            validate_glm5_dflash2_metadata_dir,
+            validate_glm5_next_metadata_dir,
+            validate_glm_moe_dsa_metadata_dir,
+        )
+
+        meta_env = os.environ.get("AMINFER_METADATA_DIR")
+        if not meta_env:
+            return
+        meta_root = pathlib.Path(meta_env)
+
+        for dname in ("zai-org__GLM-5.2", "zai-org__GLM-5.3", "RedHatAI__GLM-5.3-NVFP4"):
+            dpath = meta_root / dname
+            if dpath.is_dir():
+                rep = validate_glm_moe_dsa_metadata_dir(dpath)
+                self.assertEqual(rep.errors, (), f"{dname}: {rep.errors}")
+                self.assertEqual(rep.num_hidden_layers, 78)
+                self.assertEqual(rep.full_indexer_layers, 21)
+                self.assertEqual(rep.shared_indexer_layers, 57)
+                self.assertEqual(rep.long_backbone_names, 0)
+                self.assertTrue(rep.index_share_for_mtp_iteration)
+
+        yujie_dir = meta_root / "yujiepan__glm-moe-dsa-tiny-random"
+        if yujie_dir.is_dir():
+            rep = validate_glm_moe_dsa_metadata_dir(yujie_dir)
+            self.assertEqual(rep.errors, ())
+            self.assertEqual(rep.long_backbone_names, 0)
+
+        for dname in (
+            "zai-org__GLM-5.3-Flash",
+            "nvidia__GLM-5.3-Flash-NVFP4",
+            "TensorFold__GLM-5.3-Flash-MLX-4bit-MTP",
+        ):
+            dpath = meta_root / dname
+            if dpath.is_dir():
+                rep = validate_glm5_next_metadata_dir(dpath)
+                self.assertEqual(rep.errors, (), f"{dname}: {rep.errors}")
+                self.assertEqual(rep.num_hidden_layers, 45)
+                self.assertEqual(rep.linear_attention_layers, 34)
+                self.assertEqual(rep.nope_mla_layers, 11)
+                self.assertEqual(rep.hc_mult, 4)
+                self.assertEqual(rep.hc_sinkhorn_iters, 20)
+                self.assertEqual(rep.vision_layers, 24)
+                self.assertEqual(rep.long_backbone_names, 0)
+
+        for dname in (
+            "hf-tiny-v2__tiny-random-Glm5NextForConditionalGeneration",
+            "trl-internal-testing__tiny-Glm5NextForConditionalGeneration",
+        ):
+            dpath = meta_root / dname
+            if dpath.is_dir():
+                rep = validate_glm5_next_metadata_dir(dpath)
+                self.assertEqual(rep.errors, (), f"{dname}: {rep.errors}")
+                self.assertEqual(rep.long_backbone_names, 0)
+
+        df2_dir = meta_root / "lablup__GLM-5.3-Flash-DFlash2-Agentic"
+        if df2_dir.is_dir():
+            rep = validate_glm5_dflash2_metadata_dir(df2_dir)
+            self.assertEqual(rep.errors, ())
+            self.assertEqual(rep.long_names, 0)
+            self.assertEqual(rep.conv_kernel_size, 2)
+            self.assertEqual(rep.conv_group_size, 16)
+            self.assertEqual(rep.selector_top_k, 16)
+
 
 if __name__ == "__main__":
     unittest.main()

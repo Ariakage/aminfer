@@ -2,6 +2,24 @@
 
 APPLE_PAGE_SIZE: int = 16384
 
+from aminfer_tools.glm5 import (
+    GLM5_SYNTH_PRESETS,
+    GLM5_TIER_PROFILES,
+    Glm5ConvertReport,
+    Glm5Dflash2MetadataReport,
+    Glm5NextMetadataReport,
+    Glm5SynthBundle,
+    Glm5SynthConfig,
+    Glm5TierProfile,
+    GlmMoeDsaMetadataReport,
+    convert_glm5_checkpoint,
+    export_glm5_dflash2,
+    export_glm5_mtp,
+    generate_synth_glm5_bundle,
+    validate_glm5_dflash2_metadata_dir,
+    validate_glm5_next_metadata_dir,
+    validate_glm_moe_dsa_metadata_dir,
+)
 from aminfer_tools.mimo_v2 import (
     MIMO_SYNTH_PRESETS,
     MIMO_TIER_PROFILES,
@@ -47,4 +65,20 @@ __all__ = [
     "generate_synth_qwen35_bundle",
     "validate_mimo_v2_metadata_dir",
     "validate_qwen35_metadata_dir",
+    "GLM5_SYNTH_PRESETS",
+    "GLM5_TIER_PROFILES",
+    "Glm5ConvertReport",
+    "Glm5Dflash2MetadataReport",
+    "Glm5NextMetadataReport",
+    "Glm5SynthBundle",
+    "Glm5SynthConfig",
+    "Glm5TierProfile",
+    "GlmMoeDsaMetadataReport",
+    "convert_glm5_checkpoint",
+    "export_glm5_dflash2",
+    "export_glm5_mtp",
+    "generate_synth_glm5_bundle",
+    "validate_glm5_dflash2_metadata_dir",
+    "validate_glm5_next_metadata_dir",
+    "validate_glm_moe_dsa_metadata_dir",
 ]

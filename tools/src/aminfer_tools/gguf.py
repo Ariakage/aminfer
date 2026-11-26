@@ -1264,6 +1264,7 @@ def normalize_gguf_tensor_name(
     attn_res_shifted_by_1: bool = False,
     arch: str = "",
     mimo_mtp_mode: bool = False,
+    linear_layers: set[int] | None = None,
 ) -> str:
     """Normalize a GGUF tensor name (`blk.N.*`, `v.blk.N.*`, `mm.*`) to canonical `.amf` naming."""
     eff_arch = arch.lower()
@@ -1284,6 +1285,11 @@ def normalize_gguf_tensor_name(
             "dflash.mask_embed": "mask_embed.weight",
             "mask_embd.weight": "mask_embed.weight",
             "mask_embed.weight": "mask_embed.weight",
+            "candidate_selector.hidden_projection.weight": "candidate_selector.hidden_projection.weight",
+            "candidate_selector.predecessor_codebook": "candidate_selector.predecessor_codebook",
+            "candidate_selector.predecessor_codebook.weight": "candidate_selector.predecessor_codebook",
+            "candidate_selector.successor_codebook": "candidate_selector.successor_codebook",
+            "candidate_selector.successor_codebook.weight": "candidate_selector.successor_codebook",
         }
         if raw_name in dflash_top:
             return _normalize_name(dflash_top[raw_name])
@@ -1339,6 +1345,92 @@ def normalize_gguf_tensor_name(
                         return _normalize_name(f"layers.{blk_idx}.post_attention_layernorm.weight")
                     if rest in ("final_layernorm.weight", "nextn.norm.weight", "ffn_post_norm.weight", "output_norm.weight"):
                         return _normalize_name(f"layers.{blk_idx}.final_layernorm.weight")
+        if eff_arch == "dflash" and ("attention_conv." in rest or "attn_conv." in rest or "mlp_conv." in rest):
+            df_rest = rest.replace("attention_conv.", "attn_conv.")
+            if len(f"layers.{blk_idx}.{df_rest}".encode("utf-8")) > 47:
+                df_rest = df_rest.replace(".kernel_projection.", ".k_proj.")
+            return _normalize_name(f"layers.{blk_idx}.{df_rest}")
+        if eff_arch in ("glm-dsa", "glm_moe_dsa", "glm5-next", "glm5_next"):
+            glm_leaf_map = {
+                "indexer.attn_k.weight": "attn.idx.wk.weight",
+                "indexer.wk.weight": "attn.idx.wk.weight",
+                "indexer.attn_q_b.weight": "attn.idx.wq_b.weight",
+                "indexer.wq_b.weight": "attn.idx.wq_b.weight",
+                "indexer.k_norm.weight": "attn.idx.k_norm.weight",
+                "indexer.k_norm.bias": "attn.idx.k_norm.bias",
+                "indexer.norm.weight": "attn.idx.k_norm.weight",
+                "indexer.norm.bias": "attn.idx.k_norm.bias",
+                "indexer.proj.weight": "attn.idx.weights_proj.weight",
+                "indexer.weights_proj.weight": "attn.idx.weights_proj.weight",
+                "indexer_compressor_ape": "attn.idx.kpool_ape",
+                "indexer_compressor_ape.weight": "attn.idx.kpool_ape",
+                "indexer.kpool_ape": "attn.idx.kpool_ape",
+                "indexer_compressor_gate": "attn.idx.kpool_gate",
+                "indexer_compressor_gate.weight": "attn.idx.kpool_gate",
+                "indexer.kpool_gate": "attn.idx.kpool_gate",
+                "exp_probs_b.bias": "mlp.gate.bias",
+                "ffn_exp_probs_b.bias": "mlp.gate.bias",
+                "ffn_gate_inp.bias": "mlp.gate.bias",
+                "hc_attn_base": "hc_attn_base",
+                "hc_attn_base.weight": "hc_attn_base",
+                "hc_attn_fn": "hc_attn_fn",
+                "hc_attn_fn.weight": "hc_attn_fn",
+                "hc_attn_scale": "hc_attn_scale",
+                "hc_attn_scale.weight": "hc_attn_scale",
+                "hc_ffn_base": "hc_ffn_base",
+                "hc_ffn_base.weight": "hc_ffn_base",
+                "hc_ffn_fn": "hc_ffn_fn",
+                "hc_ffn_fn.weight": "hc_ffn_fn",
+                "hc_ffn_scale": "hc_ffn_scale",
+                "hc_ffn_scale.weight": "hc_ffn_scale",
+                "attn_q_a.weight": "self_attn.q_a_proj.weight",
+                "attn_q_b.weight": "self_attn.q_b_proj.weight",
+                "attn_q_a_norm.weight": "self_attn.q_a_layernorm.weight",
+                "attn_kv_a_mqa.weight": "self_attn.kv_a_proj_with_mqa.weight",
+                "attn_kv_a_norm.weight": "self_attn.kv_a_layernorm.weight",
+                "attn_kv_b.weight": "self_attn.kv_b_proj.weight",
+            }
+            if eff_arch in ("glm5-next", "glm5_next"):
+                glm_leaf_map.update(
+                    {
+                        "ssm_a": "linear_attn.A_log",
+                        "ssm_a.weight": "linear_attn.A_log",
+                        "ssm_dt.bias": "linear_attn.dt_bias",
+                        "ssm_dt_bias": "linear_attn.dt_bias",
+                        "ssm_dt.weight": "linear_attn.dt_bias",
+                        "ssm_beta.weight": "linear_attn.b_proj.weight",
+                        "ssm_f_a.weight": "linear_attn.f_a_proj.weight",
+                        "ssm_f_b.weight": "linear_attn.f_b_proj.weight",
+                        "ssm_g_a.weight": "linear_attn.g_a_proj.weight",
+                        "ssm_g_b.weight": "linear_attn.g_b_proj.weight",
+                        "ssm_conv1d_q.weight": "linear_attn.q_conv1d.weight",
+                        "ssm_conv1d_k.weight": "linear_attn.k_conv1d.weight",
+                        "ssm_conv1d_v.weight": "linear_attn.v_conv1d.weight",
+                        "ssm_norm.weight": "linear_attn.o_norm.weight",
+                        "ssm_norm": "linear_attn.o_norm.weight",
+                        "ssm_out.weight": "linear_attn.o_proj.weight",
+                    }
+                )
+                if linear_layers is not None and raw_blk_idx in linear_layers:
+                    glm_leaf_map.update(
+                        {
+                            "attn_q.weight": "linear_attn.q_proj.weight",
+                            "attn_k.weight": "linear_attn.k_proj.weight",
+                            "attn_v.weight": "linear_attn.v_proj.weight",
+                            "attn_output.weight": "linear_attn.o_proj.weight",
+                        }
+                    )
+            if rest in glm_leaf_map:
+                return _normalize_name(f"layers.{blk_idx}.{glm_leaf_map[rest]}")
+            if mimo_mtp_mode:
+                if rest in ("nextn.enorm.weight", "enorm.weight"):
+                    return _normalize_name(f"layers.{blk_idx}.enorm.weight")
+                if rest in ("nextn.hnorm.weight", "hnorm.weight"):
+                    return _normalize_name(f"layers.{blk_idx}.hnorm.weight")
+                if rest in ("nextn.eh_proj.weight", "eh_proj.weight"):
+                    return _normalize_name(f"layers.{blk_idx}.eh_proj.weight")
+                if rest in ("nextn.norm.weight", "shared_head.norm.weight", "output_norm.weight"):
+                    return _normalize_name("shared_head.norm.weight")
         if eff_arch in ("qwen35", "qwen3_5", "qwen35moe"):
             qwen35_leaf_map = {
                 "attn_gate.weight": "linear_attn.g_proj.weight",
@@ -1600,17 +1692,36 @@ def _build_synthesized_config_bytes(
         "model_type": arch,
     }
     if arch == "dflash":
+        is_dflash2 = any(
+            k in kv
+            for k in (
+                "dflash.conv_kernel_size",
+                "dflash.conv_group_size",
+                "dflash.conv_groups",
+                "dflash.selector_rank",
+                "dflash.selector_top_k",
+            )
+        ) or int(kv.get("dflash.version", 1) or 1) == 2
         is_mimo_dflash = (
             "dflash.target_layers" in kv
             or "dflash.attention.value_scale" in kv
             or "tokenizer.ggml.mask_token_id" in kv
         )
-        cfg["architectures"] = ["DFlashForCausalLM"]
-        cfg["draft_kind"] = "dflash"
-        cfg["dflare_format"] = "dflash" if is_mimo_dflash else "dflare"
+        cfg["architectures"] = ["DFlash2DraftModel"] if is_dflash2 else ["DFlashForCausalLM"]
+        cfg["draft_kind"] = "dflash2" if is_dflash2 else "dflash"
+        cfg["dflare_format"] = "dflash2" if is_dflash2 else ("dflash" if is_mimo_dflash else "dflare")
+        if is_dflash2:
+            cfg["dflash_version"] = 2
+            cfg["conv_kernel_size"] = int(kv.get("dflash.conv_kernel_size", 2) or 2)
+            conv_gs = int(kv.get("dflash.conv_group_size", kv.get("dflash.conv_groups", 16)) or 16)
+            cfg["conv_groups"] = conv_gs
+            cfg["conv_group_size"] = conv_gs
+            cfg["selector_rank"] = int(kv.get("dflash.selector_rank", 256) or 256)
+            cfg["selector_top_k"] = int(kv.get("dflash.selector_top_k", 16) or 16)
+            cfg["sliding_window"] = int(kv.get("dflash.attention.sliding_window", 2048) or 2048)
         cfg["block_size"] = int(kv.get("dflash.block_size", kv.get("dflare.block_size", 8)) or 8)
-        default_mrank = 0 if is_mimo_dflash else 256
-        default_mtype = "none" if is_mimo_dflash else "rnn_hidden"
+        default_mrank = 0 if (is_mimo_dflash or is_dflash2) else 256
+        default_mtype = "none" if (is_mimo_dflash or is_dflash2) else "rnn_hidden"
         cfg["markov_rank"] = int(
             kv.get("dflash.markov_rank", kv.get("dflare.markov_rank", default_mrank)) or default_mrank
         )
@@ -1638,6 +1749,66 @@ def _build_synthesized_config_bytes(
         if "tokenizer.ggml.mask_token_id" in kv:
             cfg["mask_token_id"] = int(kv["tokenizer.ggml.mask_token_id"])
         cfg["add_swa_attention_sink_bias"] = True
+    elif arch in ("glm-dsa", "glm_moe_dsa"):
+        cfg["model_type"] = "glm_moe_dsa"
+        cfg["architectures"] = ["GlmMoeDsaForCausalLM"]
+        cfg["first_k_dense_replace"] = int(kv.get(f"{arch}.leading_dense_block_count", 3) or 3)
+        cfg["index_n_heads"] = int(kv.get(f"{arch}.attention.indexer.head_count", 32) or 32)
+        cfg["index_head_dim"] = int(kv.get(f"{arch}.attention.indexer.key_length", 128) or 128)
+        cfg["index_topk"] = int(kv.get(f"{arch}.attention.indexer.top_k", 2048) or 2048)
+        cfg["index_topk_freq"] = int(kv.get(f"{arch}.attention.indexer.freq", 4) or 4)
+        cfg["index_skip_topk_offset"] = int(kv.get(f"{arch}.attention.indexer.skip_offset", 3))
+        cfg["index_share_for_mtp_iteration"] = True
+        cfg["rope_interleave"] = True
+        cfg["indexer_rope_interleave"] = True
+        if f"{arch}.attention.q_lora_rank" in kv:
+            cfg["q_lora_rank"] = int(kv[f"{arch}.attention.q_lora_rank"])
+        if f"{arch}.attention.kv_lora_rank" in kv:
+            cfg["kv_lora_rank"] = int(kv[f"{arch}.attention.kv_lora_rank"])
+        cfg["qk_rope_head_dim"] = int(kv.get(f"{arch}.rope.dimension_count", 64) or 64)
+        mla_k = int(kv.get(f"{arch}.attention.key_length_mla", 256) or 256)
+        cfg["qk_nope_head_dim"] = max(0, mla_k - cfg["qk_rope_head_dim"])
+        cfg["v_head_dim"] = int(kv.get(f"{arch}.attention.value_length_mla", 256) or 256)
+        cfg["moe_intermediate_size"] = int(kv.get(f"{arch}.expert_feed_forward_length", 2048) or 2048)
+        cfg["n_shared_experts"] = int(kv.get(f"{arch}.expert_shared_count", 1) or 1)
+        cfg["routed_scaling_factor"] = float(kv.get(f"{arch}.expert_weights_scale", 2.5) or 2.5)
+        cfg["scoring_func"] = "sigmoid"
+        cfg["norm_topk_prob"] = bool(kv.get(f"{arch}.expert_weights_norm", True))
+    elif arch in ("glm5-next", "glm5_next"):
+        cfg["model_type"] = "glm5_next"
+        cfg["architectures"] = ["Glm5NextForConditionalGeneration"]
+        cfg["first_k_dense_replace"] = int(kv.get(f"{arch}.leading_dense_block_count", 3) or 3)
+        cfg["mhc"] = True
+        cfg["hc_mult"] = int(kv.get(f"{arch}.hyper_connection.count", 4) or 4)
+        hc_iters = int(kv.get(f"{arch}.hyper_connection.sinkhorn_iterations", 20) or 20)
+        cfg["sinkhorn_iters"] = hc_iters
+        cfg["hc_sinkhorn_iters"] = hc_iters
+        cfg["hc_eps"] = float(kv.get(f"{arch}.hyper_connection.epsilon", 1e-6) or 1e-6)
+        cfg["linear_attn_kind"] = "kda"
+        cfg["linear_num_heads"] = int(kv.get(f"{arch}.attention.head_count", 64) or 64)
+        cfg["linear_head_dim"] = int(kv.get(f"{arch}.kda.head_dim", 128) or 128)
+        cfg["linear_lora_rank"] = int(kv.get(f"{arch}.kda.head_dim", 128) or 128)
+        cfg["linear_conv_kernel_dim"] = int(kv.get(f"{arch}.ssm.conv_kernel", 4) or 4)
+        cfg["linear_lower_bound"] = float(kv.get(f"{arch}.kda.gate_lower_bound", -5.0) or -5.0)
+        cfg["q_lora_rank"] = int(kv.get(f"{arch}.attention.q_lora_rank", 1536) or 1536)
+        cfg["kv_lora_rank"] = int(kv.get(f"{arch}.attention.kv_lora_rank", 512) or 512)
+        cfg["qk_rope_head_dim"] = int(kv.get(f"{arch}.rope.dimension_count", 0) or 0)
+        cfg["qk_nope_head_dim"] = int(kv.get(f"{arch}.attention.key_length_mla", 256) or 256)
+        cfg["v_head_dim"] = int(kv.get(f"{arch}.attention.value_length_mla", 256) or 256)
+        cfg["index_n_heads"] = int(kv.get(f"{arch}.attention.indexer.head_count", 32) or 32)
+        cfg["index_head_dim"] = int(kv.get(f"{arch}.attention.indexer.key_length", 128) or 128)
+        cfg["index_topk"] = int(kv.get(f"{arch}.attention.indexer.top_k", 2048) or 2048)
+        cfg["index_kpool"] = int(kv.get(f"{arch}.attention.indexer.kpool", 4) or 4)
+        cfg["index_kpool_always_select_tail"] = True
+        cfg["moe_intermediate_size"] = int(kv.get(f"{arch}.expert_feed_forward_length", 2048) or 2048)
+        cfg["n_shared_experts"] = int(kv.get(f"{arch}.expert_shared_count", 1) or 1)
+        cfg["routed_scaling_factor"] = float(kv.get(f"{arch}.expert_weights_scale", 2.5) or 2.5)
+        cfg["swiglu_limit"] = 10.0
+        cfg["scoring_func"] = "sigmoid"
+        cfg["norm_topk_prob"] = bool(kv.get(f"{arch}.expert_weights_norm", True))
+        h_kv = kv.get(f"{arch}.attention.head_count_kv")
+        if isinstance(h_kv, list) and h_kv:
+            cfg["layer_types"] = ["linear_attention" if int(x) == 0 else "mla_attention" for x in h_kv]
     elif arch in ("mimo2", "mimo_v2"):
         cfg["model_type"] = "mimo_v2"
         cfg["architectures"] = ["MiMoV2ForCausalLM"]
@@ -2095,7 +2266,7 @@ def pack_amf_from_gguf(
             }
         )
         layer_remap = {old_l: new_l for new_l, old_l in enumerate(kept_ids)}
-    if mimo_mtp_mode and arch.lower() in ("mimo2", "mimo_v2"):
+    if mimo_mtp_mode and arch.lower() in ("mimo2", "mimo_v2", "glm-dsa", "glm_moe_dsa", "glm5-next", "glm5_next"):
         mtp_blk_ids = sorted(
             {
                 int(m.group(1))
@@ -2104,7 +2275,8 @@ def pack_amf_from_gguf(
             }
         )
         blk_cnt = int(kv.get(f"{arch}.block_count", 0) or 0)
-        nextn_n = int(kv.get(f"{arch}.nextn_predict_layers", 3) or 3)
+        default_nextn = 1 if arch.lower().startswith("glm") else 3
+        nextn_n = int(kv.get(f"{arch}.nextn_predict_layers", default_nextn) or default_nextn)
         if blk_cnt > nextn_n > 0 and mtp_blk_ids and max(mtp_blk_ids) >= blk_cnt - nextn_n and min(mtp_blk_ids) < blk_cnt - nextn_n:
             mtp_start = blk_cnt - nextn_n
             flat_items = [
@@ -2116,6 +2288,29 @@ def pack_amf_from_gguf(
         if mtp_blk_ids:
             layer_remap = {old_l: new_l for new_l, old_l in enumerate(mtp_blk_ids)}
             physical_layers = len(mtp_blk_ids)
+    elif not mimo_mtp_mode and arch.lower() in ("glm-dsa", "glm_moe_dsa", "glm5-next", "glm5_next"):
+        blk_cnt = int(kv.get(f"{arch}.block_count", 0) or 0)
+        nextn_n = int(kv.get(f"{arch}.nextn_predict_layers", 0) or 0)
+        if blk_cnt > nextn_n > 0:
+            backbone_lim = blk_cnt - nextn_n
+            flat_items = [
+                item
+                for item in flat_items
+                if not ((m := _GGUF_BLK_RE.match(item[2].name)) is not None and int(m.group(1)) >= backbone_lim)
+            ]
+
+    glm5_linear_layers: set[int] | None = None
+    if arch.lower() in ("glm5-next", "glm5_next"):
+        glm5_linear_layers = set()
+        h_kv = kv.get(f"{arch}.attention.head_count_kv")
+        if isinstance(h_kv, list):
+            for idx_k, v_k in enumerate(h_kv):
+                if int(v_k) == 0:
+                    glm5_linear_layers.add(idx_k)
+        for _, _, t in flat_items:
+            m_kda = _GGUF_BLK_RE.match(t.name)
+            if m_kda is not None and m_kda.group(2).startswith(("ssm_", "linear_attn.")):
+                glm5_linear_layers.add(int(m_kda.group(1)))
 
     if stats_out is not None:
         stats_out["physical_layers"] = physical_layers
@@ -2520,14 +2715,22 @@ def pack_amf_from_gguf(
                     attn_res_shifted_by_1=attn_res_shifted_by_1,
                     arch=arch,
                     mimo_mtp_mode=mimo_mtp_mode,
+                    linear_layers=glm5_linear_layers,
                 )
             )
             if norm_name in excluded:
                 continue
             eff_shape = amf_shape_full
             if (
-                arch.lower() in ("qwen35", "qwen3_5", "qwen35moe")
-                and norm_name.endswith(".linear_attn.conv1d.weight")
+                arch.lower() in ("qwen35", "qwen3_5", "qwen35moe", "glm5-next", "glm5_next")
+                and norm_name.endswith(
+                    (
+                        ".linear_attn.conv1d.weight",
+                        ".linear_attn.q_conv1d.weight",
+                        ".linear_attn.k_conv1d.weight",
+                        ".linear_attn.v_conv1d.weight",
+                    )
+                )
                 and len(eff_shape) == 3
                 and eff_shape[1] == 1
             ):
@@ -2834,6 +3037,22 @@ def pack_amf_from_gguf(
             cfg_dict = json.loads(cfg_bytes)
             mtp_dict = build_mimo_mtp_config_dict(cfg_dict, mtp_layers=max(1, physical_layers))
             cfg_bytes = json.dumps(mtp_dict, ensure_ascii=False, indent=2).encode("utf-8") + b"\n"
+        elif meta_config_override is None and arch.lower() in ("glm-dsa", "glm_moe_dsa", "glm5-next", "glm5_next"):
+            from aminfer_tools.glm5 import (
+                build_glm5_mtp_config_dict,
+                build_glm5_next_config_json,
+                build_glm_moe_dsa_config_json,
+            )
+
+            cfg_dict = json.loads(cfg_bytes)
+            is_g5_next = arch.lower() in ("glm5-next", "glm5_next")
+            if mimo_mtp_mode:
+                out_cfg_d = build_glm5_mtp_config_dict(cfg_dict, is_glm5_next=is_g5_next)
+            elif is_g5_next:
+                out_cfg_d = build_glm5_next_config_json(cfg_dict, include_vision=not (strip_vision or vision_sidecar is not None))
+            else:
+                out_cfg_d = build_glm_moe_dsa_config_json(cfg_dict)
+            cfg_bytes = json.dumps(out_cfg_d, ensure_ascii=False, indent=2).encode("utf-8") + b"\n"
         if draft_config_output is not None:
             dcfg_p = pathlib.Path(draft_config_output)
             dcfg_p.parent.mkdir(parents=True, exist_ok=True)

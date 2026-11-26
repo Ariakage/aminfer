@@ -46,6 +46,16 @@ from aminfer_tools.inkling2 import (
     generate_synth_inkling2_bundle,
     validate_hf_metadata_dir as validate_inkling2_metadata_dir,
 )
+from aminfer_tools.glm5 import (
+    GLM5_SYNTH_PRESETS,
+    GLM5_TIER_PROFILES,
+    convert_glm5_checkpoint,
+    generate_synth_glm5_bundle,
+    is_glm5_dflash2_config,
+    validate_glm5_dflash2_metadata_dir,
+    validate_glm5_next_metadata_dir,
+    validate_glm_moe_dsa_metadata_dir,
+)
 from aminfer_tools.mimo_v2 import (
     generate_synth_mimo_bundle,
     generate_synth_qwen35_bundle,
@@ -1109,6 +1119,72 @@ def _build_parser() -> argparse.ArgumentParser:
     sq35.add_argument("--model-id", default=None)
     sq35.add_argument("--seed", type=int, default=42)
 
+    cglm5 = sub.add_parser(
+        "convert-glm5",
+        help="Convert GLM-5.2/5.3 (`glm_moe_dsa`) or GLM-5.3-Flash (`glm5_next`) + W20 ViT + 1L MTP + DFlash2 to .amf",
+    )
+    cglm5.add_argument("--input", required=True, type=pathlib.Path)
+    cglm5.add_argument("--output", required=True, type=pathlib.Path)
+    cglm5.add_argument("--model-id", default=None)
+    cglm5.add_argument("--dtype", choices=DTYPE_MODES, default="auto")
+    cglm5.add_argument("--group-size", type=int, choices=AFFINE_GROUP_SIZES, default=None)
+    cglm5.add_argument("--quant-profile", choices=QUANT_PROFILES, default="uniform")
+    cglm5.add_argument("--target-bits", type=float, default=None)
+    cglm5.add_argument("--target-tier", choices=sorted(GLM5_TIER_PROFILES.keys()), default=None)
+    cglm5.add_argument("--no-rco", action="store_true")
+    cglm5.add_argument("--manifest", type=pathlib.Path, default=None)
+    cglm5.add_argument("--cold-experts", default="")
+    cglm5.add_argument("--cold-experts-per-layer", type=int, default=None)
+    cglm5.add_argument("--heat-profile", type=pathlib.Path, default=None)
+    cglm5.add_argument("--all-experts-cold", action="store_true")
+    cglm5.add_argument("--include-vision", action="store_true")
+    cglm5.add_argument("--strip-vision", action="store_true")
+    cglm5.add_argument("--no-strip-vision", action="store_true")
+    cglm5.add_argument("--vision-sidecar", type=pathlib.Path, default=None)
+    cglm5.add_argument("--vision-block-dtype", choices=VISION_BLOCK_DTYPES, default="auto")
+    cglm5.add_argument("--mtp-input", type=pathlib.Path, default=None)
+    cglm5.add_argument("--mtp-output", type=pathlib.Path, default=None)
+    cglm5.add_argument("--mtp-config-output", type=pathlib.Path, default=None)
+    cglm5.add_argument("--dflash2-input", "--dflash-input", dest="dflash2_input", type=pathlib.Path, default=None)
+    cglm5.add_argument("--dflash2-output", "--dflash-output", dest="dflash2_output", type=pathlib.Path, default=None)
+    cglm5.add_argument(
+        "--dflash2-config-output", "--dflash-config-output", dest="dflash2_config_output", type=pathlib.Path, default=None
+    )
+    cglm5.add_argument("--dflash-block-size", type=int, choices=(8, 16), default=None)
+    cglm5.add_argument("--config-output", type=pathlib.Path, default=None)
+    cglm5.add_argument("--config", type=pathlib.Path, default=None)
+    cglm5.add_argument("--tokenizer", type=pathlib.Path, default=None)
+    cglm5.add_argument("--tokenizer-config", type=pathlib.Path, default=None)
+    cglm5.add_argument("--chat-template", type=pathlib.Path, default=None)
+    cglm5.add_argument("--no-strict-vocab", action="store_true")
+    cglm5.add_argument("--imatrix", type=pathlib.Path, default=None)
+    cglm5.add_argument("--allow-unsafe-q2", action="store_true")
+    cglm5.add_argument("--max-q2-share", type=float, default=None)
+    cglm5.add_argument("--no-retranscode-lowbit", dest="allow_retranscode_lowbit", action="store_false")
+    cglm5.add_argument("--fine-rungs", action="store_true")
+    cglm5.add_argument("--no-embed-metadata", action="store_true")
+    cglm5.add_argument("--workers", type=int, default=1)
+
+    sglm5 = sub.add_parser(
+        "synth-glm5",
+        help="Generate deterministic tiny GLM-5.2/5.3 (`glm_moe_dsa`) or GLM-5.3-Flash (`glm5_next`) + W20 ViT + 1L MTP + DFlash2 bundle",
+    )
+    sglm5.add_argument("--preset", default="tiny-glm-dsa", choices=sorted(GLM5_SYNTH_PRESETS.keys()))
+    sglm5.add_argument("--output-dir", required=True, type=pathlib.Path)
+    sglm5.add_argument("--num-layers", type=int, default=None)
+    sglm5.add_argument("--hidden-size", type=int, default=None)
+    sglm5.add_argument("--num-experts", type=int, default=None)
+    sglm5.add_argument("--vision-layers", type=int, default=None)
+    sglm5.add_argument("--vision-mode", choices=("sidecar", "inline", "strip"), default="sidecar")
+    sglm5.add_argument("--dflash-block-size", type=int, choices=(8, 16), default=None)
+    sglm5.add_argument("--dtype", choices=("bf16", "f16"), default=None)
+    sglm5.add_argument("--cold-experts-per-layer", type=int, default=None)
+    sglm5.add_argument("--no-mtp", action="store_true")
+    sglm5.add_argument("--no-dflash2", "--no-dflash", dest="no_dflash2", action="store_true")
+    sglm5.add_argument("--no-embed-metadata", action="store_true")
+    sglm5.add_argument("--model-id", default=None)
+    sglm5.add_argument("--seed", type=int, default=42)
+
     part = sub.add_parser(
         "partition-experts",
         help=(
@@ -1146,7 +1222,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     insp.add_argument(
         "--arch",
-        choices=("auto", "qwen4_exp", "deepseek41", "inkling2", "hy4", "mimo_v2", "qwen3_5"),
+        choices=("auto", "qwen4_exp", "deepseek41", "inkling2", "hy4", "mimo_v2", "qwen3_5", "glm_moe_dsa", "glm5_next", "dflash2"),
         default="auto",
         help="Architecture validator to invoke (default: auto-detect from config.json)",
     )
@@ -2689,6 +2765,87 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         return 0
 
+    if args.command == "convert-glm5":
+        inc_vis, strip_vis = _resolve_cli_vision_flags(parser, args)
+        cold = _parse_cold_experts(args.cold_experts)
+        enforce_floor = not args.allow_unsafe_q2
+        eff_max_q2 = None if args.allow_unsafe_q2 else args.max_q2_share
+        eff_fine_rungs = False if args.allow_unsafe_q2 else (True if args.fine_rungs else None)
+        rep = convert_glm5_checkpoint(
+            args.input,
+            args.output,
+            model_id=args.model_id,
+            dtype_mode=args.dtype,
+            group_size=args.group_size,
+            quant_profile=args.quant_profile,
+            target_bits=args.target_bits,
+            target_tier=args.target_tier,
+            use_rco=not args.no_rco,
+            manifest_path=args.manifest,
+            cold_experts=cold,
+            cold_experts_per_layer=args.cold_experts_per_layer,
+            heat_profile=args.heat_profile,
+            all_experts_cold=args.all_experts_cold,
+            strip_vision=strip_vis,
+            include_vision=inc_vis,
+            vision_sidecar=args.vision_sidecar,
+            vision_block_dtype=args.vision_block_dtype,
+            mtp_input=args.mtp_input,
+            mtp_output=args.mtp_output,
+            mtp_config_output=args.mtp_config_output,
+            dflash2_input=args.dflash2_input,
+            dflash2_output=args.dflash2_output,
+            dflash2_config_output=args.dflash2_config_output,
+            dflash_block_size=args.dflash_block_size,
+            config_output=args.config_output,
+            config_path=args.config,
+            tokenizer_path=args.tokenizer,
+            tokenizer_config_path=args.tokenizer_config,
+            chat_template_path=args.chat_template,
+            strict_vocab_check=not args.no_strict_vocab,
+            imatrix_path=args.imatrix,
+            enforce_backbone_floor=enforce_floor,
+            max_q2_share=eff_max_q2,
+            allow_lowbit_q2_retranscode=bool(args.allow_retranscode_lowbit),
+            fine_rungs=eff_fine_rungs,
+            embed_metadata=not args.no_embed_metadata,
+            workers=args.workers,
+        )
+        print(
+            f"converted {rep.model_type} ({len(rep.backbone_metas)} backbone tensors, "
+            f"cold_experts={rep.cold_expert_count}, mtp={len(rep.mtp_metas)}, "
+            f"dflash2={len(rep.dflash2_metas)}, vision={len(rep.vision_metas)}) "
+            f"into {rep.backbone_amf}"
+        )
+        return 0
+
+    if args.command == "synth-glm5":
+        started = time.monotonic()
+        bundle = generate_synth_glm5_bundle(
+            args.output_dir,
+            preset=args.preset,
+            num_layers=args.num_layers,
+            hidden_size=args.hidden_size,
+            num_experts=args.num_experts,
+            vision_layers=args.vision_layers,
+            vision_mode=args.vision_mode,
+            dflash_block_size=args.dflash_block_size,
+            dtype=args.dtype,
+            cold_experts_per_layer=args.cold_experts_per_layer,
+            with_mtp=not args.no_mtp,
+            with_dflash2=not args.no_dflash2,
+            embed_metadata=not args.no_embed_metadata,
+            model_id=args.model_id,
+            seed=args.seed,
+        )
+        elapsed = time.monotonic() - started
+        print(
+            f"synthesized {args.preset} -> {bundle.output_dir} "
+            f"(backbone={len(bundle.backbone_metas)}, vision={len(bundle.vision_metas)}, "
+            f"mtp={len(bundle.mtp_metas)}, dflash2={len(bundle.dflash2_metas)}) in {elapsed:.2f} s"
+        )
+        return 0
+
     if args.command == "synth-vit":
         started = time.monotonic()
         vit_cfg = SyntheticVitConfig(
@@ -2744,7 +2901,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             mt = str(raw_cfg.get("model_type", "")).lower()
             tc_mt = str(raw_cfg.get("text_config", {}).get("model_type", "")).lower() if isinstance(raw_cfg.get("text_config"), dict) else ""
             combined_mt = f"{mt} {tc_mt}"
-            if "mimo" in combined_mt:
+            if is_glm5_dflash2_config(raw_cfg):
+                arch = "dflash2"
+            elif "glm5_next" in combined_mt or "glm5-next" in combined_mt:
+                arch = "glm5_next"
+            elif "glm_moe_dsa" in combined_mt:
+                arch = "glm_moe_dsa"
+            elif "mimo" in combined_mt:
                 arch = "mimo_v2"
             elif "qwen3_5" in combined_mt or "qwen35" in combined_mt:
                 arch = "qwen3_5"
@@ -2760,7 +2923,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                 print(f"error: cannot auto-detect arch from model_type={mt!r}; pass --arch", file=sys.stderr)
                 return 2
         try:
-            if arch == "mimo_v2":
+            if arch == "glm_moe_dsa":
+                rep = validate_glm_moe_dsa_metadata_dir(base, host_ram_gib=args.host_ram_gib)
+            elif arch == "glm5_next":
+                rep = validate_glm5_next_metadata_dir(base, host_ram_gib=args.host_ram_gib)
+            elif arch == "dflash2":
+                rep = validate_glm5_dflash2_metadata_dir(base)
+            elif arch == "mimo_v2":
                 rep = validate_mimo_v2_metadata_dir(base)
             elif arch == "qwen3_5":
                 rep = validate_qwen35_metadata_dir(base)
@@ -2778,6 +2947,30 @@ def main(argv: Sequence[str] | None = None) -> int:
         data = rep.to_dict()
         if args.as_json:
             print(json.dumps(data, indent=2))
+        elif arch == "glm_moe_dsa":
+            print(
+                f"glm_moe_dsa metadata OK ({rep.model_type}): "
+                f"layers={rep.num_hidden_layers} (dense={rep.dense_layers}, moe={rep.moe_layers}; "
+                f"DSA_full={rep.full_indexer_layers}, shared={rep.shared_indexer_layers}), "
+                f"hidden={rep.hidden_size}, experts={rep.n_routed_experts} (top-{rep.num_experts_per_tok}), "
+                f"MTP={rep.mtp_layers}L (share_idx={rep.index_share_for_mtp_iteration}), "
+                f"KV={rep.mla_kv_bytes_per_token_fp16} B/tok, names>47B={rep.long_backbone_names}"
+            )
+        elif arch == "glm5_next":
+            print(
+                f"glm5_next metadata OK ({rep.model_type}): "
+                f"layers={rep.num_hidden_layers} (KDA={rep.linear_attention_layers}, NoPE_MLA={rep.nope_mla_layers}), "
+                f"mHC={rep.hc_mult}x{rep.hc_sinkhorn_iters}sinkhorn, hidden={rep.hidden_size}, "
+                f"experts={rep.n_routed_experts} (top-{rep.num_experts_per_tok}), "
+                f"ViT={rep.vision_layers}L, MTP={rep.mtp_layers}L, "
+                f"KDA_state={rep.kda_state_bytes_fp32 / (1024**2):.1f} MiB, names>47B={rep.long_backbone_names}"
+            )
+        elif arch == "dflash2":
+            print(
+                f"dflash2 metadata OK: layers={rep.num_hidden_layers}, hidden={rep.hidden_size}, "
+                f"block={rep.block_size}, conv=({rep.conv_kernel_size},g{rep.conv_group_size}), "
+                f"selector_k={rep.selector_top_k}, taps={list(rep.target_layer_ids)}, names>47B={rep.long_names}"
+            )
         elif arch == "mimo_v2":
             print(
                 f"mimo_v2 metadata OK ({rep.variant}, {rep.model_type}): "
