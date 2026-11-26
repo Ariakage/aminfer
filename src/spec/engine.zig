@@ -510,6 +510,8 @@ pub const LoadedDFlareProposer = struct {
             if (rt.dflare_tap_count > 0 and rt.dflare_tap_count <= dflare_dfly.MAX_TARGET_TAPS) {
                 cfg.num_target_taps = @intCast(rt.dflare_tap_count);
             }
+        } else if (target.dflareTapCount() > 0 and target.dflareTapCount() <= dflare_dfly.MAX_TARGET_TAPS) {
+            cfg.num_target_taps = @intCast(target.dflareTapCount());
         }
 
         const tok_hook: dflare_dfly.TokEmbedHook = .{ .callback = .{

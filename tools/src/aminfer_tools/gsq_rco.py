@@ -4497,10 +4497,14 @@ def gsq_convert(
             is_pinned_inkling_table = t.name.startswith(("attn_res.", "middle_cycle_cross_pass")) or t.name.endswith(
                 (".q_l2_clip.scale", ".rel_l2_clip.scale", ".rel_logits_proj.proj", ".static_w")
             )
+            is_pinned_gdn_gate = t.name.endswith(
+                (".linear_attn.a_proj.weight", ".linear_attn.a_proj", ".linear_attn.b_proj.weight", ".linear_attn.b_proj")
+            )
             is_ctrl = is_inkling2_controller_tensor(t.name) and t.layer != NO_LAYER
             is_quantizable = (
                 len(t.shape) == 2
                 and not is_pinned_inkling_table
+                and not is_pinned_gdn_gate
                 and t.kind not in (TensorKind.NORM, TensorKind.SPARSE_TABLE, TensorKind.LOOP_ADAPTER, TensorKind.METADATA)
                 and (t.dtype in _QUANTIZABLE_SRC_DTYPES or t.dtype >= DType.GGUF_Q4_0)
                 and t.shape[1] > 0

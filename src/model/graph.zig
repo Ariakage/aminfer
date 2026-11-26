@@ -2090,6 +2090,9 @@ pub const GraphModel = struct {
     supports_wide_prefill: bool = false,
     compute_all_logits: bool = false,
     enable_prompt_tail_pruning: bool = true,
+    post_begin_bench_hook: ?*const fn (?*anyopaque) void = null,
+    pre_commit_bench_hook: ?*const fn (?*anyopaque) void = null,
+    pre_commit_bench_ctx: ?*anyopaque = null,
     canary_result: ?dequant.CanaryResult = null,
     live_admission: budget_mod.LiveAdmissionPlan = std.mem.zeroes(budget_mod.LiveAdmissionPlan),
     aliased_scratch_saved_bytes: usize = 0,
@@ -2574,6 +2577,13 @@ pub const GraphModel = struct {
                 .bytes => |b| b.parsed.find(name),
                 .file => |f| f.file.parsed.find(name),
             };
+        }
+
+        pub fn findWithWeight(self: AmfSource, stem: []const u8) ?*const amf.TensorEntry {
+            if (self.find(stem)) |e| return e;
+            var alt_buf: [128]u8 = undefined;
+            const alt = std.fmt.bufPrint(&alt_buf, "{s}.weight", .{stem}) catch return null;
+            return self.find(alt);
         }
 
         pub fn loadIntoArena(self: AmfSource, entry: *const amf.TensorEntry, arena: *arena_mod.WiredArena) (amf.ParseError || amf.IoError || arena_mod.WiredArena.AllocError)![]align(page.APPLE_PAGE_SIZE) u8 {
@@ -6300,7 +6310,8 @@ pub const GraphModel = struct {
                     null;
                 const tok_off: u32 = tube * tokens_per_tube;
                 const proj_bind: metal.BufferBinding = .{ .buffer = proj_buf, .offset = 0 };
-                const fallback_norm = opts.norm orelse vision_mod.NormParams.QWEN_VL_DEFAULT;
+                const fallback_norm = opts.norm orelse
+                    (if (self.config.is_qwen3_5) vision_mod.NormParams.SIGLIP_DEFAULT else vision_mod.NormParams.QWEN_VL_DEFAULT);
                 switch (fmt0) {
                     .bgra8 => try ingress.encodePatchifyEmbedBgra8(
                         &vframe,
@@ -6504,7 +6515,7 @@ pub const GraphModel = struct {
         if (max_patches_per_tube == 0) return error.InvalidGeometry;
 
         const eff_norm: vision_mod.NormParams = opts.norm orelse
-            (if (vcfg.is_inkling2_vision) vision_mod.NormParams.SIGLIP_DEFAULT else vision_mod.NormParams.QWEN_VL_DEFAULT);
+            (if (vcfg.is_inkling2_vision or self.config.is_qwen3_5) vision_mod.NormParams.SIGLIP_DEFAULT else vision_mod.NormParams.QWEN_VL_DEFAULT);
 
         var ink_plan_opt: ?vision_mod.Inkling2GridPlan = null;
         var anyres_plan_opt: ?vision_mod.AnyResPlan = null;
@@ -10585,12 +10596,18 @@ pub const GraphModel = struct {
         if (frame_opt.* == null) {
             frame_opt.* = try self.compute.beginFrame(self.timeout_ms);
             self.beginLoraFrame(frame_opt.*.?.slot);
+            if (self.post_begin_bench_hook) |hook| {
+                hook(self.pre_commit_bench_ctx);
+            }
         }
         return &(frame_opt.*.?);
     }
 
     fn flushFrame(self: *GraphModel, frame_opt: *?metal.Compute.Frame) metal.Error!void {
         if (frame_opt.*) |*f| {
+            if (self.pre_commit_bench_hook) |hook| {
+                hook(self.pre_commit_bench_ctx);
+            }
             const sig = try f.commit();
             frame_opt.* = null;
             try self.compute.wait(sig, self.timeout_ms);
@@ -10718,11 +10735,11 @@ pub const GraphModel = struct {
                 cold_entry_count += 1;
                 const aligned = try page.alignUp(@intCast(e.blob_bytes));
                 const nm = e.nameSlice();
-                if (std.mem.endsWith(u8, nm, ".gate_proj")) {
+                if (std.mem.endsWith(u8, nm, ".gate_proj") or std.mem.endsWith(u8, nm, ".gate_proj.weight")) {
                     max_cold_gate_bytes = @max(max_cold_gate_bytes, aligned);
-                } else if (std.mem.endsWith(u8, nm, ".up_proj")) {
+                } else if (std.mem.endsWith(u8, nm, ".up_proj") or std.mem.endsWith(u8, nm, ".up_proj.weight")) {
                     max_cold_up_bytes = @max(max_cold_up_bytes, aligned);
-                } else if (std.mem.endsWith(u8, nm, ".down_proj")) {
+                } else if (std.mem.endsWith(u8, nm, ".down_proj") or std.mem.endsWith(u8, nm, ".down_proj.weight")) {
                     max_cold_down_bytes = @max(max_cold_down_bytes, aligned);
                 }
                 continue;
@@ -12891,7 +12908,7 @@ pub const GraphModel = struct {
 
                     // Optional `shared_expert` + `shared_expert_gate` (`G7`).
                     const sg_nm = std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.shared_expert.gate_proj", .{l}) catch unreachable;
-                    if (source.find(sg_nm) != null) {
+                    if (source.findWithWeight(sg_nm) != null) {
                         const sh_inter = if (config.shared_expert_intermediate_size > 0) config.shared_expert_intermediate_size else config.moe_intermediate_size;
                         const sg = try bindLinear(source, weight_shards, entry_shard, entry_offsets, entry_slices, entry_base_ptr, sg_nm, sh_inter, h);
                         const su_nm = std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.shared_expert.up_proj", .{l}) catch unreachable;
@@ -12943,9 +12960,9 @@ pub const GraphModel = struct {
                         const is_remote_peer = if (effective_cluster_plan) |plan| !plan.isLocal(@intCast(e)) else false;
                         if (is_remote_peer) continue;
                         const g_nm = std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.experts.{d}.gate_proj", .{ l, e }) catch unreachable;
-                        const ge = source.find(g_nm) orelse return error.MissingTensor;
+                        const ge = source.findWithWeight(g_nm) orelse return error.MissingTensor;
                         const d_nm = std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.experts.{d}.down_proj", .{ l, e }) catch unreachable;
-                        const de = source.find(d_nm) orelse return error.MissingTensor;
+                        const de = source.findWithWeight(d_nm) orelse return error.MissingTensor;
                         const g_amf = try ge.dataType();
                         const d_amf = try de.dataType();
                         if (dequant.usesQuantFormats(g_amf, ge.group_size) or
@@ -12977,11 +12994,11 @@ pub const GraphModel = struct {
                             continue;
                         }
                         const g_nm = std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.experts.{d}.gate_proj", .{ l, e }) catch unreachable;
-                        const ge = source.find(g_nm) orelse return error.MissingTensor;
+                        const ge = source.findWithWeight(g_nm) orelse return error.MissingTensor;
                         const u_nm = std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.experts.{d}.up_proj", .{ l, e }) catch unreachable;
-                        const ue = source.find(u_nm) orelse return error.MissingTensor;
+                        const ue = source.findWithWeight(u_nm) orelse return error.MissingTensor;
                         const d_nm = std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.experts.{d}.down_proj", .{ l, e }) catch unreachable;
-                        const de = source.find(d_nm) orelse return error.MissingTensor;
+                        const de = source.findWithWeight(d_nm) orelse return error.MissingTensor;
 
                         const g_amf = try ge.dataType();
                         const d_amf = try de.dataType();
@@ -13555,11 +13572,11 @@ pub const LoadedCpuMoeStore = struct {
             for (0..num_experts) |e| {
                 if (!plan.isLocal(@intCast(e))) continue;
                 const gn = std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.experts.{d}.gate_proj", .{ l, e }) catch unreachable;
-                const ge = source.find(gn) orelse return error.MissingTensor;
+                const ge = source.findWithWeight(gn) orelse return error.MissingTensor;
                 const un = std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.experts.{d}.up_proj", .{ l, e }) catch unreachable;
-                const ue = source.find(un) orelse return error.MissingTensor;
+                const ue = source.findWithWeight(un) orelse return error.MissingTensor;
                 const dn = std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.experts.{d}.down_proj", .{ l, e }) catch unreachable;
-                const de = source.find(dn) orelse return error.MissingTensor;
+                const de = source.findWithWeight(dn) orelse return error.MissingTensor;
                 total_bytes += try page.alignUp(@intCast(ge.blob_bytes));
                 total_bytes += try page.alignUp(@intCast(ue.blob_bytes));
                 total_bytes += try page.alignUp(@intCast(de.blob_bytes));
@@ -13593,11 +13610,11 @@ pub const LoadedCpuMoeStore = struct {
             for (0..num_experts) |e| {
                 if (!plan.isLocal(@intCast(e))) continue;
                 const gn = std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.experts.{d}.gate_proj", .{ l, e }) catch unreachable;
-                const ge = source.find(gn) orelse return error.MissingTensor;
+                const ge = source.findWithWeight(gn) orelse return error.MissingTensor;
                 const un = std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.experts.{d}.up_proj", .{ l, e }) catch unreachable;
-                const ue = source.find(un) orelse return error.MissingTensor;
+                const ue = source.findWithWeight(un) orelse return error.MissingTensor;
                 const dn = std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.experts.{d}.down_proj", .{ l, e }) catch unreachable;
-                const de = source.find(dn) orelse return error.MissingTensor;
+                const de = source.findWithWeight(dn) orelse return error.MissingTensor;
                 const wdt = amfToWeightDType(try ge.dataType()) orelse return error.UnsupportedDType;
                 const g_raw = try source.loadIntoArena(ge, &w_arena);
                 const u_raw = try source.loadIntoArena(ue, &w_arena);
@@ -18627,13 +18644,21 @@ pub fn buildTestAmf(allocator: std.mem.Allocator, model_id: []const u8, blobs: [
         const blob_len: u64 = try page.alignUp(@max(b.bytes.len, 1));
         var e = amf.TensorEntry.zeroed(b.name, b.kind, b.dtype);
         e.setLayoutAndParamKind(b.layout, .affine_scale_bias);
-        e.quant_bits = switch (b.dtype) {
-            .q4_affine => 4,
-            .q3_affine => 3,
-            .q2_affine => 2,
-            else => 0,
-        };
-        e.group_size = if (e.quant_bits > 0) 64 else 0;
+        if (quant_ref.ggufBlockInfo(b.dtype)) |gi| {
+            e.quant_bits = gi.quant_bits;
+            e.group_size = gi.block_elems;
+        } else {
+            e.quant_bits = switch (b.dtype) {
+                .q4_affine => 4,
+                .q3_affine => 3,
+                .q2_affine => 2,
+                .q5_affine => 5,
+                .q6_affine => 6,
+                .q8_affine => 8,
+                else => 0,
+            };
+            e.group_size = if (e.quant_bits > 0) 64 else 0;
+        }
         e.layer = b.layer;
         e.expert = b.expert;
         e.rank = b.ndim;

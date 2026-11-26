@@ -496,6 +496,14 @@ def _bf16_to_f32_bytes(raw: bytes | bytearray | memoryview) -> bytearray:
     return out
 
 
+def _f16_to_f32_bytes(raw: bytes | bytearray | memoryview) -> bytes:
+    """Widen little-endian IEEE float16 bytes to little-endian float32 bytes."""
+    if len(raw) % 2 != 0:
+        raise ValueError(f"f16 byte length must be even, got {len(raw)}")
+    count = len(raw) // 2
+    return struct.pack(f"<{count}f", *struct.unpack(f"<{count}e", raw))
+
+
 def _f32_bytes_to_f16_bytes(raw: bytes | bytearray | memoryview, what: str) -> bytes:
     count = len(raw) // 4
     try:
@@ -1514,6 +1522,8 @@ def _make_entry(
         param_kind = QuantParamKind.AFFINE_SCALE_BIAS
         if data_convert == "d2t_i64_to_u32":
             data_bytes = (data.length // 8) * 4
+        elif data_convert in ("bf16_to_f32", "f16_to_f32"):
+            data_bytes = data.length * 2
         elif data_convert == "hf_mxfp4_to_gguf_mxfp4":
             data_bytes = (data.length // 16) * 17
         elif data_convert is not None and data_convert.startswith("affine") and data_convert.endswith("_to_bf16"):
@@ -2608,6 +2618,14 @@ def plan_amf_entries(
         ):
             kern = eff_shape[2] if eff_shape[1] == 1 else eff_shape[1]
             eff_shape = (eff_shape[0], kern)
+        if norm_name.endswith((".linear_attn.A_log", ".linear_attn.dt_bias", ".linear_attn.conv1d.weight")):
+            # GDN kernels (`ami_gdn_compute_gates` / `ami_gdn_conv1d_silu`) bind float32 buffers.
+            if t.dtype == "BF16":
+                amf_dtype = DType.F32
+                convert = "bf16_to_f32"
+            elif t.dtype == "F16":
+                amf_dtype = DType.F32
+                convert = "f16_to_f32"
         entries.append(
             _make_entry(
                 norm_name,
@@ -3102,6 +3120,10 @@ def _stream_entry(entry: _PlannedEntry, readers: _ShardReaders, w: _BlobWriter) 
                 w.write(bf16_bytes_to_f16_bytes(raw, what=entry.name))
             elif entry.data_convert == "f16_to_bf16":
                 w.write(f16_bytes_to_bf16_bytes(raw))
+            elif entry.data_convert == "bf16_to_f32":
+                w.write(_bf16_to_f32_bytes(raw))
+            elif entry.data_convert == "f16_to_f32":
+                w.write(_f16_to_f32_bytes(raw))
             else:
                 raise ValueError(f"unknown conversion {entry.data_convert!r}")
             done += take
@@ -5821,6 +5843,10 @@ def _read_planned_entry_bytes(
         data = bf16_bytes_to_f16_bytes(raw, what=e.name)
     elif e.data_convert == "f16_to_bf16":
         data = f16_bytes_to_bf16_bytes(raw)
+    elif e.data_convert == "bf16_to_f32":
+        data = bytes(_bf16_to_f32_bytes(raw))
+    elif e.data_convert == "f16_to_f32":
+        data = _f16_to_f32_bytes(raw)
     elif e.data_convert == "d2t_i64_to_u32":
         vals = struct.unpack(f"<{len(raw) // 8}q", raw)
         data = struct.pack(f"<{len(vals)}I", *vals)

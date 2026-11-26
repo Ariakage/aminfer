@@ -3407,7 +3407,9 @@ fn loadInternal(
         });
         try draft_qf_pipes.?.makeResident(target.compute);
     }
-    if (config.share_embed_tokens and dequant.usesQuantFormats(target.embed.effectiveAmfDType(), target.embed.group_size)) {
+    if ((config.share_embed_tokens or embed_entry == null) and
+        dequant.usesQuantFormats(target.embed.effectiveAmfDType(), target.embed.group_size))
+    {
         draft_embed_needs_qf = true;
     }
     var draft_embed_dequant_f32: ?[]f32 = null;
