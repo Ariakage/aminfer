@@ -314,12 +314,76 @@ and usage-accounting layer:
   containers while preserving zero-overhead fast-path bypass when
   `active_adapters == 0`.
 
+### 12. Full local OpenAI and Anthropic HTTP/SSE endpoint and multimodal parity (`C29`, M9.6)
+
+Scheduled as capability `C29` (`Status: Confirmed`, `Target: M9.6`, and
+user-prioritizable ahead of `M9.1`–`M9.5` because it is pure serving and
+multimodal ingress with no dependency on frontier model-family converters), this
+extension closes the remaining local-inference OpenAI/ChatGPT and Anthropic
+HTTP/SSE protocol gaps while preserving `0` hot-path heap allocations:
+
+1. **Anthropic Models API parity (`GET /v1/models` and `GET /v1/models/{model_id}`):**
+   Preserve every OpenAI and `aminfer` `C28` metadata field (`object`,
+   `created`, `owned_by`, `root`, `parent`, `architecture`, `max_model_len`,
+   `vocab_size`, `effective_bits_per_weight`, `wired_mib`, `cold_bytes`,
+   `capabilities`) while adding Anthropic Models API fields (`type: "model"`,
+   `display_name`, RFC 3339 `created_at`, `max_input_tokens`, `max_tokens`) and
+   list pagination envelope fields (`first_id`, `last_id`, `has_more`) with
+   `limit`, `before_id`, and `after_id` query parameters, formatted strictly
+   inside preallocated `16 KiB` static buffers.
+2. **Prefix-free route aliases (without `/v1`):**
+   Support `GET /models`, `GET /models/{id}`, `POST /messages`,
+   `POST /messages/count_tokens`, `POST /chat/completions`,
+   `POST /completions`, `POST /responses`, `POST /responses/input_tokens`,
+   `GET|DELETE /responses/{id}`, `POST /responses/{id}/cancel`,
+   `GET /responses/{id}/input_items`, `POST /embeddings`, and `POST /rerank`
+   under the same constant-time `--api-key` authentication guard as `/v1/*`
+   (`/health` stays unauthenticated).
+3. **OpenAI Responses input token counting (`POST /v1/responses/input_tokens` and `/responses/input_tokens`):**
+   Mirror `POST /v1/messages/count_tokens` using the native Zig BPE tokenizer
+   (`W5`) and declarative `ChatTemplate` renderer (`W24`) for zero-inference
+   token counting over `input`, `instructions`, `tools`, and
+   `previous_response_id`.
+4. **OpenAI Stateful Responses input-items listing (`GET /v1/responses/{response_id}/input_items` and `/responses/{response_id}/input_items`):**
+   Expose stored and paginated input items from `StatefulResponseSlot` alongside
+   `GET`, `DELETE`, and `cancel` without introducing dynamic per-request heap
+   allocations.
+5. **OpenAI Legacy and FIM Text Completions (`POST /v1/completions` and `/completions`):**
+   Provide a zero-allocation raw-prompt completion endpoint supporting both
+   streaming SSE and JSON responses, string or token-ID array `prompt`, `suffix`
+   Fill-in-the-Middle generation, and shared sampler, penalties, `logit_bias`,
+   `logprobs`, `stop`, and `seed` parameters.
+6. **HTTP `OPTIONS` and CORS preflight headers:**
+   Handle `OPTIONS` requests across routes and emit configurable
+   `Access-Control-Allow-Origin`, `Access-Control-Allow-Methods`, and
+   `Access-Control-Allow-Headers` (`Authorization`, `x-api-key`,
+   `anthropic-version`, `Content-Type`) headers for direct browser WebUI
+   connectivity over both plaintext HTTP and native TLS 1.2/1.3 HTTPS (`C28`).
+7. **HTTP multimodal vision media pixel ingestion (`image_url` / `input_image` / Anthropic `image` / `video_url`):**
+   Upgrade `http_sse.zig` from template-placeholder-only parsing to bounded
+   preallocated base64 (`data:image/...;base64,...`) image and video-frame
+   decoding wired into `G14` `ImageIO`/`VideoToolbox`/`CVPixelBuffer` zero-copy
+   IOSurface ingress and the `W20` vision encoder across
+   `POST /v1/chat/completions`, `POST /v1/responses`, and `POST /v1/messages`.
+8. **Explicit non-goals (excluded by design):**
+   Cloud-hosted storage, batch-job orchestration, and non-LLM endpoints — Audio
+   (`/v1/audio/*`), Images (`/v1/images/*`), Moderations (`/v1/moderations`),
+   Files (`/v1/files*`), Batches (`/v1/messages/batches*`),
+   Assistants/Threads/VectorStores, and Fine-tuning — are explicitly excluded
+   from `aminfer`'s bare-metal local LLM/VLM serving scope. None of them fit a
+   zero-allocation, zero-database, single-model wired-RAM inference server, and
+   omitting them keeps `src/server/` lean, auditable, and strictly bounded in
+   memory.
+
 ### Scope boundary and zero-overhead non-regression guardrails
 
-- Audio and speech ingress are explicitly excluded from Milestone M7.5.
-- **Strict zero-overhead fast paths when optional M7.5 / M8.3 / M9.5 features are inactive:**
+- Cloud-hosted and non-LLM API families — Audio (`/v1/audio/*`), Images
+  (`/v1/images/*`), Moderations (`/v1/moderations`), Files (`/v1/files*`),
+  Batches (`/v1/messages/batches*`), Assistants/Threads/VectorStores, and
+  Fine-tuning — are explicitly excluded from Milestones M7.5, M8.3, and M9.6.
+- **Strict zero-overhead fast paths when optional M7.5 / M8.3 / M9.5 / M9.6 features are inactive:**
   1. `aminfer monitor` (`C19`) and `aminfer chat` (`C20`) are standalone CLI subcommands; `aminfer serve` and `decode` run zero `IOReport` polling when `monitor` is not running, and attaching `monitor --server` polls `/health` + rootless `IOReport` on `QOS_CLASS_UTILITY` E-cores at `>= 500 ms` intervals (`< 0.1%` E-core CPU, `0 B` GPU/wired bandwidth).
-  2. Single-file `.amf` metadata (`W18`), `--api-key`, `--unix-socket` (`C18`), `ModelDetailMeta`/`LoraAdapterMeta` discovery, and opt-in native TLS 1.2/1.3 HTTPS (`C28`) execute only at startup or at the HTTP/TLS connection boundary (`0` instructions added to per-token decode, and `0` TLS listener overhead when `--tls-cert` is omitted); `libaminfer.dylib` (`C17`) is a separate build target that leaves the static `aminfer` CLI binary unchanged.
+  2. Single-file `.amf` metadata (`W18`), `--api-key`, `--unix-socket` (`C18`), `ModelDetailMeta`/`LoraAdapterMeta` discovery, opt-in native TLS 1.2/1.3 HTTPS (`C28`), and `C29` HTTP protocol extensions (Anthropic Models pagination, prefix-free route aliases, `OPTIONS`/CORS headers, `/v1/responses/input_tokens`, `/v1/responses/{id}/input_items`, and `/v1/completions` FIM) execute only at startup or at the HTTP/TLS connection boundary using static preallocated buffers (`0` hot-path heap allocations, `0` instructions added to text-only per-token decode, and `0` TLS listener overhead when `--tls-cert` is omitted); `C29` base64 vision decoding (`G14`/`W20`) is bypassed completely on text-only requests; `libaminfer.dylib` (`C17`) is a separate build target that leaves the static `aminfer` CLI binary unchanged.
   3. Unconstrained requests (`response_format` unset, penalties `0`, `logit_bias` empty, `active_adapters == 0`) bypass `C22` grammar state machines and `W19`/`W30` LoRA adapter dispatches outside the layer loop. When `C22` / penalties are active on large-vocabulary models (`151K–248K` tokens), `C22` pairs with the fused GPU radix/bucket sampler (`G21` in [ADR-0023](0023-native-kernel-barrier-fusion-mma-flashattn-and-simd-accelerators.md)) and propagates masks into speculative draft proposals so neither CPU logit scans nor draft rejections degrade throughput.
   4. `W19` L2-resident SME2 LoRA adapters cap their P-core L2 footprint at `<= 4 MiB` (`25%` of M4's `16 MiB` P-core L2) inside the `R9` wired budget (never unpinning base weights), while `W30` adds an explicit configurable wired pool cap inside `R9` for `r = 16..64` `GraphModel` / `M82Runtime` GPU/SME2 and DoRA adapters without unpinning base weights. Stateful `/v1/responses` slots obey `R9` `evict_first` governance, and opt-in `--disk-prefix-cache` (`R10`, off by default) schedules `F_NOCACHE` writes on background utility I/O queues that yield strictly to `C3`–`C5` decode-critical cold-expert `pread`s.
 
@@ -327,13 +391,14 @@ and usage-accounting layer:
 
 - **Positive:** Python and native hosts can embed `aminfer` in-process with zero
   weight/logit copies and zero Python inside the engine (`C17`); standard
-  OpenAI, Anthropic, tool-calling, embedding, reranking, and multi-LoRA clients
-  work directly against `aminfer serve` over TCP, native TLS 1.2/1.3 HTTPS, or
-  `AF_UNIX` with `--api-key` auth, `/v1/models/{id}` discovery, and strict
-  grammar masks (`C18`, `C21`, `C22`, `C28`, `W19`); single-file `.amf`
-  bundles (`W18`), scrolling `aminfer chat` (`C20`), NVMe persistent prefix
-  recovery (`R10`), and rootless `aminfer monitor` (`C19`) cover daily local
-  workflows without third-party runtime dependencies.
+  OpenAI, Anthropic, browser WebUI, FIM, multimodal VLM, tool-calling,
+  embedding, reranking, and multi-LoRA clients work directly against
+  `aminfer serve` over TCP, native TLS 1.2/1.3 HTTPS, or `AF_UNIX` with
+  `--api-key` auth, `/v1/models/{id}` discovery, CORS preflight, prefix-free
+  aliases, and strict grammar masks (`C18`, `C21`, `C22`, `C28`, `C29`, `W19`);
+  single-file `.amf` bundles (`W18`), scrolling `aminfer chat` (`C20`), NVMe
+  persistent prefix recovery (`R10`), and rootless `aminfer monitor` (`C19`)
+  cover daily local workflows without third-party runtime dependencies.
 - **Negative / trade-offs:** Maintaining a stable C ABI (`include/aminfer.h`),
   stateful `/v1/responses` slot retention, grammar-constrained decoding,
   multi-LoRA slot routing, persistent KV disk validation, and three-endpoint

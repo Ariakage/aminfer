@@ -65,6 +65,45 @@
        heap allocations, HTTP/1.1 `keep-alive`, `503` saturation draining with
        TLS `close_notify`, constant-time `--api-key` auth, and concurrent
        `AF_UNIX` `--unix-socket` serving.
+   - M9.6 (`C29`, `C18`, `C28`, `G14`, `W20`;
+     [ADR-0022](../decisions/0022-native-c-python-sdk-and-full-protocol-parity.md#12-full-local-openai-and-anthropic-httpsse-endpoint-and-multimodal-parity-c29-m96),
+     user-prioritizable ahead of `M9.1`–`M9.5` as pure serving and multimodal
+     ingress) schedules the remaining local-inference OpenAI and Anthropic
+     HTTP/SSE compatibility extensions with zero hot-path heap allocation:
+     - **Anthropic Models API parity (`GET /v1/models` and `GET /v1/models/{model_id}`):**
+       preserves all OpenAI and `C28` metadata fields while adding Anthropic
+       model fields (`type: "model"`, `display_name`, RFC 3339 `created_at`,
+       `max_input_tokens`, `max_tokens`) and cursor pagination (`first_id`,
+       `last_id`, `has_more`, `limit`, `before_id`, `after_id`) inside static
+       `16 KiB` response buffers.
+     - **Prefix-free route aliases, `OPTIONS`/CORS, and missing local endpoints:**
+       adds `/v1`-free route aliases (`/models`, `/models/{id}`, `/messages`,
+       `/messages/count_tokens`, `/chat/completions`, `/completions`,
+       `/responses`, `/responses/input_tokens`, `/responses/{id}`,
+       `/responses/{id}/cancel`, `/responses/{id}/input_items`, `/embeddings`,
+       `/rerank`) under the same constant-time `--api-key` guard (`/health`
+       stays unauthenticated); adds zero-inference
+       `POST /v1/responses/input_tokens` (mirroring `POST /v1/messages/count_tokens`
+       via `W5` BPE and `ChatTemplate`), paginated
+       `GET /v1/responses/{response_id}/input_items` from `StatefulResponseSlot`,
+       zero-allocation legacy and Fill-in-the-Middle `POST /v1/completions`
+       (streaming SSE and JSON, string or token-ID array `prompt`, `suffix`,
+       shared sampler/penalties/`logit_bias`/`logprobs`/`stop`/`seed`), and
+       `OPTIONS` preflight handling with configurable CORS headers
+       (`Access-Control-Allow-Origin`, `Access-Control-Allow-Methods`,
+       `Access-Control-Allow-Headers`) over HTTP and native TLS HTTPS.
+     - **HTTP multimodal vision media pixel ingestion:** upgrades `http_sse.zig`
+       from template-placeholder-only parsing to bounded preallocated base64
+       (`data:image/...;base64,...`) image and video-frame decoding (`image_url`,
+       `input_image`, Anthropic `image`, `video_url`) wired into `G14`
+       `ImageIO`/`VideoToolbox`/`CVPixelBuffer` zero-copy IOSurface ingress and
+       the `W20` vision encoder across `/v1/chat/completions`, `/v1/responses`,
+       and `/v1/messages`.
+     - **Explicit non-goals:** cloud-hosted and non-LLM endpoints — Audio
+       (`/v1/audio/*`), Images (`/v1/images/*`), Moderations
+       (`/v1/moderations`), Files (`/v1/files*`), Batches
+       (`/v1/messages/batches*`), Assistants/Threads/VectorStores, and
+       Fine-tuning — remain excluded by design.
    - On request admission, when `temperature > 0` and `"seed"` is omitted, one
      64-bit seed is drawn from Apple Silicon's Secure Enclave TRNG-backed kernel
      CSPRNG (`getentropy`) to initialize that request slot's dedicated 32-byte
