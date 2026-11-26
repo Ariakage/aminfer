@@ -45,6 +45,9 @@ enum {
     AMI_ERR_VISION = 12,
     AMI_ERR_TELEMETRY = 13,
     AMI_ERR_TTY = 14,
+    AMI_STATUS_TLS_IDENTITY_INVALID = 15,
+    AMI_STATUS_TLS_PASSPHRASE_REQUIRED = 16,
+    AMI_STATUS_TLS_BIND_FAILED = 17,
 };
 
 enum {
@@ -708,6 +711,48 @@ uint32_t ami_tty_isatty(int32_t fd);
 ami_status ami_tty_get_winsize(int32_t fd, uint16_t *out_cols, uint16_t *out_rows);
 ami_status ami_tty_enter_raw(int32_t fd, ami_tty_raw_guard *out_guard);
 ami_status ami_tty_leave_raw(ami_tty_raw_guard *guard);
+
+/*
+ * Native TLS 1.2/1.3 listener bridge (`Network.framework` + `Security.framework`).
+ * Accepts PEM (single or fullchain + unencrypted/encrypted PKCS#8/PKCS#1/SEC1
+ * private key) or binary PKCS#12 (`.p12`/`.pfx`), imported strictly in-memory
+ * (`kSecImportToMemoryOnly`) without touching any user Keychain. Completed
+ * handshakes are exposed as non-blocking `AF_UNIX` `SOCK_STREAM` fds pumped
+ * bidirectionally with backpressure over a `socketpair`.
+ */
+typedef struct ami_tls_listener ami_tls_listener;
+
+typedef struct ami_tls_config {
+    uint8_t host_ipv4[4];
+    uint16_t port;                   /* 0 = ephemeral port */
+    uint16_t backlog;                /* max queued accepted fds; 0 defaults to 128 */
+    const uint8_t *cert_bytes;       /* PEM cert/fullchain OR PKCS#12 (.p12/.pfx) DER */
+    size_t cert_len;
+    const uint8_t *key_bytes;        /* NULL/0 for .p12; PEM private key otherwise */
+    size_t key_len;
+    const uint8_t *passphrase_bytes; /* NULL/0 when unencrypted */
+    size_t passphrase_len;
+} ami_tls_config;
+
+ami_status ami_tls_listener_create(const ami_tls_config *cfg,
+                                   ami_tls_listener **out_listener);
+void ami_tls_listener_destroy(ami_tls_listener *listener);
+uint16_t ami_tls_listener_bound_port(const ami_tls_listener *listener);
+int32_t ami_tls_listener_notify_fd(const ami_tls_listener *listener);
+ami_status ami_tls_listener_pop_accepted_fd(ami_tls_listener *listener,
+                                            int32_t *out_fd);
+
+/*
+ * Loopback TLS test client helper backed by `nw_connection_t` + `socketpair`.
+ * Accepts self-signed certs on loopback and reports the negotiated TLS
+ * protocol version (`0x0303` = TLS 1.2, `0x0304` = TLS 1.3).
+ */
+ami_status ami_tls_client_connect_socketpair(const uint8_t host_ipv4[4],
+                                             uint16_t port,
+                                             uint16_t min_tls_version,
+                                             uint16_t max_tls_version,
+                                             int32_t *out_client_fd,
+                                             uint16_t *out_tls_version);
 
 #ifdef __cplusplus
 }

@@ -18,6 +18,8 @@ const frameworks = [_][]const u8{
     "CoreMedia",
     "CoreGraphics",
     "ImageIO",
+    "Network",
+    "Security",
 };
 
 const objc_flags = [_][]const u8{ "-fobjc-arc", "-Wall", "-Wextra", "-Werror" };
