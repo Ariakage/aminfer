@@ -549,6 +549,94 @@ class TestAminferPythonSdk(unittest.TestCase):
             engine.configure_speculative(DraftMode.NONE)
             self.assertEqual(engine.spec_stats.active_draft_mode, DraftMode.NONE)
 
+    def test_08_universal_lora_hot_swap_and_bit_exact_restore(self) -> None:
+        from aminfer import LoraInfo
+        from aminfer_tools.lora import generate_synthetic_lora
+
+        lora_path = self.tmp_dir / "sdk_test_r8.amlora"
+        generate_synthetic_lora(
+            lora_path,
+            adapter_id="sdk-test-r8",
+            num_layers=2,
+            hidden_size=128,
+            q_dim=256,
+            kv_dim=128,
+            intermediate_size=256,
+            rank=8,
+            lora_alpha=16.0,
+            target_modules=("q_proj", "v_proj", "o_proj"),
+            layout="row_major",
+            dtype="f16",
+            seed=777,
+            zero_init_b=False,
+        )
+
+        with Engine(self.amf_path, max_seq_len=64, startup_canary=False) as engine:
+            info0 = engine.lora_info
+            self.assertIsInstance(info0, LoraInfo)
+            self.assertEqual(info0.active_adapters, 0)
+            self.assertIsNone(info0.active_slot)
+
+            cfg = GenerationConfig(max_tokens=4, temperature=0.0, ignore_eos=True)
+            base_out = engine.generate([1, 2, 3], cfg)
+            base_logits = bytes(engine.logits_view(DType.F32))
+
+            slot = engine.load_lora("adapter-a", lora_path, pool_bytes=4 * 1024 * 1024)
+            self.assertEqual(slot, 0)
+            info1 = engine.lora_info
+            self.assertEqual(info1.active_adapters, 1)
+            self.assertIsNone(info1.active_slot)
+            self.assertGreater(info1.pool_used_bytes, 0)
+
+            # With adapter loaded but inactive, output stays bit-exact identical to base.
+            idle_out = engine.generate([1, 2, 3], cfg)
+            self.assertEqual(idle_out.token_ids, base_out.token_ids)
+            self.assertEqual(bytes(engine.logits_view(DType.F32)), base_logits)
+
+            # Activate via set_lora -> logits must change deterministically.
+            engine.set_lora("adapter-a")
+            self.assertEqual(engine.lora_info.active_slot, slot)
+            lora_out = engine.generate([1, 2, 3], cfg)
+            lora_logits = bytes(engine.logits_view(DType.F32))
+            self.assertNotEqual(lora_logits, base_logits)
+
+            # Per-call override `lora=None` forces bit-exact base and restores active adapter.
+            override_base_out = engine.generate([1, 2, 3], cfg, lora=None)
+            self.assertEqual(override_base_out.token_ids, base_out.token_ids)
+            self.assertEqual(bytes(engine.logits_view(DType.F32)), base_logits)
+            self.assertEqual(engine.lora_info.active_slot, slot)
+
+            # Restore base via set_lora(None), then test per-call `lora="adapter-a"` in generate & stream.
+            engine.set_lora(None)
+            self.assertIsNone(engine.lora_info.active_slot)
+            restored_out = engine.generate([1, 2, 3], cfg)
+            self.assertEqual(restored_out.token_ids, base_out.token_ids)
+            self.assertEqual(bytes(engine.logits_view(DType.F32)), base_logits)
+
+            kw_lora_out = engine.generate([1, 2, 3], cfg, lora="adapter-a")
+            self.assertEqual(kw_lora_out.token_ids, lora_out.token_ids)
+            self.assertEqual(bytes(engine.logits_view(DType.F32)), lora_logits)
+            self.assertIsNone(engine.lora_info.active_slot)
+
+            streamed = list(engine.stream([1, 2, 3], cfg, lora="adapter-a"))
+            self.assertGreater(len(streamed), 0)
+            self.assertIsNone(engine.lora_info.active_slot)
+
+            # Unknown adapter must raise InvalidArgumentError.
+            with self.assertRaises(InvalidArgumentError):
+                engine.set_lora("nonexistent-adapter")
+
+            # Unload releases all wired adapter pages cleanly and preserves bit-exact base output.
+            engine.unload_lora("adapter-a")
+            info_final = engine.lora_info
+            self.assertEqual(info_final.active_adapters, 0)
+            self.assertEqual(info_final.pool_used_bytes, 0)
+            self.assertIsNone(info_final.active_slot)
+
+            after_unload = engine.generate([1, 2, 3], cfg)
+            self.assertEqual(after_unload.token_ids, base_out.token_ids)
+            self.assertEqual(bytes(engine.logits_view(DType.F32)), base_logits)
+
 
 if __name__ == "__main__":
     unittest.main()

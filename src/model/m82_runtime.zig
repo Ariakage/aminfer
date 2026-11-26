@@ -43,6 +43,7 @@ const aio = @import("../storage/aio.zig");
 const ple_mod = @import("../storage/ple.zig");
 const dflare_dfly = @import("../spec/dflare_dfly.zig");
 const qwen3 = @import("qwen3.zig");
+const lora = @import("lora.zig");
 const graph = @import("graph.zig");
 
 const APPLE_PAGE_SIZE = page.APPLE_PAGE_SIZE;
@@ -1374,6 +1375,44 @@ pub const M82Runtime = struct {
         return self.physicalLayerForStep(step_idx, cfg);
     }
 
+    /// Resolves the base linear weight binding at `(layer_idx, target)` for one-time
+    /// PEFT DoRA row-scale calibration (`W30`, 0 hot-path cost).
+    pub fn baseLinearBindingForLora(
+        self: *const M82Runtime,
+        layer_idx: usize,
+        target: lora.TargetProjection,
+    ) ?qwen3.LinearBinding {
+        if (self.family.isInkling2()) {
+            if (layer_idx >= self.ink_layers.len) return null;
+            const ink = &self.ink_layers[layer_idx];
+            return switch (target) {
+                .q_proj => ink.wq,
+                .k_proj => ink.wk,
+                .v_proj => ink.wv,
+                .o_proj => ink.wo,
+                .wr_du => ink.wr,
+                .gate_attn => ink.gate_attn,
+                else => null,
+            };
+        }
+        if (self.family.isHy4()) {
+            if (layer_idx >= self.hy4_layers.len) return null;
+            const hy = &self.hy4_layers[layer_idx];
+            return switch (target) {
+                .q_a_proj => hy.q_a_proj,
+                .q_b_proj => hy.q_b_proj,
+                .kv_a_proj => hy.kv_a_proj,
+                .o_proj => hy.o_proj,
+                .gate_attn => hy.linear_gate,
+                .gate_proj => hy.dense_gate,
+                .up_proj => hy.dense_up,
+                .down_proj => hy.dense_down,
+                else => null,
+            };
+        }
+        return null;
+    }
+
     pub fn dflyTargetKvViews(self: *const M82Runtime) []const dflare_dfly.TargetKvLayerView {
         return self.dfly_kv_views[0..self.dfly_kv_view_count];
     }
@@ -2269,6 +2308,17 @@ pub const M82Runtime = struct {
             if (layer.gate_attn) |ga| {
                 try model.encodeLinearBatched(f, ga, q_in_bind, self.bindAt(self.gate_attn_off), m, false);
             }
+            if (model.hasActiveLora()) {
+                _ = try model.encodeLoraSingle(f, l, .q_proj, q_in_bind, model.q_bind, m, layer.wq.k, layer.wq.n, true);
+                _ = try model.encodeLoraSingle(f, l, .k_proj, k_in_bind, model.k_bind, m, layer.wk.k, layer.wk.n, true);
+                _ = try model.encodeLoraSingle(f, l, .v_proj, v_in_bind, model.v_bind, m, layer.wv.k, layer.wv.n, true);
+                if (layer.wr) |wr| {
+                    _ = try model.encodeLoraSingle(f, l, .wr_du, q_in_bind, self.bindAt(self.q_rel_off), m, wr.k, wr.n, true);
+                }
+                if (layer.gate_attn) |ga| {
+                    _ = try model.encodeLoraSingle(f, l, .gate_attn, q_in_bind, self.bindAt(self.gate_attn_off), m, ga.k, ga.n, true);
+                }
+            }
         }
 
         // K/V `sconv4` (static `/ sqrt(5)` on SWA layers, dynamic `weight_proj` `/ 3.0` on global layers).
@@ -2400,8 +2450,11 @@ pub const M82Runtime = struct {
             }
             self.stats.inkling2_rel_gqa_dispatches += 1;
 
-            // Output projection `wo_ud` -> `model.proj_out_bind`
+            // Output projection `wo_ud` -> `model.proj_out_bind` (separate from residual, so DoRA runs strictly before residual add)
             try model.encodeLinearBatched(f, layer.wo, model.attn_out_bind, model.proj_out_bind, m, true);
+            if (model.hasActiveLora()) {
+                _ = try model.encodeLoraSingle(f, l, .o_proj, model.attn_out_bind, model.proj_out_bind, m, layer.wo.k, layer.wo.n, true);
+            }
 
             // Post-attention convolution (`attn_sconv.weight`: `(conv(y) + y) / sqrt(5)`)!
             if (layer.attn_sconv_w) |sw| {
@@ -3271,6 +3324,9 @@ pub const M82Runtime = struct {
 
             // --- C. MLA Q & KV Projections ---
             try model.encodeLinearBatched(f, layer.q_a_proj, model.x_norm_bind, self.bindAt(self.hy4_q_a_off), m, true);
+            if (model.hasActiveLora()) {
+                _ = try model.encodeLoraSingle(f, l, .q_a_proj, model.x_norm_bind, self.bindAt(self.hy4_q_a_off), m, layer.q_a_proj.k, layer.q_a_proj.n, true);
+            }
             if (layer.q_a_layernorm) |qan| {
                 try model.attn_pipes.encodeRmsNorm(f, .{
                     .x = self.bindAt(self.hy4_q_a_off),
@@ -3286,6 +3342,13 @@ pub const M82Runtime = struct {
             try model.encodeLinearBatched(f, layer.kv_a_proj, model.x_norm_bind, self.bindAt(self.hy4_kv_a_off), m, false);
             if (layer.linear_gate) |lg| {
                 try model.encodeLinearBatched(f, lg, model.x_norm_bind, self.bindAt(self.hy4_lin_gate_off), m, false);
+            }
+            if (model.hasActiveLora()) {
+                _ = try model.encodeLoraSingle(f, l, .q_b_proj, self.bindAt(self.hy4_q_a_off), self.bindAt(self.hy4_q_b_off), m, layer.q_b_proj.k, layer.q_b_proj.n, true);
+                _ = try model.encodeLoraSingle(f, l, .kv_a_proj, model.x_norm_bind, self.bindAt(self.hy4_kv_a_off), m, layer.kv_a_proj.k, layer.kv_a_proj.n, true);
+                if (layer.linear_gate) |lg| {
+                    _ = try model.encodeLoraSingle(f, l, .gate_attn, model.x_norm_bind, self.bindAt(self.hy4_lin_gate_off), m, lg.k, lg.n, true);
+                }
             }
         }
 
@@ -3636,6 +3699,9 @@ pub const M82Runtime = struct {
         {
             const f = try ensureFrame(model, frame_opt);
             try model.encodeLinearBatched(f, layer.o_proj, self.bindAt(self.hy4_attn_v_off), model.proj_out_bind, m, true);
+            if (model.hasActiveLora()) {
+                _ = try model.encodeLoraSingle(f, l, .o_proj, self.bindAt(self.hy4_attn_v_off), model.proj_out_bind, m, layer.o_proj.k, layer.o_proj.n, true);
+            }
             if (layer.post_proj_norm) |ppn| {
                 try model.attn_pipes.encodeRmsNorm(f, .{
                     .x = model.proj_out_bind,
@@ -3707,6 +3773,10 @@ pub const M82Runtime = struct {
             const f = try ensureFrame(model, frame_opt);
             try model.encodeLinearBatched(f, layer.dense_gate.?, model.x_norm_bind, model.dense_gate_bind, m, true);
             try model.encodeLinearBatched(f, layer.dense_up.?, model.x_norm_bind, model.dense_up_bind, m, false);
+            if (model.hasActiveLora()) {
+                _ = try model.encodeLoraSingle(f, l, .gate_proj, model.x_norm_bind, model.dense_gate_bind, m, layer.dense_gate.?.k, layer.dense_gate.?.n, true);
+                _ = try model.encodeLoraSingle(f, l, .up_proj, model.x_norm_bind, model.dense_up_bind, m, layer.dense_up.?.k, layer.dense_up.?.n, true);
+            }
             try self.pipes.encodeHy4SwigluClampedLinearGate(f, .{
                 .gate_in = model.dense_gate_bind,
                 .up_in = model.dense_up_bind,
@@ -3718,6 +3788,9 @@ pub const M82Runtime = struct {
                 .swiglu_limit = m82c.swiglu_limit,
             }, true);
             try model.encodeLinearBatched(f, layer.dense_down.?, model.dense_act_bind, model.proj_out_bind, m, true);
+            if (model.hasActiveLora()) {
+                _ = try model.encodeLoraSingle(f, l, .down_proj, model.dense_act_bind, model.proj_out_bind, m, layer.dense_down.?.k, layer.dense_down.?.n, true);
+            }
             if (layer.post_fc2_norm) |pfn| {
                 try model.attn_pipes.encodeRmsNorm(f, .{
                     .x = model.proj_out_bind,
@@ -5357,6 +5430,7 @@ fn bindLayerExperts(
 fn ensureFrame(model: *graph.GraphModel, frame_opt: *?metal.Compute.Frame) graph.GraphStepError!*metal.Compute.Frame {
     if (frame_opt.* == null) {
         frame_opt.* = try model.compute.beginFrame(model.timeout_ms);
+        model.beginLoraFrame(frame_opt.*.?.slot);
     }
     return &frame_opt.*.?;
 }
@@ -5402,8 +5476,9 @@ fn bindLinearEntry(ctx: M82LoadContext, e: *const amf.TensorEntry, expected_n: u
     const off = ctx.entry_offsets[idx];
     const dt = try e.dataType();
     const gs: u16 = if (e.group_size > 0) e.group_size else 64;
-    const has_params = (e.params_offset > 0 and e.params_offset < e.blob_bytes);
+    const has_params = (e.params_bytes > 0 and e.params_offset + e.params_bytes <= e.blob_bytes);
     const w_buf = ctx.weight_shards[sh].buffer;
+    const raw_slice = ctx.entry_slices[idx];
     return .{
         .weight = .{ .buffer = w_buf, .offset = off },
         .scale_bias = if (has_params) .{ .buffer = w_buf, .offset = off + e.params_offset } else null,
@@ -5416,8 +5491,11 @@ fn bindLinearEntry(ctx: M82LoadContext, e: *const amf.TensorEntry, expected_n: u
         .alg_bytes = e.blob_bytes,
         .layout = try e.tensorLayout(),
         .param_kind = try e.quantParamKind(),
-        .weight_host = ctx.entry_slices[idx],
-        .scale_bias_host = if (has_params) ctx.entry_slices[idx][@intCast(e.params_offset)..] else null,
+        .weight_host = raw_slice[0..@min(raw_slice.len, @as(usize, @intCast(e.data_bytes)))],
+        .scale_bias_host = if (has_params and raw_slice.len >= e.params_offset + e.params_bytes)
+            raw_slice[@intCast(e.params_offset)..][0..@intCast(e.params_bytes)]
+        else
+            null,
     };
 }
 

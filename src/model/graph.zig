@@ -25,12 +25,14 @@ const page = @import("../mem/page.zig");
 const budget_mod = @import("../mem/budget.zig");
 const arena_mod = @import("../mem/arena.zig");
 const quant = @import("../quant/spec.zig");
+const quant_ref = @import("../quant/formats.zig");
 const amf = @import("../format/amf.zig");
 const dequant = @import("../gpu/dequant.zig");
 const quant_formats = @import("../gpu/quant_formats.zig");
 const attention = @import("../gpu/attention.zig");
 const moe = @import("../gpu/moe.zig");
 const hybrid = @import("../gpu/hybrid.zig");
+const lora_gpu = @import("../gpu/lora_gpu.zig");
 const chat_template_mod = @import("chat_template.zig");
 const sysinfo = @import("../platform/sysinfo.zig");
 const chip_profile_mod = @import("../platform/chip_profile.zig");
@@ -40,6 +42,7 @@ const ple_mod = @import("../storage/ple.zig");
 const sme = @import("../cpu/sme.zig");
 const accept_mod = @import("../spec/accept.zig");
 const qwen3 = @import("qwen3.zig");
+const lora = @import("lora.zig");
 const vision_mod = @import("../gpu/vision.zig");
 const prefix_cache_mod = @import("../mem/prefix_cache.zig");
 const batch_sched = @import("../runtime/batch_scheduler.zig");
@@ -1327,7 +1330,7 @@ pub const GraphStepError = error{
     hybrid.EncodeError || hybrid.ArenaError || ple_mod.Error ||
     attention.RetiredKvQ8PoolError || expert_parallel.ClusterError ||
     sme.Error || cache_mod.CacheError || accept_mod.VerifyError ||
-    ink_gpu.EncodeError || ink_gpu.ArenaError || quant_formats.ShapeError;
+    ink_gpu.EncodeError || ink_gpu.ArenaError || quant_formats.ShapeError || lora_gpu.EncodeError;
 
 // ===========================================================================
 // Section 4: Internal Layer & Runtime Structures
@@ -1870,6 +1873,312 @@ pub const GraphModel = struct {
     // M8.2 (`Inkling 2` & `Hy4`) unified runtime (`G25`, `C26`, `D14`)
     m82: ?*m82_rt.M82Runtime = null,
 
+    // M9.5 (`W30`) Zero-Flush GPU LoRA + DoRA Runtime
+    lora_registry: ?*lora.LoraRegistry = null,
+    active_lora_slot: u32 = lora.NO_ADAPTER,
+    lora_pipes: ?lora_gpu.GpuLoraPipelines = null,
+    lora_ws: ?lora_gpu.GpuLoraWorkspace = null,
+
+    pub fn baseModelShape(self: *const GraphModel) lora.BaseModelShape {
+        return .{
+            .num_layers = self.config.num_hidden_layers,
+            .hidden_size = self.config.hidden_size,
+            .q_dim = self.config.qDim(),
+            .kv_dim = self.config.kvDim(),
+            .intermediate_size = self.config.intermediate_size,
+            .flexible_dims = true,
+        };
+    }
+
+    pub fn baseLoraShape(self: *const GraphModel) lora.BaseModelShape {
+        return self.baseModelShape();
+    }
+
+    /// Attaches a non-owning preallocated `LoraRegistry` (`W30`), lazily initializing
+    /// zero-copy `GpuLoraPipelines` and `GpuLoraWorkspace` bound to `reg.poolSlice()`.
+    /// Passing `null` detaches the registry and frees the GPU LoRA workspace immediately.
+    pub fn attachLoraRegistry(
+        self: *GraphModel,
+        reg: ?*lora.LoraRegistry,
+    ) (lora_gpu.WorkspaceInitError || metal.Error)!void {
+        if (reg == null) {
+            if (self.lora_ws) |*ws| {
+                ws.deinit(self.compute);
+                self.lora_ws = null;
+            }
+            self.lora_registry = null;
+            self.active_lora_slot = lora.NO_ADAPTER;
+            return;
+        }
+        const r = reg.?;
+        if (self.lora_registry == r) {
+            if (self.lora_ws) |*ws| {
+                const ps = r.poolSlice();
+                if (ws.pool_base_ptr == ps.ptr and ws.pool_len == ps.len) {
+                    return;
+                }
+            }
+        }
+        if (self.lora_ws) |*ws| {
+            ws.deinit(self.compute);
+            self.lora_ws = null;
+        }
+        if (self.lora_pipes == null) {
+            self.lora_pipes = try lora_gpu.GpuLoraPipelines.init(self.device, self.library);
+        }
+        self.lora_ws = try lora_gpu.GpuLoraWorkspace.init(self.device, self.compute, r, .{
+            .max_rows = 64,
+            .desc_staging_bytes_per_frame = 512 * 1024,
+            .row_slots_per_frame = 16384,
+            .frames_in_flight = metal.MAX_FRAMES_IN_FLIGHT,
+            .wired_budget = null,
+        });
+        self.lora_registry = r;
+        self.active_lora_slot = lora.NO_ADAPTER;
+    }
+
+    pub fn setActiveLoraSlot(self: *GraphModel, slot: u32) void {
+        self.active_lora_slot = slot;
+    }
+
+    /// Activates a loaded LoRA adapter by name (or `"<base>:<adapter>"` selector),
+    /// or disables LoRA (`NO_ADAPTER`, bit-exact base model) when `name` is `null` or empty.
+    pub fn setActiveLoraAdapter(self: *GraphModel, name: ?[]const u8) lora.LoraError!void {
+        const raw = name orelse {
+            self.active_lora_slot = lora.NO_ADAPTER;
+            return;
+        };
+        if (raw.len == 0) {
+            self.active_lora_slot = lora.NO_ADAPTER;
+            return;
+        }
+        const reg = self.lora_registry orelse return error.AdapterNotFound;
+        if (reg.findSlotByName(raw)) |slot_id| {
+            self.active_lora_slot = slot_id;
+            return;
+        }
+        if (std.mem.indexOfScalar(u8, raw, ':') != null) {
+            self.active_lora_slot = (try reg.resolveModelSelector(raw)) orelse lora.NO_ADAPTER;
+            return;
+        }
+        return error.AdapterNotFound;
+    }
+
+    /// Parses `"<base>:<adapter>"` and sets the active LoRA slot (`NO_ADAPTER` for plain `"<base>"`).
+    pub fn selectModelAdapter(self: *GraphModel, model_selector: []const u8) lora.LoraError!void {
+        const sel = lora.parseModelSelector(model_selector);
+        if (sel.adapter == null) {
+            self.active_lora_slot = lora.NO_ADAPTER;
+            return;
+        }
+        const reg = self.lora_registry orelse return error.AdapterNotFound;
+        self.active_lora_slot = (try reg.resolveModelSelector(model_selector)) orelse lora.NO_ADAPTER;
+    }
+
+    pub inline fn hasActiveLora(self: *const GraphModel) bool {
+        const reg = self.lora_registry orelse return false;
+        return self.lora_pipes != null and self.lora_ws != null and
+            reg.activeAdapterCount() > 0 and self.active_lora_slot != lora.NO_ADAPTER;
+    }
+
+    pub inline fn hasActiveLoraFor(self: *const GraphModel, layer_idx: usize, target: lora.TargetProjection) bool {
+        if (!self.hasActiveLora()) return false;
+        return self.lora_registry.?.pairAt(self.active_lora_slot, layer_idx, target) != null;
+    }
+
+    pub inline fn hasActiveLoraMask(self: *const GraphModel, layer_idx: usize, mask: u16) bool {
+        if (!self.hasActiveLora()) return false;
+        return self.lora_registry.?.slotTargetsLayerMask(self.active_lora_slot, layer_idx, mask);
+    }
+
+    pub inline fn hasActiveDoraFor(self: *const GraphModel, layer_idx: usize, target: lora.TargetProjection) bool {
+        if (!self.hasActiveLora()) return false;
+        const pair = self.lora_registry.?.pairAt(self.active_lora_slot, layer_idx, target) orelse return false;
+        return pair.use_dora and pair.dora_row_scale_f32 != null;
+    }
+
+    pub inline fn beginLoraFrame(self: *GraphModel, frame_slot: u32) void {
+        if (self.lora_ws) |*ws| ws.beginFrame(frame_slot);
+    }
+
+    pub fn encodeLoraSingle(
+        self: *GraphModel,
+        frame: *metal.Compute.Frame,
+        layer_idx: usize,
+        target: lora.TargetProjection,
+        x: metal.BufferBinding,
+        y: metal.BufferBinding,
+        m: u32,
+        k: u32,
+        n: u32,
+        insert_barrier_before: bool,
+    ) lora_gpu.EncodeError!bool {
+        if (!self.hasActiveLora()) return false;
+        const reg = self.lora_registry.?;
+        const pipes = self.lora_pipes.?;
+        const ws = &(self.lora_ws.?);
+        return pipes.encodeSingleAdapterProjection(frame, ws, reg, self.active_lora_slot, layer_idx, target, .{
+            .x = x,
+            .y = y,
+            .m = m,
+            .k = k,
+            .n = n,
+            .x_dtype = .f16,
+            .y_dtype = .f16,
+            .insert_barrier_before = insert_barrier_before,
+        });
+    }
+
+    pub fn encodeLoraBatch(
+        self: *GraphModel,
+        frame: *metal.Compute.Frame,
+        batch_lora_slots: []const u32,
+        layer_idx: usize,
+        target: lora.TargetProjection,
+        x: metal.BufferBinding,
+        y: metal.BufferBinding,
+        m: u32,
+        k: u32,
+        n: u32,
+        insert_barrier_before: bool,
+    ) lora_gpu.EncodeError!bool {
+        const reg = self.lora_registry orelse return false;
+        if (self.lora_pipes == null or self.lora_ws == null or reg.activeAdapterCount() == 0) return false;
+        const pipes = self.lora_pipes.?;
+        const ws = &(self.lora_ws.?);
+        return pipes.encodeBatchProjection(frame, ws, reg, batch_lora_slots, layer_idx, target, .{
+            .x = x,
+            .y = y,
+            .m = m,
+            .k = k,
+            .n = n,
+            .x_dtype = .f16,
+            .y_dtype = .f16,
+            .insert_barrier_before = insert_barrier_before,
+        });
+    }
+
+    fn findBaseLinearBinding(
+        self: *const GraphModel,
+        layer_idx: usize,
+        target: lora.TargetProjection,
+    ) ?qwen3.LinearBinding {
+        if (self.m82) |rt| {
+            return rt.baseLinearBindingForLora(layer_idx, target);
+        }
+        if (layer_idx >= self.layers.len) return null;
+        const layer = &self.layers[layer_idx];
+        return switch (target) {
+            .q_proj => switch (layer.attn) {
+                .gqa => |gqa| gqa.q_proj,
+                .qsa => |qsa| qsa.q_proj,
+                .gdn => |g| g.q_proj,
+                .mla_csa2 => null,
+            },
+            .k_proj => switch (layer.attn) {
+                .gqa => |gqa| gqa.k_proj,
+                .qsa => |qsa| qsa.k_proj,
+                .gdn => |g| g.k_proj,
+                .mla_csa2 => null,
+            },
+            .v_proj => switch (layer.attn) {
+                .gqa => |gqa| gqa.v_proj,
+                .qsa => |qsa| qsa.v_proj,
+                .gdn => |g| g.v_proj,
+                .mla_csa2 => null,
+            },
+            .o_proj => switch (layer.attn) {
+                .gqa => |gqa| gqa.o_proj,
+                .qsa => |qsa| qsa.o_proj,
+                .gdn => |g| g.o_proj,
+                .mla_csa2 => |mla| mla.o_proj,
+            },
+            .gate_attn => switch (layer.attn) {
+                .gdn => |g| g.g_proj,
+                else => null,
+            },
+            .q_a_proj => switch (layer.attn) {
+                .mla_csa2 => |mla| mla.q_a_proj,
+                else => null,
+            },
+            .q_b_proj => switch (layer.attn) {
+                .mla_csa2 => |mla| mla.q_b_proj,
+                else => null,
+            },
+            .kv_a_proj => switch (layer.attn) {
+                .mla_csa2 => |mla| mla.kv_a_proj,
+                else => null,
+            },
+            .gate_proj => if (self.config.axes.ffn_kind == .dense_swiglu) layer.dense_gate else null,
+            .up_proj => if (self.config.axes.ffn_kind == .dense_swiglu) layer.dense_up else null,
+            .down_proj => if (self.config.axes.ffn_kind == .dense_swiglu) layer.dense_down else null,
+            else => null,
+        };
+    }
+
+    /// One-time load/bind-time calibration of exact PEFT DoRA row scales
+    /// `gamma_i = m_i / sqrt(||W_0[i] + s * (B @ A)[i]||_2^2 + 1e-12)` across all
+    /// DoRA-enabled adapter pairs loaded in `self.lora_registry` (`0` hot-path cost).
+    pub fn calibrateLoraDora(
+        self: *GraphModel,
+        allocator: std.mem.Allocator,
+    ) (lora.LoraError || quant_ref.Error || error{OutOfMemory})!void {
+        const reg = self.lora_registry orelse return;
+        if (reg.activeAdapterCount() == 0) return;
+
+        var row_buf: []f32 = &.{};
+        defer if (row_buf.len > 0) allocator.free(row_buf);
+
+        for (0..lora.MAX_ADAPTERS) |slot_usize| {
+            const slot_id: u32 = @intCast(slot_usize);
+            const adp = reg.adapterAt(slot_id) orelse continue;
+            if (!adp.use_dora) continue;
+
+            for (0..adp.layers.len) |l| {
+                const mask = adp.layers[l].target_mask;
+                if (mask == 0) continue;
+                for (0..lora.TargetProjection.COUNT) |ti| {
+                    const target: lora.TargetProjection = @fromBackingInt(@intCast(ti));
+                    if ((mask & target.bit()) == 0) continue;
+                    const pair = reg.pairAtMut(slot_id, l, target) orelse continue;
+                    if (!pair.use_dora or pair.dora_mag_f32 == null or pair.dora_row_scale_f32 == null) continue;
+
+                    const lin = self.findBaseLinearBinding(l, target) orelse continue;
+                    if (lin.n != pair.n or lin.k != pair.k or lin.weight_host.len == 0) continue;
+
+                    const eff_dt = lin.effectiveAmfDType();
+                    var params_slice: []const u8 = lin.scale_bias_host orelse &.{};
+                    if (eff_dt == .fp8_e4m3_tensor) {
+                        const expected_pb: usize = if (lin.tensor_scale_per_row) @as(usize, lin.n) * 4 else 4;
+                        if (params_slice.len > expected_pb) {
+                            params_slice = params_slice[0..expected_pb];
+                        }
+                    }
+
+                    const n_usize: usize = lin.n;
+                    const k_usize: usize = lin.k;
+                    if (row_buf.len < k_usize) {
+                        if (row_buf.len > 0) allocator.free(row_buf);
+                        row_buf = try allocator.alloc(f32, k_usize);
+                    }
+                    for (0..n_usize) |row_idx| {
+                        try quant_ref.dequantRowCpuRef(
+                            eff_dt,
+                            lin.weight_host,
+                            params_slice,
+                            n_usize,
+                            k_usize,
+                            row_idx,
+                            lin.group_size,
+                            row_buf[0..k_usize],
+                        );
+                        try pair.calibrateDoraRowFromBaseRow(row_idx, row_buf[0..k_usize]);
+                    }
+                }
+            }
+        }
+    }
+
     pub fn m82Runtime(self: *const GraphModel) ?*m82_rt.M82Runtime {
         return self.m82;
     }
@@ -1978,6 +2287,16 @@ pub const GraphModel = struct {
             rt.deinit(allocator, self.compute);
             self.m82 = null;
         }
+        if (self.lora_ws) |*ws| {
+            ws.deinit(self.compute);
+            self.lora_ws = null;
+        }
+        if (self.lora_pipes) |lp| {
+            lp.deinit();
+            self.lora_pipes = null;
+        }
+        self.lora_registry = null;
+        self.active_lora_slot = lora.NO_ADAPTER;
         self.vision_state.deinit(allocator, self.compute);
         if (self.adapter_rt) |art| {
             art.deinit(allocator);
@@ -2275,7 +2594,7 @@ pub const GraphModel = struct {
     }
 
     pub fn totalWiredBytes(self: *const GraphModel) u64 {
-        return self.total_wired_bytes;
+        return self.total_wired_bytes + if (self.lora_ws) |*ws| ws.arena.bytes().len else 0;
     }
 
     pub fn shardCount(self: *const GraphModel) usize {
@@ -3118,6 +3437,7 @@ pub const GraphModel = struct {
 
         var frame = try self.compute.beginFrame(self.timeout_ms);
         errdefer frame.abort();
+        self.beginLoraFrame(frame.slot);
 
         try self.encodeEmbedLookupUnified(&frame, .{
             .weight = self.embed.weight,
@@ -3545,9 +3865,22 @@ pub const GraphModel = struct {
                                 .offset = self.wp_gdn_z_bind.offset + @as(u64, m - 1) * v_dim * @sizeOf(f16),
                             };
                             try self.encodeLinearGemv(frame, g.g_proj, last_x_norm_bind, last_z_bind, false);
+                            if (self.hasActiveLora()) {
+                                _ = try self.encodeLoraSingle(frame, l, .gate_attn, last_x_norm_bind, last_z_bind, 1, g.g_proj.k, g.g_proj.n, true);
+                            }
                         } else {
                             try self.encodeLinearGemmWithTile(frame, g.g_proj, self.wp_x_norm_bind, self.wp_gdn_z_bind, m, true, false);
+                            if (self.hasActiveLora()) {
+                                _ = try self.encodeLoraSingle(frame, l, .gate_attn, self.wp_x_norm_bind, self.wp_gdn_z_bind, m, g.g_proj.k, g.g_proj.n, true);
+                            }
                         }
+                    }
+                    if (self.hasActiveLora()) {
+                        if (need_q_r0) {
+                            _ = try self.encodeLoraSingle(frame, l, .q_proj, self.wp_x_norm_bind, q_raw_r0_bind, m, g.q_proj.k, g.q_proj.n, true);
+                        }
+                        _ = try self.encodeLoraSingle(frame, l, .k_proj, self.wp_x_norm_bind, k_raw_r0_bind, m, g.k_proj.k, g.k_proj.n, true);
+                        _ = try self.encodeLoraSingle(frame, l, .v_proj, self.wp_x_norm_bind, v_raw_r0_bind, m, g.v_proj.k, g.v_proj.n, true);
                     }
                     if (g.conv1d_w) |cw| {
                         try self.hybrid_pipes.encodeGdnConv1dSilu(frame, .{
@@ -3571,14 +3904,23 @@ pub const GraphModel = struct {
                 } else {
                     if (!skip_last_rest) {
                         try self.encodeLinearGemmWithTile(frame, g.q_proj, self.wp_x_norm_bind, self.wp_q_bind, m, true, true);
+                        if (self.hasActiveLora()) {
+                            _ = try self.encodeLoraSingle(frame, l, .q_proj, self.wp_x_norm_bind, self.wp_q_bind, m, g.q_proj.k, g.q_proj.n, true);
+                        }
                         if (tail_m1_last) {
                             const last_z_bind: metal.BufferBinding = .{
                                 .buffer = self.scratch_buf,
                                 .offset = self.wp_gdn_z_bind.offset + @as(u64, m - 1) * v_dim * @sizeOf(f16),
                             };
                             try self.encodeLinearGemv(frame, g.g_proj, last_x_norm_bind, last_z_bind, false);
+                            if (self.hasActiveLora()) {
+                                _ = try self.encodeLoraSingle(frame, l, .gate_attn, last_x_norm_bind, last_z_bind, 1, g.g_proj.k, g.g_proj.n, true);
+                            }
                         } else {
                             try self.encodeLinearGemmWithTile(frame, g.g_proj, self.wp_x_norm_bind, self.wp_gdn_z_bind, m, true, false);
+                            if (self.hasActiveLora()) {
+                                _ = try self.encodeLoraSingle(frame, l, .gate_attn, self.wp_x_norm_bind, self.wp_gdn_z_bind, m, g.g_proj.k, g.g_proj.n, true);
+                            }
                         }
                         if (g.conv1d_w) |cw| {
                             try self.hybrid_pipes.encodeGdnConv1dQSilu(frame, .{
@@ -3641,6 +3983,9 @@ pub const GraphModel = struct {
 
                 if (skip_last_rest) return;
                 try self.encodeLinearGemmWithTile(frame, g.o_proj, self.wp_attn_out_bind, self.wp_proj_out_bind, eff_m, true, true);
+                if (self.hasActiveLora()) {
+                    _ = try self.encodeLoraSingle(frame, l, .o_proj, self.wp_attn_out_bind, self.wp_proj_out_bind, eff_m, g.o_proj.k, g.o_proj.n, true);
+                }
             },
             .qsa => |*qsa| {
                 const mrope_rot: u32 = (self.config.mrope_section.section[0] + self.config.mrope_section.section[1] + self.config.mrope_section.section[2]) * 2;
@@ -3667,6 +4012,10 @@ pub const GraphModel = struct {
                         if (skip_last_rest) {
                             try self.encodeLinearGemmWithTile(frame, qsa.k_proj, self.wp_x_norm_bind, k_chunk_bind, m, true, true);
                             try self.encodeLinearGemmWithTile(frame, qsa.v_proj, self.wp_x_norm_bind, v_chunk_bind, m, true, false);
+                            if (self.hasActiveLora()) {
+                                _ = try self.encodeLoraSingle(frame, l, .k_proj, self.wp_x_norm_bind, k_chunk_bind, m, qsa.k_proj.k, qsa.k_proj.n, true);
+                                _ = try self.encodeLoraSingle(frame, l, .v_proj, self.wp_x_norm_bind, v_chunk_bind, m, qsa.v_proj.k, qsa.v_proj.n, true);
+                            }
                             try self.hybrid_pipes.encodeQsaPrefillRope(frame, .{
                                 .q = self.wp_q_bind,
                                 .k = k_chunk_bind,
@@ -3694,6 +4043,11 @@ pub const GraphModel = struct {
                             try self.encodeLinearGemmWithTile(frame, qsa.k_proj, self.wp_x_norm_bind, k_chunk_bind, m, true, true);
                             try self.encodeLinearGemmWithTile(frame, qsa.v_proj, self.wp_x_norm_bind, v_chunk_bind, m, true, false);
                             try self.encodeLinearGemv(frame, qsa.q_proj, last_x_norm_bind, self.wp_q_bind, false);
+                            if (self.hasActiveLora()) {
+                                _ = try self.encodeLoraSingle(frame, l, .k_proj, self.wp_x_norm_bind, k_chunk_bind, m, qsa.k_proj.k, qsa.k_proj.n, true);
+                                _ = try self.encodeLoraSingle(frame, l, .v_proj, self.wp_x_norm_bind, v_chunk_bind, m, qsa.v_proj.k, qsa.v_proj.n, true);
+                                _ = try self.encodeLoraSingle(frame, l, .q_proj, last_x_norm_bind, self.wp_q_bind, 1, qsa.q_proj.k, qsa.q_proj.n, true);
+                            }
                             try self.hybrid_pipes.encodeQsaPrefillRope(frame, .{
                                 .q = self.wp_q_bind,
                                 .k = k_chunk_bind,
@@ -3755,6 +4109,11 @@ pub const GraphModel = struct {
                             }, false);
                         } else {
                             try self.encodeQkvProj(frame, qsa.q_proj, qsa.k_proj, qsa.v_proj, self.wp_x_norm_bind, self.wp_q_bind, k_chunk_bind, v_chunk_bind, m, .gemm_wide, true);
+                            if (self.hasActiveLora()) {
+                                _ = try self.encodeLoraSingle(frame, l, .q_proj, self.wp_x_norm_bind, self.wp_q_bind, m, qsa.q_proj.k, qsa.q_proj.n, true);
+                                _ = try self.encodeLoraSingle(frame, l, .k_proj, self.wp_x_norm_bind, k_chunk_bind, m, qsa.k_proj.k, qsa.k_proj.n, true);
+                                _ = try self.encodeLoraSingle(frame, l, .v_proj, self.wp_x_norm_bind, v_chunk_bind, m, qsa.v_proj.k, qsa.v_proj.n, true);
+                            }
                             try self.hybrid_pipes.encodeQsaPrefillRope(frame, .{
                                 .q = self.wp_q_bind,
                                 .k = k_chunk_bind,
@@ -3786,6 +4145,9 @@ pub const GraphModel = struct {
                         else
                             self.wp_pos3d_bind;
                         try self.encodeLinearGemmWithTile(frame, qsa.q_proj, q_src, self.wp_q_bind, eff_m, true, true);
+                        if (self.hasActiveLora()) {
+                            _ = try self.encodeLoraSingle(frame, l, .q_proj, q_src, self.wp_q_bind, eff_m, qsa.q_proj.k, qsa.q_proj.n, true);
+                        }
                         try self.hybrid_pipes.encodeQsaPrefillRope(frame, .{
                             .q = self.wp_q_bind,
                             .k = self.wp_k_bind,
@@ -3860,12 +4222,19 @@ pub const GraphModel = struct {
                     }
                     if (skip_last_rest) return;
                     try self.encodeLinearGemmWithTile(frame, qsa.o_proj, self.wp_attn_out_bind, self.wp_proj_out_bind, eff_m, true, true);
+                    if (self.hasActiveLora()) {
+                        _ = try self.encodeLoraSingle(frame, l, .o_proj, self.wp_attn_out_bind, self.wp_proj_out_bind, eff_m, qsa.o_proj.k, qsa.o_proj.n, true);
+                    }
                 } else {
                     // Full-context QSA (`ring_capacity == 0`): write K/V directly to KvTiles at r == 0.
                     if (loop_step == 0) {
                         if (skip_last_rest) {
                             try self.encodeLinearGemmWithTile(frame, qsa.k_proj, self.wp_x_norm_bind, self.wp_k_bind, m, true, true);
                             try self.encodeLinearGemmWithTile(frame, qsa.v_proj, self.wp_x_norm_bind, self.wp_v_bind, m, true, false);
+                            if (self.hasActiveLora()) {
+                                _ = try self.encodeLoraSingle(frame, l, .k_proj, self.wp_x_norm_bind, self.wp_k_bind, m, qsa.k_proj.k, qsa.k_proj.n, true);
+                                _ = try self.encodeLoraSingle(frame, l, .v_proj, self.wp_x_norm_bind, self.wp_v_bind, m, qsa.v_proj.k, qsa.v_proj.n, true);
+                            }
                             try self.hybrid_pipes.encodeQsaPrefillRope(frame, .{
                                 .q = self.wp_q_bind,
                                 .k = self.wp_k_bind,
@@ -3895,6 +4264,11 @@ pub const GraphModel = struct {
                             try self.encodeLinearGemmWithTile(frame, qsa.k_proj, self.wp_x_norm_bind, self.wp_k_bind, m, true, true);
                             try self.encodeLinearGemmWithTile(frame, qsa.v_proj, self.wp_x_norm_bind, self.wp_v_bind, m, true, false);
                             try self.encodeLinearGemv(frame, qsa.q_proj, last_x_norm_bind, self.wp_q_bind, false);
+                            if (self.hasActiveLora()) {
+                                _ = try self.encodeLoraSingle(frame, l, .k_proj, self.wp_x_norm_bind, self.wp_k_bind, m, qsa.k_proj.k, qsa.k_proj.n, true);
+                                _ = try self.encodeLoraSingle(frame, l, .v_proj, self.wp_x_norm_bind, self.wp_v_bind, m, qsa.v_proj.k, qsa.v_proj.n, true);
+                                _ = try self.encodeLoraSingle(frame, l, .q_proj, last_x_norm_bind, self.wp_q_bind, 1, qsa.q_proj.k, qsa.q_proj.n, true);
+                            }
                             try self.hybrid_pipes.encodeQsaPrefillRope(frame, .{
                                 .q = self.wp_q_bind,
                                 .k = self.wp_k_bind,
@@ -3960,6 +4334,11 @@ pub const GraphModel = struct {
                             }, false);
                         } else {
                             try self.encodeQkvProj(frame, qsa.q_proj, qsa.k_proj, qsa.v_proj, self.wp_x_norm_bind, self.wp_q_bind, self.wp_k_bind, self.wp_v_bind, m, .gemm_wide, true);
+                            if (self.hasActiveLora()) {
+                                _ = try self.encodeLoraSingle(frame, l, .q_proj, self.wp_x_norm_bind, self.wp_q_bind, m, qsa.q_proj.k, qsa.q_proj.n, true);
+                                _ = try self.encodeLoraSingle(frame, l, .k_proj, self.wp_x_norm_bind, self.wp_k_bind, m, qsa.k_proj.k, qsa.k_proj.n, true);
+                                _ = try self.encodeLoraSingle(frame, l, .v_proj, self.wp_x_norm_bind, self.wp_v_bind, m, qsa.v_proj.k, qsa.v_proj.n, true);
+                            }
                             try self.hybrid_pipes.encodeQsaPrefillRope(frame, .{
                                 .q = self.wp_q_bind,
                                 .k = self.wp_k_bind,
@@ -4009,6 +4388,9 @@ pub const GraphModel = struct {
                         else
                             self.wp_pos3d_bind;
                         try self.encodeLinearGemmWithTile(frame, qsa.q_proj, q_src, self.wp_q_bind, eff_m, true, true);
+                        if (self.hasActiveLora()) {
+                            _ = try self.encodeLoraSingle(frame, l, .q_proj, q_src, self.wp_q_bind, eff_m, qsa.q_proj.k, qsa.q_proj.n, true);
+                        }
                         try self.hybrid_pipes.encodeQsaPrefillRope(frame, .{
                             .q = self.wp_q_bind,
                             .k = self.wp_k_bind,
@@ -4084,6 +4466,9 @@ pub const GraphModel = struct {
                         .causal_q_start_pos = if (tail_m1_last) base_pos + m - 1 else base_pos,
                     }, true);
                     try self.encodeLinearGemmWithTile(frame, qsa.o_proj, self.wp_attn_out_bind, self.wp_proj_out_bind, eff_m, true, true);
+                    if (self.hasActiveLora()) {
+                        _ = try self.encodeLoraSingle(frame, l, .o_proj, self.wp_attn_out_bind, self.wp_proj_out_bind, eff_m, qsa.o_proj.k, qsa.o_proj.n, true);
+                    }
                 }
             },
             .gqa => |gqa| {
@@ -4097,6 +4482,10 @@ pub const GraphModel = struct {
                     if (skip_last_rest) {
                         try self.encodeLinearGemmWithTile(frame, gqa.k_proj, self.wp_x_norm_bind, self.wp_k_bind, m, true, true);
                         try self.encodeLinearGemmWithTile(frame, gqa.v_proj, self.wp_x_norm_bind, self.wp_v_bind, m, true, false);
+                        if (self.hasActiveLora()) {
+                            _ = try self.encodeLoraSingle(frame, l, .k_proj, self.wp_x_norm_bind, self.wp_k_bind, m, gqa.k_proj.k, gqa.k_proj.n, true);
+                            _ = try self.encodeLoraSingle(frame, l, .v_proj, self.wp_x_norm_bind, self.wp_v_bind, m, gqa.v_proj.k, gqa.v_proj.n, true);
+                        }
                         try self.attn_pipes.encodePrefillQkNormRopeKvWrite(frame, .{
                             .q = self.wp_q_bind,
                             .k = self.wp_k_bind,
@@ -4121,6 +4510,11 @@ pub const GraphModel = struct {
                         try self.encodeLinearGemmWithTile(frame, gqa.k_proj, self.wp_x_norm_bind, self.wp_k_bind, m, true, true);
                         try self.encodeLinearGemmWithTile(frame, gqa.v_proj, self.wp_x_norm_bind, self.wp_v_bind, m, true, false);
                         try self.encodeLinearGemv(frame, gqa.q_proj, last_x_norm_bind, self.wp_q_bind, false);
+                        if (self.hasActiveLora()) {
+                            _ = try self.encodeLoraSingle(frame, l, .k_proj, self.wp_x_norm_bind, self.wp_k_bind, m, gqa.k_proj.k, gqa.k_proj.n, true);
+                            _ = try self.encodeLoraSingle(frame, l, .v_proj, self.wp_x_norm_bind, self.wp_v_bind, m, gqa.v_proj.k, gqa.v_proj.n, true);
+                            _ = try self.encodeLoraSingle(frame, l, .q_proj, last_x_norm_bind, self.wp_q_bind, 1, gqa.q_proj.k, gqa.q_proj.n, true);
+                        }
                         try self.attn_pipes.encodePrefillQkNormRopeKvWrite(frame, .{
                             .q = self.wp_q_bind,
                             .k = self.wp_k_bind,
@@ -4169,6 +4563,11 @@ pub const GraphModel = struct {
                         }, false);
                     } else {
                         try self.encodeQkvProj(frame, gqa.q_proj, gqa.k_proj, gqa.v_proj, self.wp_x_norm_bind, self.wp_q_bind, self.wp_k_bind, self.wp_v_bind, m, .gemm_wide, true);
+                        if (self.hasActiveLora()) {
+                            _ = try self.encodeLoraSingle(frame, l, .q_proj, self.wp_x_norm_bind, self.wp_q_bind, m, gqa.q_proj.k, gqa.q_proj.n, true);
+                            _ = try self.encodeLoraSingle(frame, l, .k_proj, self.wp_x_norm_bind, self.wp_k_bind, m, gqa.k_proj.k, gqa.k_proj.n, true);
+                            _ = try self.encodeLoraSingle(frame, l, .v_proj, self.wp_x_norm_bind, self.wp_v_bind, m, gqa.v_proj.k, gqa.v_proj.n, true);
+                        }
                         try self.attn_pipes.encodePrefillQkNormRopeKvWrite(frame, .{
                             .q = self.wp_q_bind,
                             .k = self.wp_k_bind,
@@ -4193,6 +4592,9 @@ pub const GraphModel = struct {
                     if (skip_last_rest) return;
                     const q_src = if (tail_m1_last) last_x_norm_bind else self.wp_x_norm_bind;
                     try self.encodeLinearGemmWithTile(frame, gqa.q_proj, q_src, self.wp_q_bind, eff_m, true, true);
+                    if (self.hasActiveLora()) {
+                        _ = try self.encodeLoraSingle(frame, l, .q_proj, q_src, self.wp_q_bind, eff_m, gqa.q_proj.k, gqa.q_proj.n, true);
+                    }
                     // Rotate Q in-place without overwriting committed r = 0 KvTiles using QsaPrefillRope (write_to_tiles = false, 1D RoPE).
                     try self.hybrid_pipes.encodeQsaPrefillRope(frame, .{
                         .q = self.wp_q_bind,
@@ -4233,11 +4635,19 @@ pub const GraphModel = struct {
                     .retired_chunk_stride_bytes = ret_chunk_stride,
                 }, true);
                 try self.encodeLinearGemmWithTile(frame, gqa.o_proj, self.wp_attn_out_bind, self.wp_proj_out_bind, eff_m, true, true);
+                if (self.hasActiveLora()) {
+                    _ = try self.encodeLoraSingle(frame, l, .o_proj, self.wp_attn_out_bind, self.wp_proj_out_bind, eff_m, gqa.o_proj.k, gqa.o_proj.n, true);
+                }
             },
             .mla_csa2 => |*mla| {
                 var f_opt: ?metal.Compute.Frame = frame.*;
                 try self.execMlaCsa2LayerForward(&f_opt, l, mla, base_pos, m, loop_step, true, true, null);
-                frame.* = f_opt orelse try self.compute.beginFrame(self.timeout_ms);
+                if (f_opt) |fo| {
+                    frame.* = fo;
+                } else {
+                    frame.* = try self.compute.beginFrame(self.timeout_ms);
+                    self.beginLoraFrame(frame.slot);
+                }
             },
         }
 
@@ -4305,23 +4715,43 @@ pub const GraphModel = struct {
 
         switch (self.config.axes.ffn_kind) {
             .dense_swiglu => {
-                try self.encodeDenseGateUpAct(
-                    frame,
-                    layer.dense_gate,
-                    layer.dense_up,
-                    self.wp_x_norm_bind,
-                    self.wp_dense_gate_bind,
-                    self.wp_dense_up_bind,
-                    self.wp_dense_act_bind,
-                    eff_m,
-                    .gemm_wide,
-                    true,
-                );
+                const gu_lora_mask = lora.TargetProjection.gate_proj.bit() | lora.TargetProjection.up_proj.bit();
+                if (self.hasActiveLoraMask(l, gu_lora_mask)) {
+                    try self.encodeLinearGemmWithTile(frame, layer.dense_gate, self.wp_x_norm_bind, self.wp_dense_gate_bind, eff_m, true, true);
+                    try self.encodeLinearGemmWithTile(frame, layer.dense_up, self.wp_x_norm_bind, self.wp_dense_up_bind, eff_m, true, false);
+                    _ = try self.encodeLoraSingle(frame, l, .gate_proj, self.wp_x_norm_bind, self.wp_dense_gate_bind, eff_m, layer.dense_gate.k, layer.dense_gate.n, true);
+                    _ = try self.encodeLoraSingle(frame, l, .up_proj, self.wp_x_norm_bind, self.wp_dense_up_bind, eff_m, layer.dense_up.k, layer.dense_up.n, true);
+                    try self.moe_pipes.encodeSiluMul(frame, .{
+                        .gate = self.wp_dense_gate_bind,
+                        .up = self.wp_dense_up_bind,
+                        .out = self.wp_dense_act_bind,
+                        .count = eff_m * self.config.intermediate_size,
+                    }, true);
+                } else {
+                    try self.encodeDenseGateUpAct(
+                        frame,
+                        layer.dense_gate,
+                        layer.dense_up,
+                        self.wp_x_norm_bind,
+                        self.wp_dense_gate_bind,
+                        self.wp_dense_up_bind,
+                        self.wp_dense_act_bind,
+                        eff_m,
+                        .gemm_wide,
+                        true,
+                    );
+                }
                 if (self.wp_mhc_arena) |*mhc| {
                     try self.encodeLinearGemmWithTile(frame, layer.dense_down, self.wp_dense_act_bind, self.wp_proj_out_bind, eff_m, true, true);
+                    if (self.hasActiveLora()) {
+                        _ = try self.encodeLoraSingle(frame, l, .down_proj, self.wp_dense_act_bind, self.wp_proj_out_bind, eff_m, layer.dense_down.k, layer.dense_down.n, true);
+                    }
                     try self.encodeMhcPost(frame, mhc.binding(self.scratch_buf), self.wp_proj_out_bind, layer.mhc.?, eff_m, true);
                 } else if (self.wp_gr_arena) |*gr| {
                     try self.encodeLinearGemmWithTile(frame, layer.dense_down, self.wp_dense_act_bind, self.wp_proj_out_bind, eff_m, true, true);
+                    if (self.hasActiveLora()) {
+                        _ = try self.encodeLoraSingle(frame, l, .down_proj, self.wp_dense_act_bind, self.wp_proj_out_bind, eff_m, layer.dense_down.k, layer.dense_down.n, true);
+                    }
                     const stream_eff: metal.BufferBinding = if (tail_m1_last)
                         .{ .buffer = self.scratch_buf, .offset = gr.base_offset + @as(u64, m - 1) * h * @sizeOf(f16) }
                     else
@@ -4343,10 +4773,13 @@ pub const GraphModel = struct {
                         .hidden_dim = h,
                         .branch_token_stride = w_stride,
                     }, true);
-                } else if (self.enable_g18_fusion and (eff_m == 1 or eff_m >= 64)) {
+                } else if (self.enable_g18_fusion and (eff_m == 1 or eff_m >= 64) and !self.hasActiveLoraFor(l, .down_proj)) {
                     try self.encodeLinearGemmWithTileResidual(frame, layer.dense_down, self.wp_dense_act_bind, eff_x_bind, eff_x_bind, eff_m, true, true);
                 } else {
                     try self.encodeLinearGemmWithTile(frame, layer.dense_down, self.wp_dense_act_bind, self.wp_proj_out_bind, eff_m, true, true);
+                    if (self.hasActiveLora()) {
+                        _ = try self.encodeLoraSingle(frame, l, .down_proj, self.wp_dense_act_bind, self.wp_proj_out_bind, eff_m, layer.dense_down.k, layer.dense_down.n, true);
+                    }
                     try self.moe_pipes.encodeResidualAdd(frame, .{
                         .x = eff_x_bind,
                         .delta = self.wp_proj_out_bind,
@@ -6022,8 +6455,10 @@ pub const GraphModel = struct {
         // --- FFN / MoE Dispatch ---
         switch (self.config.axes.ffn_kind) {
             .dense_swiglu => {
+                const gu_lora_mask = lora.TargetProjection.gate_proj.bit() | lora.TargetProjection.up_proj.bit();
                 const use_fused_gu = !self.hasActiveStepLora(l, loop_step, .gate_proj) and
-                    !self.hasActiveStepLora(l, loop_step, .up_proj);
+                    !self.hasActiveStepLora(l, loop_step, .up_proj) and
+                    !self.hasActiveLoraMask(l, gu_lora_mask);
                 if (use_fused_gu) {
                     const f = try self.ensureFrame(frame_opt);
                     try self.encodeDenseGateUpAct(
@@ -6043,6 +6478,10 @@ pub const GraphModel = struct {
                     try self.execLinearWithOptionalStepLora(frame_opt, l, loop_step, .up_proj, layer.dense_up, self.x_norm_bind, self.x_norm_host, self.dense_up_bind, self.dense_up_host, m, false);
                     {
                         const f = try self.ensureFrame(frame_opt);
+                        if (self.hasActiveLora()) {
+                            _ = try self.encodeLoraSingle(f, l, .gate_proj, self.x_norm_bind, self.dense_gate_bind, m, layer.dense_gate.k, layer.dense_gate.n, true);
+                            _ = try self.encodeLoraSingle(f, l, .up_proj, self.x_norm_bind, self.dense_up_bind, m, layer.dense_up.k, layer.dense_up.n, true);
+                        }
                         try self.moe_pipes.encodeSiluMul(f, .{
                             .gate = self.dense_gate_bind,
                             .up = self.dense_up_bind,
@@ -6052,12 +6491,17 @@ pub const GraphModel = struct {
                     }
                 }
                 if (self.enable_g18_fusion and (m == 1 or m >= 64) and self.mhc_arena == null and self.gr_arena == null and
-                    !self.hasActiveStepLora(l, loop_step, .down_proj))
+                    !self.hasActiveStepLora(l, loop_step, .down_proj) and
+                    !self.hasActiveLoraFor(l, .down_proj))
                 {
                     const f = try self.ensureFrame(frame_opt);
                     try self.encodeLinearBatchedResidual(f, layer.dense_down, self.dense_act_bind, self.x_bind, self.x_bind, m, true);
                 } else {
                     try self.execLinearWithOptionalStepLora(frame_opt, l, loop_step, .down_proj, layer.dense_down, self.dense_act_bind, self.dense_act_host, self.proj_out_bind, self.proj_out_host, m, true);
+                    if (self.hasActiveLoraFor(l, .down_proj)) {
+                        const f = try self.ensureFrame(frame_opt);
+                        _ = try self.encodeLoraSingle(f, l, .down_proj, self.dense_act_bind, self.proj_out_bind, m, layer.dense_down.k, layer.dense_down.n, true);
+                    }
                     try self.applyFfnResidual(frame_opt, l, m, h);
                 }
             },
@@ -6179,6 +6623,14 @@ pub const GraphModel = struct {
                 }, false);
             }
             try self.encodeLinearBatched(f, g.g_proj, self.x_norm_bind, self.gdn_z_bind, m, false);
+            if (self.hasActiveLora()) {
+                _ = try self.encodeLoraSingle(f, l, .q_proj, self.x_norm_bind, q_proj_out_bind, m, g.q_proj.k, g.q_proj.n, true);
+                if (loop_step == 0) {
+                    _ = try self.encodeLoraSingle(f, l, .k_proj, self.x_norm_bind, k_raw_r0_bind, m, g.k_proj.k, g.k_proj.n, true);
+                    _ = try self.encodeLoraSingle(f, l, .v_proj, self.x_norm_bind, v_raw_r0_bind, m, g.v_proj.k, g.v_proj.n, true);
+                }
+                _ = try self.encodeLoraSingle(f, l, .gate_attn, self.x_norm_bind, self.gdn_z_bind, m, g.g_proj.k, g.g_proj.n, true);
+            }
 
             // Optional depthwise causal Conv1D + SiLU with loop-isolated `r = 0` history.
             const q_eff_bind: metal.BufferBinding = if (g.conv1d_w != null) self.q_conv_bind else q_proj_out_bind;
@@ -6314,8 +6766,12 @@ pub const GraphModel = struct {
             }
         }
 
-        // Output projection `o_proj` (with optional Step-LoRA).
+        // Output projection `o_proj` (with optional Step-LoRA + W30 GPU LoRA/DoRA).
         try self.execLinearWithOptionalStepLora(frame_opt, l, loop_step, .o_proj, g.o_proj, self.attn_out_bind, self.attn_out_host, self.proj_out_bind, self.proj_out_host, m, true);
+        if (self.hasActiveLoraFor(l, .o_proj)) {
+            const f = try self.ensureFrame(frame_opt);
+            _ = try self.encodeLoraSingle(f, l, .o_proj, self.attn_out_bind, self.proj_out_bind, m, g.o_proj.k, g.o_proj.n, true);
+        }
     }
 
     fn execQsaAttention(
@@ -6331,6 +6787,11 @@ pub const GraphModel = struct {
         if (loop_step == 0 and !self.hasActiveStepLora(l, loop_step, .q_proj)) {
             const f = try self.ensureFrame(frame_opt);
             try self.encodeQkvProj(f, qsa.q_proj, qsa.k_proj, qsa.v_proj, self.x_norm_bind, self.q_bind, self.k_bind, self.v_bind, m, .batched_gemv, true);
+            if (self.hasActiveLora()) {
+                _ = try self.encodeLoraSingle(f, l, .q_proj, self.x_norm_bind, self.q_bind, m, qsa.q_proj.k, qsa.q_proj.n, true);
+                _ = try self.encodeLoraSingle(f, l, .k_proj, self.x_norm_bind, self.k_bind, m, qsa.k_proj.k, qsa.k_proj.n, true);
+                _ = try self.encodeLoraSingle(f, l, .v_proj, self.x_norm_bind, self.v_bind, m, qsa.v_proj.k, qsa.v_proj.n, true);
+            }
             const tree_k: metal.BufferBinding = .{ .buffer = self.scratch_buf, .offset = qsa.tree_k_off };
             const tree_v: metal.BufferBinding = .{ .buffer = self.scratch_buf, .offset = qsa.tree_v_off };
 
@@ -6371,6 +6832,13 @@ pub const GraphModel = struct {
                 if (loop_step == 0) {
                     try self.encodeLinearBatched(f, qsa.k_proj, self.x_norm_bind, self.k_bind, m, false);
                     try self.encodeLinearBatched(f, qsa.v_proj, self.x_norm_bind, self.v_bind, m, false);
+                }
+                if (self.hasActiveLora()) {
+                    _ = try self.encodeLoraSingle(f, l, .q_proj, self.x_norm_bind, self.q_bind, m, qsa.q_proj.k, qsa.q_proj.n, true);
+                    if (loop_step == 0) {
+                        _ = try self.encodeLoraSingle(f, l, .k_proj, self.x_norm_bind, self.k_bind, m, qsa.k_proj.k, qsa.k_proj.n, true);
+                        _ = try self.encodeLoraSingle(f, l, .v_proj, self.x_norm_bind, self.v_bind, m, qsa.v_proj.k, qsa.v_proj.n, true);
+                    }
                 }
 
                 // QK-Norm + YaRN + Interleaved 3D MRoPE: at `r = 0` write into `tree_k/tree_v`;
@@ -6465,6 +6933,10 @@ pub const GraphModel = struct {
         }
 
         try self.execLinearWithOptionalStepLora(frame_opt, l, loop_step, .o_proj, qsa.o_proj, self.attn_out_bind, self.attn_out_host, self.proj_out_bind, self.proj_out_host, m, true);
+        if (self.hasActiveLoraFor(l, .o_proj)) {
+            const f = try self.ensureFrame(frame_opt);
+            _ = try self.encodeLoraSingle(f, l, .o_proj, self.attn_out_bind, self.proj_out_bind, m, qsa.o_proj.k, qsa.o_proj.n, true);
+        }
     }
 
     fn execGqaAttention(
@@ -6480,6 +6952,11 @@ pub const GraphModel = struct {
         if (loop_step == 0 and !self.hasActiveStepLora(l, loop_step, .q_proj)) {
             const f = try self.ensureFrame(frame_opt);
             try self.encodeQkvProj(f, gqa.q_proj, gqa.k_proj, gqa.v_proj, self.x_norm_bind, self.q_bind, self.k_bind, self.v_bind, m, .batched_gemv, true);
+            if (self.hasActiveLora()) {
+                _ = try self.encodeLoraSingle(f, l, .q_proj, self.x_norm_bind, self.q_bind, m, gqa.q_proj.k, gqa.q_proj.n, true);
+                _ = try self.encodeLoraSingle(f, l, .k_proj, self.x_norm_bind, self.k_bind, m, gqa.k_proj.k, gqa.k_proj.n, true);
+                _ = try self.encodeLoraSingle(f, l, .v_proj, self.x_norm_bind, self.v_bind, m, gqa.v_proj.k, gqa.v_proj.n, true);
+            }
             const tree_k: metal.BufferBinding = .{ .buffer = self.scratch_buf, .offset = gqa.tree_k_off };
             const tree_v: metal.BufferBinding = .{ .buffer = self.scratch_buf, .offset = gqa.tree_v_off };
 
@@ -6513,6 +6990,13 @@ pub const GraphModel = struct {
                 if (loop_step == 0) {
                     try self.encodeLinearBatched(f, gqa.k_proj, self.x_norm_bind, self.k_bind, m, false);
                     try self.encodeLinearBatched(f, gqa.v_proj, self.x_norm_bind, self.v_bind, m, false);
+                }
+                if (self.hasActiveLora()) {
+                    _ = try self.encodeLoraSingle(f, l, .q_proj, self.x_norm_bind, self.q_bind, m, gqa.q_proj.k, gqa.q_proj.n, true);
+                    if (loop_step == 0) {
+                        _ = try self.encodeLoraSingle(f, l, .k_proj, self.x_norm_bind, self.k_bind, m, gqa.k_proj.k, gqa.k_proj.n, true);
+                        _ = try self.encodeLoraSingle(f, l, .v_proj, self.x_norm_bind, self.v_bind, m, gqa.v_proj.k, gqa.v_proj.n, true);
+                    }
                 }
 
                 try self.attn_pipes.encodeTreeQkNormRope(f, .{
@@ -6590,6 +7074,10 @@ pub const GraphModel = struct {
         }
 
         try self.execLinearWithOptionalStepLora(frame_opt, l, loop_step, .o_proj, gqa.o_proj, self.attn_out_bind, self.attn_out_host, self.proj_out_bind, self.proj_out_host, m, true);
+        if (self.hasActiveLoraFor(l, .o_proj)) {
+            const f = try self.ensureFrame(frame_opt);
+            _ = try self.encodeLoraSingle(f, l, .o_proj, self.attn_out_bind, self.proj_out_bind, m, gqa.o_proj.k, gqa.o_proj.n, true);
+        }
     }
 
     fn execMoeFfn(
@@ -7533,6 +8021,9 @@ pub const GraphModel = struct {
 
             // 1. Q path: `q_a_proj -> q_a_layernorm -> q_b_proj`.
             try encodeMatmul(self, f, mla.q_a_proj, x_norm_bind, sc.q_a_bind, m, is_wide, true);
+            if (self.hasActiveLora()) {
+                _ = try self.encodeLoraSingle(f, l, .q_a_proj, x_norm_bind, sc.q_a_bind, m, mla.q_a_proj.k, mla.q_a_proj.n, true);
+            }
             try self.attn_pipes.encodeRmsNorm(f, .{
                 .x = sc.q_a_bind,
                 .w = mla.q_a_norm.binding,
@@ -7543,6 +8034,9 @@ pub const GraphModel = struct {
                 .w_dtype = mla.q_a_norm.dtype,
             }, true);
             try encodeMatmul(self, f, mla.q_b_proj, sc.q_a_norm_bind, sc.q_full_bind, m, is_wide, true);
+            if (self.hasActiveLora()) {
+                _ = try self.encodeLoraSingle(f, l, .q_b_proj, sc.q_a_norm_bind, sc.q_full_bind, m, mla.q_b_proj.k, mla.q_b_proj.n, true);
+            }
 
             // 2. Absorb per-head `q_nope` via `W_UK^T` -> `[m, n_heads, kv_lora_rank]` and extract `q_pe`.
             for (0..n_heads) |hd| {
@@ -7583,6 +8077,9 @@ pub const GraphModel = struct {
             // 3. KV path (`Full` layers on `loop_step == 0` only): `kv_a_proj_with_mqa -> split -> kv_a_norm`.
             if (need_kv_proj) {
                 try encodeMatmul(self, f, mla.kv_a_proj, x_norm_bind, sc.kv_a_bind, m, is_wide, true);
+                if (self.hasActiveLora()) {
+                    _ = try self.encodeLoraSingle(f, l, .kv_a_proj, x_norm_bind, sc.kv_a_bind, m, mla.kv_a_proj.k, mla.kv_a_proj.n, true);
+                }
                 try self.moe_pipes.encodeCopyStrided(f, .{
                     .src = sc.kv_a_bind,
                     .dst = sc.latent_raw_bind,
@@ -7747,6 +8244,9 @@ pub const GraphModel = struct {
 
             // 7. Output projection `o_proj` -> `proj_out_bind`.
             try encodeMatmul(self, f, mla.o_proj, attn_out_bind, proj_out_bind, m, is_wide, true);
+            if (self.hasActiveLora()) {
+                _ = try self.encodeLoraSingle(f, l, .o_proj, attn_out_bind, proj_out_bind, m, mla.o_proj.k, mla.o_proj.n, true);
+            }
         }
     }
 
@@ -8365,6 +8865,7 @@ pub const GraphModel = struct {
     fn ensureFrame(self: *GraphModel, frame_opt: *?metal.Compute.Frame) metal.Error!*metal.Compute.Frame {
         if (frame_opt.* == null) {
             frame_opt.* = try self.compute.beginFrame(self.timeout_ms);
+            self.beginLoraFrame(frame_opt.*.?.slot);
         }
         return &(frame_opt.*.?);
     }
@@ -11192,6 +11693,7 @@ const GraphBatchSlotState = struct {
     chunk_is_shared: []bool = &.{},
     pinned_full_ids: []u32 = &.{},
     prompt_tokens: []u32 = &.{},
+    lora_slot: u32 = lora.NO_ADAPTER,
 };
 
 /// Preallocated zero-allocation continuous-batching (`C14`) & shared `PrefixCache` +
@@ -11848,6 +12350,44 @@ pub const GraphBatchRuntime = struct {
         };
     }
 
+    pub fn setSlotLora(self: *GraphBatchRuntime, slot_id: u32, lora_slot: u32) void {
+        if (slot_id >= self.max_slots) return;
+        self.slots[slot_id].lora_slot = lora_slot;
+    }
+
+    pub fn setSlotLoraAdapter(self: *GraphBatchRuntime, slot_id: u32, name: ?[]const u8) lora.LoraError!void {
+        if (slot_id >= self.max_slots) return;
+        const raw = name orelse {
+            self.slots[slot_id].lora_slot = lora.NO_ADAPTER;
+            return;
+        };
+        if (raw.len == 0) {
+            self.slots[slot_id].lora_slot = lora.NO_ADAPTER;
+            return;
+        }
+        const reg = self.model.lora_registry orelse return error.AdapterNotFound;
+        if (reg.findSlotByName(raw)) |sid| {
+            self.slots[slot_id].lora_slot = sid;
+            return;
+        }
+        if (std.mem.indexOfScalar(u8, raw, ':') != null) {
+            self.slots[slot_id].lora_slot = (try reg.resolveModelSelector(raw)) orelse lora.NO_ADAPTER;
+            return;
+        }
+        return error.AdapterNotFound;
+    }
+
+    pub fn selectSlotModelAdapter(self: *GraphBatchRuntime, slot_id: u32, model_selector: []const u8) lora.LoraError!void {
+        if (slot_id >= self.max_slots) return;
+        const sel = lora.parseModelSelector(model_selector);
+        if (sel.adapter == null) {
+            self.slots[slot_id].lora_slot = lora.NO_ADAPTER;
+            return;
+        }
+        const reg = self.model.lora_registry orelse return error.AdapterNotFound;
+        self.slots[slot_id].lora_slot = (try reg.resolveModelSelector(model_selector)) orelse lora.NO_ADAPTER;
+    }
+
     fn poolTilePair(self: *const GraphBatchRuntime, group_id: u32, kv_idx: u32) struct { k: metal.KvTile, v: metal.KvTile } {
         const base = (@as(usize, group_id) * self.num_kv_layers + kv_idx) * 2;
         return .{ .k = self.pool_tiles[base], .v = self.pool_tiles[base + 1] };
@@ -12163,6 +12703,9 @@ pub const GraphBatchRuntime = struct {
         const slot = &self.slots[slot_id];
         slot.in_use = true;
         const handle: u64 = @as(u64, slot_id) + 1;
+        if (slot.lora_slot != lora.NO_ADAPTER) {
+            return .{ .matched_tokens = 0, .prefix_handle = handle };
+        }
 
         var pc = &(self.prefix_cache orelse return .{ .matched_tokens = 0, .prefix_handle = handle });
         if (prompt_tokens.len <= 1 or prompt_tokens.len > self.model.max_seq_len) {
@@ -12276,6 +12819,7 @@ pub const GraphBatchRuntime = struct {
     ) void {
         var pc = &(self.prefix_cache orelse return);
         const slot = &self.slots[slot_id];
+        if (slot.lora_slot != lora.NO_ADAPTER) return;
         const bs = self.kv_chunk_tokens;
 
         while ((slot.prefix_cached_full_chunks + 1) * bs <= slot.seq_len) {
@@ -12466,6 +13010,7 @@ pub const GraphBatchRuntime = struct {
 
         var frame = try model.compute.beginFrame(model.timeout_ms);
         errdefer frame.abort();
+        model.beginLoraFrame(frame.slot);
 
         try model.encodeEmbedLookupUnified(&frame, .{
             .weight = model.embed.weight,
@@ -12574,9 +13119,22 @@ pub const GraphBatchRuntime = struct {
                                 .offset = model.wp_gdn_z_bind.offset + @as(u64, m - 1) * v_dim * @sizeOf(f16),
                             };
                             try model.encodeLinearGemv(&frame, g.g_proj, last_x_norm_bind, last_z, false);
+                            if (model.hasActiveLora()) {
+                                _ = try model.encodeLoraSingle(&frame, l, .gate_attn, last_x_norm_bind, last_z, 1, g.g_proj.k, g.g_proj.n, true);
+                            }
                         } else {
                             try model.encodeLinearGemmWithTile(&frame, g.g_proj, model.wp_x_norm_bind, model.wp_gdn_z_bind, m, true, false);
+                            if (model.hasActiveLora()) {
+                                _ = try model.encodeLoraSingle(&frame, l, .gate_attn, model.wp_x_norm_bind, model.wp_gdn_z_bind, m, g.g_proj.k, g.g_proj.n, true);
+                            }
                         }
+                    }
+                    if (model.hasActiveLora()) {
+                        if (need_q) {
+                            _ = try model.encodeLoraSingle(&frame, l, .q_proj, model.wp_x_norm_bind, model.wp_q_bind, m, g.q_proj.k, g.q_proj.n, true);
+                        }
+                        _ = try model.encodeLoraSingle(&frame, l, .k_proj, model.wp_x_norm_bind, model.wp_k_bind, m, g.k_proj.k, g.k_proj.n, true);
+                        _ = try model.encodeLoraSingle(&frame, l, .v_proj, model.wp_x_norm_bind, model.wp_v_bind, m, g.v_proj.k, g.v_proj.n, true);
                     }
 
                     if (g.conv1d_w) |cw| {
@@ -12624,6 +13182,9 @@ pub const GraphBatchRuntime = struct {
                     }, true);
                     if (skip_last_rest) break;
                     try model.encodeLinearGemmWithTile(&frame, g.o_proj, model.wp_attn_out_bind, model.wp_proj_out_bind, eff_m, true, true);
+                    if (model.hasActiveLora()) {
+                        _ = try model.encodeLoraSingle(&frame, l, .o_proj, model.wp_attn_out_bind, model.wp_proj_out_bind, eff_m, g.o_proj.k, g.o_proj.n, true);
+                    }
                 },
                 .qsa => |*qsa| {
                     const kv_idx = self.layer_to_kv_idx[l];
@@ -12637,6 +13198,10 @@ pub const GraphBatchRuntime = struct {
                     if (skip_last_rest) {
                         try model.encodeLinearGemmWithTile(&frame, qsa.k_proj, model.wp_x_norm_bind, model.wp_k_bind, m, true, true);
                         try model.encodeLinearGemmWithTile(&frame, qsa.v_proj, model.wp_x_norm_bind, model.wp_v_bind, m, true, false);
+                        if (model.hasActiveLora()) {
+                            _ = try model.encodeLoraSingle(&frame, l, .k_proj, model.wp_x_norm_bind, model.wp_k_bind, m, qsa.k_proj.k, qsa.k_proj.n, true);
+                            _ = try model.encodeLoraSingle(&frame, l, .v_proj, model.wp_x_norm_bind, model.wp_v_bind, m, qsa.v_proj.k, qsa.v_proj.n, true);
+                        }
                         try model.hybrid_pipes.encodeQsaPrefillRope(&frame, .{
                             .q = model.wp_q_bind,
                             .k = model.wp_k_bind,
@@ -12680,6 +13245,11 @@ pub const GraphBatchRuntime = struct {
                         try model.encodeLinearGemmWithTile(&frame, qsa.k_proj, model.wp_x_norm_bind, model.wp_k_bind, m, true, true);
                         try model.encodeLinearGemmWithTile(&frame, qsa.v_proj, model.wp_x_norm_bind, model.wp_v_bind, m, true, false);
                         try model.encodeLinearGemv(&frame, qsa.q_proj, last_x_norm_bind, model.wp_q_bind, false);
+                        if (model.hasActiveLora()) {
+                            _ = try model.encodeLoraSingle(&frame, l, .k_proj, model.wp_x_norm_bind, model.wp_k_bind, m, qsa.k_proj.k, qsa.k_proj.n, true);
+                            _ = try model.encodeLoraSingle(&frame, l, .v_proj, model.wp_x_norm_bind, model.wp_v_bind, m, qsa.v_proj.k, qsa.v_proj.n, true);
+                            _ = try model.encodeLoraSingle(&frame, l, .q_proj, last_x_norm_bind, model.wp_q_bind, 1, qsa.q_proj.k, qsa.q_proj.n, true);
+                        }
                         try model.hybrid_pipes.encodeQsaPrefillRope(&frame, .{
                             .q = model.wp_q_bind,
                             .k = model.wp_k_bind,
@@ -12730,6 +13300,11 @@ pub const GraphBatchRuntime = struct {
                         try model.encodeLinearGemmWithTile(&frame, qsa.q_proj, model.wp_x_norm_bind, model.wp_q_bind, m, true, true);
                         try model.encodeLinearGemmWithTile(&frame, qsa.k_proj, model.wp_x_norm_bind, model.wp_k_bind, m, true, false);
                         try model.encodeLinearGemmWithTile(&frame, qsa.v_proj, model.wp_x_norm_bind, model.wp_v_bind, m, true, false);
+                        if (model.hasActiveLora()) {
+                            _ = try model.encodeLoraSingle(&frame, l, .q_proj, model.wp_x_norm_bind, model.wp_q_bind, m, qsa.q_proj.k, qsa.q_proj.n, true);
+                            _ = try model.encodeLoraSingle(&frame, l, .k_proj, model.wp_x_norm_bind, model.wp_k_bind, m, qsa.k_proj.k, qsa.k_proj.n, true);
+                            _ = try model.encodeLoraSingle(&frame, l, .v_proj, model.wp_x_norm_bind, model.wp_v_bind, m, qsa.v_proj.k, qsa.v_proj.n, true);
+                        }
                         try model.hybrid_pipes.encodeQsaPrefillRope(&frame, .{
                             .q = model.wp_q_bind,
                             .k = model.wp_k_bind,
@@ -12787,6 +13362,9 @@ pub const GraphBatchRuntime = struct {
                         .causal_q_start_pos = if (tail_m1_last) base_pos + m - 1 else base_pos,
                     }, true);
                     try model.encodeLinearGemmWithTile(&frame, qsa.o_proj, model.wp_attn_out_bind, model.wp_proj_out_bind, eff_m, true, true);
+                    if (model.hasActiveLora()) {
+                        _ = try model.encodeLoraSingle(&frame, l, .o_proj, model.wp_attn_out_bind, model.wp_proj_out_bind, eff_m, qsa.o_proj.k, qsa.o_proj.n, true);
+                    }
                 },
                 .gqa => |gqa| {
                     const kv_idx = self.layer_to_kv_idx[l];
@@ -12795,6 +13373,10 @@ pub const GraphBatchRuntime = struct {
                     if (skip_last_rest) {
                         try model.encodeLinearGemmWithTile(&frame, gqa.k_proj, model.wp_x_norm_bind, model.wp_k_bind, m, true, true);
                         try model.encodeLinearGemmWithTile(&frame, gqa.v_proj, model.wp_x_norm_bind, model.wp_v_bind, m, true, false);
+                        if (model.hasActiveLora()) {
+                            _ = try model.encodeLoraSingle(&frame, l, .k_proj, model.wp_x_norm_bind, model.wp_k_bind, m, gqa.k_proj.k, gqa.k_proj.n, true);
+                            _ = try model.encodeLoraSingle(&frame, l, .v_proj, model.wp_x_norm_bind, model.wp_v_bind, m, gqa.v_proj.k, gqa.v_proj.n, true);
+                        }
                         try model.attn_pipes.encodePrefillQkNormRopeKvWrite(&frame, .{
                             .q = model.wp_q_bind,
                             .k = model.wp_k_bind,
@@ -12819,6 +13401,11 @@ pub const GraphBatchRuntime = struct {
                         try model.encodeLinearGemmWithTile(&frame, gqa.k_proj, model.wp_x_norm_bind, model.wp_k_bind, m, true, true);
                         try model.encodeLinearGemmWithTile(&frame, gqa.v_proj, model.wp_x_norm_bind, model.wp_v_bind, m, true, false);
                         try model.encodeLinearGemv(&frame, gqa.q_proj, last_x_norm_bind, model.wp_q_bind, false);
+                        if (model.hasActiveLora()) {
+                            _ = try model.encodeLoraSingle(&frame, l, .k_proj, model.wp_x_norm_bind, model.wp_k_bind, m, gqa.k_proj.k, gqa.k_proj.n, true);
+                            _ = try model.encodeLoraSingle(&frame, l, .v_proj, model.wp_x_norm_bind, model.wp_v_bind, m, gqa.v_proj.k, gqa.v_proj.n, true);
+                            _ = try model.encodeLoraSingle(&frame, l, .q_proj, last_x_norm_bind, model.wp_q_bind, 1, gqa.q_proj.k, gqa.q_proj.n, true);
+                        }
                         try model.attn_pipes.encodePrefillQkNormRopeKvWrite(&frame, .{
                             .q = model.wp_q_bind,
                             .k = model.wp_k_bind,
@@ -12857,6 +13444,11 @@ pub const GraphBatchRuntime = struct {
                         }, false);
                     } else {
                         try model.encodeQkvProj(&frame, gqa.q_proj, gqa.k_proj, gqa.v_proj, model.wp_x_norm_bind, model.wp_q_bind, model.wp_k_bind, model.wp_v_bind, m, .gemm_wide, true);
+                        if (model.hasActiveLora()) {
+                            _ = try model.encodeLoraSingle(&frame, l, .q_proj, model.wp_x_norm_bind, model.wp_q_bind, m, gqa.q_proj.k, gqa.q_proj.n, true);
+                            _ = try model.encodeLoraSingle(&frame, l, .k_proj, model.wp_x_norm_bind, model.wp_k_bind, m, gqa.k_proj.k, gqa.k_proj.n, true);
+                            _ = try model.encodeLoraSingle(&frame, l, .v_proj, model.wp_x_norm_bind, model.wp_v_bind, m, gqa.v_proj.k, gqa.v_proj.n, true);
+                        }
                         try model.attn_pipes.encodePrefillQkNormRopeKvWrite(&frame, .{
                             .q = model.wp_q_bind,
                             .k = model.wp_k_bind,
@@ -12889,6 +13481,9 @@ pub const GraphBatchRuntime = struct {
                         .chunk_tokens = self.kv_chunk_tokens,
                     }, true);
                     try model.encodeLinearGemmWithTile(&frame, gqa.o_proj, model.wp_attn_out_bind, model.wp_proj_out_bind, eff_m, true, true);
+                    if (model.hasActiveLora()) {
+                        _ = try model.encodeLoraSingle(&frame, l, .o_proj, model.wp_attn_out_bind, model.wp_proj_out_bind, eff_m, gqa.o_proj.k, gqa.o_proj.n, true);
+                    }
                 },
                 .mla_csa2 => {},
             }
@@ -12942,20 +13537,37 @@ pub const GraphBatchRuntime = struct {
 
             switch (model.config.axes.ffn_kind) {
                 .dense_swiglu => {
-                    try model.encodeDenseGateUpAct(
-                        &frame,
-                        layer.dense_gate,
-                        layer.dense_up,
-                        model.wp_x_norm_bind,
-                        model.wp_dense_gate_bind,
-                        model.wp_dense_up_bind,
-                        model.wp_dense_act_bind,
-                        eff_m,
-                        .gemm_wide,
-                        true,
-                    );
+                    const gu_lora_mask = lora.TargetProjection.gate_proj.bit() | lora.TargetProjection.up_proj.bit();
+                    if (model.hasActiveLoraMask(l, gu_lora_mask)) {
+                        try model.encodeLinearGemmWithTile(&frame, layer.dense_gate, model.wp_x_norm_bind, model.wp_dense_gate_bind, eff_m, true, true);
+                        try model.encodeLinearGemmWithTile(&frame, layer.dense_up, model.wp_x_norm_bind, model.wp_dense_up_bind, eff_m, true, false);
+                        _ = try model.encodeLoraSingle(&frame, l, .gate_proj, model.wp_x_norm_bind, model.wp_dense_gate_bind, eff_m, layer.dense_gate.k, layer.dense_gate.n, true);
+                        _ = try model.encodeLoraSingle(&frame, l, .up_proj, model.wp_x_norm_bind, model.wp_dense_up_bind, eff_m, layer.dense_up.k, layer.dense_up.n, true);
+                        try model.moe_pipes.encodeSiluMul(&frame, .{
+                            .gate = model.wp_dense_gate_bind,
+                            .up = model.wp_dense_up_bind,
+                            .out = model.wp_dense_act_bind,
+                            .count = eff_m * model.config.intermediate_size,
+                        }, true);
+                    } else {
+                        try model.encodeDenseGateUpAct(
+                            &frame,
+                            layer.dense_gate,
+                            layer.dense_up,
+                            model.wp_x_norm_bind,
+                            model.wp_dense_gate_bind,
+                            model.wp_dense_up_bind,
+                            model.wp_dense_act_bind,
+                            eff_m,
+                            .gemm_wide,
+                            true,
+                        );
+                    }
                     if (model.wp_gr_arena) |*gr| {
                         try model.encodeLinearGemmWithTile(&frame, layer.dense_down, model.wp_dense_act_bind, model.wp_proj_out_bind, eff_m, true, true);
+                        if (model.hasActiveLora()) {
+                            _ = try model.encodeLoraSingle(&frame, l, .down_proj, model.wp_dense_act_bind, model.wp_proj_out_bind, eff_m, layer.dense_down.k, layer.dense_down.n, true);
+                        }
                         const stream_eff: metal.BufferBinding = if (tail_m1_last)
                             .{ .buffer = model.scratch_buf, .offset = gr.base_offset + @as(u64, m - 1) * h * @sizeOf(f16) }
                         else
@@ -12977,10 +13589,13 @@ pub const GraphBatchRuntime = struct {
                             .hidden_dim = h,
                             .branch_token_stride = w_stride,
                         }, true);
-                    } else if (model.enable_g18_fusion and (eff_m == 1 or eff_m >= 64)) {
+                    } else if (model.enable_g18_fusion and (eff_m == 1 or eff_m >= 64) and !model.hasActiveLoraFor(l, .down_proj)) {
                         try model.encodeLinearGemmWithTileResidual(&frame, layer.dense_down, model.wp_dense_act_bind, eff_x_bind, eff_x_bind, eff_m, true, true);
                     } else {
                         try model.encodeLinearGemmWithTile(&frame, layer.dense_down, model.wp_dense_act_bind, model.wp_proj_out_bind, eff_m, true, true);
+                        if (model.hasActiveLora()) {
+                            _ = try model.encodeLoraSingle(&frame, l, .down_proj, model.wp_dense_act_bind, model.wp_proj_out_bind, eff_m, layer.dense_down.k, layer.dense_down.n, true);
+                        }
                         try model.moe_pipes.encodeResidualAdd(&frame, .{
                             .x = eff_x_bind,
                             .delta = model.wp_proj_out_bind,
@@ -13137,6 +13752,7 @@ pub const GraphBatchRuntime = struct {
 
         var frame = try model.compute.beginFrame(model.timeout_ms);
         errdefer frame.abort();
+        model.beginLoraFrame(frame.slot);
 
         try model.encodeEmbedLookupUnified(&frame, .{
             .weight = model.embed.weight,
@@ -13201,6 +13817,12 @@ pub const GraphBatchRuntime = struct {
                     try model.encodeLinearBatched(&frame, g.k_proj, model.x_norm_bind, model.k_bind, m, false);
                     try model.encodeLinearBatched(&frame, g.v_proj, model.x_norm_bind, model.v_bind, m, false);
                     try model.encodeLinearBatched(&frame, g.g_proj, model.x_norm_bind, model.gdn_z_bind, m, false);
+                    if (model.hasActiveLora()) {
+                        _ = try model.encodeLoraSingle(&frame, l, .q_proj, model.x_norm_bind, model.q_bind, m, g.q_proj.k, g.q_proj.n, true);
+                        _ = try model.encodeLoraSingle(&frame, l, .k_proj, model.x_norm_bind, model.k_bind, m, g.k_proj.k, g.k_proj.n, true);
+                        _ = try model.encodeLoraSingle(&frame, l, .v_proj, model.x_norm_bind, model.v_bind, m, g.v_proj.k, g.v_proj.n, true);
+                        _ = try model.encodeLoraSingle(&frame, l, .gate_attn, model.x_norm_bind, model.gdn_z_bind, m, g.g_proj.k, g.g_proj.n, true);
+                    }
                     try model.hybrid_pipes.encodeGdnComputeGates(&frame, .{
                         .x = model.x_norm_bind,
                         .w_a = g.a_proj,
@@ -13285,6 +13907,9 @@ pub const GraphBatchRuntime = struct {
                         }, true);
                     }
                     try model.encodeLinearBatched(&frame, g.o_proj, model.attn_out_bind, model.proj_out_bind, m, true);
+                    if (model.hasActiveLora()) {
+                        _ = try model.encodeLoraSingle(&frame, l, .o_proj, model.attn_out_bind, model.proj_out_bind, m, g.o_proj.k, g.o_proj.n, true);
+                    }
                 },
                 .qsa => |*qsa| {
                     const kv_idx = self.layer_to_kv_idx[l];
@@ -13293,6 +13918,11 @@ pub const GraphBatchRuntime = struct {
                     try model.encodeLinearBatched(&frame, qsa.q_proj, model.x_norm_bind, model.q_bind, m, true);
                     try model.encodeLinearBatched(&frame, qsa.k_proj, model.x_norm_bind, model.k_bind, m, false);
                     try model.encodeLinearBatched(&frame, qsa.v_proj, model.x_norm_bind, model.v_bind, m, false);
+                    if (model.hasActiveLora()) {
+                        _ = try model.encodeLoraSingle(&frame, l, .q_proj, model.x_norm_bind, model.q_bind, m, qsa.q_proj.k, qsa.q_proj.n, true);
+                        _ = try model.encodeLoraSingle(&frame, l, .k_proj, model.x_norm_bind, model.k_bind, m, qsa.k_proj.k, qsa.k_proj.n, true);
+                        _ = try model.encodeLoraSingle(&frame, l, .v_proj, model.x_norm_bind, model.v_bind, m, qsa.v_proj.k, qsa.v_proj.n, true);
+                    }
 
                     const mrope_rot: u32 = (model.config.mrope_section.section[0] + model.config.mrope_section.section[1] + model.config.mrope_section.section[2]) * 2;
                     const eff_rot_dim: u32 = if (mrope_rot > 0 and mrope_rot <= model.config.head_dim) mrope_rot else model.config.head_dim;
@@ -13381,6 +14011,9 @@ pub const GraphBatchRuntime = struct {
                     }, true);
 
                     try model.encodeLinearBatched(&frame, qsa.o_proj, model.attn_out_bind, model.proj_out_bind, m, true);
+                    if (model.hasActiveLora()) {
+                        _ = try model.encodeLoraSingle(&frame, l, .o_proj, model.attn_out_bind, model.proj_out_bind, m, qsa.o_proj.k, qsa.o_proj.n, true);
+                    }
                 },
                 .gqa => |gqa| {
                     const kv_idx = self.layer_to_kv_idx[l];
@@ -13389,6 +14022,11 @@ pub const GraphBatchRuntime = struct {
                     try model.encodeLinearBatched(&frame, gqa.q_proj, model.x_norm_bind, model.q_bind, m, true);
                     try model.encodeLinearBatched(&frame, gqa.k_proj, model.x_norm_bind, model.k_bind, m, false);
                     try model.encodeLinearBatched(&frame, gqa.v_proj, model.x_norm_bind, model.v_bind, m, false);
+                    if (model.hasActiveLora()) {
+                        _ = try model.encodeLoraSingle(&frame, l, .q_proj, model.x_norm_bind, model.q_bind, m, gqa.q_proj.k, gqa.q_proj.n, true);
+                        _ = try model.encodeLoraSingle(&frame, l, .k_proj, model.x_norm_bind, model.k_bind, m, gqa.k_proj.k, gqa.k_proj.n, true);
+                        _ = try model.encodeLoraSingle(&frame, l, .v_proj, model.x_norm_bind, model.v_bind, m, gqa.v_proj.k, gqa.v_proj.n, true);
+                    }
                     try model.attn_pipes.encodeTreeQkNormRope(&frame, .{
                         .q = model.q_bind,
                         .k = model.k_bind,
@@ -13443,6 +14081,9 @@ pub const GraphBatchRuntime = struct {
                     }, true);
 
                     try model.encodeLinearBatched(&frame, gqa.o_proj, model.attn_out_bind, model.proj_out_bind, m, true);
+                    if (model.hasActiveLora()) {
+                        _ = try model.encodeLoraSingle(&frame, l, .o_proj, model.attn_out_bind, model.proj_out_bind, m, gqa.o_proj.k, gqa.o_proj.n, true);
+                    }
                 },
                 .mla_csa2 => {},
             }
@@ -13498,7 +14139,7 @@ pub const GraphBatchRuntime = struct {
                 .w_dtype = layer.post_attention_layernorm.dtype,
             }, true);
 
-            try self.encodeLayerFfnBatched(&frame, l, layer, m);
+            try self.encodeLayerFfnBatched(&frame, l, layer, m, null);
         }
 
         if (model.gr_arena) |*gr| {
@@ -13549,6 +14190,7 @@ pub const GraphBatchRuntime = struct {
         l: usize,
         layer: *GraphLayerWeights,
         m: u32,
+        batch_lora_slots: ?[]const u32,
     ) GraphStepError!void {
         const model = self.model;
         const h = model.config.hidden_size;
@@ -13556,6 +14198,15 @@ pub const GraphBatchRuntime = struct {
             .dense_swiglu => {
                 try model.encodeLinearBatched(frame, layer.dense_gate, model.x_norm_bind, model.dense_gate_bind, m, true);
                 try model.encodeLinearBatched(frame, layer.dense_up, model.x_norm_bind, model.dense_up_bind, m, false);
+                if (batch_lora_slots) |slots| {
+                    if (slots.len > 0) {
+                        _ = try model.encodeLoraBatch(frame, slots, l, .gate_proj, model.x_norm_bind, model.dense_gate_bind, m, layer.dense_gate.k, layer.dense_gate.n, true);
+                        _ = try model.encodeLoraBatch(frame, slots, l, .up_proj, model.x_norm_bind, model.dense_up_bind, m, layer.dense_up.k, layer.dense_up.n, true);
+                    }
+                } else if (model.hasActiveLora()) {
+                    _ = try model.encodeLoraSingle(frame, l, .gate_proj, model.x_norm_bind, model.dense_gate_bind, m, layer.dense_gate.k, layer.dense_gate.n, true);
+                    _ = try model.encodeLoraSingle(frame, l, .up_proj, model.x_norm_bind, model.dense_up_bind, m, layer.dense_up.k, layer.dense_up.n, true);
+                }
                 try model.moe_pipes.encodeSiluMul(frame, .{
                     .gate = model.dense_gate_bind,
                     .up = model.dense_up_bind,
@@ -13563,6 +14214,13 @@ pub const GraphBatchRuntime = struct {
                     .count = m * model.config.intermediate_size,
                 }, true);
                 try model.encodeLinearBatched(frame, layer.dense_down, model.dense_act_bind, model.proj_out_bind, m, true);
+                if (batch_lora_slots) |slots| {
+                    if (slots.len > 0) {
+                        _ = try model.encodeLoraBatch(frame, slots, l, .down_proj, model.dense_act_bind, model.proj_out_bind, m, layer.dense_down.k, layer.dense_down.n, true);
+                    }
+                } else if (model.hasActiveLora()) {
+                    _ = try model.encodeLoraSingle(frame, l, .down_proj, model.dense_act_bind, model.proj_out_bind, m, layer.dense_down.k, layer.dense_down.n, true);
+                }
                 if (model.gr_arena) |*gr| {
                     try model.hybrid_pipes.encodeGrWriteGate(frame, .{
                         .stream = gr.binding(model.scratch_buf),
@@ -13654,6 +14312,9 @@ pub const GraphBatchRuntime = struct {
             self.resetSlotState(chunk.slot_id);
             slot.in_use = true;
         }
+        const saved_lora_slot = self.model.active_lora_slot;
+        self.model.active_lora_slot = slot.lora_slot;
+        defer self.model.active_lora_slot = saved_lora_slot;
         @memcpy(slot.prompt_tokens[chunk.start_pos .. chunk.start_pos + chunk.tokens.len], chunk.tokens);
 
         if (self.slot_mla_kv.len > 0) {
@@ -13790,6 +14451,9 @@ pub const GraphBatchRuntime = struct {
                     return error.DecodeFailed;
                 }
                 const slot = &self.slots[sid];
+                const saved_lora = model.active_lora_slot;
+                model.active_lora_slot = slot.lora_slot;
+                defer model.active_lora_slot = saved_lora;
                 model.mla_kv_buf = self.batch_buf;
                 model.mla_kv_arena = self.slot_mla_kv[sid];
                 model.csa2_summary_arena = self.slot_csa2_sum[sid];
@@ -13814,6 +14478,9 @@ pub const GraphBatchRuntime = struct {
         }
 
         var max_seq: u32 = 0;
+        var batch_lora_slots: [batch_sched.MAX_BATCH_SLOTS]u32 = undefined;
+        var any_batch_lora: bool = false;
+        const can_run_batch_lora = (model.lora_registry != null and model.lora_pipes != null and model.lora_ws != null and model.lora_registry.?.activeAdapterCount() > 0);
         for (0..b_usize) |bi| {
             const sid: u32 = view.slot_ids[bi];
             const tok = view.input_tokens[bi];
@@ -13829,8 +14496,12 @@ pub const GraphBatchRuntime = struct {
             model.pos3d_host[bi] = hybrid.Pos3D.text(pos);
             model.ancestor_masks_host[bi] = 1;
             self.gdn_slot_ids_host[bi] = sid;
+            const lslot = self.slots[sid].lora_slot;
+            batch_lora_slots[bi] = lslot;
+            if (can_run_batch_lora and lslot != lora.NO_ADAPTER) any_batch_lora = true;
             max_seq = @max(max_seq, pos + 1);
         }
+        const row_lora_slots: []const u32 = if (any_batch_lora) batch_lora_slots[0..b_usize] else &.{};
 
         // Stage per-GQA-layer batch write slots & slot descriptors.
         for (model.layers, 0..) |layer, l| {
@@ -13859,6 +14530,7 @@ pub const GraphBatchRuntime = struct {
 
         var frame = model.compute.beginFrame(model.timeout_ms) catch return error.DecodeFailed;
         errdefer frame.abort();
+        model.beginLoraFrame(frame.slot);
 
         model.encodeEmbedLookupUnified(&frame, .{
             .weight = model.embed.weight,
@@ -13928,6 +14600,12 @@ pub const GraphBatchRuntime = struct {
                     model.encodeLinearBatched(&frame, g.k_proj, model.x_norm_bind, model.k_bind, b_u32, false) catch return error.DecodeFailed;
                     model.encodeLinearBatched(&frame, g.v_proj, model.x_norm_bind, model.v_bind, b_u32, false) catch return error.DecodeFailed;
                     model.encodeLinearBatched(&frame, g.g_proj, model.x_norm_bind, model.gdn_z_bind, b_u32, false) catch return error.DecodeFailed;
+                    if (any_batch_lora) {
+                        _ = model.encodeLoraBatch(&frame, row_lora_slots, l, .q_proj, model.x_norm_bind, model.q_bind, b_u32, g.q_proj.k, g.q_proj.n, true) catch return error.DecodeFailed;
+                        _ = model.encodeLoraBatch(&frame, row_lora_slots, l, .k_proj, model.x_norm_bind, model.k_bind, b_u32, g.k_proj.k, g.k_proj.n, true) catch return error.DecodeFailed;
+                        _ = model.encodeLoraBatch(&frame, row_lora_slots, l, .v_proj, model.x_norm_bind, model.v_bind, b_u32, g.v_proj.k, g.v_proj.n, true) catch return error.DecodeFailed;
+                        _ = model.encodeLoraBatch(&frame, row_lora_slots, l, .gate_attn, model.x_norm_bind, model.gdn_z_bind, b_u32, g.g_proj.k, g.g_proj.n, true) catch return error.DecodeFailed;
+                    }
                     model.hybrid_pipes.encodeGdnComputeGates(&frame, .{
                         .x = model.x_norm_bind,
                         .w_a = g.a_proj,
@@ -13999,6 +14677,9 @@ pub const GraphBatchRuntime = struct {
                     }, true) catch return error.DecodeFailed;
 
                     model.encodeLinearBatched(&frame, g.o_proj, model.attn_out_bind, model.proj_out_bind, b_u32, true) catch return error.DecodeFailed;
+                    if (any_batch_lora) {
+                        _ = model.encodeLoraBatch(&frame, row_lora_slots, l, .o_proj, model.attn_out_bind, model.proj_out_bind, b_u32, g.o_proj.k, g.o_proj.n, true) catch return error.DecodeFailed;
+                    }
                 },
                 .qsa => |*qsa| {
                     const kv_idx = self.layer_to_kv_idx[l];
@@ -14007,6 +14688,11 @@ pub const GraphBatchRuntime = struct {
                     model.encodeLinearBatched(&frame, qsa.q_proj, model.x_norm_bind, model.q_bind, b_u32, true) catch return error.DecodeFailed;
                     model.encodeLinearBatched(&frame, qsa.k_proj, model.x_norm_bind, model.k_bind, b_u32, false) catch return error.DecodeFailed;
                     model.encodeLinearBatched(&frame, qsa.v_proj, model.x_norm_bind, model.v_bind, b_u32, false) catch return error.DecodeFailed;
+                    if (any_batch_lora) {
+                        _ = model.encodeLoraBatch(&frame, row_lora_slots, l, .q_proj, model.x_norm_bind, model.q_bind, b_u32, qsa.q_proj.k, qsa.q_proj.n, true) catch return error.DecodeFailed;
+                        _ = model.encodeLoraBatch(&frame, row_lora_slots, l, .k_proj, model.x_norm_bind, model.k_bind, b_u32, qsa.k_proj.k, qsa.k_proj.n, true) catch return error.DecodeFailed;
+                        _ = model.encodeLoraBatch(&frame, row_lora_slots, l, .v_proj, model.x_norm_bind, model.v_bind, b_u32, qsa.v_proj.k, qsa.v_proj.n, true) catch return error.DecodeFailed;
+                    }
 
                     const mrope_rot: u32 = (model.config.mrope_section.section[0] + model.config.mrope_section.section[1] + model.config.mrope_section.section[2]) * 2;
                     const eff_rot_dim: u32 = if (mrope_rot > 0 and mrope_rot <= model.config.head_dim) mrope_rot else model.config.head_dim;
@@ -14100,10 +14786,18 @@ pub const GraphBatchRuntime = struct {
                     }
 
                     model.encodeLinearBatched(&frame, qsa.o_proj, model.attn_out_bind, model.proj_out_bind, b_u32, true) catch return error.DecodeFailed;
+                    if (any_batch_lora) {
+                        _ = model.encodeLoraBatch(&frame, row_lora_slots, l, .o_proj, model.attn_out_bind, model.proj_out_bind, b_u32, qsa.o_proj.k, qsa.o_proj.n, true) catch return error.DecodeFailed;
+                    }
                 },
                 .gqa => |gqa| {
                     const kv_idx = self.layer_to_kv_idx[l];
                     model.encodeQkvProj(&frame, gqa.q_proj, gqa.k_proj, gqa.v_proj, model.x_norm_bind, model.q_bind, model.k_bind, model.v_bind, b_u32, .batched_gemv, true) catch return error.DecodeFailed;
+                    if (any_batch_lora) {
+                        _ = model.encodeLoraBatch(&frame, row_lora_slots, l, .q_proj, model.x_norm_bind, model.q_bind, b_u32, gqa.q_proj.k, gqa.q_proj.n, true) catch return error.DecodeFailed;
+                        _ = model.encodeLoraBatch(&frame, row_lora_slots, l, .k_proj, model.x_norm_bind, model.k_bind, b_u32, gqa.k_proj.k, gqa.k_proj.n, true) catch return error.DecodeFailed;
+                        _ = model.encodeLoraBatch(&frame, row_lora_slots, l, .v_proj, model.x_norm_bind, model.v_bind, b_u32, gqa.v_proj.k, gqa.v_proj.n, true) catch return error.DecodeFailed;
+                    }
 
                     model.attn_pipes.encodeBatchQkNormRopeKvWrite(&frame, .{
                         .q = model.q_bind,
@@ -14138,6 +14832,9 @@ pub const GraphBatchRuntime = struct {
                     }, true) catch return error.DecodeFailed;
 
                     model.encodeLinearBatched(&frame, gqa.o_proj, model.attn_out_bind, model.proj_out_bind, b_u32, true) catch return error.DecodeFailed;
+                    if (any_batch_lora) {
+                        _ = model.encodeLoraBatch(&frame, row_lora_slots, l, .o_proj, model.attn_out_bind, model.proj_out_bind, b_u32, gqa.o_proj.k, gqa.o_proj.n, true) catch return error.DecodeFailed;
+                    }
                 },
                 .mla_csa2 => {},
             }
@@ -14187,7 +14884,7 @@ pub const GraphBatchRuntime = struct {
                 model.encodeResidualThenRmsNorm(&frame, model.x_bind, model.proj_out_bind, layer.post_attention_layernorm, model.x_norm_bind, b_u32, true) catch return error.DecodeFailed;
             }
 
-            self.encodeLayerFfnBatched(&frame, l, layer, b_u32) catch return error.DecodeFailed;
+            self.encodeLayerFfnBatched(&frame, l, layer, b_u32, row_lora_slots) catch return error.DecodeFailed;
         }
 
         if (model.gr_arena) |*gr| {
@@ -14242,6 +14939,9 @@ pub const GraphBatchRuntime = struct {
     fn releaseSlotCb(ctx: *anyopaque, slot_id: u16, prefix_handle: u64) void {
         _ = prefix_handle;
         const self: *GraphBatchRuntime = @ptrCast(@alignCast(ctx));
+        if (slot_id < self.max_slots) {
+            self.slots[slot_id].lora_slot = lora.NO_ADAPTER;
+        }
         self.resetSlotState(slot_id);
     }
 };
@@ -18157,4 +18857,693 @@ test "M7.8 G18 GraphModel dense homogeneous QKV/GateUpSwiGLU/residual epilogue A
     const f_vr = try fused_m.verifyTree(&.{ f_d1, 11 }, &.{ @intCast(prompt.len + 1), @intCast(prompt.len + 2) }, &.{ 0b01, 0b11 }, @intCast(prompt.len + 1));
     const u_vr = try unfused_m.verifyTree(&.{ u_d1, 11 }, &.{ @intCast(prompt.len + 1), @intCast(prompt.len + 2) }, &.{ 0b01, 0b11 }, @intCast(prompt.len + 1));
     try std.testing.expectEqualSlices(u32, u_vr.argmax_tokens[0..2], f_vr.argmax_tokens[0..2]);
+}
+
+const SynthInkling2LoraOverlay = struct {
+    specs: []const lora.SyntheticLoraSpec,
+    scale: f32,
+};
+
+fn applyOverlayToF16Weight(
+    allocator: std.mem.Allocator,
+    base_bytes: []const u8,
+    n: usize,
+    k: usize,
+    spec: *const lora.SyntheticLoraSpec,
+    scale: f32,
+) ![]u8 {
+    const out = try allocator.alloc(u8, n * k * 2);
+    const r: usize = spec.rank;
+    const s64: f64 = @floatCast(scale);
+
+    for (0..n) |i| {
+        var b_row: [lora.MAX_LORA_RANK]f64 = undefined;
+        for (0..r) |j| {
+            const bf: f16 = @floatCast(spec.b_f32[i * r + j]);
+            b_row[j] = @floatCast(bf);
+        }
+        var norm_sq: f64 = 0.0;
+        var row_eff: [256]f64 = undefined;
+        std.debug.assert(k <= row_eff.len);
+        for (0..k) |t| {
+            const w0_bits = std.mem.readInt(u16, base_bytes[(i * k + t) * 2 ..][0..2], .little);
+            const w0_f16: f16 = @bitCast(w0_bits);
+            var ba: f64 = 0.0;
+            for (0..r) |j| {
+                const af: f16 = @floatCast(spec.a_f32[j * k + t]);
+                ba += b_row[j] * @as(f64, @floatCast(af));
+            }
+            const eff = @as(f64, @floatCast(w0_f16)) + s64 * ba;
+            row_eff[t] = eff;
+            norm_sq += eff * eff;
+        }
+        const gamma: f64 = if (spec.dora_mag_f32) |mag|
+            @as(f64, mag[i]) / @sqrt(norm_sq + 1.0e-12)
+        else
+            1.0;
+        for (0..k) |t| {
+            const final_f16: f16 = @floatCast(gamma * row_eff[t]);
+            std.mem.writeInt(u16, out[(i * k + t) * 2 ..][0..2], @bitCast(final_f16), .little);
+        }
+    }
+    return out;
+}
+
+fn buildSynthInkling2LoopAmf(
+    allocator: std.mem.Allocator,
+    overlay: ?SynthInkling2LoraOverlay,
+) !struct { cfg: GraphConfig, amf_bytes: []u8 } {
+    const vocab: u32 = 64;
+    const h: u32 = 64;
+    const n_layers: u32 = 4;
+    const n_heads: u32 = 2;
+    const n_kv: u32 = 2;
+    const head_dim: u32 = 32;
+    const qd: u32 = n_heads * head_dim;
+    const kvd: u32 = n_kv * head_dim;
+    const d_rel: u32 = 16;
+    const rel_extent: u32 = 16;
+    const inter: u32 = 64;
+    const n_exp: u32 = 4;
+    const top_k: u32 = 2;
+
+    const layer_attns = try allocator.alloc(AttentionKind, n_layers);
+    @memset(layer_attns, .gqa_full);
+
+    const cfg: GraphConfig = .{
+        .axes = .{
+            .backbone_kind = .decoder_only,
+            .layer_attention_kinds = layer_attns,
+            .ffn_kind = .moe_swiglu,
+            .has_shared_expert = false,
+            .residual_kind = .single_stream,
+            .residual_branches = 1,
+            .memory_lookup_kind = .none,
+            .loop_schedule = .{
+                .mode = .native_recurrent,
+                .start_layer = 1,
+                .end_layer = 3,
+                .max_loops = 3,
+                .inject_x_init = false,
+                .adapter_kind = .none,
+                .early_exit_gate = .none,
+            },
+        },
+        .m82_family = .inkling2_loop,
+        .m82_cfg = .{
+            .d_rel = d_rel,
+            .rel_extent = rel_extent,
+            .sliding_window_size = 32,
+            .n_layers_per_attn_res_block = 2,
+            .qk_l2_clip_threshold = 4.0,
+            .rel_l2_clip_threshold = 4.0,
+            .log_scaling_n_floor = 0,
+            .log_scaling_alpha = 0.0,
+            .use_value_norm_no_gamma = true,
+            .final_logit_softcapping = 30.0,
+        },
+        .vocab_size = vocab,
+        .hidden_size = h,
+        .num_hidden_layers = n_layers,
+        .num_attention_heads = n_heads,
+        .num_key_value_heads = n_kv,
+        .head_dim = head_dim,
+        .intermediate_size = inter,
+        .moe_intermediate_size = inter,
+        .num_experts = n_exp,
+        .num_experts_per_tok = top_k,
+        .rope_theta = 10_000.0,
+    };
+
+    var blobs: std.ArrayListUnmanaged(TestTensorBlob) = .empty;
+    var owned_names: std.ArrayListUnmanaged([]u8) = .empty;
+    defer {
+        for (blobs.items) |b| allocator.free(b.bytes);
+        blobs.deinit(allocator);
+        for (owned_names.items) |n| allocator.free(n);
+        owned_names.deinit(allocator);
+    }
+
+    const addBlob = struct {
+        fn call(
+            alloc: std.mem.Allocator,
+            list: *std.ArrayListUnmanaged(TestTensorBlob),
+            names: *std.ArrayListUnmanaged([]u8),
+            nm: []const u8,
+            kind: amf.TensorKind,
+            dt: amf.DType,
+            layer: u16,
+            expert_id: u16,
+            shape: [4]u32,
+            ndim: u8,
+            data: []u8,
+        ) !void {
+            const dup = try alloc.dupe(u8, nm);
+            try names.append(alloc, dup);
+            try list.append(alloc, .{
+                .name = dup,
+                .kind = kind,
+                .dtype = dt,
+                .layout = .row_major,
+                .layer = layer,
+                .expert = expert_id,
+                .shape = shape,
+                .ndim = ndim,
+                .bytes = data,
+            });
+        }
+    }.call;
+
+    const addOverlayLin = struct {
+        fn call(
+            alloc: std.mem.Allocator,
+            list: *std.ArrayListUnmanaged(TestTensorBlob),
+            names: *std.ArrayListUnmanaged([]u8),
+            nm: []const u8,
+            layer: u32,
+            target: lora.TargetProjection,
+            n_out: u32,
+            k_in: u32,
+            seed: u64,
+            amp: f32,
+            ov: ?SynthInkling2LoraOverlay,
+        ) !void {
+            const base = try fillDeterministicF16(alloc, seed, @as(usize, n_out) * k_in, amp);
+            if (ov) |o| {
+                for (o.specs) |*sp| {
+                    if (sp.layer == layer and sp.target == target) {
+                        defer alloc.free(base);
+                        const merged = try applyOverlayToF16Weight(alloc, base, n_out, k_in, sp, o.scale);
+                        try addBlob(alloc, list, names, nm, .dense, .f16, @intCast(layer), amf.NO_EXPERT, .{ n_out, k_in, 0, 0 }, 2, merged);
+                        return;
+                    }
+                }
+            }
+            try addBlob(alloc, list, names, nm, .dense, .f16, @intCast(layer), amf.NO_EXPERT, .{ n_out, k_in, 0, 0 }, 2, base);
+        }
+    }.call;
+
+    try addBlob(allocator, &blobs, &owned_names, "embed_tokens", .embedding, .f16, amf.NO_LAYER, amf.NO_EXPERT, .{ vocab, h, 0, 0 }, 2, try fillDeterministicF16(allocator, 8101, vocab * h, 0.20));
+
+    var nbuf: [128]u8 = undefined;
+    for (0..n_layers) |l| {
+        const l32: u32 = @intCast(l);
+        const sb: u64 = 9000 + l * 100;
+        try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.attn_norm.weight", .{l}), .norm, .bf16, @intCast(l), amf.NO_EXPERT, .{ h, 0, 0, 0 }, 1, try fillConstantBf16(allocator, h, 1.0));
+        try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.mlp_norm.weight", .{l}), .norm, .bf16, @intCast(l), amf.NO_EXPERT, .{ h, 0, 0, 0 }, 1, try fillConstantBf16(allocator, h, 1.0));
+
+        try addOverlayLin(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.attn.wq_du", .{l}), l32, .q_proj, qd, h, sb + 1, 0.08, overlay);
+        try addOverlayLin(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.attn.wk_dv", .{l}), l32, .k_proj, kvd, h, sb + 2, 0.08, overlay);
+        try addOverlayLin(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.attn.wv_dv", .{l}), l32, .v_proj, kvd, h, sb + 3, 0.08, overlay);
+        try addOverlayLin(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.attn.wo_ud", .{l}), l32, .o_proj, h, qd, sb + 4, 0.08, overlay);
+        try addOverlayLin(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.attn.wr_du", .{l}), l32, .wr_du, n_heads * d_rel, h, sb + 5, 0.06, overlay);
+        try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.attn.rel_logits_proj.proj", .{l}), .dense, .f16, @intCast(l), amf.NO_EXPERT, .{ rel_extent, d_rel, 0, 0 }, 2, try fillDeterministicF16(allocator, sb + 6, rel_extent * d_rel, 0.08));
+        try addOverlayLin(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.attn.gate_attn", .{l}), l32, .gate_attn, qd, h, sb + 7, 0.08, overlay);
+
+        try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.mlp.gate", .{l}), .router, .f16, @intCast(l), amf.NO_EXPERT, .{ n_exp, h, 0, 0 }, 2, try fillDeterministicF16(allocator, sb + 8, n_exp * h, 0.12));
+        for (0..n_exp) |e| {
+            const es: u64 = sb + 20 + e * 4;
+            try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.mlp.experts.{d}.w13", .{ l, e }), .hot_expert, .f16, @intCast(l), @intCast(e), .{ 2 * inter, h, 0, 0 }, 2, try fillDeterministicF16(allocator, es + 1, 2 * inter * h, 0.06));
+            try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.mlp.experts.{d}.down_proj", .{ l, e }), .hot_expert, .f16, @intCast(l), @intCast(e), .{ h, inter, 0, 0 }, 2, try fillDeterministicF16(allocator, es + 2, h * inter, 0.06));
+        }
+    }
+
+    try addBlob(allocator, &blobs, &owned_names, "norm.weight", .norm, .bf16, amf.NO_LAYER, amf.NO_EXPERT, .{ h, 0, 0, 0 }, 1, try fillConstantBf16(allocator, h, 1.0));
+    try addBlob(allocator, &blobs, &owned_names, "lm_head", .lm_head, .f16, amf.NO_LAYER, amf.NO_EXPERT, .{ vocab, h, 0, 0 }, 2, try fillDeterministicF16(allocator, 8999, vocab * h, 0.15));
+
+    const amf_bytes = try buildTestAmf(allocator, "test-inkling2-loop-lora", blobs.items);
+    return .{ .cfg = cfg, .amf_bytes = amf_bytes };
+}
+
+fn fillDeterministicF32Slice(dst: []f32, seed: u64, amp: f32) void {
+    var prng = std.Random.DefaultPrng.init(seed);
+    const r = prng.random();
+    for (dst) |*v| v.* = (r.float(f32) * 2.0 - 1.0) * amp;
+}
+
+test "M9.5 W30: Inkling2Loop zero-flush GPU LoRA (r=16) and exact PEFT DoRA parity + bit-exact base restore" {
+    const allocator = std.testing.allocator;
+    const h: u32 = 64;
+    const r_std: u32 = 16;
+    const alpha_std: f32 = 32.0;
+    const scale_std: f32 = alpha_std / @as(f32, @floatFromInt(r_std));
+
+    const r_dora: u32 = 4;
+    const alpha_dora: f32 = 8.0;
+    const scale_dora: f32 = alpha_dora / @as(f32, @floatFromInt(r_dora));
+
+    const targets = [_]struct { t: lora.TargetProjection, suf: []const u8 }{
+        .{ .t = .q_proj, .suf = "attn.wq_du" },
+        .{ .t = .k_proj, .suf = "attn.wk_dv" },
+        .{ .t = .v_proj, .suf = "attn.wv_dv" },
+        .{ .t = .o_proj, .suf = "attn.wo_ud" },
+        .{ .t = .gate_attn, .suf = "attn.gate_attn" },
+    };
+
+    // Build standard LoRA (r = 16) specs on Core physical layers 1 & 2 (executed 3x across Core x 3!).
+    var std_specs: [10]lora.SyntheticLoraSpec = undefined;
+    var std_a_bufs: [10][]f32 = undefined;
+    var std_b_bufs: [10][]f32 = undefined;
+    defer for (0..10) |idx| {
+        allocator.free(std_a_bufs[idx]);
+        allocator.free(std_b_bufs[idx]);
+    };
+    var si: usize = 0;
+    for ([_]u32{ 1, 2 }) |layer_id| {
+        for (targets, 0..) |tg, ti| {
+            std_a_bufs[si] = try allocator.alloc(f32, r_std * h);
+            std_b_bufs[si] = try allocator.alloc(f32, h * r_std);
+            fillDeterministicF32Slice(std_a_bufs[si], 10_000 + layer_id * 31 + ti * 7, 0.12);
+            fillDeterministicF32Slice(std_b_bufs[si], 20_000 + layer_id * 37 + ti * 11, 0.12);
+            std_specs[si] = .{
+                .layer = layer_id,
+                .target = tg.t,
+                .n = h,
+                .k = h,
+                .rank = r_std,
+                .layout = .row_major,
+                .dtype = .f16,
+                .a_f32 = std_a_bufs[si],
+                .b_f32 = std_b_bufs[si],
+                .custom_suffix = tg.suf,
+            };
+            si += 1;
+        }
+    }
+
+    // Build DoRA (r = 4, use_dora = true) specs on Core physical layers 1 & 2 (including wo_ud before residual!).
+    var dora_specs: [10]lora.SyntheticLoraSpec = undefined;
+    var dora_a_bufs: [10][]f32 = undefined;
+    var dora_b_bufs: [10][]f32 = undefined;
+    var dora_m_bufs: [10][]f32 = undefined;
+    defer for (0..10) |idx| {
+        allocator.free(dora_a_bufs[idx]);
+        allocator.free(dora_b_bufs[idx]);
+        allocator.free(dora_m_bufs[idx]);
+    };
+    si = 0;
+    for ([_]u32{ 1, 2 }) |layer_id| {
+        for (targets, 0..) |tg, ti| {
+            dora_a_bufs[si] = try allocator.alloc(f32, r_dora * h);
+            dora_b_bufs[si] = try allocator.alloc(f32, h * r_dora);
+            dora_m_bufs[si] = try allocator.alloc(f32, h);
+            fillDeterministicF32Slice(dora_a_bufs[si], 30_000 + layer_id * 41 + ti * 13, 0.10);
+            fillDeterministicF32Slice(dora_b_bufs[si], 40_000 + layer_id * 43 + ti * 17, 0.10);
+            for (dora_m_bufs[si], 0..) |*mv, row_i| {
+                mv.* = 0.75 + 0.01 * @as(f32, @floatFromInt((row_i * 7 + ti * 3 + layer_id) % 50));
+            }
+            dora_specs[si] = .{
+                .layer = layer_id,
+                .target = tg.t,
+                .n = h,
+                .k = h,
+                .rank = r_dora,
+                .layout = .row_major,
+                .dtype = .f16,
+                .a_f32 = dora_a_bufs[si],
+                .b_f32 = dora_b_bufs[si],
+                .dora_mag_f32 = dora_m_bufs[si],
+                .custom_suffix = tg.suf,
+            };
+            si += 1;
+        }
+    }
+
+    const std_amlora = try lora.buildSyntheticAmloraBytes(allocator, "ink-r16", r_std, alpha_std, &std_specs);
+    defer allocator.free(std_amlora);
+    const dora_amlora = try lora.buildSyntheticAmloraBytes(allocator, "ink-dora", r_dora, alpha_dora, &dora_specs);
+    defer allocator.free(dora_amlora);
+
+    // Build base + two merged-weight reference Inkling2Loop AMF models.
+    var base_bundle = try buildSynthInkling2LoopAmf(allocator, null);
+    defer {
+        base_bundle.cfg.deinit(allocator);
+        allocator.free(base_bundle.amf_bytes);
+    }
+    var merged_std_bundle = try buildSynthInkling2LoopAmf(allocator, .{ .specs = &std_specs, .scale = scale_std });
+    defer {
+        merged_std_bundle.cfg.deinit(allocator);
+        allocator.free(merged_std_bundle.amf_bytes);
+    }
+    var merged_dora_bundle = try buildSynthInkling2LoopAmf(allocator, .{ .specs = &dora_specs, .scale = scale_dora });
+    defer {
+        merged_dora_bundle.cfg.deinit(allocator);
+        allocator.free(merged_dora_bundle.amf_bytes);
+    }
+
+    var model = try GraphModel.loadFromBytes(allocator, base_bundle.amf_bytes, base_bundle.cfg, .{
+        .max_seq_len = 64,
+        .max_tree_nodes = 8,
+    });
+    defer model.deinit(allocator);
+
+    var merged_std = try GraphModel.loadFromBytes(allocator, merged_std_bundle.amf_bytes, merged_std_bundle.cfg, .{
+        .max_seq_len = 64,
+        .max_tree_nodes = 8,
+    });
+    defer merged_std.deinit(allocator);
+
+    var merged_dora = try GraphModel.loadFromBytes(allocator, merged_dora_bundle.amf_bytes, merged_dora_bundle.cfg, .{
+        .max_seq_len = 64,
+        .max_tree_nodes = 8,
+    });
+    defer merged_dora.deinit(allocator);
+
+    const prompt = [_]u32{ 3, 11, 27, 42 };
+
+    // 1. Baseline logits (0 adapters attached).
+    model.resetM82Stats();
+    const base_t0 = try model.prefillChunk(&prompt, 0, true);
+    const base_t1 = try model.stepDecode(base_t0, 4);
+    try std.testing.expectEqual(@as(u64, 0), model.m82Stats().?.mid_pass_flushes);
+    var base_logits_bits: [64]u16 = undefined;
+    for (model.readLastLogitsF16(), 0..) |v, i| base_logits_bits[i] = @bitCast(v);
+
+    // 2. Attach LoraRegistry, load standard r=16 LoRA + exact PEFT DoRA, calibrate DoRA.
+    var reg = try lora.LoraRegistry.init(.{
+        .pool_bytes = 4 * 1024 * 1024,
+        .allocator = allocator,
+        .base_shape = model.baseModelShape(),
+    });
+    defer reg.deinit(allocator);
+    try model.attachLoraRegistry(&reg);
+    defer model.attachLoraRegistry(null) catch |err| {
+        std.debug.panic("attachLoraRegistry(null) failed in test defer: {}", .{err});
+    };
+
+    const slot_std = try reg.loadAdapterFromBytes(allocator, "ink-r16", std_amlora);
+    const slot_dora = try reg.loadAdapterFromBytes(allocator, "ink-dora", dora_amlora);
+    try model.calibrateLoraDora(allocator);
+
+    // 3. Standard r=16 LoRA parity vs merged_std across prefill + stepDecode + verifyTree, zero flushes!
+    try model.setActiveLoraAdapter("ink-r16");
+    try std.testing.expectEqual(slot_std, model.active_lora_slot);
+    model.resetKvCache();
+    model.resetM82Stats();
+    const l_t0 = try model.prefillChunk(&prompt, 0, true);
+    const l_t1 = try model.stepDecode(l_t0, 4);
+    const m_t0 = try merged_std.prefillChunk(&prompt, 0, true);
+    const m_t1 = try merged_std.stepDecode(m_t0, 4);
+    try std.testing.expectEqual(@as(u64, 0), model.m82Stats().?.mid_pass_flushes);
+    try std.testing.expectEqual(m_t0, l_t0);
+    try std.testing.expectEqual(m_t1, l_t1);
+
+    var max_diff_std: f32 = 0.0;
+    var diff_vs_base_std: f32 = 0.0;
+    const got_std = model.readLastLogitsF16();
+    const ref_std = merged_std.readLastLogitsF16();
+    for (0..64) |i| {
+        const g: f32 = @floatCast(got_std[i]);
+        const rf: f32 = @floatCast(ref_std[i]);
+        const bf: f32 = @floatCast(@as(f16, @bitCast(base_logits_bits[i])));
+        max_diff_std = @max(max_diff_std, @abs(g - rf));
+        diff_vs_base_std = @max(diff_vs_base_std, @abs(g - bf));
+    }
+    try std.testing.expect(diff_vs_base_std > 1e-2);
+    try std.testing.expect(max_diff_std < 5e-2);
+
+    // Also verifyTree parity with zero flushes!
+    const l_vr = try model.verifyTree(&.{ l_t1, 7 }, &.{ 5, 6 }, &.{ 0b01, 0b11 }, 5);
+    const m_vr = try merged_std.verifyTree(&.{ m_t1, 7 }, &.{ 5, 6 }, &.{ 0b01, 0b11 }, 5);
+    try std.testing.expectEqual(@as(u64, 0), model.m82Stats().?.mid_pass_flushes);
+    try std.testing.expectEqualSlices(u32, m_vr.argmax_tokens[0..2], l_vr.argmax_tokens[0..2]);
+
+    // 4. Exact PEFT DoRA parity vs merged_dora across Core x 3, zero flushes!
+    model.setActiveLoraSlot(slot_dora);
+    model.resetKvCache();
+    model.resetM82Stats();
+    const d_t0 = try model.prefillChunk(&prompt, 0, true);
+    const d_t1 = try model.stepDecode(d_t0, 4);
+    const md_t0 = try merged_dora.prefillChunk(&prompt, 0, true);
+    const md_t1 = try merged_dora.stepDecode(md_t0, 4);
+    try std.testing.expectEqual(@as(u64, 0), model.m82Stats().?.mid_pass_flushes);
+    try std.testing.expectEqual(md_t0, d_t0);
+    try std.testing.expectEqual(md_t1, d_t1);
+
+    var max_diff_dora: f32 = 0.0;
+    var diff_vs_base_dora: f32 = 0.0;
+    const got_dora = model.readLastLogitsF16();
+    const ref_dora = merged_dora.readLastLogitsF16();
+    for (0..64) |i| {
+        const g: f32 = @floatCast(got_dora[i]);
+        const rf: f32 = @floatCast(ref_dora[i]);
+        const bf: f32 = @floatCast(@as(f16, @bitCast(base_logits_bits[i])));
+        max_diff_dora = @max(max_diff_dora, @abs(g - rf));
+        diff_vs_base_dora = @max(diff_vs_base_dora, @abs(g - bf));
+    }
+    try std.testing.expect(diff_vs_base_dora > 1e-2);
+    try std.testing.expect(max_diff_dora < 5e-2);
+
+    // 5. Bit-exact base logits restored on NO_ADAPTER and after unloading all adapters!
+    model.setActiveLoraSlot(lora.NO_ADAPTER);
+    model.resetKvCache();
+    const r0 = try model.prefillChunk(&prompt, 0, true);
+    const r1 = try model.stepDecode(r0, 4);
+    try std.testing.expectEqual(base_t0, r0);
+    try std.testing.expectEqual(base_t1, r1);
+    for (model.readLastLogitsF16(), 0..) |v, i| {
+        try std.testing.expectEqual(base_logits_bits[i], @as(u16, @bitCast(v)));
+    }
+
+    try reg.unloadAdapter(allocator, "ink-r16");
+    try reg.unloadAdapter(allocator, "ink-dora");
+    model.resetKvCache();
+    const un_t0 = try model.prefillChunk(&prompt, 0, true);
+    const un_t1 = try model.stepDecode(un_t0, 4);
+    try std.testing.expectEqual(base_t0, un_t0);
+    try std.testing.expectEqual(base_t1, un_t1);
+    for (model.readLastLogitsF16(), 0..) |v, i| {
+        try std.testing.expectEqual(base_logits_bits[i], @as(u16, @bitCast(v)));
+    }
+}
+
+test "M9.5 W30: GraphBatchRuntime heterogeneous multi-slot LoRA + DoRA (base + adapter A + adapter B) parity" {
+    const allocator = std.testing.allocator;
+    var bundle = try buildSynthLoopDenseBundle(allocator, .{
+        .hidden_size = 128,
+        .vocab_size = 128,
+        .num_layers = 2,
+        .num_attention_heads = 2,
+        .num_key_value_heads = 2,
+        .head_dim = 64,
+        .intermediate_size = 256,
+        .start_layer = 0,
+        .end_layer = 2,
+        .mode = .single_pass,
+        .max_loops = 1,
+        .include_early_exit = false,
+        .include_steplora = false,
+        .use_q4 = false,
+    });
+    defer bundle.deinit(allocator);
+
+    const h: u32 = 128;
+    const inter: u32 = 256;
+
+    // Adapter A: standard LoRA (r = 8) on q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj (layer 0 & 1).
+    const r_a: u32 = 8;
+    const a_defs = [_]struct { l: u32, t: lora.TargetProjection, n: u32, k: u32 }{
+        .{ .l = 0, .t = .q_proj, .n = h, .k = h },
+        .{ .l = 0, .t = .v_proj, .n = h, .k = h },
+        .{ .l = 0, .t = .o_proj, .n = h, .k = h },
+        .{ .l = 0, .t = .gate_proj, .n = inter, .k = h },
+        .{ .l = 0, .t = .up_proj, .n = inter, .k = h },
+        .{ .l = 0, .t = .down_proj, .n = h, .k = inter },
+        .{ .l = 1, .t = .q_proj, .n = h, .k = h },
+        .{ .l = 1, .t = .down_proj, .n = h, .k = inter },
+    };
+    var specs_a: [a_defs.len]lora.SyntheticLoraSpec = undefined;
+    var bufs_a_a: [a_defs.len][]f32 = undefined;
+    var bufs_a_b: [a_defs.len][]f32 = undefined;
+    defer for (0..a_defs.len) |i| {
+        allocator.free(bufs_a_a[i]);
+        allocator.free(bufs_a_b[i]);
+    };
+    for (a_defs, 0..) |d, i| {
+        bufs_a_a[i] = try allocator.alloc(f32, r_a * d.k);
+        bufs_a_b[i] = try allocator.alloc(f32, d.n * r_a);
+        fillDeterministicF32Slice(bufs_a_a[i], 50_000 + i * 19, 0.14);
+        fillDeterministicF32Slice(bufs_a_b[i], 60_000 + i * 23, 0.14);
+        specs_a[i] = .{
+            .layer = d.l,
+            .target = d.t,
+            .n = d.n,
+            .k = d.k,
+            .rank = r_a,
+            .a_f32 = bufs_a_a[i],
+            .b_f32 = bufs_a_b[i],
+        };
+    }
+    const amlora_a = try lora.buildSyntheticAmloraBytes(allocator, "adp-a", r_a, 16.0, &specs_a);
+    defer allocator.free(amlora_a);
+
+    // Adapter B: DoRA (r = 4, use_dora = true) on q_proj, o_proj, down_proj (layer 0 & 1).
+    const r_b: u32 = 4;
+    const b_defs = [_]struct { l: u32, t: lora.TargetProjection, n: u32, k: u32 }{
+        .{ .l = 0, .t = .q_proj, .n = h, .k = h },
+        .{ .l = 0, .t = .o_proj, .n = h, .k = h },
+        .{ .l = 0, .t = .down_proj, .n = h, .k = inter },
+        .{ .l = 1, .t = .o_proj, .n = h, .k = h },
+        .{ .l = 1, .t = .down_proj, .n = h, .k = inter },
+    };
+    var specs_b: [b_defs.len]lora.SyntheticLoraSpec = undefined;
+    var bufs_b_a: [b_defs.len][]f32 = undefined;
+    var bufs_b_b: [b_defs.len][]f32 = undefined;
+    var bufs_b_m: [b_defs.len][]f32 = undefined;
+    defer for (0..b_defs.len) |i| {
+        allocator.free(bufs_b_a[i]);
+        allocator.free(bufs_b_b[i]);
+        allocator.free(bufs_b_m[i]);
+    };
+    for (b_defs, 0..) |d, i| {
+        bufs_b_a[i] = try allocator.alloc(f32, r_b * d.k);
+        bufs_b_b[i] = try allocator.alloc(f32, d.n * r_b);
+        bufs_b_m[i] = try allocator.alloc(f32, d.n);
+        fillDeterministicF32Slice(bufs_b_a[i], 70_000 + i * 29, 0.12);
+        fillDeterministicF32Slice(bufs_b_b[i], 80_000 + i * 31, 0.12);
+        for (bufs_b_m[i], 0..) |*mv, ri| mv.* = 0.8 + 0.005 * @as(f32, @floatFromInt((ri * 5 + i * 7) % 60));
+        specs_b[i] = .{
+            .layer = d.l,
+            .target = d.t,
+            .n = d.n,
+            .k = d.k,
+            .rank = r_b,
+            .a_f32 = bufs_b_a[i],
+            .b_f32 = bufs_b_b[i],
+            .dora_mag_f32 = bufs_b_m[i],
+        };
+    }
+    const amlora_b = try lora.buildSyntheticAmloraBytes(allocator, "adp-b", r_b, 8.0, &specs_b);
+    defer allocator.free(amlora_b);
+
+    // Independent single-stream reference runs for base, adp-a, adp-b.
+    var serial_m = try GraphModel.loadFromBytes(allocator, bundle.amf_bytes, bundle.cfg, .{
+        .max_seq_len = 128,
+        .max_tree_nodes = 16,
+    });
+    defer serial_m.deinit(allocator);
+    var reg_ref = try lora.LoraRegistry.init(.{
+        .pool_bytes = 4 * 1024 * 1024,
+        .allocator = allocator,
+        .base_shape = serial_m.baseModelShape(),
+    });
+    defer reg_ref.deinit(allocator);
+    try serial_m.attachLoraRegistry(&reg_ref);
+    defer serial_m.attachLoraRegistry(null) catch |err| {
+        std.debug.panic("attachLoraRegistry(null) failed in test defer: {}", .{err});
+    };
+    const ref_slot_a = try reg_ref.loadAdapterFromBytes(allocator, "adp-a", amlora_a);
+    const ref_slot_b = try reg_ref.loadAdapterFromBytes(allocator, "adp-b", amlora_b);
+    try serial_m.calibrateLoraDora(allocator);
+
+    const p0 = [_]u32{ 5, 19, 37, 61 };
+    const p1 = [_]u32{ 7, 23, 41, 67, 83 };
+    const p2 = [_]u32{ 11, 29, 43, 71 };
+    const prompts = [_][]const u32{ &p0, &p1, &p2 };
+    const ref_lslots = [_]u32{ lora.NO_ADAPTER, ref_slot_a, ref_slot_b };
+
+    var ref_toks: [3][3]u32 = undefined;
+    var ref_final_logits: [3][128]f32 = undefined;
+    for (0..3) |s| {
+        serial_m.setActiveLoraSlot(ref_lslots[s]);
+        serial_m.resetKvCache();
+        const t0 = try serial_m.prefillChunk(prompts[s], 0, true);
+        const t1 = try serial_m.stepDecode(t0, @intCast(prompts[s].len));
+        const t2 = try serial_m.stepDecode(t1, @intCast(prompts[s].len + 1));
+        ref_toks[s] = .{ t0, t1, t2 };
+        for (serial_m.readLastLogitsF16(), 0..) |v, vi| ref_final_logits[s][vi] = @floatCast(v);
+    }
+
+    // Now run all 3 slots concurrently in ONE GraphBatchRuntime!
+    var batch_m = try GraphModel.loadFromBytes(allocator, bundle.amf_bytes, bundle.cfg, .{
+        .max_seq_len = 128,
+        .max_tree_nodes = 16,
+    });
+    defer batch_m.deinit(allocator);
+    var reg_b = try lora.LoraRegistry.init(.{
+        .pool_bytes = 4 * 1024 * 1024,
+        .allocator = allocator,
+        .base_shape = batch_m.baseModelShape(),
+    });
+    defer reg_b.deinit(allocator);
+    try batch_m.attachLoraRegistry(&reg_b);
+    defer batch_m.attachLoraRegistry(null) catch |err| {
+        std.debug.panic("attachLoraRegistry(null) failed in test defer: {}", .{err});
+    };
+    _ = try reg_b.loadAdapterFromBytes(allocator, "adp-a", amlora_a);
+    _ = try reg_b.loadAdapterFromBytes(allocator, "adp-b", amlora_b);
+    try batch_m.calibrateLoraDora(allocator);
+
+    var rt = try GraphBatchRuntime.init(allocator, &batch_m, .{
+        .max_slots = 4,
+        .prefix_cache_chunks = 8,
+    });
+    defer rt.deinit(allocator);
+
+    rt.setSlotLora(0, lora.NO_ADAPTER);
+    try rt.setSlotLoraAdapter(1, "adp-a");
+    try rt.setSlotLoraAdapter(2, "adp-b");
+
+    var rng0 = try rng_mod.RequestRng.init(101);
+    var rng1 = try rng_mod.RequestRng.init(102);
+    var rng2 = try rng_mod.RequestRng.init(103);
+    const rng_ptrs = [_]*rng_mod.RequestRng{ &rng0, &rng1, &rng2 };
+
+    var cur_toks: [3]u32 = undefined;
+    var cur_pos: [3]u32 = undefined;
+    for (0..3) |s| {
+        const pr = try rt.prefillSlot(&.{
+            .slot_id = @intCast(s),
+            .request_id = s + 1,
+            .user_tag = s,
+            .tokens = prompts[s],
+            .start_pos = 0,
+            .total_prompt_len = @intCast(prompts[s].len),
+            .is_final_chunk = true,
+            .prefix_handle = s + 1,
+            .temperature = 0.0,
+            .rng = rng_ptrs[s],
+            .ngram_domain = "",
+        });
+        cur_toks[s] = pr.first_token;
+        cur_pos[s] = @intCast(prompts[s].len);
+        try std.testing.expectEqual(ref_toks[s][0], cur_toks[s]);
+    }
+
+    const slot_ids = [_]u16{ 0, 1, 2 };
+    const req_ids = [_]u64{ 1, 2, 3 };
+    const tags = [_]u64{ 0, 1, 2 };
+    const temps = [_]f32{ 0.0, 0.0, 0.0 };
+    const domains = [_][]const u8{ "", "", "" };
+    const handles = [_]u64{ 1, 2, 3 };
+    var next_toks: [3]u32 = undefined;
+
+    for (1..3) |step| {
+        try rt.stepDecodeBatch(&.{
+            .slot_ids = &slot_ids,
+            .request_ids = &req_ids,
+            .user_tags = &tags,
+            .input_tokens = &cur_toks,
+            .seq_positions = &cur_pos,
+            .temperatures = &temps,
+            .rngs = &rng_ptrs,
+            .ngram_domains = &domains,
+            .prefix_handles = &handles,
+        }, &next_toks);
+        for (0..3) |s| {
+            try std.testing.expectEqual(ref_toks[s][step], next_toks[s]);
+            cur_toks[s] = next_toks[s];
+            cur_pos[s] += 1;
+        }
+    }
+
+    // Verify per-slot final logits match single-stream references tightly!
+    for (0..3) |s| {
+        var max_diff: f32 = 0.0;
+        const row = batch_m.logits_host[s * 128 .. (s + 1) * 128];
+        for (0..128) |vi| {
+            max_diff = @max(max_diff, @abs(@as(f32, @floatCast(row[vi])) - ref_final_logits[s][vi]));
+        }
+        try std.testing.expect(max_diff < 5e-2);
+    }
 }

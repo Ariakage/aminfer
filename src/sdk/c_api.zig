@@ -22,6 +22,7 @@ const amf_mod = aminfer.amf;
 const tokenizer_mod = aminfer.tokenizer;
 const chat_template_mod = aminfer.chat_template;
 const qwen3 = aminfer.qwen3;
+const lora_mod = aminfer.lora;
 const graph = aminfer.graph;
 const vision_mod = aminfer.vision;
 const attention = aminfer.attention;
@@ -386,6 +387,15 @@ pub const SpecStats = extern struct {
     mean_accept_len: f64,
 };
 
+pub const LoraInfo = extern struct {
+    struct_size: u32,
+    active_adapters: u32,
+    active_slot: u32,
+    max_adapters: u32,
+    pool_capacity_bytes: u64,
+    pool_used_bytes: u64,
+};
+
 comptime {
     std.debug.assert(ABI_VERSION == sdk_c.AMI_SDK_ABI_VERSION);
     std.debug.assert(@sizeOf(HostVmInfo) == @sizeOf(sdk_c.ami_sdk_host_vm_info));
@@ -428,6 +438,14 @@ comptime {
     std.debug.assert(@sizeOf(SpecOptions) == @sizeOf(sdk_c.ami_sdk_spec_options));
     std.debug.assert(@offsetOf(SpecOptions, "draft_mode") == @offsetOf(sdk_c.ami_sdk_spec_options, "draft_mode"));
     std.debug.assert(@offsetOf(SpecOptions, "draft_amf_path") == @offsetOf(sdk_c.ami_sdk_spec_options, "draft_amf_path"));
+    std.debug.assert(@sizeOf(LoraInfo) == @sizeOf(sdk_c.ami_sdk_lora_info));
+    std.debug.assert(@alignOf(LoraInfo) == @alignOf(sdk_c.ami_sdk_lora_info));
+    std.debug.assert(@offsetOf(LoraInfo, "struct_size") == @offsetOf(sdk_c.ami_sdk_lora_info, "struct_size"));
+    std.debug.assert(@offsetOf(LoraInfo, "active_adapters") == @offsetOf(sdk_c.ami_sdk_lora_info, "active_adapters"));
+    std.debug.assert(@offsetOf(LoraInfo, "active_slot") == @offsetOf(sdk_c.ami_sdk_lora_info, "active_slot"));
+    std.debug.assert(@offsetOf(LoraInfo, "max_adapters") == @offsetOf(sdk_c.ami_sdk_lora_info, "max_adapters"));
+    std.debug.assert(@offsetOf(LoraInfo, "pool_capacity_bytes") == @offsetOf(sdk_c.ami_sdk_lora_info, "pool_capacity_bytes"));
+    std.debug.assert(@offsetOf(LoraInfo, "pool_used_bytes") == @offsetOf(sdk_c.ami_sdk_lora_info, "pool_used_bytes"));
     std.debug.assert(@offsetOf(SpecOptions, "confidence_threshold") == @offsetOf(sdk_c.ami_sdk_spec_options, "confidence_threshold"));
     std.debug.assert(@sizeOf(SpecStats) == @sizeOf(sdk_c.ami_sdk_spec_stats));
     std.debug.assert(@offsetOf(SpecStats, "active_draft_mode") == @offsetOf(sdk_c.ami_sdk_spec_stats, "active_draft_mode"));
@@ -1033,6 +1051,8 @@ pub const SdkEngine = struct {
     dflare_loaded: ?*spec_engine.LoadedDFlareProposer = null,
     dfly2_loaded: ?*spec_engine.LoadedDFly2Proposer = null,
     spec_eng: ?*spec_engine.SpecEngine = null,
+    lora_registry: ?*lora_mod.LoraRegistry = null,
+    active_lora_slot: u32 = lora_mod.NO_ADAPTER,
 
     vocab_size: u32,
     hidden_size: u32,
@@ -1083,10 +1103,12 @@ pub const SdkEngine = struct {
     }
 
     fn totalModelWiredBytes(self: *const SdkEngine) u64 {
-        return switch (self.backend) {
+        const base: u64 = switch (self.backend) {
             .qwen3 => |*m| m.totalWiredBytes(),
             .graph => |*m| m.totalWiredBytes(),
         };
+        const lora_bytes: u64 = if (self.lora_registry) |reg| reg.poolSlice().len else 0;
+        return base + lora_bytes;
     }
 
     fn metalDevice(self: *const SdkEngine) metal.Device {
@@ -1181,6 +1203,18 @@ pub const SdkEngine = struct {
 
     fn destroy(self: *SdkEngine, allocator: std.mem.Allocator) void {
         self.clearSpeculative(allocator);
+        if (self.lora_registry) |reg| {
+            switch (self.backend) {
+                .qwen3 => |*m| m.attachLoraRegistry(null),
+                .graph => |*m| m.attachLoraRegistry(null) catch |err| {
+                    std.debug.panic("GraphModel.attachLoraRegistry(null) failed in SdkEngine.destroy: {}", .{err});
+                },
+            }
+            reg.deinit(allocator);
+            allocator.destroy(reg);
+            self.lora_registry = null;
+            self.active_lora_slot = lora_mod.NO_ADAPTER;
+        }
         if (self.gpu_sampler) |*gs| {
             gs.close();
             self.gpu_sampler = null;
@@ -2112,6 +2146,249 @@ pub export fn ami_sdk_engine_query_stats(
 pub export fn ami_sdk_engine_tokenizer(engine: ?*const SdkEngine) callconv(.c) ?*const SdkTokenizer {
     const eng = engine orelse return null;
     return eng.owned_tokenizer;
+}
+
+fn mapLoraError(err: anyerror) Status {
+    return switch (err) {
+        error.BudgetExceeded, error.PoolCapExceeded, error.PoolExhausted => AMI_SDK_ERR_BUDGET_EXCEEDED,
+        error.OutOfMemory => AMI_SDK_ERR_OUT_OF_MEMORY,
+        error.OpenFailed, error.StatFailed, error.ReadFailed, error.ShortRead => AMI_SDK_ERR_IO,
+        error.InvalidMagic,
+        error.UnsupportedVersion,
+        error.TruncatedFile,
+        error.InvalidJson,
+        error.MissingTensor,
+        error.DimensionMismatch,
+        error.UnsupportedDType,
+        error.UnsupportedRank,
+        error.UnsupportedLayout,
+        error.CrcMismatch,
+        => AMI_SDK_ERR_FORMAT,
+        else => AMI_SDK_ERR_INVALID_ARGUMENT,
+    };
+}
+
+fn fileSizePosix(path: [:0]const u8) ?usize {
+    const fd = std.c.open(path.ptr, .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+    if (fd < 0) return null;
+    defer _ = std.c.close(fd);
+    var st: std.c.Stat = undefined;
+    if (std.c.fstat(fd, &st) != 0 or st.size <= 0) return null;
+    return @intCast(st.size);
+}
+
+fn initLoraPoolInternal(eng: *SdkEngine, requested_bytes: usize) Status {
+    const raw_bytes: usize = if (requested_bytes == 0) lora_mod.DEFAULT_LORA_POOL_BYTES else requested_bytes;
+    const eff_bytes = page.alignUp(raw_bytes) catch {
+        return fail(AMI_SDK_ERR_INVALID_ARGUMENT, "pool_bytes overflow");
+    };
+    if (eff_bytes > lora_mod.MAX_LORA_POOL_BYTES) {
+        return fail(AMI_SDK_ERR_BUDGET_EXCEEDED, "pool_bytes exceeds MAX_LORA_POOL_BYTES (256 MiB)");
+    }
+
+    if (eng.lora_registry) |existing| {
+        if (requested_bytes == 0 or existing.poolSlice().len >= eff_bytes) {
+            return AMI_SDK_OK;
+        }
+        if (existing.activeAdapterCount() > 0) {
+            return fail(AMI_SDK_ERR_INVALID_ARGUMENT, "cannot resize non-empty LoRA pool; unload adapters first");
+        }
+        switch (eng.backend) {
+            .qwen3 => |*m| m.attachLoraRegistry(null),
+            .graph => |*m| m.attachLoraRegistry(null) catch |err| {
+                return failFmt(AMI_SDK_ERR_METAL, "detach old LoRA pool failed: {s}", .{@errorName(err)});
+            },
+        }
+        existing.deinit(gpa);
+        gpa.destroy(existing);
+        eng.lora_registry = null;
+        eng.active_lora_slot = lora_mod.NO_ADAPTER;
+    }
+
+    const used_now = eng.totalModelWiredBytes() + eng.sdk_arena.bytes().len;
+    if (eng.wired_budget_bytes > 0 and used_now + eff_bytes > eng.wired_budget_bytes) {
+        return fail(AMI_SDK_ERR_BUDGET_EXCEEDED, "LoRA pool exceeds co-tenant wired_budget_bytes");
+    }
+
+    const base_shape: lora_mod.BaseModelShape = switch (eng.backend) {
+        .qwen3 => |*m| m.baseLoraShape(),
+        .graph => |*m| m.baseModelShape(),
+    };
+
+    const reg = gpa.create(lora_mod.LoraRegistry) catch {
+        return fail(AMI_SDK_ERR_OUT_OF_MEMORY, "failed to allocate LoraRegistry");
+    };
+    reg.* = lora_mod.LoraRegistry.init(.{
+        .pool_bytes = eff_bytes,
+        .allocator = gpa,
+        .wired_budget = null,
+        .base_shape = base_shape,
+    }) catch |err| {
+        gpa.destroy(reg);
+        return failFmt(mapLoraError(err), "LoraRegistry.init failed: {s}", .{@errorName(err)});
+    };
+
+    switch (eng.backend) {
+        .qwen3 => |*m| m.attachLoraRegistry(reg),
+        .graph => |*m| m.attachLoraRegistry(reg) catch |err| {
+            reg.deinit(gpa);
+            gpa.destroy(reg);
+            return failFmt(AMI_SDK_ERR_METAL, "GraphModel.attachLoraRegistry failed: {s}", .{@errorName(err)});
+        },
+    }
+    eng.lora_registry = reg;
+    eng.active_lora_slot = lora_mod.NO_ADAPTER;
+    return AMI_SDK_OK;
+}
+
+pub export fn ami_sdk_engine_init_lora_pool(
+    engine: ?*SdkEngine,
+    pool_bytes: usize,
+) callconv(.c) Status {
+    const pool = objc_autoreleasePoolPush();
+    defer objc_autoreleasePoolPop(pool);
+
+    const eng = engine orelse return fail(AMI_SDK_ERR_INVALID_ARGUMENT, "engine is NULL");
+    return initLoraPoolInternal(eng, pool_bytes);
+}
+
+pub export fn ami_sdk_engine_load_lora(
+    engine: ?*SdkEngine,
+    name_ptr: ?[*:0]const u8,
+    amlora_path_ptr: ?[*:0]const u8,
+    out_slot_id: ?*u32,
+) callconv(.c) Status {
+    const pool = objc_autoreleasePoolPush();
+    defer objc_autoreleasePoolPop(pool);
+
+    const eng = engine orelse return fail(AMI_SDK_ERR_INVALID_ARGUMENT, "engine is NULL");
+    const name_c = name_ptr orelse return fail(AMI_SDK_ERR_INVALID_ARGUMENT, "name is NULL");
+    const path_c = amlora_path_ptr orelse return fail(AMI_SDK_ERR_INVALID_ARGUMENT, "amlora_path is NULL");
+    const name_slice = std.mem.span(name_c);
+    const path_slice = std.mem.span(path_c);
+    if (name_slice.len == 0 or name_slice.len > lora_mod.MAX_ADAPTER_NAME_LEN) {
+        return fail(AMI_SDK_ERR_INVALID_ARGUMENT, "LoRA adapter name must be 1..64 bytes");
+    }
+    if (path_slice.len == 0) {
+        return fail(AMI_SDK_ERR_INVALID_ARGUMENT, "amlora_path is empty");
+    }
+
+    if (eng.lora_registry == null) {
+        const auto_pool: usize = if (fileSizePosix(path_slice)) |fsz|
+            @min(lora_mod.MAX_LORA_POOL_BYTES, @max(lora_mod.DEFAULT_LORA_POOL_BYTES, fsz + 256 * 1024))
+        else
+            lora_mod.DEFAULT_LORA_POOL_BYTES;
+        const init_rc = initLoraPoolInternal(eng, auto_pool);
+        if (init_rc != AMI_SDK_OK) return init_rc;
+    }
+
+    const reg = eng.lora_registry.?;
+    const slot_id = reg.loadAdapterFromFile(gpa, name_slice, path_slice) catch |err| {
+        return failFmt(mapLoraError(err), "loadAdapterFromFile failed: {s}", .{@errorName(err)});
+    };
+
+    switch (eng.backend) {
+        .qwen3 => {},
+        .graph => |*m| {
+            m.calibrateLoraDora(gpa) catch |err| {
+                reg.unloadSlot(gpa, slot_id) catch |uerr| {
+                    std.debug.panic("rollback unloadSlot failed after calibrateLoraDora error: {}", .{uerr});
+                };
+                return failFmt(mapLoraError(err), "calibrateLoraDora failed: {s}", .{@errorName(err)});
+            };
+        },
+    }
+
+    if (out_slot_id) |out| out.* = slot_id;
+    return AMI_SDK_OK;
+}
+
+pub export fn ami_sdk_engine_unload_lora(
+    engine: ?*SdkEngine,
+    name_ptr: ?[*:0]const u8,
+) callconv(.c) Status {
+    const pool = objc_autoreleasePoolPush();
+    defer objc_autoreleasePoolPop(pool);
+
+    const eng = engine orelse return fail(AMI_SDK_ERR_INVALID_ARGUMENT, "engine is NULL");
+    const name_c = name_ptr orelse return fail(AMI_SDK_ERR_INVALID_ARGUMENT, "name is NULL");
+    const name_slice = std.mem.span(name_c);
+    if (name_slice.len == 0) return fail(AMI_SDK_ERR_INVALID_ARGUMENT, "name is empty");
+
+    const reg = eng.lora_registry orelse return fail(AMI_SDK_ERR_INVALID_ARGUMENT, "no LoRA pool initialized");
+    const slot_id = reg.findSlotByName(name_slice) orelse {
+        return fail(AMI_SDK_ERR_INVALID_ARGUMENT, "LoRA adapter not found");
+    };
+    if (eng.active_lora_slot == slot_id) {
+        eng.active_lora_slot = lora_mod.NO_ADAPTER;
+        switch (eng.backend) {
+            .qwen3 => |*m| m.setActiveLoraSlot(lora_mod.NO_ADAPTER),
+            .graph => |*m| m.setActiveLoraSlot(lora_mod.NO_ADAPTER),
+        }
+    }
+    reg.unloadSlot(gpa, slot_id) catch |err| {
+        return failFmt(mapLoraError(err), "unloadSlot failed: {s}", .{@errorName(err)});
+    };
+    return AMI_SDK_OK;
+}
+
+pub export fn ami_sdk_engine_set_active_lora(
+    engine: ?*SdkEngine,
+    name_ptr: ?[*:0]const u8,
+) callconv(.c) Status {
+    const eng = engine orelse return fail(AMI_SDK_ERR_INVALID_ARGUMENT, "engine is NULL");
+    const name_slice: []const u8 = if (name_ptr) |p| std.mem.span(p) else "";
+    if (name_slice.len == 0) {
+        eng.active_lora_slot = lora_mod.NO_ADAPTER;
+        switch (eng.backend) {
+            .qwen3 => |*m| m.setActiveLoraSlot(lora_mod.NO_ADAPTER),
+            .graph => |*m| m.setActiveLoraSlot(lora_mod.NO_ADAPTER),
+        }
+        return AMI_SDK_OK;
+    }
+
+    const reg = eng.lora_registry orelse return fail(AMI_SDK_ERR_INVALID_ARGUMENT, "no LoRA pool initialized");
+    const slot_id = reg.findSlotByName(name_slice) orelse {
+        return fail(AMI_SDK_ERR_INVALID_ARGUMENT, "LoRA adapter not found");
+    };
+    eng.active_lora_slot = slot_id;
+    switch (eng.backend) {
+        .qwen3 => |*m| m.setActiveLoraSlot(slot_id),
+        .graph => |*m| m.setActiveLoraSlot(slot_id),
+    }
+    return AMI_SDK_OK;
+}
+
+pub export fn ami_sdk_engine_query_lora_info(
+    engine: ?*const SdkEngine,
+    out_info: ?*LoraInfo,
+) callconv(.c) Status {
+    const eng = engine orelse return fail(AMI_SDK_ERR_INVALID_ARGUMENT, "engine is NULL");
+    const info = out_info orelse return fail(AMI_SDK_ERR_INVALID_ARGUMENT, "out_info is NULL");
+    if (info.struct_size != 0 and info.struct_size < @sizeOf(LoraInfo)) {
+        return fail(AMI_SDK_ERR_ABI_MISMATCH, "LoraInfo struct_size mismatch");
+    }
+    if (eng.lora_registry) |reg| {
+        const st = reg.stats();
+        info.* = .{
+            .struct_size = @sizeOf(LoraInfo),
+            .active_adapters = st.active_adapters,
+            .active_slot = eng.active_lora_slot,
+            .max_adapters = st.max_adapters,
+            .pool_capacity_bytes = st.pool_capacity_bytes,
+            .pool_used_bytes = st.pool_used_bytes,
+        };
+    } else {
+        info.* = .{
+            .struct_size = @sizeOf(LoraInfo),
+            .active_adapters = 0,
+            .active_slot = lora_mod.NO_ADAPTER,
+            .max_adapters = lora_mod.MAX_ADAPTERS,
+            .pool_capacity_bytes = 0,
+            .pool_used_bytes = 0,
+        };
+    }
+    return AMI_SDK_OK;
 }
 
 fn readEmbeddedMetaConfigJson(allocator: std.mem.Allocator, amf_path: [:0]const u8) ?[]u8 {
@@ -5872,4 +6149,14 @@ test "sdk.c_api: ami_sdk_dequant_nvfp4_rows_f32 exact E2M1xE4M3 decoding and arg
     try std.testing.expectApproxEqAbs(@as(f32, -3.0), dst[5], 1e-6); // -6.0 * 0.5
     try std.testing.expectApproxEqAbs(@as(f32, 0.0), dst[6], 1e-6);
     try std.testing.expectApproxEqAbs(@as(f32, 0.0), dst[7], 1e-6);
+}
+
+test "sdk.c_api: LoraInfo ABI layout and null-argument guards" {
+    try std.testing.expectEqual(@sizeOf(sdk_c.ami_sdk_lora_info), @sizeOf(LoraInfo));
+    try std.testing.expectEqual(AMI_SDK_ERR_INVALID_ARGUMENT, ami_sdk_engine_init_lora_pool(null, 0));
+    try std.testing.expectEqual(AMI_SDK_ERR_INVALID_ARGUMENT, ami_sdk_engine_load_lora(null, "a", "/tmp/x.amlora", null));
+    try std.testing.expectEqual(AMI_SDK_ERR_INVALID_ARGUMENT, ami_sdk_engine_unload_lora(null, "a"));
+    try std.testing.expectEqual(AMI_SDK_ERR_INVALID_ARGUMENT, ami_sdk_engine_set_active_lora(null, "a"));
+    var info: LoraInfo = std.mem.zeroes(LoraInfo);
+    try std.testing.expectEqual(AMI_SDK_ERR_INVALID_ARGUMENT, ami_sdk_engine_query_lora_info(null, &info));
 }

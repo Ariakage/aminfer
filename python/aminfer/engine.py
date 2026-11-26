@@ -53,6 +53,7 @@ from aminfer._bindings import (
     GenResultC,
     HostVmInfoC,
     InvalidArgumentError,
+    LoraInfoC,
     RerankParamsC,
     SpecOptionsC,
     SpecStatsC,
@@ -258,6 +259,18 @@ class SpecStats:
     dfly2_rounds: int
     dfly2_early_stops: int
     mean_accept_len: float
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class LoraInfo:
+    active_adapters: int
+    active_slot: int | None
+    max_adapters: int
+    pool_capacity_bytes: int
+    pool_used_bytes: int
+
+
+_LORA_UNSET: object = object()
 
 
 _EFFORT_NAME_MAP: dict[str, int] = {
@@ -926,6 +939,7 @@ class Engine:
                 self._lib, ctypes.c_void_p(tok_ptr), _owned=False, _owner=self
             )
         self._vocab_size: int = self.stats.vocab_size
+        self._active_lora: str | None = None
         if draft_mode is not None or draft_amf_path is not None or draft_config_path is not None:
             try:
                 self.configure_speculative(
@@ -1059,6 +1073,79 @@ class Engine:
             mean_accept_len=float(raw.mean_accept_len),
         )
 
+    def init_lora_pool(self, pool_bytes: int = 0) -> None:
+        """Preallocates the 16 KiB-aligned wired LoRA pool on this engine."""
+        if isinstance(pool_bytes, bool) or not isinstance(pool_bytes, int) or pool_bytes < 0:
+            raise _invalid_arg("pool_bytes must be a non-negative int")
+        check_status(
+            self._lib,
+            self._lib.ami_sdk_engine_init_lora_pool(self._require_open(), int(pool_bytes)),
+        )
+
+    def load_lora(
+        self,
+        name: str,
+        path: str | os.PathLike[str],
+        *,
+        pool_bytes: int | None = None,
+    ) -> int:
+        """Hot-loads an `.amlora` (LoRA or DoRA) bundle under `name` and returns its slot ID."""
+        handle = self._require_open()
+        if not isinstance(name, str) or not name:
+            raise _invalid_arg("LoRA adapter name must be a non-empty string")
+        if pool_bytes is not None:
+            self.init_lora_pool(pool_bytes)
+        name_b = name.encode("utf-8")
+        path_b = os.fsencode(os.fspath(path))
+        out_slot = ctypes.c_uint32(0)
+        check_status(
+            self._lib,
+            self._lib.ami_sdk_engine_load_lora(handle, name_b, path_b, ctypes.byref(out_slot)),
+        )
+        return int(out_slot.value)
+
+    def unload_lora(self, name: str) -> None:
+        """Hot-unloads adapter `name`, returning its wired 16 KiB pages to the pool."""
+        handle = self._require_open()
+        if not isinstance(name, str) or not name:
+            raise _invalid_arg("LoRA adapter name must be a non-empty string")
+        check_status(
+            self._lib,
+            self._lib.ami_sdk_engine_unload_lora(handle, name.encode("utf-8")),
+        )
+        if self._active_lora == name:
+            self._active_lora = None
+
+    def set_lora(self, name: str | None) -> None:
+        """Activates loaded adapter `name`, or restores bit-exact base model when `name is None`."""
+        handle = self._require_open()
+        if name is None:
+            check_status(self._lib, self._lib.ami_sdk_engine_set_active_lora(handle, None))
+            self._active_lora = None
+            return
+        if not isinstance(name, str):
+            raise _invalid_arg("LoRA adapter name must be a string or None")
+        name_b = name.encode("utf-8") if name else None
+        check_status(self._lib, self._lib.ami_sdk_engine_set_active_lora(handle, name_b))
+        self._active_lora = name if name else None
+
+    @property
+    def lora_info(self) -> LoraInfo:
+        """Queries current wired LoRA pool usage and active adapter state."""
+        raw = LoraInfoC(struct_size=ctypes.sizeof(LoraInfoC))
+        check_status(
+            self._lib,
+            self._lib.ami_sdk_engine_query_lora_info(self._require_open(), ctypes.byref(raw)),
+        )
+        slot_val = int(raw.active_slot)
+        return LoraInfo(
+            active_adapters=int(raw.active_adapters),
+            active_slot=None if slot_val == AMI_SDK_TOKEN_NONE else slot_val,
+            max_adapters=int(raw.max_adapters),
+            pool_capacity_bytes=int(raw.pool_capacity_bytes),
+            pool_used_bytes=int(raw.pool_used_bytes),
+        )
+
     @property
     def vocab_size(self) -> int:
         return self.stats.vocab_size
@@ -1143,8 +1230,29 @@ class Engine:
         config: GenerationConfig | None = None,
         *,
         on_chunk: Callable[[StreamChunk], bool | None] | None = None,
+        lora: str | None | object = _LORA_UNSET,
     ) -> GenerationOutput:
         handle = self._require_open()
+        lora_switched = lora is not _LORA_UNSET
+        prev_lora = self._active_lora
+        if lora_switched:
+            if lora is not None and not isinstance(lora, str):
+                raise _invalid_arg("lora must be a string or None")
+            self.set_lora(lora)
+        try:
+            return self._generate_inner(handle, prompt, config, on_chunk=on_chunk)
+        finally:
+            if lora_switched:
+                self.set_lora(prev_lora)
+
+    def _generate_inner(
+        self,
+        handle: ctypes.c_void_p,
+        prompt: str | bytes | Sequence[int],
+        config: GenerationConfig | None = None,
+        *,
+        on_chunk: Callable[[StreamChunk], bool | None] | None = None,
+    ) -> GenerationOutput:
         cfg = config if config is not None else GenerationConfig()
         c_params = cfg.to_c(self._lib)
 
@@ -1267,6 +1375,8 @@ class Engine:
         self,
         prompt: str | bytes | Sequence[int],
         config: GenerationConfig | None = None,
+        *,
+        lora: str | None | object = _LORA_UNSET,
     ) -> Iterator[StreamChunk]:
         """Streams generation chunks in real time while releasing the GIL on native steps."""
         self._require_open()
@@ -1281,7 +1391,7 @@ class Engine:
 
         def _worker() -> None:
             try:
-                self.generate(prompt, config, on_chunk=_on_chunk)
+                self.generate(prompt, config, on_chunk=_on_chunk, lora=lora)
             except BaseException as exc:  # noqa: BLE001
                 q.put(exc)
             finally:

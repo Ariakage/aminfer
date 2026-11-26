@@ -309,6 +309,17 @@ class VisionResultC(ctypes.Structure):
     ]
 
 
+class LoraInfoC(ctypes.Structure):
+    _fields_ = [
+        ("struct_size", ctypes.c_uint32),
+        ("active_adapters", ctypes.c_uint32),
+        ("active_slot", ctypes.c_uint32),
+        ("max_adapters", ctypes.c_uint32),
+        ("pool_capacity_bytes", ctypes.c_uint64),
+        ("pool_used_bytes", ctypes.c_uint64),
+    ]
+
+
 _LIB_CACHE: dict[str, ctypes.CDLL] = {}
 
 
@@ -619,6 +630,25 @@ def _configure_cdll(lib: ctypes.CDLL) -> None:
         ctypes.POINTER(VisionResultC),
     ]
     lib.ami_sdk_prefill_vision.restype = ctypes.c_int32
+
+    lib.ami_sdk_engine_init_lora_pool.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+    lib.ami_sdk_engine_init_lora_pool.restype = ctypes.c_int32
+    lib.ami_sdk_engine_load_lora.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_char_p,
+        ctypes.c_char_p,
+        c_u32_p,
+    ]
+    lib.ami_sdk_engine_load_lora.restype = ctypes.c_int32
+    lib.ami_sdk_engine_unload_lora.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+    lib.ami_sdk_engine_unload_lora.restype = ctypes.c_int32
+    lib.ami_sdk_engine_set_active_lora.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+    lib.ami_sdk_engine_set_active_lora.restype = ctypes.c_int32
+    lib.ami_sdk_engine_query_lora_info.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(LoraInfoC),
+    ]
+    lib.ami_sdk_engine_query_lora_info.restype = ctypes.c_int32
 
 
 def load_lib(lib_path: str | os.PathLike[str] | None = None) -> ctypes.CDLL:

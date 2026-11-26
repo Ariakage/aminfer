@@ -427,6 +427,56 @@ ami_sdk_status ami_sdk_engine_query_stats(const ami_sdk_engine *engine,
 /* Borrowed pointer to the engine's loaded tokenizer, or NULL if none was loaded. */
 const ami_sdk_tokenizer *ami_sdk_engine_tokenizer(const ami_sdk_engine *engine);
 
+/* -------------------------------------------------------------------------
+ * Universal Hot-Swap LoRA & DoRA Adapter Management (M9.5 W30)
+ * ------------------------------------------------------------------------- */
+
+typedef struct ami_sdk_lora_info {
+    uint32_t struct_size;
+    uint32_t active_adapters;
+    uint32_t active_slot;       /* UINT32_MAX when base model is active */
+    uint32_t max_adapters;
+    uint64_t pool_capacity_bytes;
+    uint64_t pool_used_bytes;
+} ami_sdk_lora_info;
+
+/*
+ * Preallocates the 16 KiB-aligned wired LoRA pool on an engine (both Qwen3
+ * and GraphModel / Inkling 2 / Hy4). Pass `pool_bytes == 0` for the default
+ * pool size (`4 MiB`).
+ */
+ami_sdk_status ami_sdk_engine_init_lora_pool(ami_sdk_engine *engine,
+                                             size_t pool_bytes);
+
+/*
+ * Hot-loads an `.amlora` bundle from `amlora_path` under adapter `name`.
+ * Lazily initializes the wired LoRA pool on first load if not yet initialized,
+ * and calibrates exact PEFT DoRA row scales against base weights.
+ * Optional `out_slot_id` receives the assigned slot index (`0..15`).
+ */
+ami_sdk_status ami_sdk_engine_load_lora(ami_sdk_engine *engine,
+                                        const char *name,
+                                        const char *amlora_path,
+                                        uint32_t *out_slot_id);
+
+/*
+ * Hot-unloads adapter `name`, immediately returning its wired 16 KiB pages
+ * to the pool. Resets active adapter to base model if `name` was active.
+ */
+ami_sdk_status ami_sdk_engine_unload_lora(ami_sdk_engine *engine,
+                                          const char *name);
+
+/*
+ * Activates loaded adapter `name`, or resets to bit-exact base model when
+ * `name == NULL` or `name[0] == '\0'`.
+ */
+ami_sdk_status ami_sdk_engine_set_active_lora(ami_sdk_engine *engine,
+                                              const char *name);
+
+/* Queries current LoRA pool usage and active adapter state. */
+ami_sdk_status ami_sdk_engine_query_lora_info(const ami_sdk_engine *engine,
+                                              ami_sdk_lora_info *out_info);
+
 ami_sdk_status ami_sdk_prefill_tokens(ami_sdk_engine *engine,
                                       const uint32_t *prompt_ids, size_t prompt_len,
                                       uint32_t compute_logits,
