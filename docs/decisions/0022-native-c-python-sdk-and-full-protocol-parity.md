@@ -275,12 +275,23 @@ and usage-accounting layer:
   full token-slice verification so cold-restart recovery never collides across
   models, quantization profiles, or diverged prefixes.
 
+### 10. Model detail discovery and native TLS 1.2/1.3 HTTPS serving (`C28`, M8.3)
+
+- **Startup `ModelDetailMeta` and `LoraAdapterMeta` discovery (`GET /v1/models` and `GET /v1/models/{id}`):**
+  - At startup, `aminfer serve` populates immutable `ModelDetailMeta` from `AmfInspection` and `ArchAxesSummary` (`architecture`, `max_model_len`, `vocab_size`, `effective_bits_per_weight`, `wired_mib`, `cold_bytes`, and `ModelCapabilities` flags including `vision`, `reasoning`, `moe`, `lora`, `embeddings`, and `rerank`) alongside `LoraAdapterMeta` entries for every mounted `-L`/`--lora` `<base>:<adapter>` adapter (`parent`, `rank`, `lora_alpha`, `scale`, `wired_bytes`).
+  - `GET /v1/models` formats the base model and all mounted adapter records into a preallocated `16 KiB` buffer (`0` steady-state heap allocations), and `GET /v1/models/{id}` performs zero-allocation URL percent-decoding (`%2F`, `%3A`) so slash- and colon-delimited IDs resolve directly, returning `405` on non-`GET` methods, `401` on missing/invalid `--api-key`, and `404 model_not_found` on unknown IDs.
+- **Zero-dependency native `Network.framework` + `Security.framework` TLS 1.2/1.3 listener:**
+  - `aminfer serve` accepts `--tls-cert`, `--tls-key`, `--tls-key-passphrase`, and `--tls-passphrase-env` without adding any third-party TLS library ([ADR-0001](0001-language-and-toolchain-boundaries.md)).
+  - `src/bridge/apple_bridge.{h,m}` and `src/bridge/tls.zig` parse PEM (single certificate or fullchain paired with PKCS#8, PKCS#1, or SEC1 keys, including encrypted PBES2, PBES1, PKCS#12-PBE, and legacy PEM) or `.p12` bundles exclusively in memory via `Security.framework` (`kSecImportToMemoryOnly`), verifying certificate/private-key public-key match with zero persistent Keychain side effects. Passphrase and key buffers are wiped immediately after `Server.init` via `memset_s` / `secureZero`, and secrets are never logged.
+  - A `Network.framework` `nw_listener` configured for TLS 1.2 and TLS 1.3 hands each accepted client to a pure-C refcounted `socketpair(AF_UNIX, SOCK_STREAM)` pump (`ami_tls_pump`) on a `DISPATCH_AUTORELEASE_FREQUENCY_WORK_ITEM` serial queue and signals the `kqueue` event loop through a non-blocking `notify_fd` (`UDATA_LISTEN`).
+  - `http_sse.zig` reuses the existing preallocated connection slots, HTTP/1.1 `keep-alive`, SSE streaming across `/v1/chat/completions`, `/v1/responses`, and `/v1/messages`, `503` saturation responses drained cleanly with TLS `close_notify`, constant-time `--api-key` auth, and concurrent plaintext `AF_UNIX` `--unix-socket` serving with `0` hot-path heap allocations.
+
 ### Scope boundary and zero-overhead non-regression guardrails
 
 - Audio and speech ingress are explicitly excluded from Milestone M7.5.
-- **Strict zero-overhead fast paths when optional M7.5 features are inactive:**
+- **Strict zero-overhead fast paths when optional M7.5 / M8.3 features are inactive:**
   1. `aminfer monitor` (`C19`) and `aminfer chat` (`C20`) are standalone CLI subcommands; `aminfer serve` and `decode` run zero `IOReport` polling when `monitor` is not running, and attaching `monitor --server` polls `/health` + rootless `IOReport` on `QOS_CLASS_UTILITY` E-cores at `>= 500 ms` intervals (`< 0.1%` E-core CPU, `0 B` GPU/wired bandwidth).
-  2. Single-file `.amf` metadata (`W18`), `--api-key`, and `--unix-socket` (`C18`) execute only at model load or per-request HTTP header ingress (`0` instructions added to per-token decode); `libaminfer.dylib` (`C17`) is a separate build target that leaves the static `aminfer` CLI binary unchanged.
+  2. Single-file `.amf` metadata (`W18`), `--api-key`, `--unix-socket` (`C18`), `ModelDetailMeta`/`LoraAdapterMeta` discovery, and opt-in native TLS 1.2/1.3 HTTPS (`C28`) execute only at startup or at the HTTP/TLS connection boundary (`0` instructions added to per-token decode, and `0` TLS listener overhead when `--tls-cert` is omitted); `libaminfer.dylib` (`C17`) is a separate build target that leaves the static `aminfer` CLI binary unchanged.
   3. Unconstrained requests (`response_format` unset, penalties `0`, `logit_bias` empty, `active_adapters == 0`) bypass `C22` grammar state machines and `W19` LoRA adapter dispatches outside the layer loop. When `C22` / penalties are active on large-vocabulary models (`151K–248K` tokens), `C22` pairs with the fused GPU radix/bucket sampler (`G21` in [ADR-0023](0023-native-kernel-barrier-fusion-mma-flashattn-and-simd-accelerators.md)) and propagates masks into speculative draft proposals so neither CPU logit scans nor draft rejections degrade throughput.
   4. `W19` L2-resident SME2 LoRA adapters cap their P-core L2 footprint at `<= 4 MiB` (`25%` of M4's `16 MiB` P-core L2) inside the `R9` wired budget (never unpinning base weights). Stateful `/v1/responses` slots obey `R9` `evict_first` governance, and opt-in `--disk-prefix-cache` (`R10`, off by default) schedules `F_NOCACHE` writes on background utility I/O queues that yield strictly to `C3`–`C5` decode-critical cold-expert `pread`s.
 
@@ -289,8 +300,9 @@ and usage-accounting layer:
 - **Positive:** Python and native hosts can embed `aminfer` in-process with zero
   weight/logit copies and zero Python inside the engine (`C17`); standard
   OpenAI, Anthropic, tool-calling, embedding, reranking, and multi-LoRA clients
-  work directly against `aminfer serve` over TCP or `AF_UNIX` with `--api-key`
-  auth and strict grammar masks (`C18`, `C21`, `C22`, `W19`); single-file `.amf`
+  work directly against `aminfer serve` over TCP, native TLS 1.2/1.3 HTTPS, or
+  `AF_UNIX` with `--api-key` auth, `/v1/models/{id}` discovery, and strict
+  grammar masks (`C18`, `C21`, `C22`, `C28`, `W19`); single-file `.amf`
   bundles (`W18`), scrolling `aminfer chat` (`C20`), NVMe persistent prefix
   recovery (`R10`), and rootless `aminfer monitor` (`C19`) cover daily local
   workflows without third-party runtime dependencies.

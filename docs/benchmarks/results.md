@@ -6221,3 +6221,83 @@ On a full-wired `128`-expert top-`8` MoE (`48` effective loop steps), batching `
 - **Option A (`inkling-2-mini-ud-iq3-xxs.amf`, `11,119.47 MiB` wired)**: preferred when maximum logit fidelity against native `NVFP4` (`mean_kl 0.0170` vs `0.0328`, `top1 98.44%` vs `95.31%`, `12/12` `quality-gate`) is prioritized on hosts with headroom for `~11.3 GiB` runtime wired RAM.
 - **Option B (`inkling-2-mini-gsq-rco-v2.amf`, `10,824.05 MiB` wired)**: preferred on tighter live `24 GB` macOS desktops (`-295 MiB` lower wired footprint, `2.34` vs `3.08 GB/tok` active, `13.90–14.05 tok/s` `M = 1`, `all_passed = yes` and `total_swapouts_delta = 0` even when stacking `+606 MiB` `3L DFlare`, matching `6/6` executable Python coding).
 
+## M8.3: HTTP/SSE Model Detail Discovery, Multi-LoRA Mounting, and Native Network.framework TLS 1.2/1.3 HTTPS
+
+Recorded on Apple M4 (`Mac16,12`, `Apple9` GPU, `24 GiB` unified memory,
+`120.0 GB/s` bus) during Milestone M8.3 (`C28`, `C18`;
+[ADR-0022](../decisions/0022-native-c-python-sdk-and-full-protocol-parity.md);
+commits `47aea65`, `2c1adf5`, `7beec27`).
+
+### 1. Verification gate summary (`47aea65`, `2c1adf5`, `7beec27`)
+
+| Gate / Suite | Scope | Measured Result (M4) |
+| --- | --- | --- |
+| **Formatting & Hygiene** | `zig fmt --check build.zig src`, `catch {}` audit, and local-mount-path audit in `src/` | Pass (`0` `catch {}`, `0` hardcoded local mount paths in `src/`) |
+| **Zig Build & Full Test Suite** | `zig build`, `zig build -Doptimize=ReleaseFast`, `zig build test -j1` (Debug & `-Doptimize=ReleaseSafe`) | Pass (`530/530` = `503` mod + `18` exe + `9` sdk on `2c1adf5`, plus 3 new M8.3 integration/CLI/bench suites in `http_sse.zig`, `main.zig`, and `bench/m83.zig` passing in both Debug and ReleaseSafe on `7beec27`) |
+| **`ReleaseFast` `aminfer bench-m83`** | `./zig-out/bin/aminfer bench-m83` and `aminfer bench-m83 --json` | **`all_passed = true`**, `malloc_delta = 0`, `swapouts_delta = 0` across `C28` discovery, native TLS 1.2/1.3, encrypted PKCS#8/`.p12`, SSE across all 3 endpoints, concurrent `AF_UNIX`, `503` saturation draining, and external `/usr/bin/curl` TLS 1.3 & TLS 1.2 checks |
+
+### 2. `ReleaseFast` `aminfer bench-m83` summary metrics
+
+| Track | Metric | Measured Result (`ReleaseFast`, M4) | Guard / Note |
+| --- | --- | --- | --- |
+| `C28` Discovery | Mounted LoRA adapters / `GET /v1/models` payload | `8` adapters / `4,822 B` | Preallocated `16 KiB` response buffer |
+| `C28` Discovery | `GET /v1/models` list mean latency | `45.10 us` | Zero-alloc formatting |
+| `C28` Discovery | `GET /v1/models/{id}` base detail mean latency | `77.78 us` | URL-decoded `%2F`/`%3A` matching |
+| `C28` Discovery | `GET /v1/models/{id}` LoRA detail mean latency | `90.41 us` | Exposes `parent`, `rank`, `lora_alpha`, `scale`, `wired_bytes` |
+| `C28` Discovery | HTTP route error semantics & steady-state heap | `405`, `404`, `401` all `true`; `malloc_delta = 0` | `passed = true` |
+| `C28` Native TLS | Negotiated protocol versions | TLS 1.3 (`0x0304`) & TLS 1.2 (`0x0303`) | Zero third-party TLS deps (`Network.framework`) |
+| `C28` Native TLS | Cold TLS 1.3 / cold TLS 1.2 request mean latency | `1.13 ms` (`1,131.85 us`) / `1.12 ms` (`1,115.64 us`) | Full handshake + HTTP request over `socketpair` pump |
+| `C28` Native TLS | Warm TLS 1.3 HTTP/1.1 `keep-alive` mean latency | `119.36 us` | Reused TLS connection + preallocated slot |
+| `C28` Native TLS | Encrypted PBES2 PKCS#8 / `.p12` identity load | `3.33 ms` (`3.333 ms`) / `6.17 ms` (`6.173 ms`) | `kSecImportToMemoryOnly` (`0` Keychain persistence, `memset_s`/`secureZero` wipe) |
+| `C28` Native TLS | Protocol & coexistence checks | SSE `/v1/chat/completions`, `/v1/responses`, `/v1/messages`, `AF_UNIX`, `503` saturation, `/usr/bin/curl` TLS 1.3 & TLS 1.2 all `true` | `malloc_delta = 0`, `swapouts_delta = 0`, `passed = true` |
+
+#### Verbatim `ReleaseFast` `aminfer bench-m83` output (`7beec27`)
+
+```text
+bench.m83.c28.models_discovery.ran               true
+bench.m83.c28.models_discovery.adapters          8
+bench.m83.c28.models_discovery.payload_bytes     4822
+bench.m83.c28.models_discovery.list_mean_us      45.10
+bench.m83.c28.models_discovery.detail_mean_us    77.78
+bench.m83.c28.models_discovery.lora_mean_us      90.41
+bench.m83.c28.models_discovery.route_405_ok      true
+bench.m83.c28.models_discovery.route_404_ok      true
+bench.m83.c28.models_discovery.route_401_ok      true
+bench.m83.c28.models_discovery.malloc_delta      0
+bench.m83.c28.models_discovery.passed            true
+bench.m83.c28.https_tls13_tls12.ran              true
+bench.m83.c28.https_tls13_tls12.tls13_version    0x0304
+bench.m83.c28.https_tls13_tls12.tls12_version    0x0303
+bench.m83.c28.https_tls13_tls12.tls13_cold_us    1131.85
+bench.m83.c28.https_tls13_tls12.tls12_cold_us    1115.64
+bench.m83.c28.https_tls13_tls12.keepalive_us     119.36
+bench.m83.c28.https_tls13_tls12.enc_pkcs8_ms     3.333
+bench.m83.c28.https_tls13_tls12.p12_load_ms      6.173
+bench.m83.c28.https_tls13_tls12.sse_chat_ok      true
+bench.m83.c28.https_tls13_tls12.sse_responses_ok true
+bench.m83.c28.https_tls13_tls12.sse_messages_ok  true
+bench.m83.c28.https_tls13_tls12.unix_socket_ok   true
+bench.m83.c28.https_tls13_tls12.sat_503_ok       true
+bench.m83.c28.https_tls13_tls12.curl_tls13_ok    true
+bench.m83.c28.https_tls13_tls12.curl_tls12_ok    true
+bench.m83.c28.https_tls13_tls12.malloc_delta     0
+bench.m83.c28.https_tls13_tls12.swapouts_delta   0
+bench.m83.c28.https_tls13_tls12.passed           true
+bench.m83.swapouts_delta                         0
+bench.m83.all_passed                             true
+```
+
+### 3. Live real-model HTTPS TLS 1.3/1.2 and `AF_UNIX` verification (`ReleaseFast`, `0` secret leaks)
+
+All live runs used ephemeral PBES2-encrypted PKCS#8 credentials supplied via `--tls-passphrase-env`, `--api-key`, and `-V`, with zero passphrase or API-key leakage in server logs and all temporary certificates deleted immediately after each run.
+
+| Model & Configuration | Wired RAM (`serve.wired_mib`) | Discovery & Protocol Checks (`TLS 1.3`, `TLS 1.2`, `AF_UNIX`) | Live TLS 1.3 SSE `POST /v1/chat/completions` | `serve.swapouts_delta` |
+| --- | --- | --- | --- | --- |
+| **`Qwen3-0.6B` + rank-8 LoRA** (`<models>/amf/qwen3-0.6b-gsq-rco.amf`, `-L sql-r8=<tmp.amlora>`, `--model-id qwen/qwen3-0.6b-gsq`, `--unix-socket`) | `4,440 MiB` | TLS 1.3 `GET /v1/models` `200` (`27.4 ms`, `qwen3_dense`, `effective_bits_per_weight = 4.348213`, `lora = true`, `embeddings = true`, `rerank = true`, plus `:sql-r8` `rank = 8`, `scale = 2.0`, `wired_bytes = 1,376,256`); TLS 1.3 `GET /v1/models/qwen%2Fqwen3-0.6b-gsq%3Asql-r8` `200` (`3.32 ms`); forced TLS 1.2 `GET /v1/models/qwen%2Fqwen3-0.6b-gsq` `200` (`3.52 ms`); `401`/`405`/`404` verified; concurrent `AF_UNIX GET /health` `200` | `model = "qwen/qwen3-0.6b-gsq:sql-r8"`: `200`, `ttft_ms = 40.709 ms`, `tpot_ms = 6.619 ms`, **`151.09 tok/s`**, `[DONE]` | `0` |
+| **`Qwen3-0.6B` base 48-token steady-state check** (`<models>/amf/qwen3-0.6b-gsq-rco.amf`, `--model-id qwen/qwen3-0.6b-gsq`, `temperature = 0`, `max_tokens = 48`) | `4,433 MiB` | TLS 1.3 `AEAD-CHACHA20-POLY1305-SHA256`, `stream_options.include_usage = true` (`28` prompt / `48` completion tokens) | Coherent English reasoning output, `finish_reason = "length"`, `ttft_ms = 103.15 ms`, steady-state `tpot_ms = 6.46 ms`, **`154.78 tok/s`**, `[DONE]` | `0` |
+| **`Inkling-2-Mini` Option B (`GSQ-RCO v2`) 48-token steady-state check** (`<models>/amf/inkling-2-mini-gsq-rco-v2.amf`, `--model-id unsloth/inkling-2-mini`, `--batch-mode serial`, `temperature = 0`, `max_tokens = 48`) | `11,217 MiB` | TLS 1.3 `GET /v1/models/unsloth%2Finkling-2-mini` `200` (`21.77 ms`, `509 B`, `TLSv1.3 / AEAD-CHACHA20-POLY1305-SHA256`, `architecture = "inkling2_loop_text"`, `max_model_len = 4096`, `vocab_size = 201024`, `effective_bits_per_weight = 3.467748`, `cold_bytes = 0`, `reasoning = true`, `vision = true`, `moe = true`); forced TLS 1.2 `GET /health` `200` (`2.15 ms`, `TLSv1.2`) | Coherent English reasoning output (`37` prompt / `48` completion tokens, `finish_reason = "length"`), `ttft_ms = 855.19 ms`, steady-state `tpot_ms = 49.73 ms/tok`, **`20.11 tok/s`** (`~47.1 GB/s` effective DRAM bandwidth on `2.34 GB/tok` active weights), `[DONE]` | `0` |
+
+#### Server runtime note on `Inkling-2-Mini` `--batch-mode serial` vs `continuous`
+
+During live M8.3 HTTPS verification, running `aminfer serve` on `inkling-2-mini-gsq-rco-v2.amf` with default `--batch-mode auto` (`continuous`) executed generic `GraphBatchRuntime` rather than `M82Runtime` (`G29`), which bypassed `Inkling 2`'s specialized sublayer operators and produced physically impossible throughput (`~134–197 tok/s`) with incoherent tokens. Passing `--batch-mode serial` routes `runServeGraph` through `GraphModel`'s single-frame `M82Runtime` hot path, yielding coherent 48-token HTTPS TLS 1.3 SSE output at **`20.11 tok/s`** (`49.73 ms/tok`, `serve.swapouts_delta = 0`), consistent with M8.25 uncontended `decode` (`13.90–18.30 tok/s`). Wiring `M82Runtime` (`inkling2_loop` / `hy_v4`) into `GraphBatchRuntime` continuous batching is tracked in [process.md](../process.md#deferred-improvements--temporary-todo-backlog).
+

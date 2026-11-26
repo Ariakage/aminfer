@@ -37,6 +37,34 @@
      [ADR-0001](../decisions/0001-language-and-toolchain-boundaries.md)), and
      the rootless `aminfer monitor` terminal TUI (`C19`, default `trans-pride`
      palette + `btop` `.theme` support and `--server` live attach).
+   - M8.3 (`C28`, `C18`; [ADR-0022](../decisions/0022-native-c-python-sdk-and-full-protocol-parity.md))
+     adds zero-hot-path-allocation model detail discovery and native TLS 1.2/1.3
+     HTTPS serving:
+     - **Model detail & multi-LoRA discovery:** startup `AmfInspection` /
+       `ArchAxesSummary` populates immutable `ModelDetailMeta` (`architecture`,
+       `max_model_len`, `vocab_size`, `effective_bits_per_weight`, `wired_mib`,
+       `cold_bytes`, `capabilities`) plus `LoraAdapterMeta` entries for mounted
+       `-L`/`--lora` `<base>:<adapter>` adapters (`parent`, `rank`,
+       `lora_alpha`, `scale`, `wired_bytes`). `GET /v1/models` renders into a
+       preallocated `16 KiB` response buffer, and `GET /v1/models/{id}` performs
+       zero-allocation URL percent-decoding (`%2F`, `%3A`) with `405` on
+       non-`GET` and `404 model_not_found` on unknown IDs.
+     - **Zero-dependency native TLS 1.2/1.3 HTTPS:** when `--tls-cert` and
+       `--tls-key` (with optional `--tls-key-passphrase` or
+       `--tls-passphrase-env`) are passed, `src/bridge/apple_bridge.{h,m}` and
+       `src/bridge/tls.zig` load PEM (single/fullchain + PKCS#8/PKCS#1/SEC1,
+       including encrypted PBES2/PBES1/PKCS#12-PBE/legacy PEM) or `.p12`
+       identities purely in memory via `Security.framework`
+       (`kSecImportToMemoryOnly`, zero persistent Keychain items, public-key
+       match verification, immediate `memset_s`/`secureZero` credential wiping,
+       and zero secret logging) into a `Network.framework` `nw_listener`
+       negotiating TLS 1.2 and TLS 1.3. Accepted TLS streams are bridged into
+       the `kqueue` `http_sse.zig` loop over non-blocking refcounted
+       `socketpair(AF_UNIX, SOCK_STREAM)` pumps (`ami_tls_pump`) plus a
+       `kqueue`-watched `notify_fd` (`UDATA_LISTEN`), preserving `0` hot-path
+       heap allocations, HTTP/1.1 `keep-alive`, `503` saturation draining with
+       TLS `close_notify`, constant-time `--api-key` auth, and concurrent
+       `AF_UNIX` `--unix-socket` serving.
    - On request admission, when `temperature > 0` and `"seed"` is omitted, one
      64-bit seed is drawn from Apple Silicon's Secure Enclave TRNG-backed kernel
      CSPRNG (`getentropy`) to initialize that request slot's dedicated 32-byte
@@ -167,7 +195,7 @@ One round:
 | L1 | 1 | `USER_INTERACTIVE` | Suffix automaton queries and updates |
 | ANE driver | 1 | `USER_INITIATED` | CoreML predictions (draft, attention blocks, expert prediction) |
 | I/O | 1–N | `UTILITY` + `IOPOL_IMPORTANT` | `aio_read` submission and `kqueue` completion; `pread` workers as fallback |
-| Server | 1 | `USER_INITIATED` | kqueue HTTP / SSE |
+| Server | 1 | `USER_INITIATED` | kqueue HTTP / HTTPS SSE (`Network.framework` TLS socketpair bridge when enabled) |
 
 Threads exchange work through preallocated lock-free SPSC / MPSC rings (status
 row C1). The wake-up mechanism — `kqueue` `EVFILT_USER`, `MTLSharedEvent`

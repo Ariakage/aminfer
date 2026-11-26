@@ -36,9 +36,10 @@ full design starts at
 
 - **Engine core** — Zig 0.17.1 + standalone ARMv9.2 SME2 `.s` microkernels:
   scheduler, memory pools, lock-free rings, suffix automaton, async I/O, kqueue
-  SSE server.
+  HTTP/HTTPS SSE server.
 - **Hardware bridge** — pure Objective-C (ARC) behind the C header
-  `apple_bridge.h`, used only to call Metal, CoreML, IOSurface and Foundation.
+  `apple_bridge.h`, used only to call Metal, CoreML, IOSurface, Network,
+  Security and Foundation.
 - **GPU kernels** — Metal Shading Language, compiled with `xcrun metal`.
 - **Offline tools** — Python managed by uv, in `tools/` only. No Python or
   PyTorch at runtime.
