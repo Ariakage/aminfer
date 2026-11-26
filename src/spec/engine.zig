@@ -4053,6 +4053,8 @@ pub const SpecEngine = struct {
         var picked_layers: [MAX_PRED_LAYERS]usize = undefined;
         var router_slices: [MAX_PRED_LAYERS][]const u8 = undefined;
         var router_fmts: [MAX_PRED_LAYERS]tree_mod.RouterWeightFormat = undefined;
+        var router_bias_slices: [MAX_PRED_LAYERS]?[]const u8 = @splat(null);
+        var router_bias_fmts: [MAX_PRED_LAYERS]tree_mod.RouterWeightFormat = @splat(.f32);
         var has_cold = false;
 
         for (0..sampled) |s| {
@@ -4085,6 +4087,27 @@ pub const SpecEngine = struct {
             router_slices[s] = shard_bytes[off .. off + need_bytes];
             router_fmts[s] = fmt;
 
+            if (layer.router_bias) |rb| {
+                const bfmt: tree_mod.RouterWeightFormat = switch (layer.router_bias_dtype) {
+                    .f32 => .f32,
+                    .f16 => .f16,
+                    .bf16 => .bf16,
+                };
+                const belem_bytes: usize = if (bfmt == .f32) 4 else 2;
+                const bneed: usize = @as(usize, n_experts) * belem_bytes;
+                for (g.weight_shards) |*ws| {
+                    if (ws.buffer.handle == rb.buffer.handle) {
+                        const bbytes = ws.arena.bytes();
+                        const boff: usize = @intCast(rb.offset);
+                        if (boff + bneed <= bbytes.len) {
+                            router_bias_slices[s] = bbytes[boff .. boff + bneed];
+                            router_bias_fmts[s] = bfmt;
+                        }
+                        break;
+                    }
+                }
+            }
+
             var cm = tree_mod.ExpertBitset.empty();
             if (layer.has_cold_experts) {
                 if (g.cold_rt) |crt| {
@@ -4115,18 +4138,39 @@ pub const SpecEngine = struct {
         }
 
         const emb = self.router_emb_scratch[0..h];
+        var bias_f32_buf: [tree_mod.ExpertBitset.MAX_EXPERTS]f32 = undefined;
+        const use_sigmoid = g.config.moe_scoring_sigmoid;
         for (tokens, 0..) |tid, ni| {
             try g.readTokenEmbedF32(tid, emb);
             for (0..sampled) |s| {
                 const top_k = g.config.layerTopK(@intCast(picked_layers[s]));
+                var bias_opt: ?[]const f32 = null;
+                if (router_bias_slices[s]) |bs| {
+                    switch (router_bias_fmts[s]) {
+                        .f32 => {
+                            const vals: []const f32 = @alignCast(std.mem.bytesAsSlice(f32, bs));
+                            bias_opt = vals[0..n_experts];
+                        },
+                        .f16 => {
+                            const vals: []const f16 = @alignCast(std.mem.bytesAsSlice(f16, bs));
+                            for (0..n_experts) |e| bias_f32_buf[e] = @floatCast(vals[e]);
+                            bias_opt = bias_f32_buf[0..n_experts];
+                        },
+                        .bf16 => {
+                            const vals: []const u16 = @alignCast(std.mem.bytesAsSlice(u16, bs));
+                            for (0..n_experts) |e| bias_f32_buf[e] = quant.bf16ToF32(vals[e]);
+                            bias_opt = bias_f32_buf[0..n_experts];
+                        },
+                    }
+                }
                 self.node_experts[ni * sampled + s] = tree_mod.predictRouterTopK(
                     router_slices[s],
                     router_fmts[s],
                     emb,
                     n_experts,
                     top_k,
-                    null,
-                    false,
+                    bias_opt,
+                    use_sigmoid,
                     self.router_logits_scratch,
                 );
             }
@@ -6284,5 +6328,455 @@ test "M9.1 D15 SpecEngine 8-16 tok DFlash block-diffusion on cold-expert NVMe Mo
             try std.testing.expect(eng.stats.dflare_rounds > 0);
             try std.testing.expectEqualSlices(u32, &ref_tokens, &spec_tokens);
         }
+    }
+}
+
+test "M9.2 D15 SpecEngine zero-reindex 1L MLA/NoPE-MLA MTP + DFlash2 (B=8, B=16, GroupedConv + CandidateSelector) + 288E D7 cold-expert pruning T=0 lossless" {
+    const allocator = std.testing.allocator;
+
+    const fillDet = struct {
+        fn run(dst: []f32, seed: u64, scale: f32) void {
+            var s = seed;
+            for (dst) |*slot| {
+                s = s *% 6364136223846793005 +% 1442695040888963407;
+                const u: f32 = @floatFromInt((s >> 40) & 0xFFFF);
+                slot.* = ((u / 32767.5) - 1.0) * scale;
+            }
+        }
+    }.run;
+
+    // -------------------------------------------------------------------------
+    // 1. Zero-Reindex 1L MLA (`glm_moe_dsa`, rope_interleave=true) & NoPE-MLA
+    //    (`glm5_next`, qk_rope=0) MTP with SpecEngine: T=0 bit-exact + zero_reindex_hits > 0
+    // -------------------------------------------------------------------------
+    {
+        const tgt_cfg: qwen3.ModelConfig = .{
+            .arch = .qwen3_dense,
+            .vocab_size = 128,
+            .hidden_size = 128,
+            .num_hidden_layers = 2,
+            .num_attention_heads = 2,
+            .num_key_value_heads = 1,
+            .head_dim = 64,
+            .intermediate_size = 256,
+            .rope_theta = 10_000.0,
+            .rms_norm_eps = 1e-6,
+            .tie_word_embeddings = true,
+        };
+        const tgt_img = try draft_mod.buildSyntheticTargetBf16ForTest(allocator, tgt_cfg, 92150);
+        defer allocator.free(tgt_img);
+
+        const prompt = [_]u32{ 5, 19, 31, 47, 61, 11 };
+        const gen_steps: usize = 12;
+
+        var ref_model = try qwen3.Qwen3Model.loadFromBytes(allocator, tgt_img, tgt_cfg, .{
+            .max_seq_len = 64,
+            .max_tree_nodes = 16,
+        });
+        defer ref_model.deinit(allocator);
+        var ref_tokens: [gen_steps]u32 = undefined;
+        ref_tokens[0] = try ref_model.prefillChunk(&prompt, 0, true);
+        for (1..gen_steps) |s| {
+            ref_tokens[s] = try ref_model.stepDecode(ref_tokens[s - 1], @intCast(prompt.len + s - 1));
+        }
+
+        const mtp_cases = [_]draft_mod.DraftConfig{
+            .{
+                .format = .mtp,
+                .mtp_arch = .glm_moe_dsa,
+                .vocab_size = 128,
+                .draft_vocab_size = 128,
+                .hidden_size = 128,
+                .target_hidden_size = 128,
+                .num_hidden_layers = 1,
+                .num_attention_heads = 2,
+                .num_key_value_heads = 2,
+                .q_lora_rank = 64,
+                .kv_lora_rank = 32,
+                .qk_nope_head_dim = 32,
+                .qk_rope_head_dim = 16,
+                .head_dim = 48,
+                .v_head_dim = 32,
+                .rope_dim = 16,
+                .rope_interleave = true,
+                .rope_theta = 10_000.0,
+                .index_share_for_mtp_iteration = true,
+                .index_topk = 4,
+                .num_experts = 8,
+                .num_experts_per_tok = 2,
+                .moe_intermediate_size = 64,
+                .intermediate_size = 64,
+                .shared_expert_intermediate_size = 64,
+                .routed_scaling_factor = 2.5,
+                .norm_topk_prob = true,
+                .moe_scoring_sigmoid = true,
+                .swiglu_limit = 10.0,
+                .share_embed_tokens = true,
+                .share_lm_head = true,
+            },
+            .{
+                .format = .mtp,
+                .mtp_arch = .glm5_next,
+                .vocab_size = 128,
+                .draft_vocab_size = 128,
+                .hidden_size = 128,
+                .target_hidden_size = 128,
+                .num_hidden_layers = 1,
+                .num_attention_heads = 2,
+                .num_key_value_heads = 2,
+                .q_lora_rank = 64,
+                .kv_lora_rank = 32,
+                .qk_nope_head_dim = 48,
+                .qk_rope_head_dim = 0,
+                .head_dim = 48,
+                .v_head_dim = 48,
+                .rope_dim = 0,
+                .rope_interleave = false,
+                .rope_theta = 0.0,
+                .index_share_for_mtp_iteration = true,
+                .index_topk = 4,
+                .num_experts = 8,
+                .num_experts_per_tok = 2,
+                .moe_intermediate_size = 64,
+                .intermediate_size = 64,
+                .shared_expert_intermediate_size = 64,
+                .routed_scaling_factor = 1.0,
+                .norm_topk_prob = true,
+                .moe_scoring_sigmoid = true,
+                .swiglu_limit = 10.0,
+                .share_embed_tokens = true,
+                .share_lm_head = true,
+            },
+        };
+
+        for (mtp_cases, 0..) |mcfg, ci| {
+            const mtp_img = try draft_mod.buildSyntheticDraftAmfImage(allocator, mcfg, 92160 + @as(u64, @intCast(ci)));
+            defer allocator.free(mtp_img);
+
+            var spec_model = try qwen3.Qwen3Model.loadFromBytes(allocator, tgt_img, tgt_cfg, .{
+                .max_seq_len = 64,
+                .max_tree_nodes = 16,
+                .enable_feature_taps = true,
+            });
+            defer spec_model.deinit(allocator);
+
+            var dh = try draft_mod.DraftHead.loadFromBytes(allocator, &spec_model, mtp_img, mcfg, .{
+                .placement = .auto,
+                .max_seq_len = 64,
+                .max_tree_slots = 16,
+            });
+            defer dh.deinit(allocator, &spec_model);
+
+            var eng = try SpecEngine.init(allocator, &spec_model, &dh, .{
+                .mode = .mtp,
+                .max_tree_nodes = 16,
+                .max_draft_depth = 3,
+                .branch_width = 2,
+                .top_k_per_node = 2,
+                .l1_max_draft = 0,
+                .min_frontier_prob = 0.0,
+                .enable_pruning = false,
+                .temperature = 0.0,
+            });
+            defer eng.deinit(allocator);
+
+            const sparse_pos = [_]u32{ 0, 2, 4, 5 };
+
+            var spec_tokens: [gen_steps]u32 = undefined;
+            spec_tokens[0] = try eng.prefill(&prompt, null);
+            dh.setSharedSparseIndices(.{
+                .host_indices = &sparse_pos,
+                .k_selected = sparse_pos.len,
+                .max_k = sparse_pos.len,
+                .num_rows = 1,
+                .valid = true,
+            });
+            var out_len: usize = 1;
+            while (out_len < gen_steps) {
+                const rs = try eng.stepRound(null, spec_tokens[out_len..]);
+                try std.testing.expect(rs.emitted_count >= 1);
+                out_len += rs.emitted_count;
+            }
+            try std.testing.expect(dh.zero_reindex_hits > 0);
+            try std.testing.expectEqual(@as(u64, 0), dh.indexer_dispatches);
+            try std.testing.expectEqualSlices(u32, &ref_tokens, &spec_tokens);
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // 2. DFlash2 (B=8 & B=16, DFlashGroupedConv + CandidateSelector + 5-tap fc)
+    //    on cold-expert NVMe MoE GraphModel + D7 pruning -> 100% T=0 bit-exact!
+    // -------------------------------------------------------------------------
+    {
+        const tmp_dir = try graph.makeTestTempDir(allocator, "m92_d15_dflash2_d7");
+        defer {
+            graph.removeTestDir(allocator, tmp_dir);
+            allocator.free(tmp_dir);
+        }
+
+        var synth = try graph.buildSynthQwen4Bundle(allocator, .{
+            .num_experts = 8,
+            .top_k = 2,
+            .cold_experts_per_layer = 4,
+            .max_loops = 1,
+            .ple_num_shards = 0,
+            .include_steplora = false,
+            .tmp_dir = tmp_dir,
+        });
+        defer {
+            if (synth.amf_file_path) |p| graph.removeTestFile(p);
+            for (synth.ple_paths) |p| graph.removeTestFile(p);
+            synth.deinit(allocator);
+        }
+
+        const prompt = [_]u32{ 4, 10, 16, 22, 28 };
+        const gen_steps: usize = 10;
+
+        var ref_model = try graph.GraphModel.loadFromFile(allocator, synth.amf_file_path.?, synth.cfg, .{
+            .max_seq_len = 64,
+            .max_tree_nodes = 16,
+            .cold_slot_count = 16,
+            .startup_canary = false,
+        });
+        defer ref_model.deinit(allocator);
+
+        var ref_tokens: [gen_steps]u32 = undefined;
+        ref_tokens[0] = try ref_model.prefillChunk(&prompt, 0, true);
+        for (1..gen_steps) |s| {
+            ref_tokens[s] = try ref_model.stepDecode(ref_tokens[s - 1], @intCast(prompt.len + s - 1));
+        }
+
+        const h: usize = synth.cfg.hidden_size;
+        const inter: usize = h * 2;
+        const nh: u32 = 2;
+        const nkvh: u32 = 1;
+        const hd: u32 = 64;
+        const q_dim: usize = @as(usize, nh) * hd;
+        const kv_dim: usize = @as(usize, nkvh) * hd;
+        const taps: usize = 5;
+        const n_layers: usize = 5;
+        const conv_taps: u8 = 2;
+        const conv_gs: u32 = 16;
+        const conv_ng: usize = h / conv_gs;
+        const conv_proj_rows: usize = 2 * @as(usize, conv_taps) * conv_ng;
+        const sel_rank: u32 = 32;
+        const sel_k: u8 = 8;
+        const v: usize = synth.cfg.vocab_size;
+
+        const l_q = try allocator.alloc(f32, n_layers * q_dim * h);
+        defer allocator.free(l_q);
+        const l_k = try allocator.alloc(f32, n_layers * kv_dim * h);
+        defer allocator.free(l_k);
+        const l_v = try allocator.alloc(f32, n_layers * kv_dim * h);
+        defer allocator.free(l_v);
+        const l_o = try allocator.alloc(f32, n_layers * h * q_dim);
+        defer allocator.free(l_o);
+        const l_gate = try allocator.alloc(f32, n_layers * inter * h);
+        defer allocator.free(l_gate);
+        const l_up = try allocator.alloc(f32, n_layers * inter * h);
+        defer allocator.free(l_up);
+        const l_down = try allocator.alloc(f32, n_layers * h * inter);
+        defer allocator.free(l_down);
+        const l_ac_base = try allocator.alloc(f32, n_layers * 2 * conv_taps * h);
+        defer allocator.free(l_ac_base);
+        const l_ac_proj = try allocator.alloc(f32, n_layers * conv_proj_rows * h);
+        defer allocator.free(l_ac_proj);
+        const l_mc_base = try allocator.alloc(f32, n_layers * 2 * conv_taps * h);
+        defer allocator.free(l_mc_base);
+        const l_mc_proj = try allocator.alloc(f32, n_layers * conv_proj_rows * h);
+        defer allocator.free(l_mc_proj);
+        const fc = try allocator.alloc(f32, h * taps * h);
+        defer allocator.free(fc);
+        const h_norm = try allocator.alloc(f32, h);
+        defer allocator.free(h_norm);
+        const f_norm = try allocator.alloc(f32, h);
+        defer allocator.free(f_norm);
+        const cs_hp = try allocator.alloc(f32, sel_rank * h);
+        defer allocator.free(cs_hp);
+        const cs_pred = try allocator.alloc(f32, v * sel_rank);
+        defer allocator.free(cs_pred);
+        const cs_succ = try allocator.alloc(f32, v * sel_rank);
+        defer allocator.free(cs_succ);
+
+        var layers: [n_layers]dflare_dfly.TransformerBlockWeights = undefined;
+        for (0..n_layers) |li| {
+            fillDet(l_q[li * q_dim * h ..][0 .. q_dim * h], 9500 + li * 20 + 1, 0.08);
+            fillDet(l_k[li * kv_dim * h ..][0 .. kv_dim * h], 9500 + li * 20 + 2, 0.08);
+            fillDet(l_v[li * kv_dim * h ..][0 .. kv_dim * h], 9500 + li * 20 + 3, 0.08);
+            fillDet(l_o[li * h * q_dim ..][0 .. h * q_dim], 9500 + li * 20 + 4, 0.08);
+            fillDet(l_gate[li * inter * h ..][0 .. inter * h], 9500 + li * 20 + 5, 0.07);
+            fillDet(l_up[li * inter * h ..][0 .. inter * h], 9500 + li * 20 + 6, 0.07);
+            fillDet(l_down[li * h * inter ..][0 .. h * inter], 9500 + li * 20 + 7, 0.07);
+            const acb = l_ac_base[li * 2 * conv_taps * h ..][0 .. 2 * conv_taps * h];
+            const mcb = l_mc_base[li * 2 * conv_taps * h ..][0 .. 2 * conv_taps * h];
+            fillDet(acb, 9500 + li * 20 + 8, 0.04);
+            fillDet(mcb, 9500 + li * 20 + 9, 0.04);
+            for (0..2) |side| {
+                for (0..h) |c| {
+                    acb[(side * conv_taps) * h + c] += 1.0;
+                    mcb[(side * conv_taps) * h + c] += 1.0;
+                }
+            }
+            fillDet(l_ac_proj[li * conv_proj_rows * h ..][0 .. conv_proj_rows * h], 9500 + li * 20 + 10, 0.05);
+            fillDet(l_mc_proj[li * conv_proj_rows * h ..][0 .. conv_proj_rows * h], 9500 + li * 20 + 11, 0.05);
+            layers[li] = .{
+                .q_proj = l_q[li * q_dim * h ..][0 .. q_dim * h],
+                .k_proj = l_k[li * kv_dim * h ..][0 .. kv_dim * h],
+                .v_proj = l_v[li * kv_dim * h ..][0 .. kv_dim * h],
+                .o_proj = l_o[li * h * q_dim ..][0 .. h * q_dim],
+                .mlp_gate_proj = l_gate[li * inter * h ..][0 .. inter * h],
+                .mlp_up_proj = l_up[li * inter * h ..][0 .. inter * h],
+                .mlp_down_proj = l_down[li * h * inter ..][0 .. h * inter],
+                .attn_conv = .{
+                    .base_kernel = acb,
+                    .kernel_proj = l_ac_proj[li * conv_proj_rows * h ..][0 .. conv_proj_rows * h],
+                    .taps = conv_taps,
+                    .group_size = conv_gs,
+                },
+                .mlp_conv = .{
+                    .base_kernel = mcb,
+                    .kernel_proj = l_mc_proj[li * conv_proj_rows * h ..][0 .. conv_proj_rows * h],
+                    .taps = conv_taps,
+                    .group_size = conv_gs,
+                },
+            };
+        }
+        fillDet(fc, 9601, 0.05);
+        @memset(h_norm, 1.0);
+        @memset(f_norm, 1.0);
+        fillDet(cs_hp, 9602, 0.12);
+        fillDet(cs_pred, 9603, 0.18);
+        fillDet(cs_succ, 9604, 0.18);
+
+        for ([_]u8{ 8, 16 }) |block_w| {
+            for ([_]bool{ false, true }) |enable_prune| {
+                var spec_model = try graph.GraphModel.loadFromFile(allocator, synth.amf_file_path.?, synth.cfg, .{
+                    .max_seq_len = 64,
+                    .max_tree_nodes = 16,
+                    .cold_slot_count = 16,
+                    .startup_canary = false,
+                });
+                defer spec_model.deinit(allocator);
+
+                const df_cfg: dflare_dfly.DFlareConfig = .{
+                    .variant = .dflash2,
+                    .dflash_version = 2,
+                    .num_layers = n_layers,
+                    .block_size = block_w,
+                    .top_k_per_pos = 1,
+                    .max_tree_nodes = 16,
+                    .hidden_size = @intCast(h),
+                    .intermediate_size = @intCast(inter),
+                    .num_attention_heads = nh,
+                    .num_key_value_heads = nkvh,
+                    .head_dim = hd,
+                    .rope_dim = 64,
+                    .sliding_window = 16,
+                    .vocab_size = synth.cfg.vocab_size,
+                    .markov_rank = 0,
+                    .num_target_taps = @intCast(taps),
+                    .mask_token_id = synth.cfg.vocab_size - 1,
+                    .conv_kernel_size = conv_taps,
+                    .conv_group_size = conv_gs,
+                    .selector_rank = sel_rank,
+                    .selector_top_k = sel_k,
+                };
+                const df_weights: dflare_dfly.DFlareWeights = .{
+                    .target_fusion_proj = fc,
+                    .target_fusion_norm = h_norm,
+                    .final_norm = f_norm,
+                    .mask_embed = &.{},
+                    .tok_embed_hook = .{ .callback = .{
+                        .ctx = &spec_model,
+                        .read_fn = LoadedDFlareProposer.readTargetTokEmbedCb,
+                    } },
+                    .layers = &layers,
+                    .candidate_selector = .{
+                        .hidden_proj = cs_hp,
+                        .predecessor_codebook = cs_pred,
+                        .successor_codebook = cs_succ,
+                        .state_rank = sel_rank,
+                        .top_k = sel_k,
+                    },
+                    .lm_head = .{ .callback = .{
+                        .ctx = &spec_model,
+                        .eval_fn = LoadedDFlareProposer.evalTargetLmHeadCb,
+                    } },
+                };
+
+                var ws = try dflare_dfly.DFlareWorkspace.init(df_cfg, null);
+                defer ws.deinit();
+                var proposer = try dflare_dfly.DFlareProposer.init(df_cfg, df_weights, &ws);
+                try proposer.attachGpu(.{
+                    .device = spec_model.device,
+                    .library = spec_model.library,
+                    .compute = &spec_model.compute,
+                    .dequant_pipes = &spec_model.dequant_pipes,
+                    .qf_pipes = if (spec_model.qf_pipes) |*qfp| qfp else null,
+                    .target_lm_head = .{
+                        .amf_dtype = spec_model.lm_head.amf_dtype,
+                        .group_size = spec_model.lm_head.group_size,
+                        .tensor_scale_per_row = spec_model.lm_head.tensor_scale_per_row,
+                        .weight = spec_model.lm_head.weight,
+                        .params = spec_model.lm_head.scale_bias,
+                        .n = spec_model.lm_head.n,
+                        .k = spec_model.lm_head.k,
+                    },
+                    .timeout_ms = spec_model.timeout_ms,
+                });
+                defer proposer.detachGpu();
+
+                var eng = try SpecEngine.initWithDFlare(allocator, &spec_model, &proposer, .{
+                    .mode = .dflare,
+                    .max_tree_nodes = 16,
+                    .max_draft_depth = 15,
+                    .enable_pruning = enable_prune,
+                    .temperature = 0.0,
+                });
+                defer eng.deinit(allocator);
+
+                var spec_tokens: [gen_steps]u32 = undefined;
+                spec_tokens[0] = try eng.prefill(&prompt, null);
+                var out_len: usize = 1;
+                while (out_len < gen_steps) {
+                    const rs = try eng.stepRound(null, spec_tokens[out_len..]);
+                    try std.testing.expect(rs.emitted_count >= 1);
+                    out_len += rs.emitted_count;
+                }
+                try std.testing.expect(eng.stats.dflare_rounds > 0);
+                try std.testing.expectEqualSlices(u32, &ref_tokens, &spec_tokens);
+            }
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // 3. D7 sigmoid + e_score_correction_bias router prediction over 288 experts
+    //    (GLM-5.3-Flash, experts 256..287 in upper ExpertBitset word 4)
+    // -------------------------------------------------------------------------
+    {
+        const ne: u32 = 288;
+        const rh: usize = 4;
+        var router_w: [ne * rh]f32 = @splat(-0.5);
+        const hidden_v = [_]f32{ 1.0, 0.0, 0.0, 0.0 };
+        var bias: [ne]f32 = @splat(0.0);
+        var scratch: [ne]f32 = @splat(0.0);
+        // Place top-8 experts across both low words and upper GLM-5.3-Flash range 256..287.
+        const hot_e = [_]u32{ 2, 19, 130, 255, 256, 267, 279, 287 };
+        for (hot_e) |e| {
+            router_w[@as(usize, e) * rh] = 0.1;
+            bias[e] = 4.0;
+        }
+        const bs = tree_mod.predictRouterTopK(
+            std.mem.sliceAsBytes(&router_w),
+            .f32,
+            &hidden_v,
+            ne,
+            8,
+            &bias,
+            true,
+            &scratch,
+        );
+        try std.testing.expectEqual(@as(u32, 8), bs.count());
+        for (hot_e) |e| try std.testing.expect(bs.contains(e));
     }
 }

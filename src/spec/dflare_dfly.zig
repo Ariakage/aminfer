@@ -90,11 +90,12 @@ pub const DraftSource = union(DraftSourceKind) {
     dfly2_5l: *DFly2Proposer,
 };
 
-/// DFlare architecture family variant (`Inkling-2-Mini 3L`, `Small 5L`, `dflash`).
+/// DFlare architecture family variant (`Inkling-2-Mini 3L`, `Small 5L`, `dflash`, `dflash2`).
 pub const DFlareVariant = enum(u8) {
     inkling2_mini_3l = 0,
     inkling2_small_5l = 1,
     dflash_standalone = 2,
+    dflash2 = 3,
 };
 
 /// Callback allowing GPU target `lm_head` (or tied Metal GEMM) to score `[batch, hidden]`
@@ -216,8 +217,12 @@ pub fn detectDraftKindFromJson(json_bytes: []const u8) ?DraftKindDetected {
     }
     if (std.mem.indexOf(u8, json_bytes, "\"dflare\"") != null or
         std.mem.indexOf(u8, json_bytes, "\"dflash\"") != null or
+        std.mem.indexOf(u8, json_bytes, "\"dflash2\"") != null or
         std.mem.indexOf(u8, json_bytes, "\"dflash_config\"") != null or
+        std.mem.indexOf(u8, json_bytes, "\"dflash_version\"") != null or
         std.mem.indexOf(u8, json_bytes, "\"DFlashDraftModel\"") != null or
+        std.mem.indexOf(u8, json_bytes, "\"DFlash2DraftModel\"") != null or
+        std.mem.indexOf(u8, json_bytes, "\"DFlash2BeamDraftModel\"") != null or
         std.mem.indexOf(u8, json_bytes, "\"DFlashForCausalLM\"") != null or
         std.mem.indexOf(u8, json_bytes, "\"markov_head_type\"") != null)
     {
@@ -312,8 +317,73 @@ pub const GpuContextHistory = struct {
     epoch: u64,
 };
 
+/// `DFlash2` `DFlashGroupedConv` dynamic depthwise K-tap block convolution weights
+/// (`sglang_dflash.py:DFlashGroupedConv`, `GLM-5.3-Flash-DFlash2-Agentic`).
+pub const GroupedConvWeights = struct {
+    /// `[2, taps, hidden_size]` (`side 0 = input prepare`, `side 1 = output finish`).
+    base_kernel: []const f32 = &.{},
+    /// `[2 * taps * num_groups, hidden_size]` where `num_groups = hidden_size / group_size`.
+    kernel_proj: []const f32 = &.{},
+    kernel_proj_bf16: ?[]const u16 = null,
+    kernel_proj_raw: ?RawLinearMat = null,
+    taps: u8 = 2,
+    group_size: u32 = 16,
+
+    pub fn validate(self: GroupedConvWeights, hidden_size: usize) Error!void {
+        if (self.taps == 0 or self.group_size == 0 or (hidden_size % self.group_size) != 0) {
+            return error.InvalidWeights;
+        }
+        const num_groups = hidden_size / self.group_size;
+        const base_need = std.math.mul(usize, 2 * @as(usize, self.taps), hidden_size) catch return error.Overflow;
+        if (self.base_kernel.len != base_need) return error.InvalidWeights;
+        const proj_rows = 2 * @as(usize, self.taps) * num_groups;
+        const proj_elems = std.math.mul(usize, proj_rows, hidden_size) catch return error.Overflow;
+        const proj_ok = (self.kernel_proj.len == proj_elems) or
+            (if (self.kernel_proj_bf16) |b| b.len == proj_elems else false) or
+            (if (self.kernel_proj_raw) |r| r.matches(proj_rows, hidden_size) else false);
+        if (!proj_ok) return error.InvalidWeights;
+    }
+};
+
+/// `DFlash2` `CandidateSelector` pairwise transition codebook weights
+/// (`sglang_dflash.py:CandidateSelector`, `GLM-5.3-Flash-DFlash2-Agentic`).
+pub const CandidateSelectorWeights = struct {
+    /// `[state_rank, hidden_size]`
+    hidden_proj: []const f32 = &.{},
+    hidden_proj_bf16: ?[]const u16 = null,
+    hidden_proj_raw: ?RawLinearMat = null,
+    /// `[vocab_size, state_rank]`
+    predecessor_codebook: []const f32 = &.{},
+    predecessor_codebook_bf16: ?[]const u16 = null,
+    predecessor_codebook_raw: ?RawLinearMat = null,
+    /// `[vocab_size, state_rank]`
+    successor_codebook: []const f32 = &.{},
+    successor_codebook_bf16: ?[]const u16 = null,
+    successor_codebook_raw: ?RawLinearMat = null,
+    state_rank: u32 = 256,
+    top_k: u8 = 16,
+
+    pub fn validate(self: CandidateSelectorWeights, hidden_size: usize, vocab_size: usize) Error!void {
+        if (self.state_rank == 0 or self.state_rank > 512) return error.InvalidWeights;
+        if (self.top_k == 0 or self.top_k > 16 or self.top_k > vocab_size) return error.InvalidWeights;
+        const r: usize = self.state_rank;
+        const rh = std.math.mul(usize, r, hidden_size) catch return error.Overflow;
+        const vr = std.math.mul(usize, vocab_size, r) catch return error.Overflow;
+        const hp_ok = (self.hidden_proj.len == rh) or
+            (if (self.hidden_proj_bf16) |b| b.len == rh else false) or
+            (if (self.hidden_proj_raw) |m| m.matches(r, hidden_size) else false);
+        const pred_ok = (self.predecessor_codebook.len == vr) or
+            (if (self.predecessor_codebook_bf16) |b| b.len == vr else false) or
+            (if (self.predecessor_codebook_raw) |m| m.matches(vocab_size, r) else false);
+        const succ_ok = (self.successor_codebook.len == vr) or
+            (if (self.successor_codebook_bf16) |b| b.len == vr else false) or
+            (if (self.successor_codebook_raw) |m| m.matches(vocab_size, r) else false);
+        if (!hp_ok or !pred_ok or !succ_ok) return error.InvalidWeights;
+    }
+};
+
 /// Shared lightweight block-parallel transformer layer weights used by both
-/// `DFlareProposer` (`3L`/`5L`) and `DFly2Proposer` (`5L`).
+/// `DFlareProposer` (`3L`/`5L`, `DFlash`, `DFlash2`) and `DFly2Proposer` (`5L`).
 pub const TransformerBlockWeights = struct {
     in_norm_weight: ?[]const f32 = null,
     q_proj: []const f32 = &.{}, // [q_dim, hidden_size]
@@ -353,6 +423,9 @@ pub const TransformerBlockWeights = struct {
     mlp_gate_raw: ?RawLinearMat = null,
     mlp_up_raw: ?RawLinearMat = null,
     mlp_down_raw: ?RawLinearMat = null,
+    /// Optional `DFlash2` `DFlashGroupedConv` sublayer wrappers (`attn_conv`, `mlp_conv`).
+    attn_conv: ?GroupedConvWeights = null,
+    mlp_conv: ?GroupedConvWeights = null,
     /// Optional Hy4 MLA attention weights (`DFly2` layers).
     mla: ?MlaBlockWeights = null,
 
@@ -403,6 +476,8 @@ pub const TransformerBlockWeights = struct {
         if (!g_ok or !u_ok or !d_ok) {
             return error.InvalidWeights;
         }
+        if (self.attn_conv) |ac| try ac.validate(hidden_size);
+        if (self.mlp_conv) |mc| try mc.validate(hidden_size);
     }
 };
 
@@ -444,6 +519,18 @@ pub const DFlareConfig = struct {
     /// When `> 0.0`, forks a runner-up top-2 branch at uncertain direct block-diffusion slots (`top1_prob < threshold`)
     /// up to `max_tree_nodes` (e.g. `16`).
     fork_top2_threshold: f32 = 0.0,
+    /// Direct block-diffusion version (`1` = MiMo-V2.6 `DFlash`, `2` = `GLM-5.3-Flash` `DFlash2`).
+    dflash_version: u8 = 1,
+    /// `DFlash2` `DFlashGroupedConv` kernel tap count (`2` on `GLM-5.3-Flash-DFlash2-Agentic`; `0` disables grouped conv).
+    conv_kernel_size: u8 = 0,
+    /// `DFlash2` `DFlashGroupedConv` channels per group (`16` -> `num_groups = hidden_size / 16`; `0` disables grouped conv).
+    conv_group_size: u32 = 0,
+    /// `DFlash2` `CandidateSelector` low-rank state dimension (`256`; `0` disables candidate selector).
+    selector_rank: u32 = 0,
+    /// `DFlash2` `CandidateSelector` base vocabulary candidate shortlist per slot (`16`; `0` disables candidate selector).
+    selector_top_k: u8 = 0,
+    /// Optional unary logit multiplier applied before `final_logit_softcapping` (`sglang_dflash.py:1936`).
+    output_multiplier: f32 = 1.0,
     unpadded_vocab_size: u32 = 0,
     final_logit_softcapping: f32 = 0.0,
     temperature: f32 = 1.0,
@@ -514,6 +601,18 @@ pub const DFlareConfig = struct {
         return self.markov_rank == 0;
     }
 
+    pub inline fn isDFlash2(self: DFlareConfig) bool {
+        return self.dflash_version >= 2 or self.variant == .dflash2;
+    }
+
+    pub inline fn hasGroupedConv(self: DFlareConfig) bool {
+        return self.conv_kernel_size >= 2 and self.conv_group_size > 0;
+    }
+
+    pub inline fn hasCandidateSelector(self: DFlareConfig) bool {
+        return self.selector_rank > 0 and self.selector_top_k > 0;
+    }
+
     pub fn validate(self: DFlareConfig) Error!void {
         if (self.num_layers == 0 or self.num_layers > MAX_LAYERS) return error.InvalidConfig;
         if (self.block_size == 0 or self.block_size > MAX_BLOCK_SIZE) return error.InvalidConfig;
@@ -529,6 +628,12 @@ pub const DFlareConfig = struct {
         if (self.refinement_iters == 0 or self.refinement_iters > 2) return error.InvalidConfig;
         if (!std.math.isFinite(self.refine_confidence_threshold) or self.refine_confidence_threshold < 0.0 or self.refine_confidence_threshold > 1.0) return error.InvalidConfig;
         if (!std.math.isFinite(self.fork_top2_threshold) or self.fork_top2_threshold < 0.0 or self.fork_top2_threshold > 1.0) return error.InvalidConfig;
+        if (!std.math.isFinite(self.output_multiplier) or self.output_multiplier <= 0.0) return error.InvalidConfig;
+        if (self.hasGroupedConv()) {
+            if ((self.hidden_size % self.conv_group_size) != 0) return error.InvalidConfig;
+        }
+        if (self.selector_rank > 512) return error.InvalidConfig;
+        if (self.selector_top_k > 16 or (self.selector_top_k > 0 and self.selector_top_k > self.vocab_size)) return error.InvalidConfig;
         if (self.mask_token_id) |mtid| {
             if (mtid >= self.vocab_size) return error.InvalidConfig;
         }
@@ -538,7 +643,7 @@ pub const DFlareConfig = struct {
         if (self.l1_max_draft_len > MAX_L1_DRAFT_LEN) return error.InvalidConfig;
     }
 
-    /// Parses `dflare_config.json`, HF `dflash/config.json`, or GGUF `arch=dflash` config JSON with target fallbacks.
+    /// Parses `dflare_config.json`, HF `dflash/config.json`, `dflash2/config.json`, or GGUF `arch=dflash` config JSON with target fallbacks.
     pub fn fromJson(
         allocator: std.mem.Allocator,
         json_bytes: []const u8,
@@ -551,10 +656,28 @@ pub const DFlareConfig = struct {
         const obj = parsed.value.object;
         const df_obj: ?std.json.ObjectMap = if (obj.get("dflash_config")) |dv| (if (dv == .object) dv.object else null) else null;
 
-        const is_dflash_arch: bool = blk: {
-            if (df_obj != null) break :blk true;
+        const explicit_dflash_ver: u8 = @intCast(jsonU32Opt(obj, "dflash_version") orelse
+            (if (df_obj) |dfo| jsonU32Opt(dfo, "dflash_version") else null) orelse 0);
+        const is_dflash2_arch: bool = blk: {
+            if (explicit_dflash_ver >= 2) break :blk true;
             if (obj.get("draft_kind")) |dk| {
-                if (dk == .string and std.mem.eql(u8, dk.string, "dflash")) break :blk true;
+                if (dk == .string and std.mem.eql(u8, dk.string, "dflash2")) break :blk true;
+            }
+            if (obj.get("architectures")) |av| {
+                if (av == .array and av.array.items.len > 0 and av.array.items[0] == .string) {
+                    if (std.mem.indexOf(u8, av.array.items[0].string, "DFlash2") != null) break :blk true;
+                }
+            }
+            if (jsonU32Opt(obj, "selector_rank") != null or jsonU32Opt(obj, "conv_kernel_size") != null) break :blk true;
+            if (df_obj) |dfo| {
+                if (jsonU32Opt(dfo, "selector_rank") != null or jsonU32Opt(dfo, "conv_kernel_size") != null) break :blk true;
+            }
+            break :blk false;
+        };
+        const is_dflash_arch: bool = blk: {
+            if (is_dflash2_arch or df_obj != null) break :blk true;
+            if (obj.get("draft_kind")) |dk| {
+                if (dk == .string and (std.mem.eql(u8, dk.string, "dflash") or std.mem.eql(u8, dk.string, "dflash2"))) break :blk true;
             }
             if (obj.get("architectures")) |av| {
                 if (av == .array and av.array.items.len > 0 and av.array.items[0] == .string) {
@@ -595,6 +718,18 @@ pub const DFlareConfig = struct {
         const refinement_iters: u8 = @intCast(jsonU32Opt(obj, "refinement_iters") orelse 1);
         const refine_conf: f32 = jsonF32Opt(obj, "refine_confidence_threshold") orelse 0.5;
         const fork_top2: f32 = jsonF32Opt(obj, "fork_top2_threshold") orelse 0.0;
+        const conv_kernel_size: u8 = @intCast(jsonU32Opt(obj, "conv_kernel_size") orelse
+            (if (df_obj) |dfo| jsonU32Opt(dfo, "conv_kernel_size") else null) orelse 0);
+        const conv_group_size: u32 = jsonU32Opt(obj, "conv_group_size") orelse
+            (if (df_obj) |dfo| jsonU32Opt(dfo, "conv_group_size") else null) orelse
+            jsonU32Opt(obj, "conv_groups") orelse
+            (if (df_obj) |dfo| jsonU32Opt(dfo, "conv_groups") else null) orelse 0;
+        const selector_rank: u32 = jsonU32Opt(obj, "selector_rank") orelse
+            (if (df_obj) |dfo| jsonU32Opt(dfo, "selector_rank") else null) orelse 0;
+        const selector_top_k: u8 = @intCast(jsonU32Opt(obj, "selector_top_k") orelse
+            (if (df_obj) |dfo| jsonU32Opt(dfo, "selector_top_k") else null) orelse (if (selector_rank > 0) @as(u32, 16) else @as(u32, 0)));
+        const output_multiplier: f32 = jsonF32Opt(obj, "output_multiplier") orelse
+            (if (df_obj) |dfo| jsonF32Opt(dfo, "output_multiplier") else null) orelse 1.0;
         const unpadded_vocab: u32 = jsonU32Opt(obj, "unpadded_vocab_size") orelse 0;
         const final_softcap: f32 = jsonF32Opt(obj, "final_logit_softcapping") orelse 0.0;
 
@@ -611,7 +746,10 @@ pub const DFlareConfig = struct {
                 }
             }
         }
-        const variant: DFlareVariant = if (is_dflash_arch)
+        const dflash_version: u8 = if (is_dflash2_arch) @max(explicit_dflash_ver, @as(u8, 2)) else 1;
+        const variant: DFlareVariant = if (is_dflash2_arch)
+            .dflash2
+        else if (is_dflash_arch)
             .dflash_standalone
         else if (num_layers >= 5)
             .inkling2_small_5l
@@ -640,6 +778,12 @@ pub const DFlareConfig = struct {
             .refinement_iters = refinement_iters,
             .refine_confidence_threshold = refine_conf,
             .fork_top2_threshold = fork_top2,
+            .dflash_version = dflash_version,
+            .conv_kernel_size = conv_kernel_size,
+            .conv_group_size = conv_group_size,
+            .selector_rank = selector_rank,
+            .selector_top_k = selector_top_k,
+            .output_multiplier = output_multiplier,
             .unpadded_vocab_size = unpadded_vocab,
             .final_logit_softcapping = final_softcap,
         };
@@ -695,6 +839,8 @@ pub const DFlareWeights = struct {
     markov_w2_vocab_bias: ?[]const f32 = null,
     markov_w2_vocab_rows: u32 = 0,
     markov_norm: ?[]const f32 = null,
+    /// Optional `DFlash2` `CandidateSelector` pairwise transition head (`GLM-5.3-Flash-DFlash2-Agentic`).
+    candidate_selector: ?CandidateSelectorWeights = null,
     lm_head: LmHeadHook,
     lm_head_raw: ?RawLinearMat = null,
     /// Optional zero-copy `WiredArena` backing slice owning the loaded `.amf` tensors.
@@ -742,7 +888,10 @@ pub const DFlareWeights = struct {
         }
 
         if (mr == 0) {
-            // Direct parallel block-diffusion mode (`D15` `DFlash`): no Markov head; scores via target `lm_head`.
+            // Direct parallel block-diffusion mode (`D15` `DFlash` v1 / `DFlash2`): no Markov head; scores via target `lm_head` (+ optional `candidate_selector`).
+            if (self.candidate_selector) |cs| {
+                try cs.validate(h, v);
+            }
             if (self.lm_head_raw) |lhr| {
                 if (!lhr.matches(v, h)) return error.InvalidWeights;
             } else {
@@ -869,6 +1018,18 @@ pub const DFlareWorkspace = struct {
     gpu_grammar_mask_u32: []u32,
     gpu_w1_row_f32: []f32,
     cpu_quant_row_scratch: []f32,
+    // `DFlash2` `DFlashGroupedConv` & `CandidateSelector` zero-copy preallocated buffers (`0` hot-path allocs).
+    conv_tmp: []f32,
+    conv_delta: []f32,
+    gpu_conv_tmp_f16: []f16,
+    gpu_conv_delta_f16: []f16,
+    sel_hidden: []f32,
+    sel_cand_ids: []u32,
+    sel_unary_logits: []f32,
+    sel_scores: []f32,
+    sel_pred_row: []f32,
+    sel_succ_row: []f32,
+    gpu_sel_hidden_f16: []f16,
 
     pub fn requiredBytes(cfg: DFlareConfig) Error!usize {
         try cfg.validate();
@@ -882,11 +1043,21 @@ pub const DFlareWorkspace = struct {
         const q_dim: usize = cfg.qDim();
         const kv_dim: usize = cfg.kvDim();
         const max_nodes: usize = cfg.max_tree_nodes;
-        const max_ctx: usize = if (cfg.sliding_window > 0) @min(@as(usize, cfg.sliding_window), 1024) else if (cfg.hidden_size >= 1024) 1024 else 64;
+        const max_ctx: usize = if (cfg.sliding_window > 0) @min(@as(usize, cfg.sliding_window), 2048) else if (cfg.hidden_size >= 1024) 1024 else 64;
         const ctx_batch_cap: usize = @min(max_ctx, 64);
         const ctx_kv_elems: usize = @as(usize, cfg.num_layers) * max_ctx * kv_dim;
         const mask_words: usize = (v + 31) / 32;
-        const row_scratch_elems: usize = @max(taps * h, @max(h, @max(inter, @max(q_dim, 2 * h + 2 * mr))));
+        const conv_tmp_elems: usize = if (cfg.hasGroupedConv()) w * h else 1;
+        const conv_delta_elems: usize = if (cfg.hasGroupedConv())
+            w * 2 * @as(usize, cfg.conv_kernel_size) * (h / cfg.conv_group_size)
+        else
+            1;
+        const sel_r: usize = if (cfg.hasCandidateSelector()) cfg.selector_rank else 1;
+        const sel_k: usize = if (cfg.hasCandidateSelector()) cfg.selector_top_k else 1;
+        const sel_hidden_elems: usize = if (cfg.hasCandidateSelector()) w * sel_r else 1;
+        const sel_cand_elems: usize = if (cfg.hasCandidateSelector()) w * sel_k else 1;
+        const sel_score_elems: usize = if (cfg.hasCandidateSelector()) w * sel_k * sel_k else 1;
+        const row_scratch_elems: usize = @max(taps * h, @max(h, @max(inter, @max(q_dim, @max(2 * h + 2 * mr, sel_r)))));
 
         const chunks = [_]usize{
             try alignUp64((taps * h) * @sizeOf(f32)), // taps_flat
@@ -952,6 +1123,17 @@ pub const DFlareWorkspace = struct {
             try alignUp64(mask_words * @sizeOf(u32)), // gpu_grammar_mask_u32
             try alignUp64(mr * @sizeOf(f32)), // gpu_w1_row_f32
             try alignUp64(row_scratch_elems * @sizeOf(f32)), // cpu_quant_row_scratch
+            try alignUp64(conv_tmp_elems * @sizeOf(f32)), // conv_tmp
+            try alignUp64(conv_delta_elems * @sizeOf(f32)), // conv_delta
+            try alignUp64(conv_tmp_elems * @sizeOf(f16)), // gpu_conv_tmp_f16
+            try alignUp64(conv_delta_elems * @sizeOf(f16)), // gpu_conv_delta_f16
+            try alignUp64(sel_hidden_elems * @sizeOf(f32)), // sel_hidden
+            try alignUp64(sel_cand_elems * @sizeOf(u32)), // sel_cand_ids
+            try alignUp64(sel_cand_elems * @sizeOf(f32)), // sel_unary_logits
+            try alignUp64(sel_score_elems * @sizeOf(f32)), // sel_scores
+            try alignUp64(sel_r * @sizeOf(f32)), // sel_pred_row
+            try alignUp64(sel_r * @sizeOf(f32)), // sel_succ_row
+            try alignUp64(sel_hidden_elems * @sizeOf(f16)), // gpu_sel_hidden_f16
         };
         var total: usize = 0;
         for (chunks) |c| total = std.math.add(usize, total, c) catch return error.Overflow;
@@ -976,11 +1158,21 @@ pub const DFlareWorkspace = struct {
         const q_dim: usize = cfg.qDim();
         const kv_dim: usize = cfg.kvDim();
         const max_nodes: usize = cfg.max_tree_nodes;
-        const max_ctx: usize = if (cfg.sliding_window > 0) @min(@as(usize, cfg.sliding_window), 1024) else if (cfg.hidden_size >= 1024) 1024 else 64;
+        const max_ctx: usize = if (cfg.sliding_window > 0) @min(@as(usize, cfg.sliding_window), 2048) else if (cfg.hidden_size >= 1024) 1024 else 64;
         const ctx_batch_cap: usize = @min(max_ctx, 64);
         const ctx_kv_elems: usize = @as(usize, cfg.num_layers) * max_ctx * kv_dim;
         const mask_words: usize = (v + 31) / 32;
-        const row_scratch_elems: usize = @max(taps * h, @max(h, @max(inter, @max(q_dim, 2 * h + 2 * mr))));
+        const conv_tmp_elems: usize = if (cfg.hasGroupedConv()) w * h else 1;
+        const conv_delta_elems: usize = if (cfg.hasGroupedConv())
+            w * 2 * @as(usize, cfg.conv_kernel_size) * (h / cfg.conv_group_size)
+        else
+            1;
+        const sel_r: usize = if (cfg.hasCandidateSelector()) cfg.selector_rank else 1;
+        const sel_k: usize = if (cfg.hasCandidateSelector()) cfg.selector_top_k else 1;
+        const sel_hidden_elems: usize = if (cfg.hasCandidateSelector()) w * sel_r else 1;
+        const sel_cand_elems: usize = if (cfg.hasCandidateSelector()) w * sel_k else 1;
+        const sel_score_elems: usize = if (cfg.hasCandidateSelector()) w * sel_k * sel_k else 1;
+        const row_scratch_elems: usize = @max(taps * h, @max(h, @max(inter, @max(q_dim, @max(2 * h + 2 * mr, sel_r)))));
 
         const taps_flat = try allocArenaSlice(f32, &mem_arena, taps * h);
         const ctx_hidden = try allocArenaSlice(f32, &mem_arena, h);
@@ -1046,6 +1238,17 @@ pub const DFlareWorkspace = struct {
         const gpu_grammar_mask_u32 = try allocArenaSlice(u32, &mem_arena, mask_words);
         const gpu_w1_row_f32 = try allocArenaSlice(f32, &mem_arena, mr);
         const cpu_quant_row_scratch = try allocArenaSlice(f32, &mem_arena, row_scratch_elems);
+        const conv_tmp = try allocArenaSlice(f32, &mem_arena, conv_tmp_elems);
+        const conv_delta = try allocArenaSlice(f32, &mem_arena, conv_delta_elems);
+        const gpu_conv_tmp_f16 = try allocArenaSlice(f16, &mem_arena, conv_tmp_elems);
+        const gpu_conv_delta_f16 = try allocArenaSlice(f16, &mem_arena, conv_delta_elems);
+        const sel_hidden = try allocArenaSlice(f32, &mem_arena, sel_hidden_elems);
+        const sel_cand_ids = try allocArenaSlice(u32, &mem_arena, sel_cand_elems);
+        const sel_unary_logits = try allocArenaSlice(f32, &mem_arena, sel_cand_elems);
+        const sel_scores = try allocArenaSlice(f32, &mem_arena, sel_score_elems);
+        const sel_pred_row = try allocArenaSlice(f32, &mem_arena, sel_r);
+        const sel_succ_row = try allocArenaSlice(f32, &mem_arena, sel_r);
+        const gpu_sel_hidden_f16 = try allocArenaSlice(f16, &mem_arena, sel_hidden_elems);
 
         @memset(mask_embed_tmp, 0.0);
         @memset(node_log_probs, 0.0);
@@ -1054,6 +1257,9 @@ pub const DFlareWorkspace = struct {
         @memset(ctx_v_cache, 0.0);
         @memset(gpu_markov_rnn_ping_f32, 0.0);
         @memset(gpu_token_chain_u32, 0);
+        @memset(sel_cand_ids, 0);
+        @memset(sel_unary_logits, 0.0);
+        @memset(sel_scores, 0.0);
 
         return .{
             .arena = mem_arena,
@@ -1123,6 +1329,17 @@ pub const DFlareWorkspace = struct {
             .gpu_grammar_mask_u32 = gpu_grammar_mask_u32,
             .gpu_w1_row_f32 = gpu_w1_row_f32,
             .cpu_quant_row_scratch = cpu_quant_row_scratch,
+            .conv_tmp = conv_tmp,
+            .conv_delta = conv_delta,
+            .gpu_conv_tmp_f16 = gpu_conv_tmp_f16,
+            .gpu_conv_delta_f16 = gpu_conv_delta_f16,
+            .sel_hidden = sel_hidden,
+            .sel_cand_ids = sel_cand_ids,
+            .sel_unary_logits = sel_unary_logits,
+            .sel_scores = sel_scores,
+            .sel_pred_row = sel_pred_row,
+            .sel_succ_row = sel_succ_row,
+            .gpu_sel_hidden_f16 = gpu_sel_hidden_f16,
         };
     }
 
@@ -1190,6 +1407,17 @@ pub const DFlareWorkspace = struct {
         self.gpu_grammar_mask_u32 = &.{};
         self.gpu_w1_row_f32 = &.{};
         self.cpu_quant_row_scratch = &.{};
+        self.conv_tmp = &.{};
+        self.conv_delta = &.{};
+        self.gpu_conv_tmp_f16 = &.{};
+        self.gpu_conv_delta_f16 = &.{};
+        self.sel_hidden = &.{};
+        self.sel_cand_ids = &.{};
+        self.sel_unary_logits = &.{};
+        self.sel_scores = &.{};
+        self.sel_pred_row = &.{};
+        self.sel_succ_row = &.{};
+        self.gpu_sel_hidden_f16 = &.{};
         self.arena.deinit();
     }
 
@@ -1414,6 +1642,50 @@ const DFlareTopKParams = extern struct {
     _pad1: u32 = 0,
 };
 
+const DFlash2GroupedConvParams = extern struct {
+    seq_len: u32,
+    hidden_size: u32,
+    block_size: u32,
+    taps: u32,
+    num_groups: u32,
+    group_size: u32,
+    side: u32,
+    add_residual: u32,
+};
+
+const DFlash2TopKUnaryParams = extern struct {
+    num_slots: u32,
+    vocab_size: u32,
+    eff_vocab_size: u32,
+    top_k: u32,
+    logits_is_f16: u32,
+    aligned_vec4: u32,
+    output_multiplier: f32,
+    softcap: f32,
+};
+
+const DFlash2SelectorScoreParams = extern struct {
+    num_slots: u32,
+    top_k: u32,
+    state_rank: u32,
+    vocab_size: u32,
+    anchor_token_id: u32,
+    pred_dtype: u32,
+    succ_dtype: u32,
+    hidden_is_f32: u32,
+};
+
+const DFlash2SelectorWalkParams = extern struct {
+    num_slots: u32,
+    top_k: u32,
+    out_k: u32,
+    inv_temp: f32,
+    _pad0: u32 = 0,
+    _pad1: u32 = 0,
+    _pad2: u32 = 0,
+    _pad3: u32 = 0,
+};
+
 comptime {
     if (@sizeOf(PackTapsParams) != 16) @compileError("PackTapsParams size");
     if (@sizeOf(MixTapsParams) != 48) @compileError("MixTapsParams size");
@@ -1433,6 +1705,10 @@ comptime {
     if (@sizeOf(DFlareW2VocabParams) != 32) @compileError("DFlareW2VocabParams size");
     if (@sizeOf(DFlareLogitsEpilogueParams) != 32) @compileError("DFlareLogitsEpilogueParams size");
     if (@sizeOf(DFlareTopKParams) != 48) @compileError("DFlareTopKParams size");
+    if (@sizeOf(DFlash2GroupedConvParams) != 32) @compileError("DFlash2GroupedConvParams size");
+    if (@sizeOf(DFlash2TopKUnaryParams) != 32) @compileError("DFlash2TopKUnaryParams size");
+    if (@sizeOf(DFlash2SelectorScoreParams) != 32) @compileError("DFlash2SelectorScoreParams size");
+    if (@sizeOf(DFlash2SelectorWalkParams) != 32) @compileError("DFlash2SelectorWalkParams size");
 }
 
 /// Startup-compiled Metal 4 compute pipelines for `src/kernels/dflare_gpu.metal`.
@@ -1456,6 +1732,10 @@ pub const DFlareGpuPipelines = struct {
     logits_epilogue: metal.Pipeline,
     top1_logits: metal.Pipeline,
     topk_logits: metal.Pipeline,
+    dflash2_grouped_conv: metal.Pipeline,
+    dflash2_topk_unary_logits: metal.Pipeline,
+    dflash2_selector_score_edges: metal.Pipeline,
+    dflash2_selector_walk_path: metal.Pipeline,
 
     pub fn init(device: metal.Device, library: metal.Library) metal.Error!DFlareGpuPipelines {
         const pack_taps8 = try metal.Pipeline.init(device, library, "dflare_pack_taps8");
@@ -1496,6 +1776,14 @@ pub const DFlareGpuPipelines = struct {
         errdefer top1_logits.close();
         const topk_logits = try metal.Pipeline.init(device, library, "dflare_topk_logits");
         errdefer topk_logits.close();
+        const dflash2_grouped_conv = try metal.Pipeline.init(device, library, "dflash2_grouped_conv");
+        errdefer dflash2_grouped_conv.close();
+        const dflash2_topk_unary_logits = try metal.Pipeline.init(device, library, "dflash2_topk_unary_logits");
+        errdefer dflash2_topk_unary_logits.close();
+        const dflash2_selector_score_edges = try metal.Pipeline.init(device, library, "dflash2_selector_score_edges");
+        errdefer dflash2_selector_score_edges.close();
+        const dflash2_selector_walk_path = try metal.Pipeline.init(device, library, "dflash2_selector_walk_path");
+        errdefer dflash2_selector_walk_path.close();
 
         return .{
             .pack_taps8 = pack_taps8,
@@ -1517,10 +1805,18 @@ pub const DFlareGpuPipelines = struct {
             .logits_epilogue = logits_epilogue,
             .top1_logits = top1_logits,
             .topk_logits = topk_logits,
+            .dflash2_grouped_conv = dflash2_grouped_conv,
+            .dflash2_topk_unary_logits = dflash2_topk_unary_logits,
+            .dflash2_selector_score_edges = dflash2_selector_score_edges,
+            .dflash2_selector_walk_path = dflash2_selector_walk_path,
         };
     }
 
     pub fn close(self: DFlareGpuPipelines) void {
+        self.dflash2_selector_walk_path.close();
+        self.dflash2_selector_score_edges.close();
+        self.dflash2_topk_unary_logits.close();
+        self.dflash2_grouped_conv.close();
         self.topk_logits.close();
         self.top1_logits.close();
         self.logits_epilogue.close();
@@ -1564,6 +1860,24 @@ pub const DFlareGpuAttachOptions = struct {
     timeout_ms: u64 = 30_000,
 };
 
+const GpuGroupedConvBindings = struct {
+    base_kernel: metal.BufferBinding,
+    kernel_proj: GpuLinearBinding,
+    taps: u32,
+    group_size: u32,
+    num_groups: u32,
+};
+
+const GpuCandidateSelectorBindings = struct {
+    hidden_proj: GpuLinearBinding,
+    pred_cb: metal.BufferBinding,
+    pred_dtype: u32, // 0 = f32, 1 = bf16, 2 = f16
+    succ_cb: metal.BufferBinding,
+    succ_dtype: u32,
+    state_rank: u32,
+    top_k: u32,
+};
+
 const GpuLayerBindings = struct {
     in_norm_w: ?metal.BufferBinding = null,
     q_proj: GpuLinearBinding,
@@ -1581,6 +1895,8 @@ const GpuLayerBindings = struct {
     mlp_gate: GpuLinearBinding,
     mlp_up: GpuLinearBinding,
     mlp_down: GpuLinearBinding,
+    attn_conv: ?GpuGroupedConvBindings = null,
+    mlp_conv: ?GpuGroupedConvBindings = null,
 };
 
 /// Zero-copy `WiredArena` Metal 4 runtime context bound to `DFlareProposer`.
@@ -1630,6 +1946,7 @@ pub const DFlareGpuContext = struct {
     markov_w2_vocab_bias: ?metal.BufferBinding = null,
     markov_w2_vocab_rows: u32 = 0,
     markov_norm: ?metal.BufferBinding = null,
+    candidate_selector: ?GpuCandidateSelectorBindings = null,
     lm_head: ?GpuLinearBinding = null,
     target_embed_norm: ?metal.BufferBinding = null,
 
@@ -1839,6 +2156,11 @@ pub const DFlareProposer = struct {
             try collectMissingQfSpec(opts.qf_pipes, &missing_specs, &missing_len, ly.mlp_gate_raw);
             try collectMissingQfSpec(opts.qf_pipes, &missing_specs, &missing_len, ly.mlp_up_raw);
             try collectMissingQfSpec(opts.qf_pipes, &missing_specs, &missing_len, ly.mlp_down_raw);
+            if (ly.attn_conv) |ac| try collectMissingQfSpec(opts.qf_pipes, &missing_specs, &missing_len, ac.kernel_proj_raw);
+            if (ly.mlp_conv) |mc| try collectMissingQfSpec(opts.qf_pipes, &missing_specs, &missing_len, mc.kernel_proj_raw);
+        }
+        if (self.weights.candidate_selector) |cs| {
+            try collectMissingQfSpec(opts.qf_pipes, &missing_specs, &missing_len, cs.hidden_proj_raw);
         }
         try collectMissingQfSpec(opts.qf_pipes, &missing_specs, &missing_len, self.weights.markov_w1_raw);
         try collectMissingQfSpec(opts.qf_pipes, &missing_specs, &missing_len, self.weights.markov_gru_proj_raw);
@@ -1904,6 +2226,19 @@ pub const DFlareProposer = struct {
             stage_bytes += stageMeasureLayerProj(wired_opt, ly.mlp_gate_proj, ly.mlp_gate_bf16, ly.mlp_gate_raw);
             stage_bytes += stageMeasureLayerProj(wired_opt, ly.mlp_up_proj, ly.mlp_up_bf16, ly.mlp_up_raw);
             stage_bytes += stageMeasureLayerProj(wired_opt, ly.mlp_down_proj, ly.mlp_down_bf16, ly.mlp_down_raw);
+            if (ly.attn_conv) |ac| {
+                stage_bytes += stageMeasureSlice(wired_opt, std.mem.sliceAsBytes(ac.base_kernel));
+                stage_bytes += stageMeasureLayerProj(wired_opt, ac.kernel_proj, ac.kernel_proj_bf16, ac.kernel_proj_raw);
+            }
+            if (ly.mlp_conv) |mc| {
+                stage_bytes += stageMeasureSlice(wired_opt, std.mem.sliceAsBytes(mc.base_kernel));
+                stage_bytes += stageMeasureLayerProj(wired_opt, mc.kernel_proj, mc.kernel_proj_bf16, mc.kernel_proj_raw);
+            }
+        }
+        if (self.weights.candidate_selector) |cs| {
+            stage_bytes += stageMeasureLayerProj(wired_opt, cs.hidden_proj, cs.hidden_proj_bf16, cs.hidden_proj_raw);
+            stage_bytes += stageMeasureLayerProj(wired_opt, cs.predecessor_codebook, cs.predecessor_codebook_bf16, cs.predecessor_codebook_raw);
+            stage_bytes += stageMeasureLayerProj(wired_opt, cs.successor_codebook, cs.successor_codebook_bf16, cs.successor_codebook_raw);
         }
 
         if (self.weights.markov_gru_bias) |b| stage_bytes += stageMeasureSlice(wired_opt, std.mem.sliceAsBytes(b));
@@ -2033,6 +2368,28 @@ pub const DFlareProposer = struct {
         }
 
         for (self.weights.layers, 0..) |ly, li| {
+            const attn_conv_b: ?GpuGroupedConvBindings = if (ly.attn_conv) |ac| blk: {
+                const ng: u32 = h / ac.group_size;
+                const proj_n: u32 = 2 * @as(u32, ac.taps) * ng;
+                break :blk .{
+                    .base_kernel = try bind_ctx.bindSlice(std.mem.sliceAsBytes(ac.base_kernel)),
+                    .kernel_proj = try bind_ctx.bindLayerProj(ac.kernel_proj, ac.kernel_proj_bf16, ac.kernel_proj_raw, proj_n, h),
+                    .taps = ac.taps,
+                    .group_size = ac.group_size,
+                    .num_groups = ng,
+                };
+            } else null;
+            const mlp_conv_b: ?GpuGroupedConvBindings = if (ly.mlp_conv) |mc| blk: {
+                const ng: u32 = h / mc.group_size;
+                const proj_n: u32 = 2 * @as(u32, mc.taps) * ng;
+                break :blk .{
+                    .base_kernel = try bind_ctx.bindSlice(std.mem.sliceAsBytes(mc.base_kernel)),
+                    .kernel_proj = try bind_ctx.bindLayerProj(mc.kernel_proj, mc.kernel_proj_bf16, mc.kernel_proj_raw, proj_n, h),
+                    .taps = mc.taps,
+                    .group_size = mc.group_size,
+                    .num_groups = ng,
+                };
+            } else null;
             ctx.layers[li] = .{
                 .in_norm_w = if (ly.in_norm_weight) |w| try bind_ctx.bindSlice(std.mem.sliceAsBytes(w)) else null,
                 .q_proj = try bind_ctx.bindLayerProj(ly.q_proj, ly.q_proj_bf16, ly.q_proj_raw, q_dim, h),
@@ -2050,6 +2407,55 @@ pub const DFlareProposer = struct {
                 .mlp_gate = try bind_ctx.bindLayerProj(ly.mlp_gate_proj, ly.mlp_gate_bf16, ly.mlp_gate_raw, inter, h),
                 .mlp_up = try bind_ctx.bindLayerProj(ly.mlp_up_proj, ly.mlp_up_bf16, ly.mlp_up_raw, inter, h),
                 .mlp_down = try bind_ctx.bindLayerProj(ly.mlp_down_proj, ly.mlp_down_bf16, ly.mlp_down_raw, h, inter),
+                .attn_conv = attn_conv_b,
+                .mlp_conv = mlp_conv_b,
+            };
+        }
+
+        if (self.weights.candidate_selector) |cs| {
+            const hp = try bind_ctx.bindLayerProj(cs.hidden_proj, cs.hidden_proj_bf16, cs.hidden_proj_raw, cs.state_rank, h);
+            var pred_cb: metal.BufferBinding = undefined;
+            var pred_dt: u32 = 0;
+            if (cs.predecessor_codebook_raw) |pr| {
+                pred_cb = try bind_ctx.bindSlice(pr.data);
+                pred_dt = switch (pr.amf_dtype) {
+                    .f32 => 0,
+                    .bf16 => 1,
+                    .f16 => 2,
+                    else => return error.InvalidWeights,
+                };
+            } else if (cs.predecessor_codebook_bf16) |pb| {
+                pred_cb = try bind_ctx.bindSlice(std.mem.sliceAsBytes(pb));
+                pred_dt = 1;
+            } else {
+                pred_cb = try bind_ctx.bindSlice(std.mem.sliceAsBytes(cs.predecessor_codebook));
+                pred_dt = 0;
+            }
+            var succ_cb: metal.BufferBinding = undefined;
+            var succ_dt: u32 = 0;
+            if (cs.successor_codebook_raw) |sr| {
+                succ_cb = try bind_ctx.bindSlice(sr.data);
+                succ_dt = switch (sr.amf_dtype) {
+                    .f32 => 0,
+                    .bf16 => 1,
+                    .f16 => 2,
+                    else => return error.InvalidWeights,
+                };
+            } else if (cs.successor_codebook_bf16) |sb| {
+                succ_cb = try bind_ctx.bindSlice(std.mem.sliceAsBytes(sb));
+                succ_dt = 1;
+            } else {
+                succ_cb = try bind_ctx.bindSlice(std.mem.sliceAsBytes(cs.successor_codebook));
+                succ_dt = 0;
+            }
+            ctx.candidate_selector = .{
+                .hidden_proj = hp,
+                .pred_cb = pred_cb,
+                .pred_dtype = pred_dt,
+                .succ_cb = succ_cb,
+                .succ_dtype = succ_dt,
+                .state_rank = cs.state_rank,
+                .top_k = cs.top_k,
             };
         }
 
@@ -2524,6 +2930,9 @@ pub const DFlareProposer = struct {
             .sliding_window = self.config.sliding_window,
             .max_ctx = max_ctx,
             .v_scale = self.config.attention_value_scale,
+            .block_size = self.config.block_size,
+            .conv_tmp = if (self.config.hasGroupedConv()) self.workspace.conv_tmp else null,
+            .conv_delta = if (self.config.hasGroupedConv()) self.workspace.conv_delta else null,
         };
         for (self.weights.layers, 0..) |layer, li| {
             if (use_cached_ctx) {
@@ -3297,27 +3706,45 @@ pub const DFlareProposer = struct {
                 self.workspace.cpu_quant_row_scratch,
             );
 
-            for (0..draft_slots) |si| {
-                const row = self.workspace.base_logits_buf[si * v ..][0..eff_v];
-                if (self.config.final_logit_softcapping > 0.0) {
-                    const cap = self.config.final_logit_softcapping;
-                    for (row) |*lv| lv.* = std.math.tanh(lv.* / cap) * cap;
-                }
-                const got = try extractDeterministicTopKMasked(
-                    row,
+            if (self.weights.candidate_selector) |cs| {
+                try self.runCandidateSelectorCpu(
+                    cs,
+                    root_token,
+                    self.workspace.slot_hiddens[slot_offset * h .. (slot_offset + draft_slots) * h],
+                    self.workspace.base_logits_buf[0 .. draft_slots * v],
+                    draft_slots,
+                    eff_v,
+                    eff_k,
                     inv_temp,
-                    null,
-                    self.workspace.topk_tokens[0..eff_k],
-                    self.workspace.topk_probs[0..eff_k],
+                    &slot_cands,
+                    &slot_counts,
                 );
-                slot_counts[si] = @intCast(got);
-                for (0..got) |ki| {
-                    const p = self.workspace.topk_probs[ki];
-                    slot_cands[si][ki] = .{
-                        .token_id = self.workspace.topk_tokens[ki],
-                        .prob = p,
-                        .log_prob = logProbOf(p),
-                    };
+            } else {
+                for (0..draft_slots) |si| {
+                    const row = self.workspace.base_logits_buf[si * v ..][0..eff_v];
+                    if (self.config.output_multiplier != 1.0) {
+                        for (row) |*lv| lv.* *= self.config.output_multiplier;
+                    }
+                    if (self.config.final_logit_softcapping > 0.0) {
+                        const cap = self.config.final_logit_softcapping;
+                        for (row) |*lv| lv.* = std.math.tanh(lv.* / cap) * cap;
+                    }
+                    const got = try extractDeterministicTopKMasked(
+                        row,
+                        inv_temp,
+                        null,
+                        self.workspace.topk_tokens[0..eff_k],
+                        self.workspace.topk_probs[0..eff_k],
+                    );
+                    slot_counts[si] = @intCast(got);
+                    for (0..got) |ki| {
+                        const p = self.workspace.topk_probs[ki];
+                        slot_cands[si][ki] = .{
+                            .token_id = self.workspace.topk_tokens[ki],
+                            .prob = p,
+                            .log_prob = logProbOf(p),
+                        };
+                    }
                 }
             }
         }
@@ -3334,6 +3761,195 @@ pub const DFlareProposer = struct {
             node_valid,
             out_tree,
         );
+    }
+
+    fn readCodebookRowF32(
+        f32_tbl: []const f32,
+        bf16_tbl: ?[]const u16,
+        raw_tbl: ?RawLinearMat,
+        tok_id: u32,
+        rank: usize,
+        out_row: []f32,
+    ) Error!void {
+        if (raw_tbl) |r| {
+            if (tok_id >= r.n) return error.TokenOutOfRange;
+            try readRawRowF32(r, tok_id, out_row[0..rank]);
+            return;
+        }
+        const off = @as(usize, tok_id) * rank;
+        if (bf16_tbl) |bt| {
+            if (off + rank > bt.len) return error.TokenOutOfRange;
+            for (0..rank) |i| out_row[i] = quant.bf16ToF32(bt[off + i]);
+            return;
+        }
+        if (off + rank > f32_tbl.len) return error.TokenOutOfRange;
+        @memcpy(out_row[0..rank], f32_tbl[off..][0..rank]);
+    }
+
+    /// Exact CPU reference for `DFlash2` `CandidateSelector` (`sglang_dflash.py:1743-1897`):
+    /// top-K unary logit shortlist -> `hidden_projection` -> K x K pairwise codebook lattice -> greedy walk.
+    fn runCandidateSelectorCpu(
+        self: *DFlareProposer,
+        cs: CandidateSelectorWeights,
+        root_token: u32,
+        draft_hiddens: []const f32,
+        base_logits: []const f32,
+        draft_slots: usize,
+        eff_v: usize,
+        eff_k: usize,
+        inv_temp: f32,
+        slot_cands: *[MAX_BLOCK_SIZE][2]moe.TopKCandidate,
+        slot_counts: *[MAX_BLOCK_SIZE]u8,
+    ) Error!void {
+        const ws = self.workspace;
+        const h: usize = self.config.hidden_size;
+        const v: usize = self.config.vocab_size;
+        const rank: usize = cs.state_rank;
+        const sel_k: usize = @min(@as(usize, cs.top_k), eff_v);
+        if (sel_k == 0 or ws.sel_cand_ids.len < draft_slots * sel_k or
+            ws.sel_unary_logits.len < draft_slots * sel_k or
+            ws.sel_scores.len < draft_slots * sel_k * sel_k or
+            ws.sel_hidden.len < draft_slots * rank)
+        {
+            return error.BufferTooSmall;
+        }
+
+        // 1. Extract deterministic top-K `(candidate_id, transformed_unary_logit)` per draft slot.
+        for (0..draft_slots) |si| {
+            const row = base_logits[si * v ..][0..eff_v];
+            const out_ids = ws.sel_cand_ids[si * sel_k ..][0..sel_k];
+            const out_vals = ws.sel_unary_logits[si * sel_k ..][0..sel_k];
+            for (0..sel_k) |j| {
+                out_ids[j] = std.math.maxInt(u32);
+                out_vals[j] = -std.math.inf(f32);
+            }
+            for (0..eff_v) |tid_usize| {
+                const tid: u32 = @intCast(tid_usize);
+                var val: f32 = row[tid_usize] * self.config.output_multiplier;
+                if (self.config.final_logit_softcapping > 0.0) {
+                    const cap = self.config.final_logit_softcapping;
+                    val = std.math.tanh(val / cap) * cap;
+                }
+                const last_v = out_vals[sel_k - 1];
+                const last_i = out_ids[sel_k - 1];
+                if (val > last_v or (val == last_v and tid < last_i)) {
+                    var pos: usize = sel_k - 1;
+                    while (pos > 0) : (pos -= 1) {
+                        const pv = out_vals[pos - 1];
+                        const pi = out_ids[pos - 1];
+                        if (val > pv or (val == pv and tid < pi)) {
+                            out_vals[pos] = pv;
+                            out_ids[pos] = pi;
+                        } else {
+                            break;
+                        }
+                    }
+                    out_vals[pos] = val;
+                    out_ids[pos] = tid;
+                }
+            }
+            // 2. Project slot hidden state `hidden[e] = hidden_projection(H_draft[e])`.
+            matVecLayer(
+                cs.hidden_proj,
+                cs.hidden_proj_bf16,
+                cs.hidden_proj_raw,
+                draft_hiddens[si * h ..][0..h],
+                rank,
+                h,
+                ws.sel_hidden[si * rank ..][0..rank],
+                false,
+                ws.cpu_quant_row_scratch,
+            );
+        }
+
+        // 3. Build transition lattice `score[e, p, c] = unary[e, c] + <pred[pred_id] * hidden[e], succ[cand[e, c]]>`.
+        for (0..draft_slots) |e| {
+            const h_row = ws.sel_hidden[e * rank ..][0..rank];
+            const c_ids = ws.sel_cand_ids[e * sel_k ..][0..sel_k];
+            const u_row = ws.sel_unary_logits[e * sel_k ..][0..sel_k];
+            for (0..sel_k) |p| {
+                const pred_tok: u32 = if (e == 0) root_token else ws.sel_cand_ids[(e - 1) * sel_k + p];
+                const score_row = ws.sel_scores[(e * sel_k + p) * sel_k ..][0..sel_k];
+                if (pred_tok >= v) {
+                    @memset(score_row, -std.math.inf(f32));
+                    continue;
+                }
+                try readCodebookRowF32(cs.predecessor_codebook, cs.predecessor_codebook_bf16, cs.predecessor_codebook_raw, pred_tok, rank, ws.sel_pred_row[0..rank]);
+                for (0..rank) |r| ws.sel_pred_row[r] *= h_row[r];
+                for (0..sel_k) |c| {
+                    const cand_tok = c_ids[c];
+                    if (cand_tok >= v) {
+                        score_row[c] = -std.math.inf(f32);
+                        continue;
+                    }
+                    try readCodebookRowF32(cs.successor_codebook, cs.successor_codebook_bf16, cs.successor_codebook_raw, cand_tok, rank, ws.sel_succ_row[0..rank]);
+                    var dot: f32 = 0.0;
+                    for (0..rank) |r| dot += ws.sel_pred_row[r] * ws.sel_succ_row[r];
+                    score_row[c] = u_row[c] + dot;
+                }
+            }
+        }
+
+        // 4. Greedy lattice walk with softmax probabilities over the `K` transition scores.
+        var prev_idx: usize = 0;
+        for (0..draft_slots) |e| {
+            const score_row = ws.sel_scores[(e * sel_k + prev_idx) * sel_k ..][0..sel_k];
+            const c_ids = ws.sel_cand_ids[e * sel_k ..][0..sel_k];
+            var max_s: f32 = -std.math.inf(f32);
+            var b1_c: usize = 0;
+            var b1_v: f32 = -std.math.inf(f32);
+            var b1_tok: u32 = std.math.maxInt(u32);
+            for (0..sel_k) |c| {
+                const tok = c_ids[c];
+                if (tok >= v) continue;
+                const sc = score_row[c] * inv_temp;
+                if (sc > max_s) max_s = sc;
+                if (sc > b1_v or (sc == b1_v and tok < b1_tok)) {
+                    b1_v = sc;
+                    b1_tok = tok;
+                    b1_c = c;
+                }
+            }
+            var sum_e: f32 = 0.0;
+            for (0..sel_k) |c| {
+                if (c_ids[c] >= v) continue;
+                const sc = score_row[c] * inv_temp;
+                if (std.math.isFinite(sc)) sum_e += @exp(sc - max_s);
+            }
+            var cnt: u8 = 0;
+            if (b1_tok < v and sum_e > 0.0) {
+                const p1 = @exp(b1_v - max_s) / sum_e;
+                slot_cands[e][0] = .{
+                    .token_id = b1_tok,
+                    .prob = p1,
+                    .log_prob = (b1_v - max_s) - @log(sum_e),
+                };
+                cnt = 1;
+                if (eff_k >= 2 and sel_k >= 2) {
+                    var b2_v: f32 = -std.math.inf(f32);
+                    var b2_tok: u32 = std.math.maxInt(u32);
+                    for (0..sel_k) |c| {
+                        if (c == b1_c or c_ids[c] >= v) continue;
+                        const sc = score_row[c] * inv_temp;
+                        if (sc > b2_v or (sc == b2_v and c_ids[c] < b2_tok)) {
+                            b2_v = sc;
+                            b2_tok = c_ids[c];
+                        }
+                    }
+                    if (b2_tok < v) {
+                        const p2 = @exp(b2_v - max_s) / sum_e;
+                        slot_cands[e][1] = .{
+                            .token_id = b2_tok,
+                            .prob = p2,
+                            .log_prob = (b2_v - max_s) - @log(sum_e),
+                        };
+                        cnt = 2;
+                    }
+                }
+            }
+            slot_counts[e] = cnt;
+            prev_idx = b1_c;
+        }
     }
 
     // ========================================================================
@@ -3825,6 +4441,8 @@ pub const DFlareProposer = struct {
         // Execute all `num_layers` (`3L` / `5L`) block-parallel transformer layers.
         const max_ctx: u32 = ws.max_ctx_len;
         const attn_scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(self.config.head_dim)));
+        const conv_tmp_b = ws.sliceBinding(wb, ws.gpu_conv_tmp_f16);
+        const conv_delta_b = ws.sliceBinding(wb, ws.gpu_conv_delta_f16);
         for (0..self.config.num_layers) |li| {
             const gl = gpu.layers[li];
             const in_np: DFlareRmsNormParams = .{
@@ -3844,9 +4462,33 @@ pub const DFlareProposer = struct {
                 true,
             );
 
-            try encodeGpuLinear(gpu, frame, gl.q_proj, norm_b, q_b, w, null, false, true);
-            try encodeGpuLinear(gpu, frame, gl.k_proj, norm_b, k_b, w, null, false, false);
-            try encodeGpuLinear(gpu, frame, gl.v_proj, norm_b, v_b, w, null, false, false);
+            var attn_in_b = norm_b;
+            if (gl.attn_conv) |ac| {
+                try encodeGpuLinear(gpu, frame, ac.kernel_proj, norm_b, conv_delta_b, w, null, false, true);
+                const ac_in_p: DFlash2GroupedConvParams = .{
+                    .seq_len = w,
+                    .hidden_size = h,
+                    .block_size = w,
+                    .taps = ac.taps,
+                    .num_groups = ac.num_groups,
+                    .group_size = ac.group_size,
+                    .side = 0,
+                    .add_residual = 0,
+                };
+                try frame.encodeThreads(
+                    gpu.pipes.dflash2_grouped_conv,
+                    &.{ norm_b, conv_delta_b, ac.base_kernel, dummy_b, conv_tmp_b },
+                    std.mem.asBytes(&ac_in_p),
+                    .{ h, w, 1 },
+                    .{ @min(h, 256), 1, 1 },
+                    true,
+                );
+                attn_in_b = conv_tmp_b;
+            }
+
+            try encodeGpuLinear(gpu, frame, gl.q_proj, attn_in_b, q_b, w, null, false, true);
+            try encodeGpuLinear(gpu, frame, gl.k_proj, attn_in_b, k_b, w, null, false, false);
+            try encodeGpuLinear(gpu, frame, gl.v_proj, attn_in_b, v_b, w, null, false, false);
 
             if (gl.q_norm_w != null or gl.k_norm_w != null or self.config.rope_theta > 0.0) {
                 const qp: DFlareQkNormRopeParams = .{
@@ -3894,10 +4536,32 @@ pub const DFlareProposer = struct {
                 true,
             );
 
-            // `o_proj` + fused residual into `slot_hiddens`.
-            try encodeGpuLinear(gpu, frame, gl.o_proj, attn_out_b, slot_b, w, slot_b, false, true);
+            // `o_proj` + optional `DFlash2` `attn_conv.finish` + fused residual into `slot_hiddens`.
+            if (gl.attn_conv) |ac| {
+                try encodeGpuLinear(gpu, frame, gl.o_proj, attn_out_b, conv_tmp_b, w, null, false, true);
+                const ac_out_p: DFlash2GroupedConvParams = .{
+                    .seq_len = w,
+                    .hidden_size = h,
+                    .block_size = w,
+                    .taps = ac.taps,
+                    .num_groups = ac.num_groups,
+                    .group_size = ac.group_size,
+                    .side = 1,
+                    .add_residual = 1,
+                };
+                try frame.encodeThreads(
+                    gpu.pipes.dflash2_grouped_conv,
+                    &.{ conv_tmp_b, conv_delta_b, ac.base_kernel, slot_b, slot_b },
+                    std.mem.asBytes(&ac_out_p),
+                    .{ h, w, 1 },
+                    .{ @min(h, 256), 1, 1 },
+                    true,
+                );
+            } else {
+                try encodeGpuLinear(gpu, frame, gl.o_proj, attn_out_b, slot_b, w, slot_b, false, true);
+            }
 
-            // Post-attention RMSNorm + SwiGLU MLP + fused residual.
+            // Post-attention RMSNorm + optional `DFlash2` `mlp_conv` + SwiGLU MLP + fused residual.
             const post_np: DFlareRmsNormParams = .{
                 .num_rows = w,
                 .dim = h,
@@ -3915,8 +4579,32 @@ pub const DFlareProposer = struct {
                 true,
             );
 
-            try encodeGpuLinear(gpu, frame, gl.mlp_gate, norm_b, mlp_gate_b, w, null, false, true);
-            try encodeGpuLinear(gpu, frame, gl.mlp_up, norm_b, mlp_up_b, w, null, false, false);
+            var mlp_in_b = norm_b;
+            if (gl.mlp_conv) |mc| {
+                try encodeGpuLinear(gpu, frame, mc.kernel_proj, norm_b, conv_delta_b, w, null, false, true);
+                const mc_in_p: DFlash2GroupedConvParams = .{
+                    .seq_len = w,
+                    .hidden_size = h,
+                    .block_size = w,
+                    .taps = mc.taps,
+                    .num_groups = mc.num_groups,
+                    .group_size = mc.group_size,
+                    .side = 0,
+                    .add_residual = 0,
+                };
+                try frame.encodeThreads(
+                    gpu.pipes.dflash2_grouped_conv,
+                    &.{ norm_b, conv_delta_b, mc.base_kernel, dummy_b, conv_tmp_b },
+                    std.mem.asBytes(&mc_in_p),
+                    .{ h, w, 1 },
+                    .{ @min(h, 256), 1, 1 },
+                    true,
+                );
+                mlp_in_b = conv_tmp_b;
+            }
+
+            try encodeGpuLinear(gpu, frame, gl.mlp_gate, mlp_in_b, mlp_gate_b, w, null, false, true);
+            try encodeGpuLinear(gpu, frame, gl.mlp_up, mlp_in_b, mlp_up_b, w, null, false, false);
 
             const sw_cnt: u32 = w * inter;
             const sw_p: DFlareElemParams = .{ .count = sw_cnt };
@@ -3929,7 +4617,29 @@ pub const DFlareProposer = struct {
                 true,
             );
 
-            try encodeGpuLinear(gpu, frame, gl.mlp_down, mlp_gate_b, slot_b, w, slot_b, false, true);
+            if (gl.mlp_conv) |mc| {
+                try encodeGpuLinear(gpu, frame, gl.mlp_down, mlp_gate_b, conv_tmp_b, w, null, false, true);
+                const mc_out_p: DFlash2GroupedConvParams = .{
+                    .seq_len = w,
+                    .hidden_size = h,
+                    .block_size = w,
+                    .taps = mc.taps,
+                    .num_groups = mc.num_groups,
+                    .group_size = mc.group_size,
+                    .side = 1,
+                    .add_residual = 1,
+                };
+                try frame.encodeThreads(
+                    gpu.pipes.dflash2_grouped_conv,
+                    &.{ conv_tmp_b, conv_delta_b, mc.base_kernel, slot_b, slot_b },
+                    std.mem.asBytes(&mc_out_p),
+                    .{ h, w, 1 },
+                    .{ @min(h, 256), 1, 1 },
+                    true,
+                );
+            } else {
+                try encodeGpuLinear(gpu, frame, gl.mlp_down, mlp_gate_b, slot_b, w, slot_b, false, true);
+            }
             _ = mlp_down_b;
             _ = q_dim;
         }
@@ -5107,27 +5817,93 @@ pub const DFlareProposer = struct {
                 };
                 const base_logits_b = ws.sliceBinding(wb, ws.gpu_base_logits_f16);
                 try encodeGpuLinear(gpu, &frame, lmh, slot_draft_b, base_logits_b, @intCast(draft_slots), null, false, true);
-                const row_bytes: u64 = @as(u64, v) * @sizeOf(f16);
-                for (0..draft_slots) |si| {
-                    const row_b: metal.BufferBinding = .{
-                        .buffer = wb,
-                        .offset = base_logits_b.offset + @as(u64, si) * row_bytes,
+
+                if (gpu.candidate_selector) |sel| {
+                    // Single-frame `DFlash2` `CandidateSelector` pipeline on Metal 4 GPU (`0` extra CBs, `0` allocs):
+                    // 1) top-K unary logit shortlist -> 2) `hidden_projection` -> 3) K x K pairwise lattice -> 4) greedy path walk.
+                    const eff_sel_k: u32 = @min(sel.top_k, eff_v);
+                    const cand_ids_b = ws.sliceBinding(wb, ws.sel_cand_ids);
+                    const unary_b = ws.sliceBinding(wb, ws.sel_unary_logits);
+                    const sel_h_b = ws.sliceBinding(wb, ws.gpu_sel_hidden_f16);
+                    const scores_b = ws.sliceBinding(wb, ws.sel_scores);
+                    const out_cands_b = ws.sliceBinding(wb, ws.gpu_topk_cands);
+
+                    const tk_p: DFlash2TopKUnaryParams = .{
+                        .num_slots = @intCast(draft_slots),
+                        .vocab_size = self.config.vocab_size,
+                        .eff_vocab_size = eff_v,
+                        .top_k = eff_sel_k,
+                        .logits_is_f16 = 1,
+                        .aligned_vec4 = if ((base_logits_b.offset & 7) == 0) 1 else 0,
+                        .output_multiplier = self.config.output_multiplier,
+                        .softcap = self.config.final_logit_softcapping,
                     };
-                    try encodeGpuTopK(
-                        gpu,
-                        ws,
-                        &frame,
-                        row_b,
+                    try frame.encodeThreadgroups(
+                        gpu.pipes.dflash2_topk_unary_logits,
+                        &.{ base_logits_b, cand_ids_b, unary_b },
+                        std.mem.asBytes(&tk_p),
+                        .{ draft_slots, 1, 1 },
+                        .{ 64, 1, 1 },
                         true,
-                        eff_v,
-                        eff_k,
-                        inv_temp,
-                        self.config.final_logit_softcapping,
-                        false,
-                        @intCast(si * eff_k),
-                        false,
-                        0,
                     );
+                    try encodeGpuLinear(gpu, &frame, sel.hidden_proj, slot_draft_b, sel_h_b, @intCast(draft_slots), null, false, false);
+
+                    const sc_p: DFlash2SelectorScoreParams = .{
+                        .num_slots = @intCast(draft_slots),
+                        .top_k = eff_sel_k,
+                        .state_rank = sel.state_rank,
+                        .vocab_size = self.config.vocab_size,
+                        .anchor_token_id = root_token,
+                        .pred_dtype = sel.pred_dtype,
+                        .succ_dtype = sel.succ_dtype,
+                        .hidden_is_f32 = 0,
+                    };
+                    try frame.encodeThreadgroups(
+                        gpu.pipes.dflash2_selector_score_edges,
+                        &.{ sel.pred_cb, sel.succ_cb, sel_h_b, cand_ids_b, unary_b, scores_b },
+                        std.mem.asBytes(&sc_p),
+                        .{ eff_sel_k, draft_slots, 1 },
+                        .{ 128, 1, 1 },
+                        true,
+                    );
+
+                    const wk_p: DFlash2SelectorWalkParams = .{
+                        .num_slots = @intCast(draft_slots),
+                        .top_k = eff_sel_k,
+                        .out_k = eff_k,
+                        .inv_temp = inv_temp,
+                    };
+                    try frame.encodeThreadgroups(
+                        gpu.pipes.dflash2_selector_walk_path,
+                        &.{ cand_ids_b, scores_b, out_cands_b },
+                        std.mem.asBytes(&wk_p),
+                        .{ 1, 1, 1 },
+                        .{ 32, 1, 1 },
+                        true,
+                    );
+                } else {
+                    const row_bytes: u64 = @as(u64, v) * @sizeOf(f16);
+                    for (0..draft_slots) |si| {
+                        const row_b: metal.BufferBinding = .{
+                            .buffer = wb,
+                            .offset = base_logits_b.offset + @as(u64, si) * row_bytes,
+                        };
+                        try encodeGpuTopK(
+                            gpu,
+                            ws,
+                            &frame,
+                            row_b,
+                            true,
+                            eff_v,
+                            eff_k,
+                            inv_temp,
+                            self.config.final_logit_softcapping,
+                            false,
+                            @intCast(si * eff_k),
+                            false,
+                            0,
+                        );
+                    }
                 }
                 const sig = try frame.commit();
                 try gpu.compute_ptr.wait(sig, gpu.timeout_ms);
@@ -5160,27 +5936,45 @@ pub const DFlareProposer = struct {
                     ws.base_logits_buf[0 .. draft_slots * v],
                     ws.cpu_quant_row_scratch,
                 );
-                for (0..draft_slots) |si| {
-                    const row = ws.base_logits_buf[si * v ..][0..eff_v];
-                    if (self.config.final_logit_softcapping > 0.0) {
-                        const cap = self.config.final_logit_softcapping;
-                        for (row) |*lv| lv.* = std.math.tanh(lv.* / cap) * cap;
-                    }
-                    const got = try extractDeterministicTopKMasked(
-                        row,
+                if (self.weights.candidate_selector) |cs| {
+                    try self.runCandidateSelectorCpu(
+                        cs,
+                        root_token,
+                        ws.slot_hiddens[slot_offset * h .. (slot_offset + draft_slots) * h],
+                        ws.base_logits_buf[0 .. draft_slots * v],
+                        draft_slots,
+                        eff_v,
+                        eff_k,
                         inv_temp,
-                        null,
-                        ws.topk_tokens[0..eff_k],
-                        ws.topk_probs[0..eff_k],
+                        &slot_cands,
+                        &slot_counts,
                     );
-                    slot_counts[si] = @intCast(got);
-                    for (0..got) |ki| {
-                        const p = ws.topk_probs[ki];
-                        slot_cands[si][ki] = .{
-                            .token_id = ws.topk_tokens[ki],
-                            .prob = p,
-                            .log_prob = logProbOf(p),
-                        };
+                } else {
+                    for (0..draft_slots) |si| {
+                        const row = ws.base_logits_buf[si * v ..][0..eff_v];
+                        if (self.config.output_multiplier != 1.0) {
+                            for (row) |*lv| lv.* *= self.config.output_multiplier;
+                        }
+                        if (self.config.final_logit_softcapping > 0.0) {
+                            const cap = self.config.final_logit_softcapping;
+                            for (row) |*lv| lv.* = std.math.tanh(lv.* / cap) * cap;
+                        }
+                        const got = try extractDeterministicTopKMasked(
+                            row,
+                            inv_temp,
+                            null,
+                            ws.topk_tokens[0..eff_k],
+                            ws.topk_probs[0..eff_k],
+                        );
+                        slot_counts[si] = @intCast(got);
+                        for (0..got) |ki| {
+                            const p = ws.topk_probs[ki];
+                            slot_cands[si][ki] = .{
+                                .token_id = ws.topk_tokens[ki],
+                                .prob = p,
+                                .log_prob = logProbOf(p),
+                            };
+                        }
                     }
                 }
             }
@@ -5307,6 +6101,10 @@ pub const LoadedDFlareBundle = struct {
         mlp_gate: *const amf.TensorEntry = undefined,
         mlp_up: *const amf.TensorEntry = undefined,
         mlp_down: *const amf.TensorEntry = undefined,
+        attn_conv_base: ?*const amf.TensorEntry = null,
+        attn_conv_proj: ?*const amf.TensorEntry = null,
+        mlp_conv_base: ?*const amf.TensorEntry = null,
+        mlp_conv_proj: ?*const amf.TensorEntry = null,
         ctx_mix: ?*const amf.TensorEntry = null,
     };
 
@@ -5461,6 +6259,44 @@ pub const LoadedDFlareBundle = struct {
             refs.mlp_down = (try findLayerEntry(amf_file, l, &.{ "mlp.down_proj.weight", "ffn_down.weight" }, &nb0, &nb1, &nb2)) orelse return error.MissingTensor;
             try planRawBytes(&weight_bytes, refs.mlp_down, h, inter, false);
 
+            // Optional `DFlash2` `DFlashGroupedConv` (`attn_conv` / `attention_conv` & `mlp_conv`).
+            refs.attn_conv_base = try findLayerEntry(amf_file, l, &.{ "attn_conv.base_kernel", "attention_conv.base_kernel" }, &nb0, &nb1, &nb2);
+            refs.attn_conv_proj = try findLayerEntry(amf_file, l, &.{ "attn_conv.kernel_projection.weight", "attention_conv.kernel_projection.weight" }, &nb0, &nb1, &nb2);
+            if ((refs.attn_conv_base != null) != (refs.attn_conv_proj != null)) return error.MissingTensor;
+            if (refs.attn_conv_base) |acb| {
+                const acp = refs.attn_conv_proj.?;
+                const b_elems = try entryElems(acb);
+                if (b_elems == 0 or (b_elems % (2 * h)) != 0) return error.DimensionMismatch;
+                const taps_inferred: u8 = @intCast(b_elems / (2 * h));
+                const proj_rows: usize = acp.shape[0];
+                if (proj_rows == 0 or (proj_rows % (2 * @as(usize, taps_inferred))) != 0) return error.DimensionMismatch;
+                const ng: usize = proj_rows / (2 * @as(usize, taps_inferred));
+                if (ng == 0 or (h % ng) != 0) return error.DimensionMismatch;
+                const gs: u32 = @intCast(h / ng);
+                cfg.conv_kernel_size = taps_inferred;
+                cfg.conv_group_size = gs;
+                _ = try planF32Bytes(&weight_bytes, &max_small_blob, acb, b_elems);
+                try planRawBytes(&weight_bytes, acp, proj_rows, h, false);
+            }
+            refs.mlp_conv_base = try findLayerEntry(amf_file, l, &.{"mlp_conv.base_kernel"}, &nb0, &nb1, &nb2);
+            refs.mlp_conv_proj = try findLayerEntry(amf_file, l, &.{"mlp_conv.kernel_projection.weight"}, &nb0, &nb1, &nb2);
+            if ((refs.mlp_conv_base != null) != (refs.mlp_conv_proj != null)) return error.MissingTensor;
+            if (refs.mlp_conv_base) |mcb| {
+                const mcp = refs.mlp_conv_proj.?;
+                const b_elems = try entryElems(mcb);
+                if (b_elems == 0 or (b_elems % (2 * h)) != 0) return error.DimensionMismatch;
+                const taps_inferred: u8 = @intCast(b_elems / (2 * h));
+                const proj_rows: usize = mcp.shape[0];
+                if (proj_rows == 0 or (proj_rows % (2 * @as(usize, taps_inferred))) != 0) return error.DimensionMismatch;
+                const ng: usize = proj_rows / (2 * @as(usize, taps_inferred));
+                if (ng == 0 or (h % ng) != 0) return error.DimensionMismatch;
+                const gs: u32 = @intCast(h / ng);
+                cfg.conv_kernel_size = taps_inferred;
+                cfg.conv_group_size = gs;
+                _ = try planF32Bytes(&weight_bytes, &max_small_blob, mcb, b_elems);
+                try planRawBytes(&weight_bytes, mcp, proj_rows, h, false);
+            }
+
             if (has_ctx_mix) {
                 const nm = std.fmt.bufPrint(&nb0, "layers.{d}.ctx_mix.weight", .{l}) catch return error.Overflow;
                 refs.ctx_mix = amf_file.parsed.find(nm);
@@ -5483,9 +6319,33 @@ pub const LoadedDFlareBundle = struct {
                 eff_mr = w1e.shape[0];
                 cfg.markov_rank = @intCast(eff_mr);
             }
-        } else if (eff_mr > 0 and gru_entry == null and any_markov_w1 == null and cfg.variant == .dflash_standalone) {
+        } else if (eff_mr > 0 and gru_entry == null and any_markov_w1 == null and (cfg.variant == .dflash_standalone or cfg.variant == .dflash2)) {
             eff_mr = 0;
             cfg.markov_rank = 0;
+        }
+        // Optional `DFlash2` `CandidateSelector` weights (`candidate_selector.{hidden_projection.weight,predecessor_codebook,successor_codebook}`).
+        const cs_hp_entry = findAnyEntry(amf_file, &.{ "candidate_selector.hidden_projection.weight", "candidate_selector.hidden_projection" });
+        const cs_pred_entry = findAnyEntry(amf_file, &.{"candidate_selector.predecessor_codebook"});
+        const cs_succ_entry = findAnyEntry(amf_file, &.{"candidate_selector.successor_codebook"});
+        var cs_rank: u32 = cfg.selector_rank;
+        if (cs_hp_entry != null or cs_pred_entry != null or cs_succ_entry != null) {
+            if (cs_hp_entry == null or cs_pred_entry == null or cs_succ_entry == null) return error.MissingTensor;
+            const hpe = cs_hp_entry.?;
+            if (hpe.rank != 2 or hpe.shape[0] == 0 or hpe.shape[1] != h) return error.DimensionMismatch;
+            cs_rank = hpe.shape[0];
+            cfg.selector_rank = cs_rank;
+            if (cfg.selector_top_k == 0) cfg.selector_top_k = @intCast(@min(@as(usize, 16), v));
+            cfg.dflash_version = 2;
+            cfg.variant = .dflash2;
+            cfg.markov_rank = 0;
+            eff_mr = 0;
+            try planRawBytes(&weight_bytes, hpe, cs_rank, h, false);
+            try planRawBytes(&weight_bytes, cs_pred_entry.?, v, cs_rank, false);
+            try planRawBytes(&weight_bytes, cs_succ_entry.?, v, cs_rank, false);
+        }
+        if (cfg.hasGroupedConv()) {
+            cfg.dflash_version = 2;
+            cfg.variant = .dflash2;
         }
         const is_direct_dflash: bool = (eff_mr == 0);
         const is_real_gru: bool = if (!is_direct_dflash) (if (gru_entry) |ge| (ge.shape[0] == 3 * eff_mr and ge.shape[1] == 2 * h + 2 * eff_mr) else false) else false;
@@ -5685,6 +6545,32 @@ pub const LoadedDFlareBundle = struct {
                 .mlp_gate_raw = try readRawEntryIntoArena(&weight_arena, amf_file, refs.mlp_gate, inter, h, false),
                 .mlp_up_raw = try readRawEntryIntoArena(&weight_arena, amf_file, refs.mlp_up, inter, h, false),
                 .mlp_down_raw = try readRawEntryIntoArena(&weight_arena, amf_file, refs.mlp_down, h, inter, false),
+                .attn_conv = if (refs.attn_conv_base) |acb| blk: {
+                    const acp = refs.attn_conv_proj.?;
+                    const b_elems = try entryElems(acb);
+                    const taps_u8: u8 = @intCast(b_elems / (2 * h));
+                    const proj_rows: usize = acp.shape[0];
+                    const gs: u32 = @intCast(h / (proj_rows / (2 * @as(usize, taps_u8))));
+                    break :blk .{
+                        .base_kernel = try readF32EntryIntoArena(&weight_arena, small_scratch, amf_file, acb, b_elems),
+                        .kernel_proj_raw = try readRawEntryIntoArena(&weight_arena, amf_file, acp, proj_rows, h, false),
+                        .taps = taps_u8,
+                        .group_size = gs,
+                    };
+                } else null,
+                .mlp_conv = if (refs.mlp_conv_base) |mcb| blk: {
+                    const mcp = refs.mlp_conv_proj.?;
+                    const b_elems = try entryElems(mcb);
+                    const taps_u8: u8 = @intCast(b_elems / (2 * h));
+                    const proj_rows: usize = mcp.shape[0];
+                    const gs: u32 = @intCast(h / (proj_rows / (2 * @as(usize, taps_u8))));
+                    break :blk .{
+                        .base_kernel = try readF32EntryIntoArena(&weight_arena, small_scratch, amf_file, mcb, b_elems),
+                        .kernel_proj_raw = try readRawEntryIntoArena(&weight_arena, amf_file, mcp, proj_rows, h, false),
+                        .taps = taps_u8,
+                        .group_size = gs,
+                    };
+                } else null,
             };
         }
 
@@ -5722,6 +6608,14 @@ pub const LoadedDFlareBundle = struct {
                 if (markov_hidden_bias_entry) |e| markov_hidden_bias = try readF32EntryIntoArena(&weight_arena, small_scratch, amf_file, e, h);
             }
         }
+
+        const candidate_selector: ?CandidateSelectorWeights = if (cs_hp_entry) |hpe| .{
+            .hidden_proj_raw = try readRawEntryIntoArena(&weight_arena, amf_file, hpe, cs_rank, h, false),
+            .predecessor_codebook_raw = try readRawEntryIntoArena(&weight_arena, amf_file, cs_pred_entry.?, v, cs_rank, false),
+            .successor_codebook_raw = try readRawEntryIntoArena(&weight_arena, amf_file, cs_succ_entry.?, v, cs_rank, false),
+            .state_rank = cs_rank,
+            .top_k = cfg.selector_top_k,
+        } else null;
 
         const lm_head_raw: ?RawLinearMat = if (lm_head_entry) |lme|
             try readRawEntryIntoArena(&weight_arena, amf_file, lme, v, h, true)
@@ -5761,6 +6655,7 @@ pub const LoadedDFlareBundle = struct {
             .markov_w2_vocab_bias = markov_w2_vocab_bias,
             .markov_w2_vocab_rows = markov_w2_vocab_rows,
             .markov_norm = markov_norm,
+            .candidate_selector = candidate_selector,
             .lm_head = lm_head,
             .lm_head_raw = lm_head_raw,
             .wired_arena_bytes = weight_arena.bytes(),
@@ -6897,7 +7792,48 @@ const BlockAttnExtras = struct {
     sliding_window: u32 = 0,
     max_ctx: usize = 0,
     v_scale: f32 = 1.0,
+    block_size: usize = 0,
+    conv_tmp: ?[]f32 = null,
+    conv_delta: ?[]f32 = null,
 };
+
+fn applyGroupedConvCpu(
+    x: []const f32,
+    delta: []const f32,
+    base_kernel: []const f32,
+    seq_len: usize,
+    hidden_size: usize,
+    block_size: usize,
+    taps: usize,
+    group_size: usize,
+    side: usize,
+    out: []f32,
+    add_residual: bool,
+) void {
+    const num_groups = hidden_size / group_size;
+    const side_taps = taps * num_groups;
+    const base_side = side * taps * hidden_size;
+    for (0..seq_len) |t| {
+        const pos = if (block_size > 0) (t % block_size) else t;
+        const delta_row = t * (2 * side_taps) + side * side_taps;
+        const out_row = out[t * hidden_size ..][0..hidden_size];
+        for (0..hidden_size) |c| {
+            const g = c / group_size;
+            var acc: f32 = 0.0;
+            for (0..taps) |tap| {
+                if (tap <= pos) {
+                    const coeff = base_kernel[base_side + tap * hidden_size + c] + delta[delta_row + tap * num_groups + g];
+                    acc += coeff * x[(t - tap) * hidden_size + c];
+                }
+            }
+            if (add_residual) {
+                out_row[c] += acc;
+            } else {
+                out_row[c] = acc;
+            }
+        }
+    }
+}
 
 fn applyRopeNeoXInPlace(buf: []f32, num_heads: u32, head_dim: u32, rope_dim: u32, pos: u32, theta: f32) void {
     const hd: usize = head_dim;
@@ -6990,7 +7926,46 @@ fn runTransformerBlock(
         const dst = norm_buf[pos * hidden_size ..][0..hidden_size];
         @memcpy(dst, src);
         applyRmsNormInPlace(dst, layer.in_norm_weight, rms_eps);
+    }
 
+    var attn_in_buf: []const f32 = norm_buf[0 .. seq_len * hidden_size];
+    if (layer.attn_conv) |ac| {
+        const ctmp = extras.conv_tmp orelse return error.BufferTooSmall;
+        const cdelta = extras.conv_delta orelse return error.BufferTooSmall;
+        const ng = hidden_size / ac.group_size;
+        const proj_rows = 2 * @as(usize, ac.taps) * ng;
+        if (ctmp.len < seq_len * hidden_size or cdelta.len < seq_len * proj_rows) return error.BufferTooSmall;
+        for (0..seq_len) |pos| {
+            matVecLayer(
+                ac.kernel_proj,
+                ac.kernel_proj_bf16,
+                ac.kernel_proj_raw,
+                norm_buf[pos * hidden_size ..][0..hidden_size],
+                proj_rows,
+                hidden_size,
+                cdelta[pos * proj_rows ..][0..proj_rows],
+                false,
+                scratch,
+            );
+        }
+        applyGroupedConvCpu(
+            norm_buf[0 .. seq_len * hidden_size],
+            cdelta[0 .. seq_len * proj_rows],
+            ac.base_kernel,
+            seq_len,
+            hidden_size,
+            if (extras.block_size > 0) extras.block_size else seq_len,
+            ac.taps,
+            ac.group_size,
+            0,
+            ctmp[0 .. seq_len * hidden_size],
+            false,
+        );
+        attn_in_buf = ctmp[0 .. seq_len * hidden_size];
+    }
+
+    for (0..seq_len) |pos| {
+        const dst = attn_in_buf[pos * hidden_size ..][0..hidden_size];
         matVecLayer(layer.q_proj, layer.q_proj_bf16, layer.q_proj_raw, dst, q_dim, hidden_size, q_buf[pos * q_dim ..][0..q_dim], false, scratch);
         matVecLayer(layer.k_proj, layer.k_proj_bf16, layer.k_proj_raw, dst, kv_dim, hidden_size, k_buf[pos * kv_dim ..][0..kv_dim], false, scratch);
         matVecLayer(layer.v_proj, layer.v_proj_bf16, layer.v_proj_raw, dst, kv_dim, hidden_size, v_buf[pos * kv_dim ..][0..kv_dim], false, scratch);
@@ -7097,18 +8072,79 @@ fn runTransformerBlock(
             }
         }
 
-        // Residual connection after attention projection.
-        const h_row = hiddens[q_pos * hidden_size ..][0..hidden_size];
-        matVecLayer(layer.o_proj, layer.o_proj_bf16, layer.o_proj_raw, out_row, hidden_size, q_dim, h_row, true, scratch);
+        // Residual connection (or buffered output for `DFlash2` `attn_conv.finish`).
+        if (layer.attn_conv != null) {
+            const ctmp = extras.conv_tmp.?;
+            matVecLayer(layer.o_proj, layer.o_proj_bf16, layer.o_proj_raw, out_row, hidden_size, q_dim, ctmp[q_pos * hidden_size ..][0..hidden_size], false, scratch);
+        } else {
+            const h_row = hiddens[q_pos * hidden_size ..][0..hidden_size];
+            matVecLayer(layer.o_proj, layer.o_proj_bf16, layer.o_proj_raw, out_row, hidden_size, q_dim, h_row, true, scratch);
+        }
+    }
+    if (layer.attn_conv) |ac| {
+        const ctmp = extras.conv_tmp.?;
+        const cdelta = extras.conv_delta.?;
+        const ng = hidden_size / ac.group_size;
+        const proj_rows = 2 * @as(usize, ac.taps) * ng;
+        applyGroupedConvCpu(
+            ctmp[0 .. seq_len * hidden_size],
+            cdelta[0 .. seq_len * proj_rows],
+            ac.base_kernel,
+            seq_len,
+            hidden_size,
+            if (extras.block_size > 0) extras.block_size else seq_len,
+            ac.taps,
+            ac.group_size,
+            1,
+            hiddens[0 .. seq_len * hidden_size],
+            true,
+        );
     }
 
-    // SwiGLU MLP + residual add across all block slots.
+    // SwiGLU MLP + optional `DFlash2` `mlp_conv` + residual add across all block slots.
     for (0..seq_len) |pos| {
         const h_row = hiddens[pos * hidden_size ..][0..hidden_size];
         const norm_row = norm_buf[pos * hidden_size ..][0..hidden_size];
         @memcpy(norm_row, h_row);
         applyRmsNormInPlace(norm_row, layer.post_norm_weight, rms_eps);
-
+    }
+    var mlp_in_buf: []const f32 = norm_buf[0 .. seq_len * hidden_size];
+    if (layer.mlp_conv) |mc| {
+        const ctmp = extras.conv_tmp orelse return error.BufferTooSmall;
+        const cdelta = extras.conv_delta orelse return error.BufferTooSmall;
+        const ng = hidden_size / mc.group_size;
+        const proj_rows = 2 * @as(usize, mc.taps) * ng;
+        if (ctmp.len < seq_len * hidden_size or cdelta.len < seq_len * proj_rows) return error.BufferTooSmall;
+        for (0..seq_len) |pos| {
+            matVecLayer(
+                mc.kernel_proj,
+                mc.kernel_proj_bf16,
+                mc.kernel_proj_raw,
+                norm_buf[pos * hidden_size ..][0..hidden_size],
+                proj_rows,
+                hidden_size,
+                cdelta[pos * proj_rows ..][0..proj_rows],
+                false,
+                scratch,
+            );
+        }
+        applyGroupedConvCpu(
+            norm_buf[0 .. seq_len * hidden_size],
+            cdelta[0 .. seq_len * proj_rows],
+            mc.base_kernel,
+            seq_len,
+            hidden_size,
+            if (extras.block_size > 0) extras.block_size else seq_len,
+            mc.taps,
+            mc.group_size,
+            0,
+            ctmp[0 .. seq_len * hidden_size],
+            false,
+        );
+        mlp_in_buf = ctmp[0 .. seq_len * hidden_size];
+    }
+    for (0..seq_len) |pos| {
+        const norm_row = mlp_in_buf[pos * hidden_size ..][0..hidden_size];
         const g_row = mlp_gate[pos * intermediate_size ..][0..intermediate_size];
         const u_row = mlp_up[pos * intermediate_size ..][0..intermediate_size];
         matVecLayer(layer.mlp_gate_proj, layer.mlp_gate_bf16, layer.mlp_gate_raw, norm_row, intermediate_size, hidden_size, g_row, false, scratch);
@@ -7118,7 +8154,28 @@ fn runTransformerBlock(
         }
         const d_row = mlp_down[pos * hidden_size ..][0..hidden_size];
         matVecLayer(layer.mlp_down_proj, layer.mlp_down_bf16, layer.mlp_down_raw, g_row, hidden_size, intermediate_size, d_row, false, scratch);
-        for (0..hidden_size) |d| h_row[d] += d_row[d];
+        if (layer.mlp_conv == null) {
+            const h_row = hiddens[pos * hidden_size ..][0..hidden_size];
+            for (0..hidden_size) |d| h_row[d] += d_row[d];
+        }
+    }
+    if (layer.mlp_conv) |mc| {
+        const cdelta = extras.conv_delta.?;
+        const ng = hidden_size / mc.group_size;
+        const proj_rows = 2 * @as(usize, mc.taps) * ng;
+        applyGroupedConvCpu(
+            mlp_down[0 .. seq_len * hidden_size],
+            cdelta[0 .. seq_len * proj_rows],
+            mc.base_kernel,
+            seq_len,
+            hidden_size,
+            if (extras.block_size > 0) extras.block_size else seq_len,
+            mc.taps,
+            mc.group_size,
+            1,
+            hiddens[0 .. seq_len * hidden_size],
+            true,
+        );
     }
 }
 
@@ -10602,4 +11659,423 @@ test "M9.1 D15 DFlash 5L direct block-diffusion (B=8 & B=16, markov_rank=0, 5-ta
     try std.testing.expect(ps.kept_nodes < pre_nodes);
     try std.testing.expect(ps.kept_nodes >= 1);
     try std.testing.expectEqual(@as(f32, 0.0), p_rg.nodeLogProb(0));
+}
+
+test "DFlareProposer D15 DFlash2 (B=8 & B=16, DFlashGroupedConv + CandidateSelector + 5-tap fc) GPU == CPU parity & 288E D7 pruning" {
+    const allocator = std.testing.allocator;
+
+    // 1. Verify exact real-HF `lablup/GLM-5.3-Flash-DFlash2-Agentic` config JSON + canonical `.amf` JSON parsing.
+    const hf_dflash2_json =
+        \\{
+        \\  "architectures": ["DFlash2DraftModel"],
+        \\  "dflash_config": {
+        \\    "block_size": 8,
+        \\    "conv_group_size": 16,
+        \\    "conv_kernel_size": 2,
+        \\    "mask_token_id": 154856,
+        \\    "selector_rank": 256,
+        \\    "selector_top_k": 16,
+        \\    "target_layer_ids": [5, 14, 24, 33, 42]
+        \\  },
+        \\  "hidden_size": 4096,
+        \\  "intermediate_size": 12288,
+        \\  "num_attention_heads": 32,
+        \\  "num_key_value_heads": 8,
+        \\  "head_dim": 128,
+        \\  "num_hidden_layers": 5,
+        \\  "rms_norm_eps": 1e-5,
+        \\  "rope_theta": 10000.0,
+        \\  "sliding_window": 2048,
+        \\  "vocab_size": 154880
+        \\}
+    ;
+    try std.testing.expectEqual(DraftKindDetected.dflare, detectDraftKindFromJson(hf_dflash2_json).?);
+    const parsed_hf = try DFlareConfig.fromJson(allocator, hf_dflash2_json, 4096, 154880);
+    try std.testing.expectEqual(DFlareVariant.dflash2, parsed_hf.variant);
+    try std.testing.expectEqual(@as(u8, 2), parsed_hf.dflash_version);
+    try std.testing.expectEqual(@as(u8, 5), parsed_hf.num_layers);
+    try std.testing.expectEqual(@as(u8, 8), parsed_hf.block_size);
+    try std.testing.expectEqual(@as(u8, 2), parsed_hf.conv_kernel_size);
+    try std.testing.expectEqual(@as(u32, 16), parsed_hf.conv_group_size);
+    try std.testing.expectEqual(@as(u32, 256), parsed_hf.selector_rank);
+    try std.testing.expectEqual(@as(u8, 16), parsed_hf.selector_top_k);
+    try std.testing.expectEqual(@as(u32, 2048), parsed_hf.sliding_window);
+    try std.testing.expectEqual(@as(?u32, 154856), parsed_hf.mask_token_id);
+    try std.testing.expectEqual(@as(u8, 5), parsed_hf.num_target_taps);
+    try std.testing.expectEqualSlices(u16, &.{ 5, 14, 24, 33, 42 }, parsed_hf.target_layer_ids[0..5]);
+
+    const canon_dflash2_json =
+        \\{
+        \\  "draft_kind": "dflash2",
+        \\  "dflash_version": 2,
+        \\  "block_size": 16,
+        \\  "conv_kernel_size": 2,
+        \\  "conv_groups": 16,
+        \\  "selector_rank": 256,
+        \\  "selector_top_k": 16,
+        \\  "sliding_window": 2048,
+        \\  "mask_token_id": 154856,
+        \\  "target_layer_ids": [5, 14, 24, 33, 42],
+        \\  "hidden_size": 4096,
+        \\  "intermediate_size": 12288,
+        \\  "num_attention_heads": 32,
+        \\  "num_key_value_heads": 8,
+        \\  "head_dim": 128,
+        \\  "num_hidden_layers": 5,
+        \\  "vocab_size": 154880
+        \\}
+    ;
+    const parsed_canon = try DFlareConfig.fromJson(allocator, canon_dflash2_json, 4096, 154880);
+    try std.testing.expectEqual(DFlareVariant.dflash2, parsed_canon.variant);
+    try std.testing.expectEqual(@as(u8, 16), parsed_canon.block_size);
+    try std.testing.expectEqual(@as(u32, 16), parsed_canon.conv_group_size);
+    try std.testing.expect(parsed_canon.hasGroupedConv());
+    try std.testing.expect(parsed_canon.hasCandidateSelector());
+
+    // 2. Build compact `5L` `DFlash2` model (`5`-tap `fc`, `DFlashGroupedConv` `taps=2, group_size=16`,
+    //    `CandidateSelector` `state_rank=64, top_k=16` with BF16 codebooks) and verify Metal 4 GPU == CPU parity!
+    const device = try metal.Device.open();
+    defer device.close();
+    const library = try metal.Library.openEmbedded(device);
+    defer library.close();
+
+    const h: usize = 64;
+    const inter: usize = 128;
+    const nh: u32 = 2;
+    const nkvh: u32 = 1;
+    const hd: u32 = 32;
+    const q_dim: usize = @as(usize, nh) * hd;
+    const kv_dim: usize = @as(usize, nkvh) * hd;
+    const v: usize = 48;
+    const taps: usize = 5;
+    const num_layers: u8 = 5;
+    const conv_taps: u8 = 2;
+    const conv_gs: u32 = 16;
+    const conv_ng: usize = h / conv_gs;
+    const conv_proj_rows: usize = 2 * @as(usize, conv_taps) * conv_ng;
+    const sel_rank: u32 = 64;
+    const sel_k: u8 = 16;
+
+    const fc = try allocator.alloc(f32, h * taps * h);
+    defer allocator.free(fc);
+    const hidden_norm = try allocator.alloc(f32, h);
+    defer allocator.free(hidden_norm);
+    const tok_embed = try allocator.alloc(f32, v * h);
+    defer allocator.free(tok_embed);
+    const lm_head = try allocator.alloc(f32, v * h);
+    defer allocator.free(lm_head);
+    const final_norm = try allocator.alloc(f32, h);
+    defer allocator.free(final_norm);
+
+    fillDetWeight(fc, 9201, 0.06);
+    @memset(hidden_norm, 1.0);
+    fillDetWeight(tok_embed, 9202, 0.35);
+    fillDetWeight(lm_head, 9203, 0.25);
+    @memset(final_norm, 1.0);
+
+    const l_q = try allocator.alloc(f32, num_layers * q_dim * h);
+    defer allocator.free(l_q);
+    const l_k = try allocator.alloc(f32, num_layers * kv_dim * h);
+    defer allocator.free(l_k);
+    const l_v = try allocator.alloc(f32, num_layers * kv_dim * h);
+    defer allocator.free(l_v);
+    const l_o = try allocator.alloc(f32, num_layers * h * q_dim);
+    defer allocator.free(l_o);
+    const l_qn = try allocator.alloc(f32, num_layers * hd);
+    defer allocator.free(l_qn);
+    const l_kn = try allocator.alloc(f32, num_layers * hd);
+    defer allocator.free(l_kn);
+    const l_gate = try allocator.alloc(f32, num_layers * inter * h);
+    defer allocator.free(l_gate);
+    const l_up = try allocator.alloc(f32, num_layers * inter * h);
+    defer allocator.free(l_up);
+    const l_down = try allocator.alloc(f32, num_layers * h * inter);
+    defer allocator.free(l_down);
+    const l_ac_base = try allocator.alloc(f32, num_layers * 2 * conv_taps * h);
+    defer allocator.free(l_ac_base);
+    const l_ac_proj = try allocator.alloc(f32, num_layers * conv_proj_rows * h);
+    defer allocator.free(l_ac_proj);
+    const l_mc_base = try allocator.alloc(f32, num_layers * 2 * conv_taps * h);
+    defer allocator.free(l_mc_base);
+    const l_mc_proj = try allocator.alloc(f32, num_layers * conv_proj_rows * h);
+    defer allocator.free(l_mc_proj);
+
+    var layers: [num_layers]TransformerBlockWeights = undefined;
+    for (0..num_layers) |li| {
+        fillDetWeight(l_q[li * q_dim * h ..][0 .. q_dim * h], 9300 + li * 20 + 1, 0.12);
+        fillDetWeight(l_k[li * kv_dim * h ..][0 .. kv_dim * h], 9300 + li * 20 + 2, 0.12);
+        fillDetWeight(l_v[li * kv_dim * h ..][0 .. kv_dim * h], 9300 + li * 20 + 3, 0.12);
+        fillDetWeight(l_o[li * h * q_dim ..][0 .. h * q_dim], 9300 + li * 20 + 4, 0.12);
+        fillDetWeight(l_gate[li * inter * h ..][0 .. inter * h], 9300 + li * 20 + 5, 0.10);
+        fillDetWeight(l_up[li * inter * h ..][0 .. inter * h], 9300 + li * 20 + 6, 0.10);
+        fillDetWeight(l_down[li * h * inter ..][0 .. h * inter], 9300 + li * 20 + 7, 0.10);
+        @memset(l_qn[li * hd ..][0..hd], 1.0);
+        @memset(l_kn[li * hd ..][0..hd], 1.0);
+
+        const acb = l_ac_base[li * 2 * conv_taps * h ..][0 .. 2 * conv_taps * h];
+        const mcb = l_mc_base[li * 2 * conv_taps * h ..][0 .. 2 * conv_taps * h];
+        fillDetWeight(acb, 9300 + li * 20 + 8, 0.15);
+        fillDetWeight(mcb, 9300 + li * 20 + 9, 0.15);
+        // Emphasize tap 0 near 1.0 as in `sglang_dflash.py:956` (`base_kernel[:, 0] = 1.0`).
+        for (0..2) |side| {
+            for (0..h) |c| {
+                acb[(side * conv_taps) * h + c] += 1.0;
+                mcb[(side * conv_taps) * h + c] += 1.0;
+            }
+        }
+        fillDetWeight(l_ac_proj[li * conv_proj_rows * h ..][0 .. conv_proj_rows * h], 9300 + li * 20 + 10, 0.08);
+        fillDetWeight(l_mc_proj[li * conv_proj_rows * h ..][0 .. conv_proj_rows * h], 9300 + li * 20 + 11, 0.08);
+
+        layers[li] = .{
+            .q_proj = l_q[li * q_dim * h ..][0 .. q_dim * h],
+            .k_proj = l_k[li * kv_dim * h ..][0 .. kv_dim * h],
+            .v_proj = l_v[li * kv_dim * h ..][0 .. kv_dim * h],
+            .o_proj = l_o[li * h * q_dim ..][0 .. h * q_dim],
+            .q_norm_weight = l_qn[li * hd ..][0..hd],
+            .k_norm_weight = l_kn[li * hd ..][0..hd],
+            .mlp_gate_proj = l_gate[li * inter * h ..][0 .. inter * h],
+            .mlp_up_proj = l_up[li * inter * h ..][0 .. inter * h],
+            .mlp_down_proj = l_down[li * h * inter ..][0 .. h * inter],
+            .attn_conv = .{
+                .base_kernel = acb,
+                .kernel_proj = l_ac_proj[li * conv_proj_rows * h ..][0 .. conv_proj_rows * h],
+                .taps = conv_taps,
+                .group_size = conv_gs,
+            },
+            .mlp_conv = .{
+                .base_kernel = mcb,
+                .kernel_proj = l_mc_proj[li * conv_proj_rows * h ..][0 .. conv_proj_rows * h],
+                .taps = conv_taps,
+                .group_size = conv_gs,
+            },
+        };
+    }
+
+    const cs_hp = try allocator.alloc(f32, sel_rank * h);
+    defer allocator.free(cs_hp);
+    const cs_pred_f32 = try allocator.alloc(f32, v * sel_rank);
+    defer allocator.free(cs_pred_f32);
+    const cs_succ_f32 = try allocator.alloc(f32, v * sel_rank);
+    defer allocator.free(cs_succ_f32);
+    const cs_pred_bf16 = try allocator.alloc(u16, v * sel_rank);
+    defer allocator.free(cs_pred_bf16);
+    const cs_succ_bf16 = try allocator.alloc(u16, v * sel_rank);
+    defer allocator.free(cs_succ_bf16);
+    fillDetWeight(cs_hp, 9401, 0.15);
+    fillDetWeight(cs_pred_f32, 9402, 0.25);
+    fillDetWeight(cs_succ_f32, 9403, 0.25);
+    for (0..v * sel_rank) |i| {
+        cs_pred_bf16[i] = quant.f32ToBf16(cs_pred_f32[i]);
+        cs_succ_bf16[i] = quant.f32ToBf16(cs_succ_f32[i]);
+    }
+
+    const hist_cap: usize = 12;
+    const hist_f32 = try allocator.alloc(f32, hist_cap * taps * h);
+    defer allocator.free(hist_f32);
+    fillDetWeight(hist_f32, 9450, 0.35);
+
+    const HistState2 = struct {
+        data: []const f32,
+        len: u32,
+        epoch: u64,
+        h_dim: usize,
+        n_taps: usize,
+        fn read(c: *const anyopaque, out_len: *u32, out_epoch: *u64, pos: u32, tap_idx: usize, dst: []f32) bool {
+            const self_p: *const @This() = @ptrCast(@alignCast(c));
+            out_len.* = self_p.len;
+            out_epoch.* = self_p.epoch;
+            if (pos >= self_p.len or tap_idx >= self_p.n_taps or dst.len < self_p.h_dim) return false;
+            const off = (@as(usize, pos) * self_p.n_taps + tap_idx) * self_p.h_dim;
+            @memcpy(dst[0..self_p.h_dim], self_p.data[off..][0..self_p.h_dim]);
+            return true;
+        }
+    };
+    const DualHookCtx2 = struct {
+        tok: []const f32,
+        h_dim: usize,
+        v_len: usize,
+        hist: *HistState2,
+        fn readTok(c: ?*anyopaque, token_id: u32, dst: []f32) Error!void {
+            const dc: *const @This() = @ptrCast(@alignCast(c.?));
+            if (token_id >= dc.v_len or dst.len < dc.h_dim) return error.TokenOutOfRange;
+            @memcpy(dst[0..dc.h_dim], dc.tok[@as(usize, token_id) * dc.h_dim ..][0..dc.h_dim]);
+        }
+        fn readHist(c: *const anyopaque, out_len: *u32, out_epoch: *u64, pos: u32, tap_idx: usize, dst: []f32) bool {
+            const dc: *const @This() = @ptrCast(@alignCast(c));
+            return HistState2.read(dc.hist, out_len, out_epoch, pos, tap_idx, dst);
+        }
+    };
+
+    var hist_state: HistState2 = .{ .data = hist_f32, .len = 0, .epoch = 1, .h_dim = h, .n_taps = taps };
+    var dual_ctx: DualHookCtx2 = .{ .tok = tok_embed, .h_dim = h, .v_len = v, .hist = &hist_state };
+    registerContextHistoryProvider(&dual_ctx, DualHookCtx2.readHist);
+    defer unregisterContextHistoryProvider(&dual_ctx);
+
+    const weights: DFlareWeights = .{
+        .target_fusion_proj = fc,
+        .target_fusion_norm = hidden_norm,
+        .mask_embed = &.{},
+        .tok_embed_hook = .{ .callback = .{ .ctx = &dual_ctx, .read_fn = DualHookCtx2.readTok } },
+        .layers = &layers,
+        .final_norm = final_norm,
+        .candidate_selector = .{
+            .hidden_proj = cs_hp,
+            .predecessor_codebook_bf16 = cs_pred_bf16,
+            .successor_codebook_bf16 = cs_succ_bf16,
+            .state_rank = sel_rank,
+            .top_k = sel_k,
+        },
+        .lm_head = .{ .dense_f32 = lm_head },
+    };
+
+    var tap_slices: [taps][]const f32 = undefined;
+    for ([_]u8{ 8, 16 }) |block_w| {
+        const cfg: DFlareConfig = .{
+            .variant = .dflash2,
+            .dflash_version = 2,
+            .num_layers = num_layers,
+            .block_size = block_w,
+            .top_k_per_pos = 1,
+            .max_tree_nodes = 16,
+            .hidden_size = @intCast(h),
+            .intermediate_size = @intCast(inter),
+            .num_attention_heads = nh,
+            .num_key_value_heads = nkvh,
+            .head_dim = hd,
+            .rope_theta = 10_000.0,
+            .sliding_window = 6,
+            .vocab_size = @intCast(v),
+            .markov_rank = 0,
+            .num_target_taps = @intCast(taps),
+            .target_layer_ids = .{ 5, 14, 24, 33, 42, 0, 0, 0 },
+            .mask_token_id = @intCast(v - 1),
+            .conv_kernel_size = conv_taps,
+            .conv_group_size = conv_gs,
+            .selector_rank = sel_rank,
+            .selector_top_k = sel_k,
+            .rms_eps = 1e-5,
+        };
+
+        var ws_cpu = try DFlareWorkspace.init(cfg, null);
+        defer ws_cpu.deinit();
+        var ws_gpu = try DFlareWorkspace.init(cfg, null);
+        defer ws_gpu.deinit();
+
+        var cpu_p = try DFlareProposer.init(cfg, weights, &ws_cpu);
+        var gpu_p = try DFlareProposer.init(cfg, weights, &ws_gpu);
+        try gpu_p.attachGpu(.{ .device = device, .library = library });
+        defer gpu_p.detachGpu();
+
+        for ([_]u32{ 3, 7, 10 }) |ctx_len| {
+            hist_state.len = ctx_len;
+            const pos_off = (@as(usize, ctx_len) - 1) * taps * h;
+            for (0..taps) |ti| tap_slices[ti] = hist_f32[pos_off + ti * h ..][0..h];
+
+            var cpu_tree: CandidateTree = undefined;
+            var gpu_tree: CandidateTree = undefined;
+            const cpu_res = try cpu_p.propose(4, &tap_slices, null, &cpu_tree);
+            const gpu_res = try gpu_p.propose(4, &tap_slices, null, &gpu_tree);
+
+            try std.testing.expectEqual(@as(u16, block_w), cpu_res.tree_nodes);
+            try std.testing.expectEqual(cpu_res.tree_nodes, gpu_res.tree_nodes);
+
+            // Assert cosine similarity >= 0.9999 across ALL B block hidden vectors (CPU vs Metal 4 GPU)!
+            var dot_sum: f64 = 0.0;
+            var na_sum: f64 = 0.0;
+            var nb_sum: f64 = 0.0;
+            for (0..@as(usize, block_w) * h) |idx| {
+                const ca: f64 = ws_cpu.slot_hiddens[idx];
+                const gb: f64 = @floatCast(ws_gpu.gpu_slot_hiddens_f16[idx]);
+                dot_sum += ca * gb;
+                na_sum += ca * ca;
+                nb_sum += gb * gb;
+            }
+            const cos_sim = dot_sum / (@sqrt(na_sum) * @sqrt(nb_sum));
+            try std.testing.expect(cos_sim >= 0.9999);
+
+            // Assert candidate shortlist + matched (pred_tok, cand_tok) lattice score parity + selected path match!
+            // (Comparing by token-pair handles harmless f16 tie-order swaps between nearly-equal tail shortlist ranks.)
+            const draft_slots = @as(usize, block_w) - 1;
+            var max_score_diff: f32 = 0.0;
+            var matched_pairs: usize = 0;
+            for (0..draft_slots) |e| {
+                const cpu_cands = ws_cpu.sel_cand_ids[e * sel_k ..][0..sel_k];
+                const gpu_cands = ws_gpu.sel_cand_ids[e * sel_k ..][0..sel_k];
+                var overlap: usize = 0;
+                for (cpu_cands, 0..) |ctok, ci| {
+                    const g_ci_opt = std.mem.indexOfScalar(u32, gpu_cands, ctok);
+                    if (g_ci_opt) |g_ci| {
+                        overlap += 1;
+                        try std.testing.expect(@abs(ws_cpu.sel_unary_logits[e * sel_k + ci] - ws_gpu.sel_unary_logits[e * sel_k + g_ci]) < 1e-2);
+                        if (e == 0) {
+                            const cs_v = ws_cpu.sel_scores[ci];
+                            const gs_v = ws_gpu.sel_scores[g_ci];
+                            max_score_diff = @max(max_score_diff, @abs(cs_v - gs_v));
+                            matched_pairs += 1;
+                        } else {
+                            const prev_cpu = ws_cpu.sel_cand_ids[(e - 1) * sel_k ..][0..sel_k];
+                            const prev_gpu = ws_gpu.sel_cand_ids[(e - 1) * sel_k ..][0..sel_k];
+                            for (prev_cpu, 0..) |ptok, pi| {
+                                if (std.mem.indexOfScalar(u32, prev_gpu, ptok)) |g_pi| {
+                                    const cs_v = ws_cpu.sel_scores[(e * sel_k + pi) * sel_k + ci];
+                                    const gs_v = ws_gpu.sel_scores[(e * sel_k + g_pi) * sel_k + g_ci];
+                                    max_score_diff = @max(max_score_diff, @abs(cs_v - gs_v));
+                                    matched_pairs += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+                try std.testing.expect(overlap + 1 >= sel_k);
+            }
+            try std.testing.expect(matched_pairs > 0);
+            try std.testing.expect(max_score_diff < 1e-2);
+            for (0..cpu_tree.count) |ni| {
+                try std.testing.expectEqual(cpu_tree.nodes[ni].token_id, gpu_tree.nodes[ni].token_id);
+                try std.testing.expect(@abs(cpu_tree.nodes[ni].step_prob - gpu_tree.nodes[ni].step_prob) < 1e-2);
+            }
+        }
+
+        // 3. Verify D7 cold-expert block pruning over `288` experts (`GLM-5.3-Flash`, experts `256..287` cold in upper ExpertBitset words!).
+        var prune_tree: CandidateTree = undefined;
+        _ = try gpu_p.propose(4, &tap_slices, null, &prune_tree);
+        const d7_layers: u32 = 2;
+        const num_experts_flash: u32 = 288;
+        var node_exps: [16 * d7_layers]tree_mod.ExpertBitset = @splat(tree_mod.ExpertBitset.empty());
+        var cold_masks: [d7_layers]tree_mod.ExpertBitset = @splat(tree_mod.ExpertBitset.empty());
+        for (0..d7_layers) |l| {
+            for (256..288) |e| cold_masks[l].set(@intCast(e));
+        }
+        var pre_cold: u32 = 0;
+        for (0..prune_tree.count) |ni| {
+            const depth = prune_tree.nodes[ni].depth;
+            for (0..d7_layers) |l| {
+                if (depth <= 2) {
+                    node_exps[ni * d7_layers + l].set(3); // hot expert in low word
+                } else {
+                    const cold_e: u32 = 256 + @as(u32, @intCast((ni * 3 + l) % 32)); // cold expert in 256..287!
+                    node_exps[ni * d7_layers + l].set(cold_e);
+                }
+            }
+        }
+        for (0..d7_layers) |l| {
+            var u_bs = tree_mod.ExpertBitset.empty();
+            for (0..prune_tree.count) |ni| u_bs = u_bs.unionWith(node_exps[ni * d7_layers + l]);
+            pre_cold += u_bs.intersectWith(cold_masks[l]).count();
+        }
+        try std.testing.expect(pre_cold > 0);
+        const pre_nodes = prune_tree.count;
+        const d7_cost = tree_mod.PruneCostModel.uniformBeta(100.0, 2.0, 300_000.0, 8_000_000.0, 60.0, d7_layers, num_experts_flash);
+        const ps = try gpu_p.pruneWithD7(
+            32,
+            &prune_tree,
+            d7_cost,
+            node_exps[0 .. @as(usize, pre_nodes) * d7_layers],
+            &cold_masks,
+            16,
+        );
+        try std.testing.expect(ps.kept_nodes < pre_nodes);
+        try std.testing.expect(ps.kept_nodes >= 1);
+        try std.testing.expectEqual(@as(f32, 0.0), gpu_p.nodeLogProb(0));
+    }
 }
