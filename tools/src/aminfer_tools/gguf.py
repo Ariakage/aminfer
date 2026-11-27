@@ -1431,6 +1431,57 @@ def normalize_gguf_tensor_name(
                     return _normalize_name(f"layers.{blk_idx}.eh_proj.weight")
                 if rest in ("nextn.norm.weight", "shared_head.norm.weight", "output_norm.weight"):
                     return _normalize_name("shared_head.norm.weight")
+        if eff_arch == "bailingmoe3":
+            ling_leaf_map = {
+                "exp_probs_b.bias": "mlp.gate.bias",
+                "ffn_exp_probs_b.bias": "mlp.gate.bias",
+                "ffn_gate_inp.bias": "mlp.gate.bias",
+                "attn_gate.weight": "self_attn.g_proj.weight",
+                "attn_q_a.weight": "self_attn.q_a_proj.weight",
+                "attn_q_b.weight": "self_attn.q_b_proj.weight",
+                "attn_q_a_norm.weight": "self_attn.q_a_layernorm.weight",
+                "attn_kv_a_mqa.weight": "self_attn.kv_a_proj_with_mqa.weight",
+                "attn_kv_a_norm.weight": "self_attn.kv_a_layernorm.weight",
+                "attn_kv_b.weight": "self_attn.kv_b_proj.weight",
+                "ssm_a": "linear_attn.A_log",
+                "ssm_a.weight": "linear_attn.A_log",
+                "ssm_dt.bias": "linear_attn.dt_bias",
+                "ssm_dt_bias": "linear_attn.dt_bias",
+                "ssm_dt.weight": "linear_attn.dt_bias",
+                "ssm_beta.weight": "linear_attn.b_proj.weight",
+                "ssm_f_a.weight": "linear_attn.f_proj.weight",
+                "ssm_f.weight": "linear_attn.f_proj.weight",
+                "ssm_g_a.weight": "linear_attn.g_proj.weight",
+                "ssm_g.weight": "linear_attn.g_proj.weight",
+                "ssm_conv1d_q.weight": "linear_attn.q_conv1d.weight",
+                "ssm_conv1d_k.weight": "linear_attn.k_conv1d.weight",
+                "ssm_conv1d_v.weight": "linear_attn.v_conv1d.weight",
+                "ssm_norm.weight": "linear_attn.o_norm.weight",
+                "ssm_norm": "linear_attn.o_norm.weight",
+                "ssm_out.weight": "linear_attn.o_proj.weight",
+            }
+            if linear_layers is not None and raw_blk_idx in linear_layers:
+                ling_leaf_map.update(
+                    {
+                        "attn_q.weight": "linear_attn.q_proj.weight",
+                        "attn_k.weight": "linear_attn.k_proj.weight",
+                        "attn_v.weight": "linear_attn.v_proj.weight",
+                        "attn_output.weight": "linear_attn.o_proj.weight",
+                    }
+                )
+            if rest in ling_leaf_map:
+                return _normalize_name(f"layers.{blk_idx}.{ling_leaf_map[rest]}")
+            if mimo_mtp_mode:
+                if rest in ("nextn.enorm.weight", "enorm.weight"):
+                    return _normalize_name(f"layers.{blk_idx}.enorm.weight")
+                if rest in ("nextn.hnorm.weight", "hnorm.weight"):
+                    return _normalize_name(f"layers.{blk_idx}.hnorm.weight")
+                if rest in ("nextn.eh_proj.weight", "eh_proj.weight"):
+                    return _normalize_name(f"layers.{blk_idx}.eh_proj.weight")
+                if rest in ("layer_output_norm.weight", "final_layernorm.weight"):
+                    return _normalize_name(f"layers.{blk_idx}.final_layernorm.weight")
+                if rest in ("nextn.norm.weight", "shared_head.norm.weight", "output_norm.weight"):
+                    return _normalize_name("shared_head.norm.weight")
         if eff_arch in ("qwen35", "qwen3_5", "qwen35moe"):
             qwen35_leaf_map = {
                 "attn_gate.weight": "linear_attn.g_proj.weight",
@@ -1809,6 +1860,50 @@ def _build_synthesized_config_bytes(
         h_kv = kv.get(f"{arch}.attention.head_count_kv")
         if isinstance(h_kv, list) and h_kv:
             cfg["layer_types"] = ["linear_attention" if int(x) == 0 else "mla_attention" for x in h_kv]
+    elif arch == "bailingmoe3":
+        cfg["model_type"] = "bailing_hybrid"
+        cfg["architectures"] = ["BailingMoeV3ForCausalLM"]
+        blk_cnt = int(kv.get(f"{arch}.block_count", 73) or 73)
+        nextn_n = int(kv.get(f"{arch}.nextn_predict_layers", 0) or 0)
+        bb_layers = max(1, blk_cnt - nextn_n) if blk_cnt > nextn_n > 0 else blk_cnt
+        cfg["num_hidden_layers"] = bb_layers
+        cfg["first_k_dense_replace"] = int(kv.get(f"{arch}.leading_dense_block_count", 4) or 4)
+        cfg["layer_group_size"] = 8
+        if f"{arch}.attention.q_lora_rank" in kv:
+            cfg["q_lora_rank"] = int(kv[f"{arch}.attention.q_lora_rank"])
+        if f"{arch}.attention.kv_lora_rank" in kv:
+            cfg["kv_lora_rank"] = int(kv[f"{arch}.attention.kv_lora_rank"])
+        if f"{arch}.attention.key_length_mla" in kv:
+            qk_tot = int(kv[f"{arch}.attention.key_length_mla"])
+            rope_d = int(kv.get(f"{arch}.rope.dimension_count", 64) or 64)
+            cfg["qk_rope_head_dim"] = rope_d
+            cfg["qk_nope_head_dim"] = max(0, qk_tot - rope_d)
+        if f"{arch}.attention.value_length_mla" in kv:
+            cfg["v_head_dim"] = int(kv[f"{arch}.attention.value_length_mla"])
+        if f"{arch}.expert_feed_forward_length" in kv:
+            cfg["moe_intermediate_size"] = int(kv[f"{arch}.expert_feed_forward_length"])
+        if f"{arch}.expert_shared_feed_forward_length" in kv:
+            cfg["moe_shared_expert_intermediate_size"] = int(kv[f"{arch}.expert_shared_feed_forward_length"])
+        cfg["num_shared_experts"] = int(kv.get(f"{arch}.expert_shared_count", 1) or 1)
+        cfg["n_group"] = int(kv.get(f"{arch}.expert_group_count", 8) or 8)
+        cfg["topk_group"] = int(kv.get(f"{arch}.expert_group_used_count", 4) or 4)
+        cfg["routed_scaling_factor"] = float(kv.get(f"{arch}.expert_weights_scale", 2.5) or 2.5)
+        cfg["scoring_func"] = "sigmoid"
+        cfg["norm_topk_prob"] = bool(kv.get(f"{arch}.expert_weights_norm", True))
+        cfg["no_kda_lora"] = True
+        cfg["linear_silu"] = True
+        cfg["kda_safe_gate"] = bool(kv.get(f"{arch}.kda.safe_gate", True))
+        cfg["kda_lower_bound"] = float(kv.get(f"{arch}.kda.gate_lower_bound", -5.0) or -5.0)
+        cfg["short_conv_kernel_size"] = int(kv.get(f"{arch}.ssm.conv_kernel", 4) or 4)
+        cfg["mla_gated_proj"] = True
+        cfg["gated_attention_proj_granularity_type"] = "head_wise"
+        cfg["rope_interleave"] = True
+        if nextn_n > 0:
+            cfg["num_nextn_predict_layers"] = nextn_n
+        h_kv = kv.get(f"{arch}.attention.head_count_kv")
+        if isinstance(h_kv, list) and h_kv:
+            cfg["layer_types"] = ["linear_attention" if int(x) == 0 else "mla_attention" for x in h_kv[:bb_layers]]
+            cfg["num_key_value_heads"] = next((int(x) for x in h_kv[:bb_layers] if int(x) > 0), int(kv.get(f"{arch}.attention.head_count", 64) or 64))
     elif arch in ("mimo2", "mimo_v2"):
         cfg["model_type"] = "mimo_v2"
         cfg["architectures"] = ["MiMoV2ForCausalLM"]
@@ -2197,6 +2292,23 @@ def _decode_gguf_tensor_f32(shard: GgufShard, info: GgufTensorInfo) -> tuple[flo
             fh.seek(shard.data_offset + info.offset)
             raw = fh.read(info.expected_bytes)
         return tuple(f16_bytes_to_f32_list(raw))
+    spec = _GGML_TYPE_INFO.get(info.ggml_type)
+    if spec is not None and spec[3] is not None and spec[3] >= DType.GGUF_Q4_0 and info.amf_shape:
+        amf_dt = spec[3]
+        cols = info.amf_shape[-1]
+        rows = 1
+        for d in info.amf_shape[:-1]:
+            rows *= d
+        if rows > 0 and cols > 0 and info.expected_bytes % rows == 0:
+            row_b = info.expected_bytes // rows
+            with shard.path.open("rb") as fh:
+                fh.seek(shard.data_offset + info.offset)
+                raw = fh.read(info.expected_bytes)
+            mv = memoryview(raw)
+            out: list[float] = []
+            for r in range(rows):
+                out.extend(dequantize_gguf_amf_row_f32(amf_dt, mv[r * row_b : (r + 1) * row_b], cols))
+            return tuple(out)
     raise ValueError(f"expected float tensor (F32/F16/BF16) for {info.name!r}, got ggml_type={info.ggml_type}")
 
 
@@ -2266,7 +2378,7 @@ def pack_amf_from_gguf(
             }
         )
         layer_remap = {old_l: new_l for new_l, old_l in enumerate(kept_ids)}
-    if mimo_mtp_mode and arch.lower() in ("mimo2", "mimo_v2", "glm-dsa", "glm_moe_dsa", "glm5-next", "glm5_next"):
+    if mimo_mtp_mode and arch.lower() in ("mimo2", "mimo_v2", "glm-dsa", "glm_moe_dsa", "glm5-next", "glm5_next", "bailingmoe3"):
         mtp_blk_ids = sorted(
             {
                 int(m.group(1))
@@ -2275,7 +2387,7 @@ def pack_amf_from_gguf(
             }
         )
         blk_cnt = int(kv.get(f"{arch}.block_count", 0) or 0)
-        default_nextn = 1 if arch.lower().startswith("glm") else 3
+        default_nextn = 1 if arch.lower().startswith(("glm", "bailing")) else 3
         nextn_n = int(kv.get(f"{arch}.nextn_predict_layers", default_nextn) or default_nextn)
         if blk_cnt > nextn_n > 0 and mtp_blk_ids and max(mtp_blk_ids) >= blk_cnt - nextn_n and min(mtp_blk_ids) < blk_cnt - nextn_n:
             mtp_start = blk_cnt - nextn_n
@@ -2288,7 +2400,7 @@ def pack_amf_from_gguf(
         if mtp_blk_ids:
             layer_remap = {old_l: new_l for new_l, old_l in enumerate(mtp_blk_ids)}
             physical_layers = len(mtp_blk_ids)
-    elif not mimo_mtp_mode and arch.lower() in ("glm-dsa", "glm_moe_dsa", "glm5-next", "glm5_next"):
+    elif not mimo_mtp_mode and arch.lower() in ("glm-dsa", "glm_moe_dsa", "glm5-next", "glm5_next", "bailingmoe3"):
         blk_cnt = int(kv.get(f"{arch}.block_count", 0) or 0)
         nextn_n = int(kv.get(f"{arch}.nextn_predict_layers", 0) or 0)
         if blk_cnt > nextn_n > 0:
@@ -2300,7 +2412,7 @@ def pack_amf_from_gguf(
             ]
 
     glm5_linear_layers: set[int] | None = None
-    if arch.lower() in ("glm5-next", "glm5_next"):
+    if arch.lower() in ("glm5-next", "glm5_next", "bailingmoe3"):
         glm5_linear_layers = set()
         h_kv = kv.get(f"{arch}.attention.head_count_kv")
         if isinstance(h_kv, list):
@@ -2511,8 +2623,10 @@ def pack_amf_from_gguf(
             fused_split_gate_ups[t_name] = up_hit
             consumed_names.add(up_cand)
 
+    target_f16_dt = DType.F16 if dtype_mode == "f16" else DType.BF16
+
     # Synthesize stacked multi-pass `attn_res_query.weight` / `ffn_res_query.weight` or pass deltas if present.
-    synthetic_override_items: dict[str, tuple[str, tuple[int, ...], bytes]] = {}
+    synthetic_override_items: dict[str, tuple[str, DType, tuple[int, ...], bytes]] = {}
     extra_pass_items: list[tuple[str, tuple[int, GgufShard, GgufTensorInfo]]] = []
     if pass_deltas:
         for (base_core, leaf), delta_list in sorted(pass_deltas.items()):
@@ -2540,6 +2654,7 @@ def pack_amf_from_gguf(
                 n_rows_p = 1 + len(delta_list_sorted)
                 synthetic_override_items[base_name] = (
                     out_nm,
+                    DType.F32,
                     (n_rows_p, base_hit[2].amf_shape[0]),
                     struct.pack(f"<{len(stacked_vals)}f", *stacked_vals),
                 )
@@ -2556,14 +2671,50 @@ def pack_amf_from_gguf(
                     )
                     extra_pass_items.append((f"{base_out}.pass{p_i}", item))
 
+    if arch.lower() == "bailingmoe3":
+        for t_name, (_s_i, k_sh, k_t) in raw_by_name.items():
+            km = re.match(r"^blk\.(\d+)\.attn_k_b\.weight$", t_name)
+            if km is None or len(k_t.amf_shape) != 3:
+                continue
+            raw_li = int(km.group(1))
+            v_cand = f"blk.{raw_li}.attn_v_b.weight"
+            v_hit = raw_by_name.get(v_cand)
+            if v_hit is None or len(v_hit[2].amf_shape) != 3:
+                continue
+            _, v_sh, v_t = v_hit
+            n_h, kv_lora, qk_nope = k_t.amf_shape
+            v_nh, v_hd, v_kl = v_t.amf_shape
+            if n_h != v_nh or kv_lora != v_kl:
+                continue
+            k_vals = _decode_gguf_tensor_f32(k_sh, k_t)
+            v_vals = _decode_gguf_tensor_f32(v_sh, v_t)
+            fused_vals: list[float] = []
+            k_stride = kv_lora * qk_nope
+            v_stride = v_hd * kv_lora
+            for h in range(n_h):
+                kb = h * k_stride
+                for rn in range(qk_nope):
+                    for kl in range(kv_lora):
+                        fused_vals.append(k_vals[kb + kl * qk_nope + rn])
+                vb = h * v_stride
+                fused_vals.extend(v_vals[vb : vb + v_stride])
+            phys_li = layer_remap.get(raw_li, raw_li)
+            out_kv_nm = _normalize_name(f"layers.{phys_li}.self_attn.kv_b_proj.weight")
+            ov_bytes = f32_to_f16_bytes(fused_vals) if target_f16_dt == DType.F16 else f32_to_bf16_bytes(fused_vals)
+            synthetic_override_items[t_name] = (
+                out_kv_nm,
+                target_f16_dt,
+                (n_h * (qk_nope + v_hd), kv_lora),
+                ov_bytes,
+            )
+            consumed_names.add(v_cand)
+
     def _convert_ink2_f32_needed(out_nm: str, out_k: TensorKind, g_type: int) -> bool:
         if not use_inkling2_runtime_names or g_type != 0:
             return False
         if out_k == TensorKind.NORM or is_inkling2_controller_tensor(out_nm):
             return True
         return out_nm.endswith(".mlp.gate.weight") or out_nm.endswith(".mlp.gate")
-
-    target_f16_dt = DType.F16 if dtype_mode == "f16" else DType.BF16
 
     all_planning_items: list[tuple[str | None, int, GgufShard, GgufTensorInfo]] = [
         (None, s_idx, sh, t) for s_idx, sh, t in flat_items
@@ -2573,7 +2724,7 @@ def pack_amf_from_gguf(
         if override_out_name is None and (t.name in excluded or t.name in consumed_names):
             continue
         if override_out_name is None and t.name in synthetic_override_items:
-            ov_nm, ov_shp, ov_bytes = synthetic_override_items[t.name]
+            ov_nm, ov_dt, ov_shp, ov_bytes = synthetic_override_items[t.name]
             if ov_nm in excluded:
                 continue
             ov_kind, ov_layer, ov_exp = _classify_tensor(ov_nm, cold_set, all_experts_cold)
@@ -2581,7 +2732,7 @@ def pack_amf_from_gguf(
                 _PlannedGgufEntry(
                     name=ov_nm,
                     kind=ov_kind,
-                    dtype=DType.F32,
+                    dtype=ov_dt,
                     quant_bits=0,
                     group_size=0,
                     layer=ov_layer,
@@ -2722,7 +2873,7 @@ def pack_amf_from_gguf(
                 continue
             eff_shape = amf_shape_full
             if (
-                arch.lower() in ("qwen35", "qwen3_5", "qwen35moe", "glm5-next", "glm5_next")
+                arch.lower() in ("qwen35", "qwen3_5", "qwen35moe", "glm5-next", "glm5_next", "bailingmoe3")
                 and norm_name.endswith(
                     (
                         ".linear_attn.conv1d.weight",
@@ -2735,6 +2886,13 @@ def pack_amf_from_gguf(
                 and eff_shape[1] == 1
             ):
                 eff_shape = (eff_shape[0], eff_shape[2])
+            elif (
+                arch.lower() in ("glm5-next", "glm5_next", "bailingmoe3")
+                and norm_name.endswith(".linear_attn.A_log")
+                and len(eff_shape) == 2
+                and eff_shape[1] == 1
+            ):
+                eff_shape = (eff_shape[0],)
             kind, layer_i, exp_i = _classify_tensor(norm_name, cold_set, all_experts_cold)
             slices = [(norm_name, kind, layer_i, exp_i, eff_shape, t.offset, t.expected_bytes, False, None, 0, None, None)]
             eff_arch_l = arch.lower()
@@ -2883,6 +3041,24 @@ def pack_amf_from_gguf(
                 data_bytes = shp[0] * shp[1]
                 params_offset = _align_up(data_bytes, 64)
                 params_bytes = shp[0] * 4
+            elif (
+                arch.lower() in ("bailingmoe3", "glm5-next", "glm5_next")
+                and norm_name.endswith(
+                    (
+                        ".linear_attn.A_log",
+                        ".linear_attn.dt_bias",
+                        ".linear_attn.conv1d.weight",
+                        ".linear_attn.q_conv1d.weight",
+                        ".linear_attn.k_conv1d.weight",
+                        ".linear_attn.v_conv1d.weight",
+                        ".mlp.gate.bias",
+                    )
+                )
+                and t.ggml_type in (1, 30)
+            ):
+                out_dt = DType.F32
+                convert = "f16_to_f32" if t.ggml_type == 1 else "bf16_to_f32"
+                data_bytes = src_len * 2
             elif _convert_ink2_f32_needed(out_name, out_kind, t.ggml_type):
                 out_dt = target_f16_dt
                 convert = "f32_to_f16" if target_f16_dt == DType.F16 else "f32_to_bf16"
@@ -3037,6 +3213,12 @@ def pack_amf_from_gguf(
             cfg_dict = json.loads(cfg_bytes)
             mtp_dict = build_mimo_mtp_config_dict(cfg_dict, mtp_layers=max(1, physical_layers))
             cfg_bytes = json.dumps(mtp_dict, ensure_ascii=False, indent=2).encode("utf-8") + b"\n"
+        elif meta_config_override is None and arch.lower() == "bailingmoe3":
+            from aminfer_tools.ling3 import build_ling3_config_json, build_ling3_mtp_config_dict
+
+            cfg_dict = json.loads(cfg_bytes)
+            out_cfg_d = build_ling3_mtp_config_dict(cfg_dict) if mimo_mtp_mode else build_ling3_config_json(cfg_dict)
+            cfg_bytes = json.dumps(out_cfg_d, ensure_ascii=False, indent=2).encode("utf-8") + b"\n"
         elif meta_config_override is None and arch.lower() in ("glm-dsa", "glm_moe_dsa", "glm5-next", "glm5_next"):
             from aminfer_tools.glm5 import (
                 build_glm5_mtp_config_dict,
@@ -3256,6 +3438,12 @@ def pack_amf_from_gguf(
                             raw = _read_exact(sfh, e.src_bytes, e.name)
                         vals = struct.unpack(f"<{e.src_bytes // 4}f", raw)
                         w.write(f32_to_f16_bytes(vals) if e.data_convert == "f32_to_f16" else f32_to_bf16_bytes(vals))
+                    elif e.data_convert in ("f16_to_f32", "bf16_to_f32"):
+                        assert e.shard is not None
+                        sfh = in_fhs[e.shard.path]
+                        sfh.seek(e.shard.data_offset + e.src_offset)
+                        raw = _read_exact(sfh, e.src_bytes, e.name)
+                        w.write(_bf16_to_f32_bytes(raw) if e.data_convert == "bf16_to_f32" else struct.pack(f"<{len(raw) // 2}f", *f16_bytes_to_f32_list(raw)))
                     elif e.data_convert in (
                         "sme2_f16",
                         "sme2_f16_to_bf16",

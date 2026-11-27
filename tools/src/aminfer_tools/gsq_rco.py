@@ -74,6 +74,8 @@ from aminfer_tools.amf import (
     _ShardReaders,
     _should_sme2_pack,
     _stream_entry,
+    _AFFINE_BITS_DTYPE,
+    META_CONFIG_JSON,
     is_inkling2_controller_tensor,
     bf16_bytes_to_f16_bytes,
     bf16_bytes_to_f32_list,
@@ -1980,7 +1982,7 @@ def _algorithmic_bytes(dtype: DType, shape: tuple[int, ...], group_size: int) ->
     return d + p
 
 
-def _role_of_tensor(name: str, kind: TensorKind) -> str:
+def _role_of_tensor(name: str, kind: TensorKind, *, dense_kda_rco_q3: bool = False) -> str:
     lower = name.lower()
     if (
         kind == TensorKind.NORM
@@ -2065,6 +2067,10 @@ def _role_of_tensor(name: str, kind: TensorKind) -> str:
         return "latent_moe_proj"
     if is_vision_tensor(name):
         return "vision"
+    if dense_kda_rco_q3 and ".linear_attn." in lower and any(
+        tok in lower for tok in (".q_proj", ".k_proj", ".v_proj", ".f_proj", ".g_proj", ".o_proj")
+    ):
+        return "kda_dense_proj"
     if ".self_attn." in lower or ".linear_attn." in lower or ".attn." in lower:
         if any(tok in lower for tok in (".v_proj", ".g_proj", ".wv_")):
             return "attn_v"
@@ -2096,6 +2102,7 @@ _ROLE_WEIGHT = {
     "attn_vo": 3.2,
     "attn_qk": 2.4,
     "ffn_down": 1.8,
+    "kda_dense_proj": 1.6,
     "dense_ffn": 1.0,
     "moe_expert": 1.0,
     "dense": 1.2,
@@ -2130,6 +2137,7 @@ _BACKBONE_PROTECTED_ROLES = _PROTECTED_HIGH_PRECISION_ROLES | frozenset(
         "embed_head",
         "attn_qkv_o",
         "ssm_proj",
+        "kda_dense_proj",
     }
 )
 
@@ -3023,8 +3031,10 @@ class _UnifiedSource:
             eff_mimo_tp = 1
             eff_qwen35_cfg = None
             eff_glm5_cfg = None
+            eff_ling3_cfg = None
             if resolved.config_path is not None and resolved.config_path.is_file():
                 from aminfer_tools.glm5 import is_glm5_config
+                from aminfer_tools.ling3 import is_ling3_config
                 from aminfer_tools.mimo_v2 import (
                     _effective_mimo_cfg,
                     infer_mimo_qkv_tp_degree,
@@ -3036,6 +3046,8 @@ class _UnifiedSource:
                 if isinstance(probe_cfg, dict):
                     if is_glm5_config(probe_cfg):
                         eff_glm5_cfg = probe_cfg
+                    elif is_ling3_config(probe_cfg):
+                        eff_ling3_cfg = probe_cfg
                     elif is_mimo_v2_config(probe_cfg):
                         eff_mimo_cfg = _effective_mimo_cfg(probe_cfg)
                         eff_mimo_tp = infer_mimo_qkv_tp_degree(probe_cfg, raw_tensors)
@@ -3056,6 +3068,7 @@ class _UnifiedSource:
                 mimo_qkv_tp_degree=eff_mimo_tp,
                 qwen35_config=eff_qwen35_cfg,
                 glm5_config=eff_glm5_cfg,
+                ling3_config=eff_ling3_cfg,
             )
             self._sf_readers = _ShardReaders()
             self.model_id = model_id_override or self.input_path.stem
@@ -3153,6 +3166,75 @@ class _UnifiedSource:
                     return r_start + cur
                 cur -= r_cnt
             raise IndexError(f"row {log_r} out of bounds for gathered {e.name}")
+
+        if e.mlx_kv_b_pair is not None:
+            from aminfer_tools.amf import decode_mlx_affine_3d_head_f32
+
+            (
+                n_heads,
+                kv_lora,
+                qk_nope,
+                v_hd,
+                eq_w,
+                eq_s,
+                eq_b,
+                eq_bits,
+                eq_gs,
+                uo_w,
+                uo_s,
+                uo_b,
+                uo_bits,
+                uo_gs,
+            ) = e.mlx_kv_b_pair
+            per_h = qk_nope + v_hd
+            eq_cache: dict[int, list[list[float]]] = {}
+            uo_cache: dict[int, list[list[float]]] = {}
+            for r in row_indices:
+                if r < 0 or r >= n_rows:
+                    raise IndexError(f"row {r} out of bounds for {e.name}")
+                h = r // per_h
+                in_h = r % per_h
+                if in_h < qk_nope:
+                    if h not in eq_cache:
+                        eq_cache[h] = decode_mlx_affine_3d_head_f32(
+                            self._sf_readers, eq_w, eq_s, eq_b, eq_bits, eq_gs, n_heads, kv_lora, qk_nope, h
+                        )
+                    eq_mat = eq_cache[h]
+                    out.append([eq_mat[kl][in_h] for kl in range(kv_lora)])
+                else:
+                    if h not in uo_cache:
+                        uo_cache[h] = decode_mlx_affine_3d_head_f32(
+                            self._sf_readers, uo_w, uo_s, uo_b, uo_bits, uo_gs, n_heads, v_hd, kv_lora, h
+                        )
+                    out.append(uo_cache[h][in_h - qk_nope])
+            return out
+
+        if e.data_convert is not None and e.data_convert.startswith("affine") and e.data_convert.endswith("_to_bf16"):
+            assert e.scales is not None and e.biases is not None
+            bits = int(e.data_convert[len("affine") : -len("_to_bf16")])
+            aff_dt = _AFFINE_BITS_DTYPE[bits]
+            row_data_fn, deq = _AFFINE_DEQUANT_SPEC[aff_dt]
+            sb_elem = 2 if e.scales.dtype in ("F16", "BF16") else 4
+            groups = (e.scales.length // sb_elem) // n_rows
+            gs = k // groups
+            row_d = row_data_fn(k)
+            row_sb = groups * sb_elem
+            s_fh = self._sf_readers.get(e.scales.path)
+            b_fh = self._sf_readers.get(e.biases.path)
+            for r in row_indices:
+                if r < 0 or r >= n_rows:
+                    raise IndexError(f"row {r} out of bounds for {e.name}")
+                pr = _phys_row(r)
+                d_raw = _read_exact(fh, e.data.offset + pr * row_d, row_d)
+                s_raw = _read_exact(s_fh, e.scales.offset + pr * row_sb, row_sb)
+                b_raw = _read_exact(b_fh, e.biases.offset + pr * row_sb, row_sb)
+                s_vals = _decode_sf_floats(s_raw, e.scales.dtype)
+                b_vals = _decode_sf_floats(b_raw, e.biases.dtype)
+                p_buf = bytearray(groups * 4)
+                for g_idx in range(groups):
+                    _F16_PAIR_STRUCT.pack_into(p_buf, g_idx * 4, _clamp_f16(s_vals[g_idx]), _clamp_f16(b_vals[g_idx]))
+                out.append(deq(d_raw, p_buf, k, group_size=gs))
+            return out
 
         if e.dtype in _AFFINE_DEQUANT_SPEC:
             assert e.scales is not None and e.biases is not None
@@ -3294,7 +3376,9 @@ class _UnifiedSource:
             DType.MXFP8_G32,
             DType.NVFP4_G16,
             DType.GGUF_MXFP4,
-        ) or e.mimo_qkv_slice is not None:
+        ) or e.mimo_qkv_slice is not None or e.mlx_kv_b_pair is not None or (
+            e.data_convert is not None and e.data_convert.startswith("affine") and e.data_convert.endswith("_to_bf16")
+        ):
             return self._decode_sf_quant_rows(e, row_indices)
 
         def _phys_row_u(log_r: int) -> int:
@@ -3374,7 +3458,9 @@ class _UnifiedSource:
             DType.MXFP8_G32,
             DType.NVFP4_G16,
             DType.GGUF_MXFP4,
-        ) or e.mimo_qkv_slice is not None or e.row_gather_runs is not None:
+        ) or e.mimo_qkv_slice is not None or e.row_gather_runs is not None or e.mlx_kv_b_pair is not None or (
+            e.data_convert is not None and e.data_convert.startswith("affine") and e.data_convert.endswith("_to_bf16")
+        ):
             for r0 in range(0, n_rows, batch_rows):
                 cnt = min(batch_rows, n_rows - r0)
                 yield self.read_rows_f32(t, range(r0, r0 + cnt))
@@ -4390,6 +4476,7 @@ def gsq_convert(
     max_q2_share: float | None = None,
     allow_lowbit_q2_retranscode: bool = True,
     fine_rungs: bool = False,
+    dense_kda_rco_q3: bool | None = None,
     meta_blobs: Sequence[tuple[str, bytes]] = (),
     stats_out: dict[str, int] | None = None,
 ) -> GsqConvertReport:
@@ -4452,6 +4539,19 @@ def gsq_convert(
         else:
             req_sme2 = sme2_pack
         eff_sme2_pack = "all-linear" if (lut16_sme2 and req_sme2 == "none") else req_sme2
+        if dense_kda_rco_q3 is not None:
+            eff_dense_kda_rco_q3 = bool(dense_kda_rco_q3)
+        else:
+            eff_dense_kda_rco_q3 = False
+            for m_nm, m_bytes in (*src.metadata_blobs, *meta_blobs):
+                if m_nm == META_CONFIG_JSON:
+                    try:
+                        m_obj = json.loads(m_bytes.decode("utf-8"))
+                        if isinstance(m_obj, dict) and m_obj.get("dense_kda_rco_q3"):
+                            eff_dense_kda_rco_q3 = True
+                    except (UnicodeDecodeError, ValueError):
+                        pass
+                    break
         model_id_str = src.model_id
         model_id_bytes = model_id_str.encode("utf-8")
         if len(model_id_bytes) == 0 or len(model_id_bytes) > 63:
@@ -4521,6 +4621,8 @@ def gsq_convert(
                     ".linear_attn.f_a_proj",
                     ".linear_attn.g_a_proj.weight",
                     ".linear_attn.g_a_proj",
+                    ".self_attn.g_proj.weight",
+                    ".self_attn.g_proj",
                     ".hc_attn_fn",
                     ".hc_attn_fn.weight",
                     ".hc_ffn_fn",
@@ -4626,10 +4728,30 @@ def gsq_convert(
                         and src_dt not in (DType.Q2_AFFINE, DType.Q3_AFFINE)
                     ):
                         return
+                    if (
+                        eff_dense_kda_rco_q3
+                        and role in ("attn_qk", "attn_v", "attn_o", "attn_vo")
+                        and ".self_attn." in members[0].name.lower()
+                        and cdt == DType.Q3_AFFINE
+                        and src_dt not in (DType.Q2_AFFINE, DType.Q3_AFFINE)
+                    ):
+                        return
                 seen_specs.add((cdt, gs))
                 cand_specs.append((cdt, gs))
 
-            if role == "controller":
+            if eff_dense_kda_rco_q3 and role == "kda_dense_proj":
+                # RCO-Q3 dense-KDA compression profile: keep KDA dense linear projections in
+                # calibrated Q3_AFFINE (forbidding Q2_AFFINE and without lifting to Q4/BF16),
+                # while keeping 9L global Gated MLA protected at >= Q4_AFFINE.
+                _add_spec(DType.Q3_AFFINE, group_size)
+                if fine_rungs and group_size != 32:
+                    _add_spec(DType.Q3_AFFINE, 32)
+                if not cand_specs:
+                    if is_float_src:
+                        _add_spec(f_target, 0)
+                    elif all_same_src:
+                        _add_spec(src_dt, members[0].group_size or group_size)
+            elif role == "controller":
                 # Inkling 2 `gate_rank=64` controllers in `M82Runtime` support Q4_AFFINE (g=64) or BF16/F16 only.
                 if all(m.shape[1] % SME2_GROUP_K == 0 for m in members):
                     _add_spec(DType.Q4_AFFINE, SME2_GROUP_K)
@@ -4812,7 +4934,7 @@ def gsq_convert(
             )
 
         for t in standalone_quant:
-            role = _role_of_tensor(t.name, t.kind)
+            role = _role_of_tensor(t.name, t.kind, dense_kda_rco_q3=eff_dense_kda_rco_q3)
             unit_inputs.append(_build_unit(t.name, [t], role, t.layer, t.expert))
         for l_idx, members in sorted(controller_groups.items()):
             uid = f"layers.{l_idx}.controllers"

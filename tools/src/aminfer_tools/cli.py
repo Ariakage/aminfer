@@ -56,6 +56,14 @@ from aminfer_tools.glm5 import (
     validate_glm5_next_metadata_dir,
     validate_glm_moe_dsa_metadata_dir,
 )
+from aminfer_tools.ling3 import (
+    LING3_SYNTH_PRESETS,
+    LING3_TIER_PROFILES,
+    convert_ling3_checkpoint,
+    generate_synth_ling3_bundle,
+    is_ling3_config,
+    validate_ling3_metadata_dir,
+)
 from aminfer_tools.mimo_v2 import (
     generate_synth_mimo_bundle,
     generate_synth_qwen35_bundle,
@@ -364,6 +372,12 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     _add_gsq_safety_args(pack)
     pack.add_argument(
+        "--dense-kda-rco-q3",
+        action="store_true",
+        default=None,
+        help="Compress no_kda_lora dense KDA projections to calibrated RCO Q3_AFFINE while keeping MLA >= Q4_AFFINE",
+    )
+    pack.add_argument(
         "--no-rco",
         action="store_true",
         help="Disable RCO scale/bias refinement (use naive min-max baseline) under --quant-profile gsq-rco",
@@ -537,6 +551,12 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Hard wired `.amf` size cap in GiB (e.g. 10.6 for full-wired 24 GB M4)",
     )
     _add_gsq_safety_args(gsq)
+    gsq.add_argument(
+        "--dense-kda-rco-q3",
+        action="store_true",
+        default=None,
+        help="Compress no_kda_lora dense KDA projections to calibrated RCO Q3_AFFINE while keeping MLA >= Q4_AFFINE",
+    )
     gsq.add_argument(
         "--heat-profile",
         type=pathlib.Path,
@@ -1185,6 +1205,65 @@ def _build_parser() -> argparse.ArgumentParser:
     sglm5.add_argument("--model-id", default=None)
     sglm5.add_argument("--seed", type=int, default=42)
 
+    cling3 = sub.add_parser(
+        "convert-ling3",
+        help="Convert Ling-3.1 (`bailing_hybrid` / `bailingmoe3`) + RCO-Q3 dense-KDA + 1L MTP to .amf",
+    )
+    cling3.add_argument("--input", required=True, type=pathlib.Path)
+    cling3.add_argument("--output", required=True, type=pathlib.Path)
+    cling3.add_argument("--model-id", default=None)
+    cling3.add_argument("--dtype", choices=DTYPE_MODES, default="auto")
+    cling3.add_argument("--group-size", type=int, choices=AFFINE_GROUP_SIZES, default=64)
+    cling3.add_argument("--quant-profile", choices=QUANT_PROFILES, default="uniform")
+    cling3.add_argument("--target-bits", type=float, default=None)
+    cling3.add_argument("--target-wired-gib", type=float, default=None)
+    cling3.add_argument("--target-tier", choices=sorted(LING3_TIER_PROFILES.keys()), default=None)
+    cling3.add_argument("--dense-kda-rco-q3", dest="dense_kda_rco_q3", action="store_true", default=None)
+    cling3.add_argument("--no-dense-kda-rco-q3", dest="dense_kda_rco_q3", action="store_false")
+    cling3.add_argument("--no-rco", action="store_true")
+    cling3.add_argument("--manifest", type=pathlib.Path, default=None)
+    cling3.add_argument("--cold-experts", default="")
+    cling3.add_argument("--cold-experts-per-layer", type=int, default=None)
+    cling3.add_argument("--heat-profile", type=pathlib.Path, default=None)
+    cling3.add_argument("--all-experts-cold", action="store_true")
+    cling3.add_argument("--mtp-output", type=pathlib.Path, default=None)
+    cling3.add_argument("--mtp-config-output", type=pathlib.Path, default=None)
+    cling3.add_argument("--repack-sme2", action="store_true")
+    cling3.add_argument("--mtp-eh-proj-bits", type=int, choices=(2, 3, 4), default=None)
+    cling3.add_argument("--config-output", type=pathlib.Path, default=None)
+    cling3.add_argument("--config", type=pathlib.Path, default=None)
+    cling3.add_argument("--tokenizer", type=pathlib.Path, default=None)
+    cling3.add_argument("--tokenizer-config", type=pathlib.Path, default=None)
+    cling3.add_argument("--chat-template", type=pathlib.Path, default=None)
+    cling3.add_argument("--no-strict-vocab", action="store_true")
+    cling3.add_argument("--imatrix", type=pathlib.Path, default=None)
+    cling3.add_argument("--allow-unsafe-q2", action="store_true")
+    cling3.add_argument("--max-q2-share", type=float, default=None)
+    cling3.add_argument("--no-retranscode-lowbit", dest="allow_retranscode_lowbit", action="store_false")
+    cling3.add_argument("--fine-rungs", action="store_true")
+    cling3.add_argument("--no-embed-metadata", action="store_true")
+    cling3.add_argument("--workers", type=int, default=1)
+
+    sling3 = sub.add_parser(
+        "synth-ling3",
+        help="Generate deterministic tiny Ling-3.1 (`bailing_hybrid`) + optional RCO-Q3 dense-KDA + 1L MTP bundle",
+    )
+    sling3.add_argument("--preset", default="tiny-ling3", choices=sorted(LING3_SYNTH_PRESETS.keys()))
+    sling3.add_argument("--output-dir", required=True, type=pathlib.Path)
+    sling3.add_argument("--num-layers", type=int, default=None)
+    sling3.add_argument("--hidden-size", type=int, default=None)
+    sling3.add_argument("--num-experts", type=int, default=None)
+    sling3.add_argument("--dtype", choices=("bf16", "f16"), default=None)
+    sling3.add_argument("--cold-experts-per-layer", type=int, default=None)
+    sling3.add_argument("--no-mtp", action="store_true")
+    sling3.add_argument("--repack-sme2", action="store_true")
+    sling3.add_argument("--mtp-eh-proj-bits", type=int, choices=(2, 3, 4), default=None)
+    sling3.add_argument("--rco-q3", action="store_true")
+    sling3.add_argument("--rco-q3-target-bits", type=float, default=None)
+    sling3.add_argument("--no-embed-metadata", action="store_true")
+    sling3.add_argument("--model-id", default=None)
+    sling3.add_argument("--seed", type=int, default=42)
+
     part = sub.add_parser(
         "partition-experts",
         help=(
@@ -1222,7 +1301,20 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     insp.add_argument(
         "--arch",
-        choices=("auto", "qwen4_exp", "deepseek41", "inkling2", "hy4", "mimo_v2", "qwen3_5", "glm_moe_dsa", "glm5_next", "dflash2"),
+        choices=(
+            "auto",
+            "qwen4_exp",
+            "deepseek41",
+            "inkling2",
+            "hy4",
+            "mimo_v2",
+            "qwen3_5",
+            "glm_moe_dsa",
+            "glm5_next",
+            "dflash2",
+            "bailing_hybrid",
+            "ling3",
+        ),
         default="auto",
         help="Architecture validator to invoke (default: auto-detect from config.json)",
     )
@@ -1842,6 +1934,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 max_q2_share=max_q2,
                 allow_lowbit_q2_retranscode=allow_lowbit,
                 fine_rungs=fine_rungs,
+                dense_kda_rco_q3=args.dense_kda_rco_q3,
                 stats_out=stats_map,
             )
             stripped_vision = stats_map.get("stripped_vision_tensors", 0)
@@ -1923,6 +2016,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 max_q2_share=max_q2,
                 allow_lowbit_q2_retranscode=allow_lowbit,
                 fine_rungs=fine_rungs,
+                dense_kda_rco_q3=args.dense_kda_rco_q3,
                 stats_out=vis_stats,
             )
             elapsed = time.monotonic() - started
@@ -2004,6 +2098,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             max_q2_share=max_q2,
             allow_lowbit_q2_retranscode=allow_lowbit,
             fine_rungs=fine_rungs,
+            dense_kda_rco_q3=args.dense_kda_rco_q3,
         )
         elapsed = time.monotonic() - started
         total_bytes = args.output.stat().st_size
@@ -2846,6 +2941,80 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         return 0
 
+    if args.command == "convert-ling3":
+        cold = _parse_cold_experts(args.cold_experts)
+        enforce_floor = not args.allow_unsafe_q2
+        eff_max_q2 = None if args.allow_unsafe_q2 else args.max_q2_share
+        eff_fine_rungs = False if args.allow_unsafe_q2 else (True if args.fine_rungs else None)
+        rep = convert_ling3_checkpoint(
+            args.input,
+            args.output,
+            model_id=args.model_id,
+            dtype_mode=args.dtype,
+            group_size=args.group_size,
+            quant_profile=args.quant_profile,
+            target_bits=args.target_bits,
+            target_wired_gib=args.target_wired_gib,
+            target_tier=args.target_tier,
+            dense_kda_rco_q3=args.dense_kda_rco_q3,
+            use_rco=not args.no_rco,
+            manifest_path=args.manifest,
+            cold_experts=cold,
+            cold_experts_per_layer=args.cold_experts_per_layer,
+            heat_profile=args.heat_profile,
+            all_experts_cold=args.all_experts_cold,
+            mtp_output=args.mtp_output,
+            mtp_config_output=args.mtp_config_output,
+            mtp_repack_sme2=args.repack_sme2,
+            mtp_eh_proj_bits=args.mtp_eh_proj_bits,
+            config_output=args.config_output,
+            config_path=args.config,
+            tokenizer_path=args.tokenizer,
+            tokenizer_config_path=args.tokenizer_config,
+            chat_template_path=args.chat_template,
+            strict_vocab_check=not args.no_strict_vocab,
+            imatrix_path=args.imatrix,
+            enforce_backbone_floor=enforce_floor,
+            max_q2_share=eff_max_q2,
+            allow_lowbit_q2_retranscode=bool(args.allow_retranscode_lowbit),
+            fine_rungs=eff_fine_rungs,
+            embed_metadata=not args.no_embed_metadata,
+            workers=args.workers,
+        )
+        print(
+            f"converted {rep.model_type} ({len(rep.backbone_metas)} backbone tensors, "
+            f"cold_experts={rep.cold_expert_count}, rco_q3_kda={rep.dense_kda_rco_q3}, "
+            f"mtp={len(rep.mtp_metas)}) into {rep.backbone_amf}"
+        )
+        return 0
+
+    if args.command == "synth-ling3":
+        started = time.monotonic()
+        bundle = generate_synth_ling3_bundle(
+            args.output_dir,
+            preset=args.preset,
+            num_layers=args.num_layers,
+            hidden_size=args.hidden_size,
+            num_experts=args.num_experts,
+            dtype=args.dtype,
+            cold_experts_per_layer=args.cold_experts_per_layer,
+            with_mtp=not args.no_mtp,
+            mtp_repack_sme2=True if args.repack_sme2 else None,
+            mtp_eh_proj_bits=args.mtp_eh_proj_bits,
+            with_rco_q3=True if args.rco_q3 else None,
+            rco_q3_target_bits=args.rco_q3_target_bits,
+            embed_metadata=not args.no_embed_metadata,
+            model_id=args.model_id,
+            seed=args.seed,
+        )
+        elapsed = time.monotonic() - started
+        print(
+            f"synthesized {args.preset} -> {bundle.output_dir} "
+            f"(backbone={len(bundle.backbone_metas)}, rco_q3={len(bundle.rco_q3_metas)}, "
+            f"mtp={len(bundle.mtp_metas)}) in {elapsed:.2f} s"
+        )
+        return 0
+
     if args.command == "synth-vit":
         started = time.monotonic()
         vit_cfg = SyntheticVitConfig(
@@ -2903,6 +3072,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             combined_mt = f"{mt} {tc_mt}"
             if is_glm5_dflash2_config(raw_cfg):
                 arch = "dflash2"
+            elif is_ling3_config(raw_cfg):
+                arch = "bailing_hybrid"
             elif "glm5_next" in combined_mt or "glm5-next" in combined_mt:
                 arch = "glm5_next"
             elif "glm_moe_dsa" in combined_mt:
@@ -2927,6 +3098,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 rep = validate_glm_moe_dsa_metadata_dir(base, host_ram_gib=args.host_ram_gib)
             elif arch == "glm5_next":
                 rep = validate_glm5_next_metadata_dir(base, host_ram_gib=args.host_ram_gib)
+            elif arch in ("bailing_hybrid", "ling3"):
+                rep = validate_ling3_metadata_dir(base, host_ram_gib=args.host_ram_gib)
             elif arch == "dflash2":
                 rep = validate_glm5_dflash2_metadata_dir(base)
             elif arch == "mimo_v2":
@@ -2963,6 +3136,18 @@ def main(argv: Sequence[str] | None = None) -> int:
                 f"mHC={rep.hc_mult}x{rep.hc_sinkhorn_iters}sinkhorn, hidden={rep.hidden_size}, "
                 f"experts={rep.n_routed_experts} (top-{rep.num_experts_per_tok}), "
                 f"ViT={rep.vision_layers}L, MTP={rep.mtp_layers}L, "
+                f"KDA_state={rep.kda_state_bytes_fp32 / (1024**2):.1f} MiB, names>47B={rep.long_backbone_names}"
+            )
+        elif arch in ("bailing_hybrid", "ling3"):
+            print(
+                f"bailing_hybrid metadata OK ({rep.model_type}): "
+                f"layers={rep.num_hidden_layers} (KDA={rep.linear_attention_layers}, GatedMLA={rep.mla_layers}; "
+                f"dense={rep.dense_layers}, moe={rep.moe_layers}), "
+                f"hidden={rep.hidden_size}, experts={rep.n_routed_experts} (top-{rep.num_experts_per_tok}, "
+                f"shared={rep.n_shared_experts}), MTP={rep.mtp_layers}L, "
+                f"active+MTP={rep.always_active_plus_mtp_params / 1e9:.2f}B "
+                f"(Q4={rep.q4_always_active_plus_mtp_gib:.2f} GiB -> RCO-Q3={rep.rco_q3_always_active_plus_mtp_gib:.2f} GiB, "
+                f"M4_hot_cache={rep.m4_24gb_hot_cache_rco_q3_gib:.2f} GiB), "
                 f"KDA_state={rep.kda_state_bytes_fp32 / (1024**2):.1f} MiB, names>47B={rep.long_backbone_names}"
             )
         elif arch == "dflash2":

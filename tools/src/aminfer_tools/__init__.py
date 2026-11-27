@@ -20,6 +20,19 @@ from aminfer_tools.glm5 import (
     validate_glm5_next_metadata_dir,
     validate_glm_moe_dsa_metadata_dir,
 )
+from aminfer_tools.ling3 import (
+    LING3_SYNTH_PRESETS,
+    LING3_TIER_PROFILES,
+    Ling3ConvertReport,
+    Ling3MetadataReport,
+    Ling3SynthBundle,
+    Ling3SynthConfig,
+    Ling3TierProfile,
+    convert_ling3_checkpoint,
+    export_ling3_mtp,
+    generate_synth_ling3_bundle,
+    validate_ling3_metadata_dir,
+)
 from aminfer_tools.mimo_v2 import (
     MIMO_SYNTH_PRESETS,
     MIMO_TIER_PROFILES,
@@ -81,4 +94,15 @@ __all__ = [
     "validate_glm5_dflash2_metadata_dir",
     "validate_glm5_next_metadata_dir",
     "validate_glm_moe_dsa_metadata_dir",
+    "LING3_SYNTH_PRESETS",
+    "LING3_TIER_PROFILES",
+    "Ling3ConvertReport",
+    "Ling3MetadataReport",
+    "Ling3SynthBundle",
+    "Ling3SynthConfig",
+    "Ling3TierProfile",
+    "convert_ling3_checkpoint",
+    "export_ling3_mtp",
+    "generate_synth_ling3_bundle",
+    "validate_ling3_metadata_dir",
 ]

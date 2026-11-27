@@ -785,6 +785,178 @@ class MimoAndQwen35MetadataValidationTests(unittest.TestCase):
             self.assertEqual(rep.conv_group_size, 16)
             self.assertEqual(rep.selector_top_k, 16)
 
+    def test_synthetic_ling3_w28_metadata_and_cli(self) -> None:
+        from aminfer_tools.cli import main as cli_main
+        from aminfer_tools.ling3 import validate_ling3_metadata_dir
+
+        with tempfile.TemporaryDirectory() as tmp:
+            meta_dir = pathlib.Path(tmp) / "ling3"
+            meta_dir.mkdir(parents=True, exist_ok=True)
+            cfg = {
+                "model_type": "bailing_hybrid",
+                "architectures": ["BailingMoeV3ForCausalLM"],
+                "hidden_size": 4096,
+                "intermediate_size": 10240,
+                "moe_intermediate_size": 1280,
+                "moe_shared_expert_intermediate_size": 1280,
+                "num_hidden_layers": 72,
+                "layer_group_size": 8,
+                "first_k_dense_replace": 4,
+                "vocab_size": 157184,
+                "num_attention_heads": 64,
+                "num_key_value_heads": 64,
+                "head_dim": 128,
+                "q_lora_rank": 1536,
+                "kv_lora_rank": 512,
+                "qk_nope_head_dim": 128,
+                "qk_rope_head_dim": 64,
+                "qk_head_dim": 192,
+                "v_head_dim": 128,
+                "num_experts": 512,
+                "num_shared_experts": 1,
+                "num_experts_per_tok": 8,
+                "n_group": 8,
+                "topk_group": 4,
+                "routed_scaling_factor": 2.5,
+                "no_kda_lora": True,
+                "kda_safe_gate": True,
+                "kda_lower_bound": -5.0,
+                "linear_silu": True,
+                "short_conv_kernel_size": 4,
+                "gated_attention_proj_granularity_type": "head_wise",
+                "rope_interleave": True,
+                "rope_theta": 6000000.0,
+                "rms_norm_eps": 1e-6,
+                "num_nextn_predict_layers": 1,
+                "mtp_use_kda": False,
+                "expert_swiglu_limit_list": [0.0] * 65 + [10.0] * 8,
+                "share_expert_swiglu_limit_list": [0.0] * 65 + [10.0] * 8,
+            }
+            (meta_dir / "config.json").write_text(json.dumps(cfg), encoding="utf-8")
+            wmap = {
+                "model.word_embeddings.weight": "s0.safetensors",
+                "model.norm.weight": "s1.safetensors",
+                "lm_head.weight": "s1.safetensors",
+                "model.layers.0.attention.q_proj.weight": "s0.safetensors",
+                "model.layers.0.attention.k_proj.weight": "s0.safetensors",
+                "model.layers.0.attention.v_proj.weight": "s0.safetensors",
+                "model.layers.0.attention.f_proj.weight": "s0.safetensors",
+                "model.layers.0.attention.g_proj.weight": "s0.safetensors",
+                "model.layers.0.attention.b_proj.weight": "s0.safetensors",
+                "model.layers.0.attention.o_proj.weight": "s0.safetensors",
+                "model.layers.0.attention.q_conv1d.weight": "s0.safetensors",
+                "model.layers.0.attention.k_conv1d.weight": "s0.safetensors",
+                "model.layers.0.attention.v_conv1d.weight": "s0.safetensors",
+                "model.layers.0.attention.A_log": "s0.safetensors",
+                "model.layers.0.attention.dt_bias": "s0.safetensors",
+                "model.layers.0.attention.o_norm.weight": "s0.safetensors",
+                "model.layers.7.attention.q_a_proj.weight": "s0.safetensors",
+                "model.layers.7.attention.q_b_proj.weight": "s0.safetensors",
+                "model.layers.7.attention.kv_a_proj_with_mqa.weight": "s0.safetensors",
+                "model.layers.7.attention.kv_b_proj.weight": "s0.safetensors",
+                "model.layers.7.attention.g_proj.weight": "s0.safetensors",
+                "model.layers.7.attention.dense.weight": "s0.safetensors",
+                "model.layers.71.mlp.shared_experts.down_proj.weight": "s0.safetensors",
+                "model.layers.71.mlp.gate.expert_bias": "s0.safetensors",
+                "model.layers.71.mlp.experts.511.down_proj.weight": "s0.safetensors",
+                "model.layers.72.enorm.weight": "s1.safetensors",
+                "model.layers.72.hnorm.weight": "s1.safetensors",
+                "model.layers.72.eh_proj.weight": "s1.safetensors",
+                "model.layers.72.attention.dense.weight": "s1.safetensors",
+                "model.layers.72.final_layernorm.weight": "s1.safetensors",
+            }
+            (meta_dir / "model.safetensors.index.json").write_text(json.dumps({"weight_map": wmap}), encoding="utf-8")
+            (meta_dir / "safetensors_headers_summary.json").write_text(
+                json.dumps(
+                    {
+                        "sampled_headers": {
+                            "s0.safetensors": {
+                                "model.layers.0.attention.f_proj.weight": {"dtype": "F8_E4M3", "shape": [8192, 4096]},
+                                "model.layers.0.attention.g_proj.weight": {"dtype": "F8_E4M3", "shape": [8192, 4096]},
+                                "model.layers.0.attention.b_proj.weight": {"dtype": "BF16", "shape": [64, 4096]},
+                                "model.layers.0.attention.o_norm.weight": {"dtype": "BF16", "shape": [128]},
+                                "model.layers.7.attention.kv_a_proj_with_mqa.weight": {"dtype": "F8_E4M3", "shape": [576, 4096]},
+                                "model.layers.7.attention.g_proj.weight": {"dtype": "BF16", "shape": [64, 4096]},
+                                "model.layers.7.attention.dense.weight": {"dtype": "F8_E4M3", "shape": [4096, 8192]},
+                                "model.layers.71.mlp.experts.511.down_proj.weight": {"dtype": "F8_E4M3", "shape": [4096, 1280]},
+                            },
+                            "s1.safetensors": {
+                                "model.layers.72.eh_proj.weight": {"dtype": "BF16", "shape": [4096, 8192]},
+                                "model.layers.72.final_layernorm.weight": {"dtype": "BF16", "shape": [4096]},
+                            },
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            rep = validate_ling3_metadata_dir(meta_dir)
+            self.assertEqual(rep.errors, ())
+            self.assertEqual(rep.long_backbone_names, 0)
+            self.assertEqual(rep.long_mtp_names, 0)
+            self.assertEqual(rep.linear_attention_layers, 63)
+            self.assertEqual(rep.mla_layers, 9)
+            self.assertEqual(rep.dense_layers, 4)
+            self.assertEqual(rep.moe_layers, 68)
+            self.assertEqual(rep.mtp_layers, 1)
+            self.assertGreater(rep.always_active_plus_mtp_params, 24_000_000_000)
+            self.assertLess(rep.always_active_plus_mtp_params, 25_000_000_000)
+            self.assertGreater(rep.routed_per_tok_params, 8_000_000_000)
+            self.assertLess(rep.rco_q3_always_active_plus_mtp_gib, rep.q4_always_active_plus_mtp_gib - 2.0)
+            self.assertGreater(rep.m4_24gb_hot_cache_rco_q3_gib, rep.m4_24gb_hot_cache_q4_gib + 2.0)
+
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                rc = cli_main(["inspect-metadata", "--input", str(meta_dir), "--json"])
+            self.assertEqual(rc, 0)
+            parsed = json.loads(buf.getvalue())
+            self.assertEqual(parsed["linear_attention_layers"], 63)
+            self.assertEqual(parsed["mla_layers"], 9)
+
+    def test_opportunistic_live_staged_ling3_metadata(self) -> None:
+        from aminfer_tools.ling3 import validate_ling3_metadata_dir
+
+        meta_env = os.environ.get("AMINFER_METADATA_DIR")
+        if not meta_env:
+            return
+        meta_root = pathlib.Path(meta_env)
+
+        for dname in (
+            "inclusionAI__Ling-3.1-flash-1019",
+            "inclusionAI__Ling-3.1-flash",
+            "mlx-community__Ling-3.1-flash-1019-oQ4e-mtp",
+            "mlx-community__Ling-3.1-flash-1019-oQ2e-mtp",
+        ):
+            dpath = meta_root / dname
+            if dpath.is_dir():
+                rep = validate_ling3_metadata_dir(dpath)
+                self.assertEqual(rep.errors, (), f"{dname}: {rep.errors}")
+                self.assertEqual(rep.num_hidden_layers, 72)
+                self.assertEqual(rep.linear_attention_layers, 63)
+                self.assertEqual(rep.mla_layers, 9)
+                self.assertEqual(rep.dense_layers, 4)
+                self.assertEqual(rep.moe_layers, 68)
+                self.assertEqual(rep.n_routed_experts, 512)
+                self.assertEqual(rep.mtp_layers, 1)
+                self.assertTrue(rep.no_kda_lora)
+                self.assertTrue(rep.kda_safe_gate)
+                self.assertAlmostEqual(rep.kda_lower_bound, -5.0)
+                self.assertEqual(rep.long_backbone_names, 0)
+                self.assertEqual(rep.long_mtp_names, 0)
+                self.assertLessEqual(rep.max_backbone_name_bytes, 47)
+                if dname == "inclusionAI__Ling-3.1-flash-1019":
+                    self.assertGreater(rep.header_summary_shards, 50)
+                    self.assertGreater(rep.routed_expert_ids_detected, 500)
+
+        tiny30 = meta_root / "inclusionAI__Ling-3.0-tiny"
+        if tiny30.is_dir():
+            rep_t = validate_ling3_metadata_dir(tiny30)
+            self.assertEqual(rep_t.errors, ())
+            self.assertEqual(rep_t.num_hidden_layers, 24)
+            self.assertEqual(rep_t.linear_attention_layers, 18)
+            self.assertEqual(rep_t.mla_layers, 6)
+            self.assertEqual(rep_t.n_routed_experts, 128)
+            self.assertEqual(rep_t.long_backbone_names, 0)
+
 
 if __name__ == "__main__":
     unittest.main()
