@@ -20031,12 +20031,28 @@ fn inferVisionConfigFromEntries(
     }
     if (num_layers == 0) return .{ .has_vision = false };
 
-    const head_candidates = [_]u32{ 72, 64, 48, 32, 16, 12, 8, 4 };
     var head_dim: u32 = 0;
-    for (head_candidates) |cand| {
-        if (cand <= vision_mod.MAX_VIT_HEAD_DIM and (vis_hidden % cand) == 0) {
-            head_dim = cand;
-            break;
+    {
+        const qn_s = std.fmt.bufPrint(&buf, "{s}blocks.0.attn.q_norm", .{pfx}) catch return error.InvalidConfig;
+        const qn_entry = findVisionStemEntry(vsrc, qn_s) orelse blk_kn: {
+            const kn_s = std.fmt.bufPrint(&buf, "{s}blocks.0.attn.k_norm", .{pfx}) catch return error.InvalidConfig;
+            break :blk_kn findVisionStemEntry(vsrc, kn_s);
+        };
+        if (qn_entry) |qe| {
+            const d = qe.shape[0];
+            if (d == 0 or d > vision_mod.MAX_VIT_HEAD_DIM or (d % 4) != 0 or (vis_hidden % d) != 0) {
+                return error.TensorShapeMismatch;
+            }
+            head_dim = d;
+        }
+    }
+    if (head_dim == 0) {
+        const head_candidates = [_]u32{ 72, 64, 48, 32, 16, 12, 8, 4 };
+        for (head_candidates) |cand| {
+            if (cand <= vision_mod.MAX_VIT_HEAD_DIM and (vis_hidden % cand) == 0) {
+                head_dim = cand;
+                break;
+            }
         }
     }
     if (head_dim == 0) return error.InvalidConfig;
@@ -20105,33 +20121,63 @@ fn inferVisionConfigFromEntries(
         } else return error.TensorShapeMismatch;
     }
 
-    const merger_stems = [_][]const u8{
-        "visual.merger.linear_fc1",
-        "visual.merger.fc1",
-        "visual.merger.w1",
-        "visual.merger.proj",
-        "visual.downsample",
-        "visual.proj_in",
-        "vision.merger.linear_fc1",
-        "vision.merger.fc1",
-        "vision.merger.w1",
-        "vision.merger.proj.0",
-        "aligner.linear_fc1",
-        "aligner.fc1",
-        "aligner.w1",
-        "multi_modal_projector.linear_1",
-    };
-    const m1 = (findVisionStemFirst(vsrc, &merger_stems) orelse return error.MissingTensor).entry;
-    const merger_hidden = m1.shape[0];
-    const merged_in_dim = m1.shape[1];
+    var ds_buf: [128]u8 = undefined;
+    var mg_buf: [128]u8 = undefined;
+    const ds_stem = std.fmt.bufPrint(&ds_buf, "{s}downsample", .{pfx}) catch unreachable;
+    const mg_stem = std.fmt.bufPrint(&mg_buf, "{s}merger.gate_proj", .{pfx}) catch unreachable;
+    const ds_entry = findVisionStemEntry(vsrc, ds_stem);
+    const m_gate_entry = findVisionStemEntry(vsrc, mg_stem);
+    const is_glm5_vision = (ds_entry != null and m_gate_entry != null);
+
+    var merger_hidden: u32 = 0;
     var spatial_merge: u32 = 0;
-    for ([_]u32{ 1, 2, 3, 4 }) |sm| {
-        if (sm * sm * vis_hidden == merged_in_dim) {
-            spatial_merge = sm;
-            break;
+    if (is_glm5_vision) {
+        const ds = ds_entry.?;
+        const mg = m_gate_entry.?;
+        merger_hidden = mg.shape[0];
+        if (ds.rank == 4) {
+            if (ds.shape[1] != vis_hidden or ds.shape[2] != ds.shape[3] or ds.shape[2] == 0 or ds.shape[2] > 4) {
+                return error.TensorShapeMismatch;
+            }
+            spatial_merge = ds.shape[2];
+        } else {
+            const ds_cols = entryFlattenedCols(ds) orelse return error.TensorShapeMismatch;
+            for ([_]u32{ 1, 2, 3, 4 }) |sm| {
+                if (sm * sm * vis_hidden == ds_cols) {
+                    spatial_merge = sm;
+                    break;
+                }
+            }
         }
+        if (spatial_merge == 0) return error.TensorShapeMismatch;
+    } else {
+        const merger_stems = [_][]const u8{
+            "visual.merger.linear_fc1",
+            "visual.merger.fc1",
+            "visual.merger.w1",
+            "visual.merger.proj",
+            "visual.downsample",
+            "visual.proj_in",
+            "vision.merger.linear_fc1",
+            "vision.merger.fc1",
+            "vision.merger.w1",
+            "vision.merger.proj.0",
+            "aligner.linear_fc1",
+            "aligner.fc1",
+            "aligner.w1",
+            "multi_modal_projector.linear_1",
+        };
+        const m1 = (findVisionStemFirst(vsrc, &merger_stems) orelse return error.MissingTensor).entry;
+        merger_hidden = m1.shape[0];
+        const merged_in_dim = entryFlattenedCols(m1) orelse return error.TensorShapeMismatch;
+        for ([_]u32{ 1, 2, 3, 4 }) |sm| {
+            if (sm * sm * vis_hidden == merged_in_dim) {
+                spatial_merge = sm;
+                break;
+            }
+        }
+        if (spatial_merge == 0) return error.TensorShapeMismatch;
     }
-    if (spatial_merge == 0) return error.TensorShapeMismatch;
 
     var cls_buf: [128]u8 = undefined;
     var cls_pos_buf: [128]u8 = undefined;
@@ -20178,9 +20224,13 @@ fn inferVisionConfigFromEntries(
         .is_inkling2_vision = is_inkling2_vision,
         .has_cls_token = has_cls_emb,
         .posemb_grid_size = posemb_grid_size,
-        .layer_norm_eps = if (is_inkling2_vision) 1e-5 else 1e-6,
+        .layer_norm_eps = if (is_inkling2_vision or is_glm5_vision) 1e-5 else 1e-6,
         .rope_swap_hw_axes = is_inkling2_vision,
         .apply_rope_on_split_qkv = is_inkling2_vision,
+        .rope_global_half_split = is_glm5_vision,
+        .swiglu_limit = if (is_glm5_vision) 10.0 else 0.0,
+        .channel_first_spatial_merge = is_glm5_vision,
+        .merger_is_swiglu = is_glm5_vision,
     };
     try cfg.validate();
     return cfg;
@@ -20251,7 +20301,8 @@ const VisionTensorResolver = struct {
     ) GraphLoadError!vision_mod.VisionLinearWeight {
         const found = findVisionStemFirst(self.vsrc, stems) orelse return error.MissingTensor;
         const e = found.entry;
-        if (e.shape[0] != expected_n or e.shape[1] != expected_k) return error.TensorShapeMismatch;
+        const actual_k = entryFlattenedCols(e) orelse return error.TensorShapeMismatch;
+        if (e.shape[0] != expected_n or actual_k != expected_k) return error.TensorShapeMismatch;
         const base_bind = try self.bindingForEntry(e);
         const bias = try self.bindOptionalBias(found.stem, expected_n);
         const dt = try e.dataType();
@@ -20391,6 +20442,18 @@ fn bindVisionWeights(
         };
         const proj = try res.bindLinear(&proj_stems, vis_h, vis_h);
 
+        const qn_stem = std.fmt.bufPrint(&b2, "{s}blocks.{d}.attn.q_norm", .{ pfx, l }) catch unreachable;
+        const kn_stem = std.fmt.bufPrint(&b3, "{s}blocks.{d}.attn.k_norm", .{ pfx, l }) catch unreachable;
+        const q_norm_opt: ?vision_mod.VisionNormWeight = if (findVisionStemEntry(res.vsrc, qn_stem) != null)
+            try res.bindNorm(qn_stem, cfg.head_dim, cfg.layer_norm_eps)
+        else
+            null;
+        const k_norm_opt: ?vision_mod.VisionNormWeight = if (findVisionStemEntry(res.vsrc, kn_stem) != null)
+            try res.bindNorm(kn_stem, cfg.head_dim, cfg.layer_norm_eps)
+        else
+            null;
+        if ((q_norm_opt != null) != (k_norm_opt != null)) return error.MissingTensor;
+
         var mlp_fc1: vision_mod.VisionLinearWeight = undefined;
         var mlp_up: ?vision_mod.VisionLinearWeight = null;
         var mlp_fc2: vision_mod.VisionLinearWeight = undefined;
@@ -20431,6 +20494,8 @@ fn bindVisionWeights(
             .q_proj = q_proj_opt,
             .k_proj = k_proj_opt,
             .v_proj = v_proj_opt,
+            .q_norm = q_norm_opt,
+            .k_norm = k_norm_opt,
             .proj = proj,
             .ls_1 = ls1,
             .norm2 = norm2,
@@ -20439,6 +20504,50 @@ fn bindVisionWeights(
             .mlp_fc2 = mlp_fc2,
             .ls_2 = ls2,
             .use_window_attn = false,
+        };
+    }
+
+    if (cfg.merger_is_swiglu) {
+        const ds_s = [_][]const u8{std.fmt.bufPrint(&b0, "{s}downsample", .{pfx}) catch unreachable};
+        const m_ds = try res.bindLinear(&ds_s, cfg.lm_hidden, merged_in_dim);
+
+        const proj_s = [_][]const u8{std.fmt.bufPrint(&b0, "{s}merger.proj", .{pfx}) catch unreachable};
+        const m_proj = try res.bindLinear(&proj_s, cfg.lm_hidden, cfg.lm_hidden);
+
+        const post_ln_stem = std.fmt.bufPrint(&b0, "{s}post_layernorm", .{pfx}) catch unreachable;
+        const m_pre_norm: ?vision_mod.VisionNormWeight = if (findVisionStemEntry(res.vsrc, post_ln_stem) != null)
+            try res.bindNorm(post_ln_stem, vis_h, cfg.layer_norm_eps)
+        else
+            null;
+
+        const ppn_stem = std.fmt.bufPrint(&b1, "{s}merger.post_projection_norm", .{pfx}) catch unreachable;
+        const m_ppn: ?vision_mod.VisionNormWeight = if (findVisionStemEntry(res.vsrc, ppn_stem) != null)
+            try res.bindNorm(ppn_stem, cfg.lm_hidden, cfg.layer_norm_eps)
+        else
+            null;
+
+        const mg_s = [_][]const u8{std.fmt.bufPrint(&b0, "{s}merger.gate_proj", .{pfx}) catch unreachable};
+        const mu_s = [_][]const u8{std.fmt.bufPrint(&b1, "{s}merger.up_proj", .{pfx}) catch unreachable};
+        const md_s = [_][]const u8{std.fmt.bufPrint(&b2, "{s}merger.down_proj", .{pfx}) catch unreachable};
+        const m_gate = try res.bindLinear(&mg_s, cfg.merger_hidden, cfg.lm_hidden);
+        const m_up = try res.bindLinear(&mu_s, cfg.merger_hidden, cfg.lm_hidden);
+        const m_down = try res.bindLinear(&md_s, cfg.lm_hidden, cfg.merger_hidden);
+
+        return .{
+            .blocks = blocks,
+            .merger = .{
+                .norm = m_pre_norm,
+                .norm_placement = if (m_pre_norm != null) .pre_merge else .none,
+                .fc1 = m_proj,
+                .fc2 = m_down,
+                .merger_hidden_size = cfg.merger_hidden,
+                .act_kind = .gelu_exact,
+                .downsample = m_ds,
+                .post_proj_norm = m_ppn,
+                .gate_proj = m_gate,
+                .up_proj = m_up,
+            },
+            .patch_embed = patch_embed,
         };
     }
 
@@ -25320,4 +25429,318 @@ test "M9.2 G27: synthetic glm5_next (20-step hc_mult=4 mHC Sinkhorn + 3L KDA + 1
         post_diff = @max(post_diff, @abs(@as(f32, @floatCast(serial_m.readLogitsF16()[vi])) - @as(f32, @floatCast(tree_m.readLogitsF16()[vi]))));
     }
     try std.testing.expect(post_diff < 5e-2);
+}
+
+fn fillTestSolidBgra8Frame(frame: metal.VisionFrame, width: u32, height: u32, r: u8, g_ch: u8, b: u8) !void {
+    var guard = try frame.lockPlane(0, false);
+    errdefer guard.release();
+    for (0..height) |y| {
+        const row = guard.rowBytes(@intCast(y));
+        for (0..width) |x| {
+            row[x * 4 + 0] = b;
+            row[x * 4 + 1] = g_ch;
+            row[x * 4 + 2] = r;
+            row[x * 4 + 3] = 255;
+        }
+    }
+    try guard.unlock();
+}
+
+fn buildSynthGlm5VisionSidecarAmfBytes(
+    allocator: std.mem.Allocator,
+    num_layers: u32,
+    vis_hidden: u32,
+    head_dim: u32,
+    vis_intermediate: u32,
+    lm_hidden: u32,
+    proj_intermediate: u32,
+    patch_size: u32,
+    t_patch: u32,
+    spatial_merge: u32,
+) ![]u8 {
+    var blobs: std.ArrayListUnmanaged(TestTensorBlob) = .empty;
+    var names: std.ArrayListUnmanaged([]u8) = .empty;
+    defer {
+        for (blobs.items) |b| allocator.free(b.bytes);
+        blobs.deinit(allocator);
+        for (names.items) |n| allocator.free(n);
+        names.deinit(allocator);
+    }
+
+    const addVis = struct {
+        fn call(
+            alloc: std.mem.Allocator,
+            list: *std.ArrayListUnmanaged(TestTensorBlob),
+            nms: *std.ArrayListUnmanaged([]u8),
+            nm: []const u8,
+            layer: u16,
+            shape: [4]u32,
+            ndim: u8,
+            data: []u8,
+        ) !void {
+            const dup = try alloc.dupe(u8, nm);
+            try nms.append(alloc, dup);
+            try list.append(alloc, .{
+                .name = dup,
+                .kind = if (ndim == 1) .norm else .dense,
+                .dtype = .bf16,
+                .layer = layer,
+                .shape = shape,
+                .ndim = ndim,
+                .bytes = data,
+            });
+        }
+    }.call;
+
+    const pe_in = 3 * t_patch * patch_size * patch_size;
+    var nb: [128]u8 = undefined;
+    try addVis(allocator, &blobs, &names, "visual.patch_embed.proj.weight", amf.NO_LAYER, .{ vis_hidden, pe_in, 0, 0 }, 2, try fillDeterministicBf16(allocator, 31001, vis_hidden * pe_in, 0.04));
+    try addVis(allocator, &blobs, &names, "visual.patch_embed.proj.bias", amf.NO_LAYER, .{ vis_hidden, 0, 0, 0 }, 1, try fillDeterministicBf16(allocator, 31002, vis_hidden, 0.01));
+
+    for (0..num_layers) |l| {
+        const s0: u64 = 32000 + l * 200;
+        const l16: u16 = @intCast(l);
+        try addVis(allocator, &blobs, &names, std.fmt.bufPrint(&nb, "visual.blocks.{d}.norm1.weight", .{l}) catch unreachable, l16, .{ vis_hidden, 0, 0, 0 }, 1, try fillConstantBf16(allocator, vis_hidden, 1.0));
+        try addVis(allocator, &blobs, &names, std.fmt.bufPrint(&nb, "visual.blocks.{d}.norm2.weight", .{l}) catch unreachable, l16, .{ vis_hidden, 0, 0, 0 }, 1, try fillConstantBf16(allocator, vis_hidden, 1.0));
+        try addVis(allocator, &blobs, &names, std.fmt.bufPrint(&nb, "visual.blocks.{d}.attn.q_norm.weight", .{l}) catch unreachable, l16, .{ head_dim, 0, 0, 0 }, 1, try fillConstantBf16(allocator, head_dim, 1.0));
+        try addVis(allocator, &blobs, &names, std.fmt.bufPrint(&nb, "visual.blocks.{d}.attn.k_norm.weight", .{l}) catch unreachable, l16, .{ head_dim, 0, 0, 0 }, 1, try fillConstantBf16(allocator, head_dim, 1.0));
+        try addVis(allocator, &blobs, &names, std.fmt.bufPrint(&nb, "visual.blocks.{d}.attn.qkv.weight", .{l}) catch unreachable, l16, .{ 3 * vis_hidden, vis_hidden, 0, 0 }, 2, try fillDeterministicBf16(allocator, s0 + 1, 3 * vis_hidden * vis_hidden, 0.05));
+        try addVis(allocator, &blobs, &names, std.fmt.bufPrint(&nb, "visual.blocks.{d}.attn.qkv.bias", .{l}) catch unreachable, l16, .{ 3 * vis_hidden, 0, 0, 0 }, 1, try fillDeterministicBf16(allocator, s0 + 2, 3 * vis_hidden, 0.01));
+        try addVis(allocator, &blobs, &names, std.fmt.bufPrint(&nb, "visual.blocks.{d}.attn.proj.weight", .{l}) catch unreachable, l16, .{ vis_hidden, vis_hidden, 0, 0 }, 2, try fillDeterministicBf16(allocator, s0 + 3, vis_hidden * vis_hidden, 0.05));
+        try addVis(allocator, &blobs, &names, std.fmt.bufPrint(&nb, "visual.blocks.{d}.attn.proj.bias", .{l}) catch unreachable, l16, .{ vis_hidden, 0, 0, 0 }, 1, try fillDeterministicBf16(allocator, s0 + 4, vis_hidden, 0.01));
+        try addVis(allocator, &blobs, &names, std.fmt.bufPrint(&nb, "visual.blocks.{d}.mlp.gate_proj.weight", .{l}) catch unreachable, l16, .{ vis_intermediate, vis_hidden, 0, 0 }, 2, try fillDeterministicBf16(allocator, s0 + 5, vis_intermediate * vis_hidden, 0.05));
+        try addVis(allocator, &blobs, &names, std.fmt.bufPrint(&nb, "visual.blocks.{d}.mlp.gate_proj.bias", .{l}) catch unreachable, l16, .{ vis_intermediate, 0, 0, 0 }, 1, try fillDeterministicBf16(allocator, s0 + 6, vis_intermediate, 0.01));
+        try addVis(allocator, &blobs, &names, std.fmt.bufPrint(&nb, "visual.blocks.{d}.mlp.up_proj.weight", .{l}) catch unreachable, l16, .{ vis_intermediate, vis_hidden, 0, 0 }, 2, try fillDeterministicBf16(allocator, s0 + 7, vis_intermediate * vis_hidden, 0.05));
+        try addVis(allocator, &blobs, &names, std.fmt.bufPrint(&nb, "visual.blocks.{d}.mlp.up_proj.bias", .{l}) catch unreachable, l16, .{ vis_intermediate, 0, 0, 0 }, 1, try fillDeterministicBf16(allocator, s0 + 8, vis_intermediate, 0.01));
+        try addVis(allocator, &blobs, &names, std.fmt.bufPrint(&nb, "visual.blocks.{d}.mlp.down_proj.weight", .{l}) catch unreachable, l16, .{ vis_hidden, vis_intermediate, 0, 0 }, 2, try fillDeterministicBf16(allocator, s0 + 9, vis_hidden * vis_intermediate, 0.05));
+        try addVis(allocator, &blobs, &names, std.fmt.bufPrint(&nb, "visual.blocks.{d}.mlp.down_proj.bias", .{l}) catch unreachable, l16, .{ vis_hidden, 0, 0, 0 }, 1, try fillDeterministicBf16(allocator, s0 + 10, vis_hidden, 0.01));
+    }
+
+    try addVis(allocator, &blobs, &names, "visual.post_layernorm.weight", amf.NO_LAYER, .{ vis_hidden, 0, 0, 0 }, 1, try fillConstantBf16(allocator, vis_hidden, 1.0));
+    // Exact 4D Conv2d `[out_H, vis_H, sm, sm]` layout matching `Glm5NextVisionModel.downsample`.
+    try addVis(allocator, &blobs, &names, "visual.downsample.weight", amf.NO_LAYER, .{ lm_hidden, vis_hidden, spatial_merge, spatial_merge }, 4, try fillDeterministicBf16(allocator, 33001, lm_hidden * vis_hidden * spatial_merge * spatial_merge, 0.08));
+    try addVis(allocator, &blobs, &names, "visual.downsample.bias", amf.NO_LAYER, .{ lm_hidden, 0, 0, 0 }, 1, try fillDeterministicBf16(allocator, 33002, lm_hidden, 0.01));
+    try addVis(allocator, &blobs, &names, "visual.merger.proj.weight", amf.NO_LAYER, .{ lm_hidden, lm_hidden, 0, 0 }, 2, try fillDeterministicBf16(allocator, 33003, lm_hidden * lm_hidden, 0.08));
+    try addVis(allocator, &blobs, &names, "visual.merger.post_projection_norm.weight", amf.NO_LAYER, .{ lm_hidden, 0, 0, 0 }, 1, try fillConstantBf16(allocator, lm_hidden, 1.0));
+    try addVis(allocator, &blobs, &names, "visual.merger.post_projection_norm.bias", amf.NO_LAYER, .{ lm_hidden, 0, 0, 0 }, 1, try fillDeterministicBf16(allocator, 33004, lm_hidden, 0.01));
+    try addVis(allocator, &blobs, &names, "visual.merger.gate_proj.weight", amf.NO_LAYER, .{ proj_intermediate, lm_hidden, 0, 0 }, 2, try fillDeterministicBf16(allocator, 33005, proj_intermediate * lm_hidden, 0.08));
+    try addVis(allocator, &blobs, &names, "visual.merger.up_proj.weight", amf.NO_LAYER, .{ proj_intermediate, lm_hidden, 0, 0 }, 2, try fillDeterministicBf16(allocator, 33006, proj_intermediate * lm_hidden, 0.08));
+    try addVis(allocator, &blobs, &names, "visual.merger.down_proj.weight", amf.NO_LAYER, .{ lm_hidden, proj_intermediate, 0, 0 }, 2, try fillDeterministicBf16(allocator, 33007, lm_hidden * proj_intermediate, 0.08));
+    return buildTestAmf(allocator, "synth-glm5-vision", blobs.items);
+}
+
+test "M9.2 Glm5NextVision sidecar VisionTowerConfig inference and image-dependent prefillMultimodal" {
+    const allocator = std.testing.allocator;
+    const tmp_dir = try makeTestTempDir(allocator, "m92_glm5_vis");
+    defer {
+        removeTestDir(allocator, tmp_dir);
+        allocator.free(tmp_dir);
+    }
+
+    var bundle = try buildSynthQwen4TestBundle(allocator, 4, 2, 0, 1, 0, null);
+    defer bundle.deinit(allocator);
+    bundle.cfg.qsa_window_size = 0;
+
+    // Exercise exact `glm5-next-tiny-random-vision` head_dim=8 / vis_hidden=16 + 4D downsample + SwiGLU merger.
+    const vis_bytes = try buildSynthGlm5VisionSidecarAmfBytes(
+        allocator,
+        2,
+        16,
+        8,
+        32,
+        bundle.cfg.hidden_size,
+        48,
+        14,
+        2,
+        2,
+    );
+    defer allocator.free(vis_bytes);
+    const vis_path = try std.fs.path.joinZ(allocator, &.{ tmp_dir, "glm5_vision.amf" });
+    defer allocator.free(vis_path);
+    try writeBytesFile(vis_path, vis_bytes);
+
+    var m_a = try GraphModel.loadFromBytes(allocator, bundle.amf_bytes, bundle.cfg, .{
+        .max_seq_len = 256,
+        .max_tree_nodes = 32,
+        .vision_amf_path = vis_path,
+        .vision_max_patches = 64,
+    });
+    defer m_a.deinit(allocator);
+
+    try std.testing.expect(m_a.hasVisionTower());
+    const vcfg = m_a.visionTowerConfig();
+    try std.testing.expectEqual(@as(u32, 2), vcfg.num_layers);
+    try std.testing.expectEqual(@as(u32, 16), vcfg.vis_hidden);
+    try std.testing.expectEqual(@as(u32, 32), vcfg.vis_intermediate);
+    try std.testing.expectEqual(@as(u32, 2), vcfg.num_heads);
+    try std.testing.expectEqual(@as(u32, 8), vcfg.head_dim);
+    try std.testing.expectEqual(@as(u32, 2), vcfg.spatial_merge);
+    try std.testing.expectEqual(@as(u32, 48), vcfg.merger_hidden);
+    try std.testing.expectEqual(vision_mod.VisionMlpKind.swiglu, vcfg.mlp_kind);
+    try std.testing.expect(vcfg.rope_global_half_split);
+    try std.testing.expect(vcfg.channel_first_spatial_merge);
+    try std.testing.expect(vcfg.merger_is_swiglu);
+    try std.testing.expectApproxEqAbs(@as(f32, 10.0), vcfg.swiglu_limit, 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 1e-5), vcfg.layer_norm_eps, 1e-8);
+    try std.testing.expectEqual(@as(usize, 0), m_a.visionOwnedWiredBytes());
+
+    var m_b = try GraphModel.loadFromBytes(allocator, bundle.amf_bytes, bundle.cfg, .{
+        .max_seq_len = 256,
+        .max_tree_nodes = 32,
+        .vision_amf_path = vis_path,
+        .vision_max_patches = 64,
+    });
+    defer m_b.deinit(allocator);
+
+    const f_a0 = try metal.VisionFrame.init(m_a.device, .bgra8, 56, 56);
+    defer f_a0.close();
+    const f_a1 = try metal.VisionFrame.init(m_a.device, .bgra8, 56, 56);
+    defer f_a1.close();
+    try fillTestSolidBgra8Frame(f_a0, 56, 56, 240, 10, 10);
+    try fillTestSolidBgra8Frame(f_a1, 56, 56, 240, 10, 10);
+
+    const f_b0 = try metal.VisionFrame.init(m_b.device, .bgra8, 56, 56);
+    defer f_b0.close();
+    const f_b1 = try metal.VisionFrame.init(m_b.device, .bgra8, 56, 56);
+    defer f_b1.close();
+    try fillTestSolidBgra8Frame(f_b0, 56, 56, 10, 10, 240);
+    try fillTestSolidBgra8Frame(f_b1, 56, 56, 10, 10, 240);
+
+    const prefix = [_]u32{ 1, 4 };
+    const suffix = [_]u32{ 7 };
+    const mm_a = try m_a.prefillMultimodal(allocator, &prefix, &suffix, &.{ f_a0, f_a1 }, .{
+        .anyres_mode = .smart_resize,
+        .compute_logits = true,
+    });
+    const mm_b = try m_b.prefillMultimodal(allocator, &prefix, &suffix, &.{ f_b0, f_b1 }, .{
+        .anyres_mode = .smart_resize,
+        .compute_logits = true,
+    });
+    try std.testing.expect(mm_a.vision_tower_active and mm_b.vision_tower_active);
+    try std.testing.expectEqual(@as(u32, 4), mm_a.vision_tokens);
+    try std.testing.expectEqual(mm_a.vision_tokens, mm_b.vision_tokens);
+    try std.testing.expect(mm_a.first_token < bundle.cfg.vocab_size);
+    try std.testing.expect(mm_b.first_token < bundle.cfg.vocab_size);
+
+    const la = m_a.readLastLogitsF16();
+    const lb = m_b.readLastLogitsF16();
+    var max_diff: f32 = 0.0;
+    for (0..bundle.cfg.vocab_size) |vi| {
+        const va: f32 = @floatCast(la[vi]);
+        const vb: f32 = @floatCast(lb[vi]);
+        try std.testing.expect(std.math.isFinite(va) and std.math.isFinite(vb));
+        max_diff = @max(max_diff, @abs(va - vb));
+    }
+    try std.testing.expect(max_diff > 1e-4);
+}
+
+test "M9.2 Glm5NextVision real glm5-next-tiny-random-vision.amf sidecar verification (AMINFER_MODELS_DIR)" {
+    const allocator = std.testing.allocator;
+    const models_dir_c = std.c.getenv("AMINFER_MODELS_DIR") orelse return;
+    const models_dir = std.mem.span(models_dir_c);
+    if (models_dir.len == 0) return;
+
+    const vis_path = try std.fs.path.joinZ(allocator, &.{ models_dir, "glm5-next-tiny-random-vision.amf" });
+    defer allocator.free(vis_path);
+
+    var vis_file = amf.AmfFile.open(allocator, vis_path) catch return;
+    defer vis_file.close(allocator);
+
+    // 1. Verify exact Glm5NextVision config inference from the real HF-converted sidecar.
+    const vcfg = try inferVisionConfigFromEntries(.{ .sidecar = &vis_file.parsed }, 32, 64);
+    try std.testing.expect(vcfg.has_vision);
+    try std.testing.expectEqual(@as(u32, 2), vcfg.num_layers);
+    try std.testing.expectEqual(@as(u32, 16), vcfg.vis_hidden);
+    try std.testing.expectEqual(@as(u32, 32), vcfg.vis_intermediate);
+    try std.testing.expectEqual(@as(u32, 2), vcfg.num_heads);
+    try std.testing.expectEqual(@as(u32, 8), vcfg.head_dim);
+    try std.testing.expectEqual(@as(u32, 32), vcfg.lm_hidden);
+    try std.testing.expectEqual(@as(u32, 32), vcfg.merger_hidden);
+    try std.testing.expectEqual(@as(u32, 14), vcfg.patch_size);
+    try std.testing.expectEqual(@as(u32, 2), vcfg.t_patch);
+    try std.testing.expectEqual(@as(u32, 2), vcfg.spatial_merge);
+    try std.testing.expectEqual(vision_mod.VisionMlpKind.swiglu, vcfg.mlp_kind);
+    try std.testing.expect(vcfg.rope_global_half_split);
+    try std.testing.expect(vcfg.channel_first_spatial_merge);
+    try std.testing.expect(vcfg.merger_is_swiglu);
+    try std.testing.expectApproxEqAbs(@as(f32, 10.0), vcfg.swiglu_limit, 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 1e-5), vcfg.layer_norm_eps, 1e-8);
+
+    // 2. Load the real `glm5-next-tiny-random.amf` + `glm5-next-tiny-random-vision.amf` pair if present.
+    const main_path = try std.fs.path.joinZ(allocator, &.{ models_dir, "glm5-next-tiny-random.amf" });
+    defer allocator.free(main_path);
+    var main_file = amf.AmfFile.open(allocator, main_path) catch return;
+    defer main_file.close(allocator);
+    const cfg_json = (try main_file.readMetadataAlloc(allocator, amf.META_CONFIG_JSON)) orelse return;
+    defer allocator.free(cfg_json);
+    var gcfg = GraphConfig.fromJson(allocator, cfg_json) catch |err| blk: {
+        if (err != error.InvalidConfig) return err;
+        // Compatibility shim for pre-merge base before `linear_num_heads` -> `kda_num_heads` mapping lands.
+        const r1 = try std.mem.replaceOwned(u8, allocator, cfg_json, "\"linear_num_heads\"", "\"kda_num_heads\"");
+        defer allocator.free(r1);
+        const r2 = try std.mem.replaceOwned(u8, allocator, r1, "\"linear_head_dim\"", "\"kda_head_dim\"");
+        defer allocator.free(r2);
+        const r3 = try std.mem.replaceOwned(u8, allocator, r2, "\"linear_lora_rank\"", "\"kda_lora_rank\"");
+        defer allocator.free(r3);
+        break :blk try GraphConfig.fromJson(allocator, r3);
+    };
+    defer gcfg.deinit(allocator);
+
+    var m_a = try GraphModel.loadFromFile(allocator, main_path, gcfg, .{
+        .max_seq_len = 128,
+        .max_tree_nodes = 16,
+        .vision_amf_path = vis_path,
+        .vision_max_patches = 64,
+    });
+    defer m_a.deinit(allocator);
+    try std.testing.expect(m_a.hasVisionTower());
+    try std.testing.expectEqual(@as(u32, 8), m_a.visionTowerConfig().head_dim);
+
+    var m_b = try GraphModel.loadFromFile(allocator, main_path, gcfg, .{
+        .max_seq_len = 128,
+        .max_tree_nodes = 16,
+        .vision_amf_path = vis_path,
+        .vision_max_patches = 64,
+    });
+    defer m_b.deinit(allocator);
+
+    const f_a0 = try metal.VisionFrame.init(m_a.device, .bgra8, 56, 56);
+    defer f_a0.close();
+    const f_a1 = try metal.VisionFrame.init(m_a.device, .bgra8, 56, 56);
+    defer f_a1.close();
+    try fillTestSolidBgra8Frame(f_a0, 56, 56, 240, 10, 10);
+    try fillTestSolidBgra8Frame(f_a1, 56, 56, 240, 10, 10);
+
+    const f_b0 = try metal.VisionFrame.init(m_b.device, .bgra8, 56, 56);
+    defer f_b0.close();
+    const f_b1 = try metal.VisionFrame.init(m_b.device, .bgra8, 56, 56);
+    defer f_b1.close();
+    try fillTestSolidBgra8Frame(f_b0, 56, 56, 10, 10, 240);
+    try fillTestSolidBgra8Frame(f_b1, 56, 56, 10, 10, 240);
+
+    const prefix = [_]u32{ 1, 2 };
+    const suffix = [_]u32{ 3 };
+    const mm_a = try m_a.prefillMultimodal(allocator, &prefix, &suffix, &.{ f_a0, f_a1 }, .{
+        .anyres_mode = .smart_resize,
+        .compute_logits = true,
+    });
+    const mm_b = try m_b.prefillMultimodal(allocator, &prefix, &suffix, &.{ f_b0, f_b1 }, .{
+        .anyres_mode = .smart_resize,
+        .compute_logits = true,
+    });
+    try std.testing.expect(mm_a.vision_tower_active and mm_b.vision_tower_active);
+    try std.testing.expectEqual(@as(u32, 4), mm_a.vision_tokens);
+    try std.testing.expect(mm_a.first_token < gcfg.vocab_size);
+    try std.testing.expect(mm_b.first_token < gcfg.vocab_size);
+
+    const la = m_a.readLastLogitsF16();
+    const lb = m_b.readLastLogitsF16();
+    var max_diff: f32 = 0.0;
+    for (0..gcfg.vocab_size) |vi| {
+        const va: f32 = @floatCast(la[vi]);
+        const vb: f32 = @floatCast(lb[vi]);
+        try std.testing.expect(std.math.isFinite(va) and std.math.isFinite(vb));
+        max_diff = @max(max_diff, @abs(va - vb));
+    }
+    try std.testing.expect(max_diff > 1e-4);
 }

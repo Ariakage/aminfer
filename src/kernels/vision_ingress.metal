@@ -643,6 +643,26 @@ kernel void ami_vision_anyres_patchify_embed_nv12(const device uchar *weight [[b
     }
 }
 
+static inline float vision_apply_act(float v, uint act_kind) {
+    if (act_kind == 1u) {
+        // PyTorch `gelu_pytorch_tanh`: 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3))).
+        // Clamp `inner` to [-20, 20] so Metal fast-math `tanh` never evaluates `inf / inf = NaN`.
+        const float inner = clamp(0.7978845608028654f * fma(0.044715f * v * v, v, v), -20.0f, 20.0f);
+        return 0.5f * v * (1.0f + tanh(inner));
+    }
+    if (act_kind == 2u) {
+        // Exact GELU via Abramowitz-Stegun erf (max error < 1.5e-7; matches PyTorch `nn.GELU()`).
+        const float z = v * 0.7071067811865475f;
+        const float az = fabs(z);
+        const float t = 1.0f / fma(0.3275911f, az, 1.0f);
+        const float poly = (((((1.061405429f * t - 1.453152027f) * t + 1.421413741f) * t - 0.284496736f) * t) + 0.254829592f) * t;
+        const float erf_a = 1.0f - poly * exp(-min(az * az, 80.0f));
+        const float erf_z = (z >= 0.0f) ? erf_a : -erf_a;
+        return 0.5f * v * (1.0f + erf_z);
+    }
+    return v;
+}
+
 // ===========================================================================
 // M7.8 G22: ViT LayerNorm / RMSNorm (`ami_vision_norm`)
 // Grid: (num_tokens, 1, 1), threadgroup: (256, 1, 1) (8 simdgroups).
@@ -654,7 +674,7 @@ struct VisionNormParams {
     float eps;
     uint is_rmsnorm;
     uint has_bias;
-    uint _pad0;
+    uint act_kind; // 0 = none, 1 = gelu_tanh, 2 = gelu_exact (Glm5Next post_projection_norm + nn.GELU)
     uint _pad1;
     uint _pad2;
 };
@@ -727,12 +747,13 @@ kernel void ami_vision_norm(const device half *x [[buffer(0)]],
         if (p.has_bias != 0u) {
             y += vision_load_f16_or_bf16(beta, (ulong)d, VISION_EFF_W_BF16);
         }
+        y = vision_apply_act(y, p.act_kind);
         out[row_base + d] = half(y);
     }
 }
 
 // ===========================================================================
-// M7.8 G22: Fused QKV Split + 2D-Rotary Positional Embeddings (`2D-RoPE`)
+// M7.8 G22: Fused QKV Split + Optional QK-RMSNorm + 2D-Rotary Positional Embeddings
 // Grid: (num_heads, num_tokens, 1), threadgroup: (64, 1, 1) (head_dim <= 128).
 // ===========================================================================
 
@@ -741,10 +762,10 @@ struct VisionRope2DParams {
     uint num_heads;
     uint head_dim;
     uint qkv_layout;       // 0 = [S, 3, H, D], 1 = [S, H, 3, D]
-    uint rope_interleaved; // 0 = half-split per axis (Qwen-VL), 1 = adjacent pairs (Inkling2)
+    uint rope_interleaved; // 0 = per-axis half-split (Qwen-VL), 1 = per-axis interleaved (Inkling2), 2 = global half-split cat([h,w,h,w]) (Glm5Next)
     float rope_theta;
-    uint swap_hw_axes;     // 0 = [H, W] (Qwen-VL), 1 = [W, H] (Inkling2: cat([freq_w, freq_h]))
-    uint _pad1;
+    uint swap_hw_axes;     // 0 = [H, W] (Qwen-VL/Glm5Next), 1 = [W, H] (Inkling2: cat([freq_w, freq_h]))
+    float qk_norm_eps;     // RMSNorm epsilon for `ami_vision_qkv_qknorm_rope_2d` (e.g. 1e-5 for Glm5Next)
 };
 
 static_assert(sizeof(VisionRope2DParams) == 32, "VisionRope2DParams must be 32 bytes");
@@ -777,9 +798,16 @@ kernel void ami_vision_qkv_rope_2d(const device half *qkv [[buffer(0)]],
     const float cos_a = cos(angle);
     const float sin_a = sin(angle);
 
-    const uint axis_base = is_second_axis ? axis_dim : 0u;
-    const uint d0 = (p.rope_interleaved == 0u) ? (axis_base + pair_idx) : (axis_base + 2u * pair_idx);
-    const uint d1 = (p.rope_interleaved == 0u) ? (axis_base + pair_idx + axis_pairs) : (axis_base + 2u * pair_idx + 1u);
+    uint d0;
+    uint d1;
+    if (p.rope_interleaved == 2u) {
+        d0 = tid;
+        d1 = tid + half_dim;
+    } else {
+        const uint axis_base = is_second_axis ? axis_dim : 0u;
+        d0 = (p.rope_interleaved == 0u) ? (axis_base + pair_idx) : (axis_base + 2u * pair_idx);
+        d1 = (p.rope_interleaved == 0u) ? (axis_base + pair_idx + axis_pairs) : (axis_base + 2u * pair_idx + 1u);
+    }
 
     const ulong hidden = (ulong)p.num_heads * (ulong)p.head_dim;
     const ulong qkv_tok_base = (ulong)tok * 3ul * hidden;
@@ -815,6 +843,117 @@ kernel void ami_vision_qkv_rope_2d(const device half *qkv [[buffer(0)]],
     v_out[out_base + d1] = qkv[v_in_base + d1];
 }
 
+// M9.2: Fused QKV split + per-head Q/K RMSNorm + 2D axial RoPE (`Glm5NextVision`).
+// Grid: (num_heads, num_tokens, 1), threadgroup: (64, 1, 1) (2 simdgroups, head_dim <= 128).
+// Specialized on `VISION_WEIGHT_BF16` (`function_constant(0)`).
+kernel void ami_vision_qkv_qknorm_rope_2d(const device half *qkv [[buffer(0)]],
+                                          const device uint2 *coords [[buffer(1)]],
+                                          const device uchar *q_norm_w [[buffer(2)]],
+                                          const device uchar *k_norm_w [[buffer(3)]],
+                                          device half *q_out [[buffer(4)]],
+                                          device half *k_out [[buffer(5)]],
+                                          device half *v_out [[buffer(6)]],
+                                          constant VisionRope2DParams &p [[buffer(7)]],
+                                          uint2 tg_pos [[threadgroup_position_in_grid]],
+                                          uint tid [[thread_index_in_threadgroup]],
+                                          uint sg_id [[simdgroup_index_in_threadgroup]],
+                                          uint lane [[thread_index_in_simdgroup]]) {
+    const uint head = tg_pos.x;
+    const uint tok = tg_pos.y;
+    if (head >= p.num_heads || tok >= p.num_tokens) {
+        return;
+    }
+
+    const uint half_dim = p.head_dim >> 1;
+    const bool active = (tid < half_dim);
+    const uint axis_dim = half_dim;
+    const uint axis_pairs = axis_dim >> 1;
+    const bool is_second_axis = (tid >= axis_pairs);
+    const uint pair_idx = is_second_axis ? (tid - axis_pairs) : tid;
+
+    uint d0 = 0u;
+    uint d1 = 0u;
+    if (p.rope_interleaved == 2u) {
+        d0 = tid;
+        d1 = tid + half_dim;
+    } else {
+        const uint axis_base = is_second_axis ? axis_dim : 0u;
+        d0 = (p.rope_interleaved == 0u) ? (axis_base + pair_idx) : (axis_base + 2u * pair_idx);
+        d1 = (p.rope_interleaved == 0u) ? (axis_base + pair_idx + axis_pairs) : (axis_base + 2u * pair_idx + 1u);
+    }
+
+    const ulong hidden = (ulong)p.num_heads * (ulong)p.head_dim;
+    const ulong qkv_tok_base = (ulong)tok * 3ul * hidden;
+    ulong q_in_base;
+    ulong k_in_base;
+    ulong v_in_base;
+    if (p.qkv_layout == 0u) {
+        q_in_base = qkv_tok_base + (ulong)head * (ulong)p.head_dim;
+        k_in_base = qkv_tok_base + hidden + (ulong)head * (ulong)p.head_dim;
+        v_in_base = qkv_tok_base + 2ul * hidden + (ulong)head * (ulong)p.head_dim;
+    } else {
+        const ulong h_base = qkv_tok_base + (ulong)head * 3ul * (ulong)p.head_dim;
+        q_in_base = h_base;
+        k_in_base = h_base + (ulong)p.head_dim;
+        v_in_base = h_base + 2ul * (ulong)p.head_dim;
+    }
+
+    float q0 = 0.0f;
+    float q1 = 0.0f;
+    float k0 = 0.0f;
+    float k1 = 0.0f;
+    if (active) {
+        q0 = float(qkv[q_in_base + d0]);
+        q1 = float(qkv[q_in_base + d1]);
+        k0 = float(qkv[k_in_base + d0]);
+        k1 = float(qkv[k_in_base + d1]);
+    }
+
+    float q_sq = active ? fma(q0, q0, q1 * q1) : 0.0f;
+    float k_sq = active ? fma(k0, k0, k1 * k1) : 0.0f;
+    q_sq = simd_sum(q_sq);
+    k_sq = simd_sum(k_sq);
+
+    threadgroup float tg_sq[4];
+    if (lane == 0u) {
+        tg_sq[sg_id] = q_sq;
+        tg_sq[2u + sg_id] = k_sq;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (!active) {
+        return;
+    }
+
+    const float inv_d = 1.0f / float(p.head_dim);
+    const float q_inv_rms = rsqrt(max(0.0f, (tg_sq[0] + tg_sq[1]) * inv_d) + p.qk_norm_eps);
+    const float k_inv_rms = rsqrt(max(0.0f, (tg_sq[2] + tg_sq[3]) * inv_d) + p.qk_norm_eps);
+
+    q0 *= q_inv_rms * vision_load_f16_or_bf16(q_norm_w, (ulong)d0, VISION_EFF_W_BF16);
+    q1 *= q_inv_rms * vision_load_f16_or_bf16(q_norm_w, (ulong)d1, VISION_EFF_W_BF16);
+    k0 *= k_inv_rms * vision_load_f16_or_bf16(k_norm_w, (ulong)d0, VISION_EFF_W_BF16);
+    k1 *= k_inv_rms * vision_load_f16_or_bf16(k_norm_w, (ulong)d1, VISION_EFF_W_BF16);
+
+    const uint2 hw = coords[tok];
+    const bool use_w = (p.swap_hw_axes != 0u) ? (!is_second_axis) : is_second_axis;
+    const float pos = float(use_w ? hw.y : hw.x);
+    const float inv_freq = pow(p.rope_theta, -float(2u * pair_idx) / float(axis_dim));
+    const float angle = pos * inv_freq;
+    const float cos_a = cos(angle);
+    const float sin_a = sin(angle);
+
+    const ulong out_base = ((ulong)tok * (ulong)p.num_heads + (ulong)head) * (ulong)p.head_dim;
+
+    q_out[out_base + d0] = half(fma(q0, cos_a, -q1 * sin_a));
+    q_out[out_base + d1] = half(fma(q0, sin_a, q1 * cos_a));
+
+    k_out[out_base + d0] = half(fma(k0, cos_a, -k1 * sin_a));
+    k_out[out_base + d1] = half(fma(k0, sin_a, k1 * cos_a));
+
+    v_out[out_base + d0] = qkv[v_in_base + d0];
+    v_out[out_base + d1] = qkv[v_in_base + d1];
+}
+
 // M9.7: In-place 2D axial RoPE for split Q/K projections (Inkling 2 ViT).
 // Grid: (num_heads, num_tokens, 1), threadgroup: (64, 1, 1) (head_dim <= 128).
 kernel void ami_vision_qk_rope_2d_inplace(device half *q [[buffer(0)]],
@@ -843,9 +982,16 @@ kernel void ami_vision_qk_rope_2d_inplace(device half *q [[buffer(0)]],
     const float cos_a = cos(angle);
     const float sin_a = sin(angle);
 
-    const uint axis_base = is_second_axis ? axis_dim : 0u;
-    const uint d0 = (p.rope_interleaved == 0u) ? (axis_base + pair_idx) : (axis_base + 2u * pair_idx);
-    const uint d1 = (p.rope_interleaved == 0u) ? (axis_base + pair_idx + axis_pairs) : (axis_base + 2u * pair_idx + 1u);
+    uint d0;
+    uint d1;
+    if (p.rope_interleaved == 2u) {
+        d0 = tid;
+        d1 = tid + half_dim;
+    } else {
+        const uint axis_base = is_second_axis ? axis_dim : 0u;
+        d0 = (p.rope_interleaved == 0u) ? (axis_base + pair_idx) : (axis_base + 2u * pair_idx);
+        d1 = (p.rope_interleaved == 0u) ? (axis_base + pair_idx + axis_pairs) : (axis_base + 2u * pair_idx + 1u);
+    }
 
     const ulong base = ((ulong)tok * (ulong)p.num_heads + (ulong)head) * (ulong)p.head_dim;
 
@@ -1335,26 +1481,6 @@ struct VisionLinearParams {
 
 static_assert(sizeof(VisionLinearParams) == 32, "VisionLinearParams must be 32 bytes");
 
-static inline float vision_apply_act(float v, uint act_kind) {
-    if (act_kind == 1u) {
-        // PyTorch `gelu_pytorch_tanh`: 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3))).
-        // Clamp `inner` to [-20, 20] so Metal fast-math `tanh` never evaluates `inf / inf = NaN`.
-        const float inner = clamp(0.7978845608028654f * fma(0.044715f * v * v, v, v), -20.0f, 20.0f);
-        return 0.5f * v * (1.0f + tanh(inner));
-    }
-    if (act_kind == 2u) {
-        // Exact GELU via Abramowitz-Stegun erf (max error < 1.5e-7)
-        const float z = v * 0.7071067811865475f;
-        const float az = fabs(z);
-        const float t = 1.0f / fma(0.3275911f, az, 1.0f);
-        const float poly = (((((1.061405429f * t - 1.453152027f) * t + 1.421413741f) * t - 0.284496736f) * t) + 0.254829592f) * t;
-        const float erf_a = 1.0f - poly * exp(-min(az * az, 80.0f));
-        const float erf_z = (z >= 0.0f) ? erf_a : -erf_a;
-        return 0.5f * v * (1.0f + erf_z);
-    }
-    return v;
-}
-
 kernel void ami_vision_linear_mma(const device half *x [[buffer(0)]],
                                   const device uchar *weight [[buffer(1)]],
                                   const device uchar *bias [[buffer(2)]],
@@ -1648,7 +1774,7 @@ kernel void ami_vision_linear_nax(const device half *x [[buffer(0)]],
 
 struct VisionSwiGluParams {
     uint count;
-    uint _pad0;
+    float clamp_limit; // <= 0.0f disables clamping; > 0.0f clamps gate <= limit and up in [-limit, limit] (Glm5Next: 10.0)
     uint _pad1;
     uint _pad2;
 };
@@ -1663,8 +1789,12 @@ kernel void ami_vision_swiglu(const device half *gate [[buffer(0)]],
     if (gid >= p.count) {
         return;
     }
-    const float g = float(gate[gid]);
-    const float u = float(up[gid]);
+    float g = float(gate[gid]);
+    float u = float(up[gid]);
+    if (p.clamp_limit > 0.0f) {
+        g = min(g, p.clamp_limit);
+        u = clamp(u, -p.clamp_limit, p.clamp_limit);
+    }
     const float sig = (g >= 0.0f)
         ? (1.0f / (1.0f + exp(-min(g, 40.0f))))
         : (exp(max(g, -40.0f)) / (1.0f + exp(max(g, -40.0f))));
@@ -1679,7 +1809,7 @@ struct VisionMergeParams {
     uint tile_count;
     uint has_cls_token;     // 0 = no CLS prefix per tile, 1 = skip leading [CLS] token per tile
     uint preordered_blocks; // 0 = raster (ph, pw) input tokens, 1 = spatial-merge-block preordered tokens
-    uint _pad2;
+    uint channel_first;     // 0 = [sm, sm, vis_hidden] (Qwen/DeepSeek/Inkling2), 1 = [vis_hidden, sm, sm] (Glm5Next Conv2d)
 };
 
 static_assert(sizeof(VisionMergeParams) == 32, "VisionMergeParams must be 32 bytes");
@@ -1710,8 +1840,15 @@ kernel void ami_vision_spatial_merge_concat(const device half *in_tokens [[buffe
     const ulong out_base = (ulong)out_tok * (ulong)out_dim;
 
     for (uint idx = tid; idx < out_dim; idx += tg_size) {
-        const uint sub = idx / p.vis_hidden;
-        const uint d = idx - sub * p.vis_hidden;
+        uint sub;
+        uint d;
+        if (p.channel_first != 0u) {
+            d = idx / merge_sq;
+            sub = idx - d * merge_sq;
+        } else {
+            sub = idx / p.vis_hidden;
+            d = idx - sub * p.vis_hidden;
+        }
         ulong in_tok;
         if (p.preordered_blocks != 0u) {
             in_tok = (ulong)tile_idx * (ulong)in_per_tile + (ulong)p.has_cls_token +
