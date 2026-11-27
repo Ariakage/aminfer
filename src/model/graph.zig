@@ -1085,10 +1085,10 @@ pub const GraphConfig = struct {
         }
 
         // Override from `linear_attn_config.{kda_layers,full_attn_layers}` if present on `glm5_next`.
-        var kda_num_heads: u32 = jsonU32(obj, "kda_num_heads") orelse 0;
-        var kda_head_dim: u32 = jsonU32(obj, "kda_head_dim") orelse 0;
-        var kda_lora_rank: u32 = jsonU32(obj, "kda_lora_rank") orelse 0;
-        var kda_lower_bound: f32 = jsonF32(obj, "kda_lower_bound") orelse jsonF32(obj, "gate_lower_bound") orelse -5.0;
+        var kda_num_heads: u32 = jsonU32(obj, "kda_num_heads") orelse jsonU32(obj, "linear_num_heads") orelse 0;
+        var kda_head_dim: u32 = jsonU32(obj, "kda_head_dim") orelse jsonU32(obj, "linear_head_dim") orelse 0;
+        var kda_lora_rank: u32 = jsonU32(obj, "kda_lora_rank") orelse jsonU32(obj, "linear_lora_rank") orelse 0;
+        var kda_lower_bound: f32 = jsonF32(obj, "kda_lower_bound") orelse jsonF32(obj, "linear_lower_bound") orelse jsonF32(obj, "gate_lower_bound") orelse -5.0;
         var linear_conv_kernel_dim: u32 = jsonU32(obj, "linear_conv_kernel_dim") orelse
             jsonU32(obj, "short_conv_kernel_size") orelse 4;
         if (obj.get("linear_attn_config") orelse root.get("linear_attn_config")) |lac_val| {
@@ -2588,6 +2588,7 @@ pub const GraphModel = struct {
     wp_g27_kda_scratch: G27KdaScratchBindings = .{},
     last_dsa_valid: bool = false,
     last_dsa_num_rows: u32 = 0,
+    last_dsa_selected_row: u32 = 0,
     last_dsa_is_wide: bool = false,
     dsa_full_index_dispatches: u64 = 0,
     dsa_shared_reuse_hits: u64 = 0,
@@ -2635,21 +2636,23 @@ pub const GraphModel = struct {
             });
         const nrows: u32 = @min(self.last_dsa_num_rows, idx_buf.spec.max_rows);
         const max_k: u32 = idx_buf.spec.max_out_k;
-        const last_row: usize = if (nrows > 0) @as(usize, nrows - 1) else 0;
-        const k_sel: u32 = if (nrows > 0 and last_row < idx_buf.counts_host.len)
-            @min(idx_buf.counts_host[last_row], max_k)
+        const sel_row: usize = if (nrows > 0) @min(@as(usize, self.last_dsa_selected_row), nrows - 1) else 0;
+        const k_sel: u32 = if (nrows > 0 and sel_row < idx_buf.counts_host.len)
+            @min(idx_buf.counts_host[sel_row], max_k)
         else
             0;
         const host_slice: []const u32 = if (nrows > 0 and k_sel > 0)
-            idx_buf.indices_host[last_row * max_k ..][0..k_sel]
+            idx_buf.indices_host[sel_row * max_k ..][0..k_sel]
         else
             &.{};
+        const base_bind = idx_buf.indicesBinding(self.scratch_buf);
+        const row_byte_off: u64 = @as(u64, sel_row) * max_k * @sizeOf(u32);
         return .{
-            .gpu_buf = idx_buf.indicesBinding(self.scratch_buf),
+            .gpu_buf = .{ .buffer = base_bind.buffer, .offset = base_bind.offset + row_byte_off },
             .host_indices = host_slice,
             .k_selected = k_sel,
             .max_k = max_k,
-            .num_rows = nrows,
+            .num_rows = if (nrows > 0) 1 else 0,
             .valid = (nrows > 0 and k_sel > 0),
         };
     }
@@ -3234,6 +3237,7 @@ pub const GraphModel = struct {
         if (self.g27_dsa_idx_kv_arena) |*ika| @memset(ika.backing, 0);
         self.last_dsa_valid = false;
         self.last_dsa_num_rows = 0;
+        self.last_dsa_selected_row = 0;
         self.last_dsa_is_wide = false;
         if (self.retired_kv_pool) |*pool| pool.reset();
         for (0..self.active_tile_phys_ring.len) |i| {
@@ -6757,6 +6761,11 @@ pub const GraphModel = struct {
         }
         self.seq_len = base_pos + @as(u32, @intCast(accepted_nodes.len));
         self.mrope_next_pos = self.seq_len;
+        if (self.last_dsa_valid and accepted_nodes.len > 0) {
+            const last_acc: u32 = accepted_nodes[accepted_nodes.len - 1];
+            const max_row: u32 = if (self.last_dsa_num_rows > 0) self.last_dsa_num_rows - 1 else 0;
+            self.last_dsa_selected_row = @min(last_acc, max_row);
+        }
         try self.retireExcessCompletedChunks();
     }
 
@@ -10752,6 +10761,7 @@ pub const GraphModel = struct {
             self.dsa_full_index_dispatches += 1;
             self.last_dsa_valid = true;
             self.last_dsa_num_rows = m;
+            self.last_dsa_selected_row = m - 1;
             self.last_dsa_is_wide = is_wide;
         } else {
             // `"shared"` DSA layer (`3/4` of MoE layers on GLM-5.2/5.3): strictly 0 indexer dispatches!
@@ -15410,6 +15420,7 @@ pub const GraphModel = struct {
             .wp_g27_kda_scratch = wp_g27_kda_scratch,
             .last_dsa_valid = false,
             .last_dsa_num_rows = 0,
+            .last_dsa_selected_row = 0,
             .last_dsa_is_wide = false,
             .dsa_full_index_dispatches = 0,
             .dsa_shared_reuse_hits = 0,
@@ -20689,9 +20700,9 @@ fn initGraphVisionState(
         const alloc_bytes = try page.alignUp(@max(sidecar_bytes, page.APPLE_PAGE_SIZE));
         try wired_budget.checkPlan(total_wired_bytes.* + alloc_bytes);
         var sa = try arena_mod.WiredArena.init(alloc_bytes, wired_budget);
-        errdefer sa.deinit();
+        errdefer if (sidecar_arena_opt == null) sa.deinit();
         const sb = try metal.Buffer.wrap(device, sa.bytes());
-        errdefer sb.close();
+        errdefer if (sidecar_buf_opt == null) sb.close();
         try compute.makeResident(&.{sb});
         sidecar_arena_opt = sa;
         sidecar_buf_opt = sb;
@@ -25446,7 +25457,7 @@ fn fillTestSolidBgra8Frame(frame: metal.VisionFrame, width: u32, height: u32, r:
     try guard.unlock();
 }
 
-fn buildSynthGlm5VisionSidecarAmfBytes(
+pub fn buildSynthGlm5VisionSidecarAmfBytes(
     allocator: std.mem.Allocator,
     num_layers: u32,
     vis_hidden: u32,
@@ -25607,7 +25618,7 @@ test "M9.2 Glm5NextVision sidecar VisionTowerConfig inference and image-dependen
     try fillTestSolidBgra8Frame(f_b1, 56, 56, 10, 10, 240);
 
     const prefix = [_]u32{ 1, 4 };
-    const suffix = [_]u32{ 7 };
+    const suffix = [_]u32{7};
     const mm_a = try m_a.prefillMultimodal(allocator, &prefix, &suffix, &.{ f_a0, f_a1 }, .{
         .anyres_mode = .smart_resize,
         .compute_logits = true,
@@ -25673,17 +25684,7 @@ test "M9.2 Glm5NextVision real glm5-next-tiny-random-vision.amf sidecar verifica
     defer main_file.close(allocator);
     const cfg_json = (try main_file.readMetadataAlloc(allocator, amf.META_CONFIG_JSON)) orelse return;
     defer allocator.free(cfg_json);
-    var gcfg = GraphConfig.fromJson(allocator, cfg_json) catch |err| blk: {
-        if (err != error.InvalidConfig) return err;
-        // Compatibility shim for pre-merge base before `linear_num_heads` -> `kda_num_heads` mapping lands.
-        const r1 = try std.mem.replaceOwned(u8, allocator, cfg_json, "\"linear_num_heads\"", "\"kda_num_heads\"");
-        defer allocator.free(r1);
-        const r2 = try std.mem.replaceOwned(u8, allocator, r1, "\"linear_head_dim\"", "\"kda_head_dim\"");
-        defer allocator.free(r2);
-        const r3 = try std.mem.replaceOwned(u8, allocator, r2, "\"linear_lora_rank\"", "\"kda_lora_rank\"");
-        defer allocator.free(r3);
-        break :blk try GraphConfig.fromJson(allocator, r3);
-    };
+    var gcfg = try GraphConfig.fromJson(allocator, cfg_json);
     defer gcfg.deinit(allocator);
 
     var m_a = try GraphModel.loadFromFile(allocator, main_path, gcfg, .{
@@ -25719,7 +25720,7 @@ test "M9.2 Glm5NextVision real glm5-next-tiny-random-vision.amf sidecar verifica
     try fillTestSolidBgra8Frame(f_b1, 56, 56, 10, 10, 240);
 
     const prefix = [_]u32{ 1, 2 };
-    const suffix = [_]u32{ 3 };
+    const suffix = [_]u32{3};
     const mm_a = try m_a.prefillMultimodal(allocator, &prefix, &suffix, &.{ f_a0, f_a1 }, .{
         .anyres_mode = .smart_resize,
         .compute_logits = true,

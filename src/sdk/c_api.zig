@@ -2488,23 +2488,15 @@ pub export fn ami_sdk_engine_configure_speculative(
                 } else {
                     gpa.free(sib);
                 }
-            } else if (gcfg.is_mimo_v2) {
-                const sib = buildSiblingPathZ(gpa, eng.amf_path_owned, "dflash.amf") catch return fail(AMI_SDK_ERR_OUT_OF_MEMORY, "path alloc failed");
-                if (fileExistsPosix(sib)) {
-                    resolved_mode = .dflare;
-                    resolved_amf_owned = sib;
-                } else {
-                    const sib_alt = buildSiblingPathZ(gpa, eng.amf_path_owned, "dflare.amf") catch {
-                        gpa.free(sib);
-                        return fail(AMI_SDK_ERR_OUT_OF_MEMORY, "path alloc failed");
-                    };
-                    gpa.free(sib);
-                    if (fileExistsPosix(sib_alt)) {
+            } else if (gcfg.is_mimo_v2 or gcfg.is_glm5_next) {
+                for ([_][]const u8{ "dflash2.amf", "dflash.amf", "dflare.amf" }) |stem| {
+                    const sib = buildSiblingPathZ(gpa, eng.amf_path_owned, stem) catch return fail(AMI_SDK_ERR_OUT_OF_MEMORY, "path alloc failed");
+                    if (fileExistsPosix(sib)) {
                         resolved_mode = .dflare;
-                        resolved_amf_owned = sib_alt;
-                    } else {
-                        gpa.free(sib_alt);
+                        resolved_amf_owned = sib;
+                        break;
                     }
+                    gpa.free(sib);
                 }
             } else if (gcfg.m82_family.isHy4()) {
                 const sib = buildSiblingPathZ(gpa, eng.amf_path_owned, "dfly2.amf") catch return fail(AMI_SDK_ERR_OUT_OF_MEMORY, "path alloc failed");
@@ -2550,38 +2542,30 @@ pub export fn ami_sdk_engine_configure_speculative(
             };
             const draft_amf: [:0]const u8 = explicit_amf orelse blk: {
                 if (resolved_amf_owned == null) {
-                    const sib_dflare = buildSiblingPathZ(gpa, eng.amf_path_owned, "dflare.amf") catch
-                        return fail(AMI_SDK_ERR_OUT_OF_MEMORY, "path alloc failed");
-                    if (fileExistsPosix(sib_dflare)) {
-                        resolved_amf_owned = sib_dflare;
-                    } else {
-                        const sib_dflash = buildSiblingPathZ(gpa, eng.amf_path_owned, "dflash.amf") catch {
-                            gpa.free(sib_dflare);
+                    for ([_][]const u8{ "dflare.amf", "dflash.amf", "dflash2.amf" }) |stem| {
+                        const sib = buildSiblingPathZ(gpa, eng.amf_path_owned, stem) catch
                             return fail(AMI_SDK_ERR_OUT_OF_MEMORY, "path alloc failed");
-                        };
-                        if (fileExistsPosix(sib_dflash)) {
-                            gpa.free(sib_dflare);
-                            resolved_amf_owned = sib_dflash;
-                        } else {
-                            gpa.free(sib_dflash);
-                            resolved_amf_owned = sib_dflare;
+                        if (fileExistsPosix(sib)) {
+                            resolved_amf_owned = sib;
+                            break;
                         }
+                        gpa.free(sib);
+                    }
+                    if (resolved_amf_owned == null) {
+                        resolved_amf_owned = buildSiblingPathZ(gpa, eng.amf_path_owned, "dflare.amf") catch
+                            return fail(AMI_SDK_ERR_OUT_OF_MEMORY, "path alloc failed");
                     }
                 }
                 break :blk resolved_amf_owned.?;
             };
             if (cfg_bytes_owned == null) {
-                const sib_cfg = buildSiblingPathZ(gpa, eng.amf_path_owned, "dflare_config.json") catch
-                    return fail(AMI_SDK_ERR_OUT_OF_MEMORY, "path alloc failed");
-                defer gpa.free(sib_cfg);
-                if (fileExistsPosix(sib_cfg)) {
-                    cfg_bytes_owned = readFileAllocPosix(gpa, sib_cfg, 4 * 1024 * 1024) catch |err| return mapAnyError(err);
-                } else {
-                    const sib_df_cfg = buildSiblingPathZ(gpa, eng.amf_path_owned, "dflash_config.json") catch
+                for ([_][]const u8{ "dflare_config.json", "dflash_config.json", "dflash2_config.json" }) |cfg_nm| {
+                    const sib_cfg = buildSiblingPathZ(gpa, eng.amf_path_owned, cfg_nm) catch
                         return fail(AMI_SDK_ERR_OUT_OF_MEMORY, "path alloc failed");
-                    defer gpa.free(sib_df_cfg);
-                    if (fileExistsPosix(sib_df_cfg)) {
-                        cfg_bytes_owned = readFileAllocPosix(gpa, sib_df_cfg, 4 * 1024 * 1024) catch |err| return mapAnyError(err);
+                    defer gpa.free(sib_cfg);
+                    if (fileExistsPosix(sib_cfg)) {
+                        cfg_bytes_owned = readFileAllocPosix(gpa, sib_cfg, 4 * 1024 * 1024) catch |err| return mapAnyError(err);
+                        break;
                     }
                 }
             }

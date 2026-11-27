@@ -99,6 +99,8 @@ const usage =
     \\                    [-h] [--json]
     \\  bench-m91         run M9.1 MiMo-V2.6 & Qwen3.5 G26 192/128 SWA, D15 3L MTP/DFlash+D7 & W30 parity benchmark
     \\                    [-h] [--json]
+    \\  bench-m92         run M9.2 GLM-5 (glm_moe_dsa & glm5_next) G27/D15/W30 parity & throughput benchmark
+    \\                    [-h] [--json] [--models-dir <dir>]
     \\  peer-worker       start a zero-allocation kqueue expert-parallel peer worker (M7 X1-X3)
     \\                    [-hRV] -l|--listen <ip:port> -m|--amf <path> -c|--config <path> -r|--rank N -w|--world-size N
     \\                    [--partition contiguous|round-robin] [--cluster-transport auto|tcp|rdma]
@@ -140,7 +142,7 @@ const usage =
     \\  spec-decode       run speculative decoding (L1 SAM + C6 N-gram + EAGLE/MTP/Small/Self-Recurrent/DSpark/DFlare/DFly2)
     \\                    [-AEehlNPRSV] -m|--amf <path> [-c|--config <path>] [-k|--tokenizer <path>] -p|--prompt <text>
     \\                    [-d|--draft-amf <path> --draft-config <path>]
-    \\                    [-M|--draft-mode l1|eagle3|eagle2|mtp|small|self-recurrent|dspark|dflare|dfly2]
+    \\                    [-M|--draft-mode l1|eagle3|eagle2|mtp|small|self-recurrent|dspark|dflare|dflash|dflash2|dfly2]
     \\                    [--placement auto|gpu|ane|sme2] [--kv-retire-q8-after-chunks N]
     \\                    [--ple-amf <path>] [--max-loops N] [--loop-adapter-amf <path>]
     \\                    [-E|--loop-early-exit] [--peer <ip:port>] [--rank N] [--world-size N]
@@ -173,7 +175,7 @@ const usage =
     \\                    [-B|--message-boundary-cache on|off]
     \\                    [--kv-retire-q8-after-chunks N] [--ngram-pack <domain>=<path.ang>]
     \\                    [-d|--draft-amf <path> --draft-config <path>]
-    \\                    [--draft-mode l1|eagle3|eagle2|mtp|small|self-recurrent|dspark|dflare|dfly2]
+    \\                    [--draft-mode l1|eagle3|eagle2|mtp|small|self-recurrent|dspark|dflare|dflash|dflash2|dfly2]
     \\                    [--placement auto|gpu|ane|sme2]
     \\                    [--ple-amf <path>] [--max-loops N] [--loop-adapter-amf <path>]
     \\                    [-E|--loop-early-exit]
@@ -345,6 +347,12 @@ pub fn main(init: std.process.Init) !void {
             try out.writeAll(usage);
         } else {
             try runBenchM91(arena, args[2..], out);
+        }
+    } else if (args.len >= 2 and std.mem.eql(u8, args[1], "bench-m92")) {
+        if (hasHelpFlag(args[2..])) {
+            try out.writeAll(usage);
+        } else {
+            try runBenchM92(arena, args[2..], out);
         }
     } else if (args.len >= 2 and std.mem.eql(u8, args[1], "peer-worker")) {
         if (hasHelpFlag(args[2..])) {
@@ -535,18 +543,19 @@ fn computeLoraPoolBytes(specs: []const LoraSpecArg) !usize {
 fn resolveServeGraphUseContinuous(
     batch_mode: ServeBatchMode,
     m82_family: aminfer.m82_runtime.M82Family,
+    has_kda_or_dsa: bool,
     has_vision_sidecar: bool,
     use_spec: bool,
     max_active_requests: usize,
 ) error{InvalidFlagCombination}!bool {
-    const is_m82 = (m82_family != .none);
+    const is_unsupported = (m82_family != .none) or has_kda_or_dsa;
     return switch (batch_mode) {
         .serial => false,
         .continuous => blk: {
-            if (use_spec or is_m82) return error.InvalidFlagCombination;
+            if (use_spec or is_unsupported) return error.InvalidFlagCombination;
             break :blk true;
         },
-        .auto => (!use_spec and !is_m82 and !has_vision_sidecar and max_active_requests > 1),
+        .auto => (!use_spec and !is_unsupported and !has_vision_sidecar and max_active_requests > 1),
     };
 }
 
@@ -1273,15 +1282,25 @@ fn resolveStandardDraftSpecAlloc(
     }
 
     const dir = std.fs.path.dirname(anchor_path) orelse ".";
+    const stem_opt: ?[]const u8 = if (std.mem.endsWith(u8, anchor_path, ".amf"))
+        anchor_path[0 .. anchor_path.len - ".amf".len]
+    else
+        null;
     const amf_path: [:0]u8 = if (draft_amf_override) |p|
         try std.fmt.allocPrintSentinel(allocator, "{s}", .{p}, 0)
     else if (explicit_mode == .mtp) blk: {
         const sib = try std.fmt.allocPrintSentinel(allocator, "{s}/mtp.amf", .{dir}, 0);
-        if (!fileExistsPosix(sib)) {
-            allocator.free(sib);
-            return error.MissingRequiredFlag;
+        if (fileExistsPosix(sib)) break :blk sib;
+        allocator.free(sib);
+        if (stem_opt) |stem| {
+            const sib_dash = try std.fmt.allocPrintSentinel(allocator, "{s}-mtp.amf", .{stem}, 0);
+            if (fileExistsPosix(sib_dash)) break :blk sib_dash;
+            allocator.free(sib_dash);
+            const sib_under = try std.fmt.allocPrintSentinel(allocator, "{s}_mtp.amf", .{stem}, 0);
+            if (fileExistsPosix(sib_under)) break :blk sib_under;
+            allocator.free(sib_under);
         }
-        break :blk sib;
+        return error.MissingRequiredFlag;
     } else return null;
     errdefer allocator.free(amf_path);
 
@@ -1297,6 +1316,12 @@ fn resolveStandardDraftSpecAlloc(
         defer allocator.free(sib_cfg);
         if (fileExistsPosix(sib_cfg)) {
             cfg_bytes_owned = try readFileAllocPosix(allocator, sib_cfg, 4 * 1024 * 1024);
+        } else if (stem_opt) |stem| {
+            const stem_cfg = try std.fmt.allocPrintSentinel(allocator, "{s}-mtp_config.json", .{stem}, 0);
+            defer allocator.free(stem_cfg);
+            if (fileExistsPosix(stem_cfg)) {
+                cfg_bytes_owned = try readFileAllocPosix(allocator, stem_cfg, 4 * 1024 * 1024);
+            }
         }
     }
 
@@ -1393,8 +1418,8 @@ fn resolveM82DraftSpecAlloc(
                 return .{ .mode = .dflare, .amf_path = sib_amf, .config_bytes = cfg_bytes };
             }
             allocator.free(sib_amf);
-        } else if (gcfg.is_mimo_v2) {
-            for ([_][]const u8{ "dflash", "dflare" }) |stem| {
+        } else if (gcfg.is_mimo_v2 or gcfg.is_glm5_next) {
+            for ([_][]const u8{ "dflash2", "dflash", "dflare" }) |stem| {
                 const sib_amf = try std.fmt.allocPrintSentinel(allocator, "{s}/{s}.amf", .{ dir, stem }, 0);
                 if (fileExistsPosix(sib_amf)) {
                     if (cfg_bytes == null) {
@@ -1430,33 +1455,31 @@ fn resolveM82DraftSpecAlloc(
     const amf_path: [:0]u8 = if (draft_amf_override) |p|
         try std.fmt.allocPrintSentinel(allocator, "{s}", .{p}, 0)
     else if (mode == .dflare) blk: {
-        const p_dflare = try std.fmt.allocPrintSentinel(allocator, "{s}/dflare.amf", .{dir}, 0);
-        if (fileExistsPosix(p_dflare)) break :blk p_dflare;
-        const p_dflash = std.fmt.allocPrintSentinel(allocator, "{s}/dflash.amf", .{dir}, 0) catch |err| {
-            allocator.free(p_dflare);
-            return err;
-        };
-        if (fileExistsPosix(p_dflash)) {
-            allocator.free(p_dflare);
-            break :blk p_dflash;
+        const candidates: [3][]const u8 = if (gcfg.is_glm5_next)
+            .{ "dflash2.amf", "dflash.amf", "dflare.amf" }
+        else
+            .{ "dflare.amf", "dflash.amf", "dflash2.amf" };
+        for (candidates) |cand| {
+            const p = try std.fmt.allocPrintSentinel(allocator, "{s}/{s}", .{ dir, cand }, 0);
+            if (fileExistsPosix(p)) break :blk p;
+            allocator.free(p);
         }
-        allocator.free(p_dflash);
-        break :blk p_dflare;
+        break :blk try std.fmt.allocPrintSentinel(allocator, "{s}/dflare.amf", .{dir}, 0);
     } else try std.fmt.allocPrintSentinel(allocator, "{s}/dfly2.amf", .{dir}, 0);
     errdefer allocator.free(amf_path);
 
     if (cfg_bytes == null) {
         if (mode == .dflare) {
-            const p_cfg = try std.fmt.allocPrintSentinel(allocator, "{s}/dflare_config.json", .{dir}, 0);
-            defer allocator.free(p_cfg);
-            if (fileExistsPosix(p_cfg)) {
-                cfg_bytes = try readFileAllocPosix(allocator, p_cfg, 4 * 1024 * 1024);
-            } else {
-                const df_cfg = try std.fmt.allocPrintSentinel(allocator, "{s}/dflash_config.json", .{dir}, 0);
-                defer allocator.free(df_cfg);
-                if (fileExistsPosix(df_cfg)) {
-                    cfg_bytes = try readFileAllocPosix(allocator, df_cfg, 4 * 1024 * 1024);
-                } else if (readEmbeddedMetaConfigJsonAlloc(allocator, amf_path)) |emb| {
+            for ([_][]const u8{ "dflash2_config.json", "dflare_config.json", "dflash_config.json" }) |cfg_nm| {
+                const p_cfg = try std.fmt.allocPrintSentinel(allocator, "{s}/{s}", .{ dir, cfg_nm }, 0);
+                defer allocator.free(p_cfg);
+                if (fileExistsPosix(p_cfg)) {
+                    cfg_bytes = try readFileAllocPosix(allocator, p_cfg, 4 * 1024 * 1024);
+                    break;
+                }
+            }
+            if (cfg_bytes == null) {
+                if (readEmbeddedMetaConfigJsonAlloc(allocator, amf_path)) |emb| {
                     cfg_bytes = emb;
                 }
             }
@@ -3211,6 +3234,34 @@ fn runBenchM91(allocator: std.mem.Allocator, raw_args: []const [:0]const u8, out
     if (!report.all_passed) return error.BenchmarkGateFailed;
 }
 
+fn runBenchM92(allocator: std.mem.Allocator, raw_args: []const [:0]const u8, out: *Io.Writer) !void {
+    var json_out = false;
+    var models_dir: ?[]const u8 = null;
+    var i: usize = 0;
+    while (i < raw_args.len) : (i += 1) {
+        const flag = raw_args[i];
+        if (std.mem.eql(u8, flag, "--json")) {
+            json_out = true;
+        } else if (std.mem.eql(u8, flag, "--models-dir")) {
+            i += 1;
+            if (i >= raw_args.len) return error.MissingFlagValue;
+            models_dir = raw_args[i];
+        } else {
+            return error.UnknownFlag;
+        }
+    }
+    const report = try aminfer.bench_m92.runM92WithConfig(allocator, .{
+        .models_dir = models_dir,
+    });
+    if (json_out) {
+        try report.writeJson(out);
+    } else {
+        try report.write(out);
+    }
+    try out.flush();
+    if (!report.all_passed) return error.BenchmarkGateFailed;
+}
+
 fn parseQualityGateArgs(args: []const [:0]const u8) !aminfer.bench.QualityGateConfig {
     var cfg: aminfer.bench.QualityGateConfig = .{};
     var i: usize = 0;
@@ -3897,6 +3948,7 @@ fn runSpecDecodeGraph(
         .max_seq_len = max_seq_len,
         .max_tree_nodes = target_tree_cap,
         .enable_feature_taps = needs_taps,
+        .enable_dflare_taps = (mode == .dflare),
         .aux_layer_ids = aux_ids,
         .dflare_target_layers = explicit_dflash_taps,
         .wired_budget_override = budget_override,
@@ -7121,6 +7173,7 @@ fn runServeGraph(
     const use_continuous = try resolveServeGraphUseContinuous(
         cli.batch_mode,
         gcfg.m82_family,
+        gcfg.axes.hasKda() or gcfg.axes.hasMlaDsa(),
         cli.m6.vision_sidecar_path != null,
         use_spec,
         cli.max_active_requests,
@@ -7128,7 +7181,7 @@ fn runServeGraph(
     const max_seq_len: u32 = @min(gcfg.max_position_embeddings, @max(@as(u32, 512), cli.max_seq_len));
     var gcfg_kv_layers: u32 = 0;
     for (gcfg.axes.layer_attention_kinds) |ak| {
-        if (ak != .gated_deltanet) gcfg_kv_layers += 1;
+        if (ak != .gated_deltanet and ak != .kda_linear) gcfg_kv_layers += 1;
     }
     const raw_batch_slots: usize = if (use_continuous)
         @min(@max(cli.max_active_requests, 1), aminfer.batch_scheduler.MAX_BATCH_SLOTS)
@@ -7206,6 +7259,7 @@ fn runServeGraph(
         .max_seq_len = max_seq_len,
         .max_tree_nodes = target_tree_cap,
         .enable_feature_taps = needs_taps,
+        .enable_dflare_taps = (mode == .dflare),
         .aux_layer_ids = aux_ids,
         .dflare_target_layers = explicit_dflash_taps,
         .wired_budget_override = budget_override,
@@ -11116,13 +11170,15 @@ test "M9.5 & M9.6 CLI parsers, M82Runtime auto-serial routing, and vision prompt
     try std.testing.expect(bj_json.json);
     try std.testing.expectError(error.UnknownFlag, parseBenchJsonArgs(&.{"--nope"}));
 
-    // 3. M82Family & vision sidecar continuous-batching resolution
-    try std.testing.expectEqual(false, try resolveServeGraphUseContinuous(.auto, .inkling2_loop, false, false, 8));
-    try std.testing.expectEqual(false, try resolveServeGraphUseContinuous(.auto, .hy4, false, false, 8));
-    try std.testing.expectError(error.InvalidFlagCombination, resolveServeGraphUseContinuous(.continuous, .inkling2_loop, false, false, 8));
-    try std.testing.expectError(error.InvalidFlagCombination, resolveServeGraphUseContinuous(.continuous, .hy4, false, false, 8));
-    try std.testing.expectEqual(false, try resolveServeGraphUseContinuous(.auto, .none, true, false, 8));
-    try std.testing.expectEqual(true, try resolveServeGraphUseContinuous(.auto, .none, false, false, 8));
+    // 3. M82Family, KDA/MLA-DSA, & vision sidecar continuous-batching resolution
+    try std.testing.expectEqual(false, try resolveServeGraphUseContinuous(.auto, .inkling2_loop, false, false, false, 8));
+    try std.testing.expectEqual(false, try resolveServeGraphUseContinuous(.auto, .hy4, false, false, false, 8));
+    try std.testing.expectEqual(false, try resolveServeGraphUseContinuous(.auto, .none, true, false, false, 8));
+    try std.testing.expectError(error.InvalidFlagCombination, resolveServeGraphUseContinuous(.continuous, .inkling2_loop, false, false, false, 8));
+    try std.testing.expectError(error.InvalidFlagCombination, resolveServeGraphUseContinuous(.continuous, .hy4, false, false, false, 8));
+    try std.testing.expectError(error.InvalidFlagCombination, resolveServeGraphUseContinuous(.continuous, .none, true, false, false, 8));
+    try std.testing.expectEqual(false, try resolveServeGraphUseContinuous(.auto, .none, false, true, false, 8));
+    try std.testing.expectEqual(true, try resolveServeGraphUseContinuous(.auto, .none, false, false, false, 8));
 
     // 4. Multimodal prompt splitting across Inkling2 and ChatML
     const ink_tpl = aminfer.chat_template.ChatTemplate.preset(.inkling2);

@@ -1324,7 +1324,7 @@ def build_glm5_next_config_json(
     la_cfg = cfg.get("linear_attn_config") if isinstance(cfg.get("linear_attn_config"), Mapping) else {}
     lin_heads = int(cfg.get("linear_num_heads") or la_cfg.get("num_heads") or 64)
     lin_hd = int(cfg.get("linear_head_dim") or la_cfg.get("head_dim") or 128)
-    lin_lora_rank = int(cfg.get("linear_lora_rank") or la_cfg.get("lora_rank") or 128)
+    lin_lora_rank = int(cfg.get("linear_lora_rank") or la_cfg.get("lora_rank") or lin_hd)
     lin_conv = int(cfg.get("linear_conv_kernel_dim") or la_cfg.get("short_conv_kernel_size") or 4)
     lin_lb = float(
         cfg.get("linear_lower_bound")
@@ -2264,10 +2264,10 @@ def generate_synth_glm5_bundle(
         qh = cfg.num_attention_heads
         qk_hd = cfg.qk_nope_head_dim + rope_hd
         _add(recs, f"layers.{l_idx}.self_attn.q_a_proj.weight", TensorKind.DENSE, fdt, l_idx, NO_EXPERT, (cfg.q_lora_rank, h), _fbytes(_det_f32(rng, cfg.q_lora_rank * h)))
-        _add(recs, f"layers.{l_idx}.self_attn.q_a_layernorm.weight", TensorKind.NORM, DType.F32, l_idx, NO_EXPERT, (cfg.q_lora_rank,), f32_values_to_f32_bytes(_det_f32(rng, cfg.q_lora_rank, std=0.02, mean=1.0)))
+        _add(recs, f"layers.{l_idx}.self_attn.q_a_layernorm.weight", TensorKind.NORM, fdt, l_idx, NO_EXPERT, (cfg.q_lora_rank,), _fbytes(_det_f32(rng, cfg.q_lora_rank, std=0.02, mean=1.0)))
         _add(recs, f"layers.{l_idx}.self_attn.q_b_proj.weight", TensorKind.DENSE, fdt, l_idx, NO_EXPERT, (qh * qk_hd, cfg.q_lora_rank), _fbytes(_det_f32(rng, qh * qk_hd * cfg.q_lora_rank)))
         _add(recs, f"layers.{l_idx}.self_attn.kv_a_proj_with_mqa.weight", TensorKind.DENSE, fdt, l_idx, NO_EXPERT, (cfg.kv_lora_rank + rope_hd, h), _fbytes(_det_f32(rng, (cfg.kv_lora_rank + rope_hd) * h)))
-        _add(recs, f"layers.{l_idx}.self_attn.kv_a_layernorm.weight", TensorKind.NORM, DType.F32, l_idx, NO_EXPERT, (cfg.kv_lora_rank,), f32_values_to_f32_bytes(_det_f32(rng, cfg.kv_lora_rank, std=0.02, mean=1.0)))
+        _add(recs, f"layers.{l_idx}.self_attn.kv_a_layernorm.weight", TensorKind.NORM, fdt, l_idx, NO_EXPERT, (cfg.kv_lora_rank,), _fbytes(_det_f32(rng, cfg.kv_lora_rank, std=0.02, mean=1.0)))
         _add(recs, f"layers.{l_idx}.self_attn.kv_b_proj.weight", TensorKind.DENSE, fdt, l_idx, NO_EXPERT, (qh * (cfg.qk_nope_head_dim + cfg.v_head_dim), cfg.kv_lora_rank), _fbytes(_det_f32(rng, qh * (cfg.qk_nope_head_dim + cfg.v_head_dim) * cfg.kv_lora_rank)))
         _add(recs, f"layers.{l_idx}.self_attn.o_proj.weight", TensorKind.DENSE, fdt, l_idx, NO_EXPERT, (h, qh * cfg.v_head_dim), _fbytes(_det_f32(rng, h * qh * cfg.v_head_dim)))
         if with_indexer:
@@ -2304,12 +2304,12 @@ def generate_synth_glm5_bundle(
 
     bb_recs: list[tuple] = []
     _add(bb_recs, "embed_tokens.weight", TensorKind.EMBEDDING, fdt, NO_LAYER, NO_EXPERT, (vocab, h), _fbytes(_det_f32(rng, vocab * h)))
-    _add(bb_recs, "norm.weight", TensorKind.NORM, DType.F32, NO_LAYER, NO_EXPERT, (h,), f32_values_to_f32_bytes(_det_f32(rng, h, std=0.02, mean=1.0)))
+    _add(bb_recs, "norm.weight", TensorKind.NORM, fdt, NO_LAYER, NO_EXPERT, (h,), _fbytes(_det_f32(rng, h, std=0.02, mean=1.0)))
     _add(bb_recs, "lm_head.weight", TensorKind.LM_HEAD, fdt, NO_LAYER, NO_EXPERT, (vocab, h), _fbytes(_det_f32(rng, vocab * h)))
 
     for l_idx in range(cfg.num_hidden_layers):
-        _add(bb_recs, f"layers.{l_idx}.input_layernorm.weight", TensorKind.NORM, DType.F32, l_idx, NO_EXPERT, (h,), f32_values_to_f32_bytes(_det_f32(rng, h, std=0.02, mean=1.0)))
-        _add(bb_recs, f"layers.{l_idx}.post_attention_layernorm.weight", TensorKind.NORM, DType.F32, l_idx, NO_EXPERT, (h,), f32_values_to_f32_bytes(_det_f32(rng, h, std=0.02, mean=1.0)))
+        _add(bb_recs, f"layers.{l_idx}.input_layernorm.weight", TensorKind.NORM, fdt, l_idx, NO_EXPERT, (h,), _fbytes(_det_f32(rng, h, std=0.02, mean=1.0)))
+        _add(bb_recs, f"layers.{l_idx}.post_attention_layernorm.weight", TensorKind.NORM, fdt, l_idx, NO_EXPERT, (h,), _fbytes(_det_f32(rng, h, std=0.02, mean=1.0)))
         if is_next:
             hc_rows = (2 + cfg.hc_mult) * cfg.hc_mult
             for sub in ("attn", "ffn"):
@@ -2331,7 +2331,7 @@ def generate_synth_glm5_bundle(
                 _add(bb_recs, f"layers.{l_idx}.linear_attn.g_a_proj.weight", TensorKind.DENSE, fdt, l_idx, NO_EXPERT, (lhd, h), _fbytes(_det_f32(rng, lhd * h)))
                 _add(bb_recs, f"layers.{l_idx}.linear_attn.g_b_proj.weight", TensorKind.DENSE, fdt, l_idx, NO_EXPERT, (qkv_dim, lhd), _fbytes(_det_f32(rng, qkv_dim * lhd)))
                 _add(bb_recs, f"layers.{l_idx}.linear_attn.o_proj.weight", TensorKind.DENSE, fdt, l_idx, NO_EXPERT, (h, qkv_dim), _fbytes(_det_f32(rng, h * qkv_dim)))
-                _add(bb_recs, f"layers.{l_idx}.linear_attn.o_norm.weight", TensorKind.NORM, DType.F32, l_idx, NO_EXPERT, (lhd,), f32_values_to_f32_bytes(_det_f32(rng, lhd, std=0.02, mean=1.0)))
+                _add(bb_recs, f"layers.{l_idx}.linear_attn.o_norm.weight", TensorKind.NORM, fdt, l_idx, NO_EXPERT, (lhd,), _fbytes(_det_f32(rng, lhd, std=0.02, mean=1.0)))
                 _add(bb_recs, f"layers.{l_idx}.linear_attn.A_log", TensorKind.NORM, DType.F32, l_idx, NO_EXPERT, (lh,), f32_values_to_f32_bytes(_det_f32(rng, lh, std=0.1, mean=-2.0)))
                 _add(bb_recs, f"layers.{l_idx}.linear_attn.dt_bias", TensorKind.NORM, DType.F32, l_idx, NO_EXPERT, (qkv_dim,), f32_values_to_f32_bytes(_det_f32(rng, qkv_dim, std=0.1)))
             else:
@@ -2344,20 +2344,23 @@ def generate_synth_glm5_bundle(
     if cfg.vision_layers > 0 and cfg.vision_mode != "strip":
         vh = cfg.vision_hidden_size
         vi = cfg.vision_intermediate_size
+        vhd = vh // 2 if vh >= 16 and (vh // 2) % 4 == 0 else vh
         _add(vis_recs, "visual.patch_embed.proj.weight", TensorKind.DENSE, fdt, NO_LAYER, NO_EXPERT, (vh, 3 * 2 * 14 * 14), _fbytes(_det_f32(rng, vh * 3 * 2 * 14 * 14)))
-        _add(vis_recs, "visual.patch_embed.proj.bias", TensorKind.NORM, DType.F32, NO_LAYER, NO_EXPERT, (vh,), f32_values_to_f32_bytes(_det_f32(rng, vh, std=0.01)))
+        _add(vis_recs, "visual.patch_embed.proj.bias", TensorKind.NORM, fdt, NO_LAYER, NO_EXPERT, (vh,), _fbytes(_det_f32(rng, vh, std=0.01)))
         for vl in range(cfg.vision_layers):
-            _add(vis_recs, f"visual.blocks.{vl}.norm1.weight", TensorKind.NORM, DType.F32, vl, NO_EXPERT, (vh,), f32_values_to_f32_bytes(_det_f32(rng, vh, std=0.02, mean=1.0)))
-            _add(vis_recs, f"visual.blocks.{vl}.norm2.weight", TensorKind.NORM, DType.F32, vl, NO_EXPERT, (vh,), f32_values_to_f32_bytes(_det_f32(rng, vh, std=0.02, mean=1.0)))
+            _add(vis_recs, f"visual.blocks.{vl}.norm1.weight", TensorKind.NORM, fdt, vl, NO_EXPERT, (vh,), _fbytes(_det_f32(rng, vh, std=0.02, mean=1.0)))
+            _add(vis_recs, f"visual.blocks.{vl}.norm2.weight", TensorKind.NORM, fdt, vl, NO_EXPERT, (vh,), _fbytes(_det_f32(rng, vh, std=0.02, mean=1.0)))
+            _add(vis_recs, f"visual.blocks.{vl}.attn.q_norm.weight", TensorKind.NORM, fdt, vl, NO_EXPERT, (vhd,), _fbytes(_det_f32(rng, vhd, std=0.02, mean=1.0)))
+            _add(vis_recs, f"visual.blocks.{vl}.attn.k_norm.weight", TensorKind.NORM, fdt, vl, NO_EXPERT, (vhd,), _fbytes(_det_f32(rng, vhd, std=0.02, mean=1.0)))
             _add(vis_recs, f"visual.blocks.{vl}.attn.qkv.weight", TensorKind.DENSE, fdt, vl, NO_EXPERT, (3 * vh, vh), _fbytes(_det_f32(rng, 3 * vh * vh)))
             _add(vis_recs, f"visual.blocks.{vl}.attn.proj.weight", TensorKind.DENSE, fdt, vl, NO_EXPERT, (vh, vh), _fbytes(_det_f32(rng, vh * vh)))
             _add(vis_recs, f"visual.blocks.{vl}.mlp.gate_proj.weight", TensorKind.DENSE, fdt, vl, NO_EXPERT, (vi, vh), _fbytes(_det_f32(rng, vi * vh)))
             _add(vis_recs, f"visual.blocks.{vl}.mlp.up_proj.weight", TensorKind.DENSE, fdt, vl, NO_EXPERT, (vi, vh), _fbytes(_det_f32(rng, vi * vh)))
             _add(vis_recs, f"visual.blocks.{vl}.mlp.down_proj.weight", TensorKind.DENSE, fdt, vl, NO_EXPERT, (vh, vi), _fbytes(_det_f32(rng, vh * vi)))
-        _add(vis_recs, "visual.post_layernorm.weight", TensorKind.NORM, DType.F32, NO_LAYER, NO_EXPERT, (vh,), f32_values_to_f32_bytes(_det_f32(rng, vh, std=0.02, mean=1.0)))
+        _add(vis_recs, "visual.post_layernorm.weight", TensorKind.NORM, fdt, NO_LAYER, NO_EXPERT, (vh,), _fbytes(_det_f32(rng, vh, std=0.02, mean=1.0)))
         _add(vis_recs, "visual.downsample.weight", TensorKind.DENSE, fdt, NO_LAYER, NO_EXPERT, (h, vh, 2, 2), _fbytes(_det_f32(rng, h * vh * 4)))
         _add(vis_recs, "visual.merger.proj.weight", TensorKind.DENSE, fdt, NO_LAYER, NO_EXPERT, (h, h), _fbytes(_det_f32(rng, h * h)))
-        _add(vis_recs, "visual.merger.post_projection_norm.weight", TensorKind.NORM, DType.F32, NO_LAYER, NO_EXPERT, (h,), f32_values_to_f32_bytes(_det_f32(rng, h, std=0.02, mean=1.0)))
+        _add(vis_recs, "visual.merger.post_projection_norm.weight", TensorKind.NORM, fdt, NO_LAYER, NO_EXPERT, (h,), _fbytes(_det_f32(rng, h, std=0.02, mean=1.0)))
         _add(vis_recs, "visual.merger.gate_proj.weight", TensorKind.DENSE, fdt, NO_LAYER, NO_EXPERT, (2 * h, h), _fbytes(_det_f32(rng, 2 * h * h)))
         _add(vis_recs, "visual.merger.up_proj.weight", TensorKind.DENSE, fdt, NO_LAYER, NO_EXPERT, (2 * h, h), _fbytes(_det_f32(rng, 2 * h * h)))
         _add(vis_recs, "visual.merger.down_proj.weight", TensorKind.DENSE, fdt, NO_LAYER, NO_EXPERT, (h, 2 * h), _fbytes(_det_f32(rng, h * 2 * h)))
@@ -2393,12 +2396,12 @@ def generate_synth_glm5_bundle(
         mtp_cfg_b = json.dumps(mtp_cfg, indent=2).encode("utf-8") + b"\n"
         (out_dir / "mtp_config.json").write_bytes(mtp_cfg_b)
         mtp_recs: list[tuple] = []
-        _add(mtp_recs, "layers.0.enorm.weight", TensorKind.NORM, DType.F32, 0, NO_EXPERT, (h,), f32_values_to_f32_bytes(_det_f32(rng, h, std=0.02, mean=1.0)))
-        _add(mtp_recs, "layers.0.hnorm.weight", TensorKind.NORM, DType.F32, 0, NO_EXPERT, (h,), f32_values_to_f32_bytes(_det_f32(rng, h, std=0.02, mean=1.0)))
+        _add(mtp_recs, "layers.0.enorm.weight", TensorKind.NORM, fdt, 0, NO_EXPERT, (h,), _fbytes(_det_f32(rng, h, std=0.02, mean=1.0)))
+        _add(mtp_recs, "layers.0.hnorm.weight", TensorKind.NORM, fdt, 0, NO_EXPERT, (h,), _fbytes(_det_f32(rng, h, std=0.02, mean=1.0)))
         _add(mtp_recs, "layers.0.eh_proj.weight", TensorKind.DENSE, fdt, 0, NO_EXPERT, (h, 2 * h), _fbytes(_det_f32(rng, h * 2 * h)))
-        _add(mtp_recs, "shared_head.norm.weight", TensorKind.NORM, DType.F32, NO_LAYER, NO_EXPERT, (h,), f32_values_to_f32_bytes(_det_f32(rng, h, std=0.02, mean=1.0)))
-        _add(mtp_recs, "layers.0.input_layernorm.weight", TensorKind.NORM, DType.F32, 0, NO_EXPERT, (h,), f32_values_to_f32_bytes(_det_f32(rng, h, std=0.02, mean=1.0)))
-        _add(mtp_recs, "layers.0.post_attention_layernorm.weight", TensorKind.NORM, DType.F32, 0, NO_EXPERT, (h,), f32_values_to_f32_bytes(_det_f32(rng, h, std=0.02, mean=1.0)))
+        _add(mtp_recs, "shared_head.norm.weight", TensorKind.NORM, fdt, NO_LAYER, NO_EXPERT, (h,), _fbytes(_det_f32(rng, h, std=0.02, mean=1.0)))
+        _add(mtp_recs, "layers.0.input_layernorm.weight", TensorKind.NORM, fdt, 0, NO_EXPERT, (h,), _fbytes(_det_f32(rng, h, std=0.02, mean=1.0)))
+        _add(mtp_recs, "layers.0.post_attention_layernorm.weight", TensorKind.NORM, fdt, 0, NO_EXPERT, (h,), _fbytes(_det_f32(rng, h, std=0.02, mean=1.0)))
         _emit_mla_and_idx(mtp_recs, 0, rope_hd=(0 if is_next else cfg.qk_rope_head_dim), with_indexer=True, with_kpool=is_next)
         _emit_moe_or_dense(mtp_recs, 0, True)
         if embed_metadata:

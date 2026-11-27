@@ -67,7 +67,7 @@ pub const DraftMode = enum {
         if (std.mem.eql(u8, str, "small") or std.mem.eql(u8, str, "small_draft")) return .small_draft;
         if (std.mem.eql(u8, str, "self-recurrent") or std.mem.eql(u8, str, "self_recurrent")) return .self_recurrent;
         if (std.mem.eql(u8, str, "dspark")) return .dspark;
-        if (std.mem.eql(u8, str, "dflare") or std.mem.eql(u8, str, "dflash")) return .dflare;
+        if (std.mem.eql(u8, str, "dflare") or std.mem.eql(u8, str, "dflash") or std.mem.eql(u8, str, "dflash2")) return .dflare;
         if (std.mem.eql(u8, str, "dfly2") or std.mem.eql(u8, str, "dfly")) return .dfly2;
         return error.InvalidDraftMode;
     }
@@ -533,7 +533,7 @@ fn detectFormat(obj: std.json.ObjectMap) ?DraftMode {
     if (jsonOptString(obj, "model_type")) |s| {
         if (std.mem.eql(u8, s, "eagle3")) return .eagle3;
         if (std.mem.eql(u8, s, "eagle")) return .eagle2;
-        if (std.mem.eql(u8, s, "mtp")) return .mtp;
+        if (std.mem.eql(u8, s, "mtp") or std.mem.eql(u8, s, "glm_moe_dsa_mtp") or std.mem.eql(u8, s, "glm5_next_mtp")) return .mtp;
     }
     if (obj.get("architectures")) |v| {
         if (v == .array and v.array.items.len > 0) {
@@ -3105,7 +3105,7 @@ fn validateNorm1D(entry: *const amf.TensorEntry, dim: u32) DraftLoadError!quant.
     if (entry.rank != 1 or entry.shape[0] != dim) return error.UnexpectedTensorShape;
     return switch (dt) {
         .f16 => .f16,
-        .bf16 => .bf16,
+        .bf16, .f32 => .bf16,
         else => error.UnexpectedTensorDType,
     };
 }
@@ -3142,6 +3142,9 @@ fn validateLinear2D(entry: *const amf.TensorEntry, n: u32, k: u32) DraftLoadErro
         if ((k % sme.GROUP_SIZE) != 0) return error.UnalignedK;
         _ = sme.panelDTypeFromAmf(dt) catch return error.UnexpectedTensorDType;
         return dequant.legacyWeightDTypeForAmf(dt);
+    }
+    if (dt == .f32 and entry.params_bytes == 0 and n > 0 and k > 0) {
+        return .bf16;
     }
     try dequant.validateLinearAmfShape(dt, n, k, entry.group_size);
     return dequant.legacyWeightDTypeForAmf(dt);
@@ -3520,6 +3523,85 @@ fn loadBlobIntoArena(
         .slice = slice,
         .offset = arena.offsetOf(slice.ptr),
         .buffer = buf,
+    };
+}
+
+fn convertBlobF32ToBf16InPlace(blob: LoadedBlob, elems: usize) DraftLoadError!void {
+    const need_f32 = std.math.mul(usize, elems, 4) catch return error.Overflow;
+    if (blob.slice.len < need_f32) return error.UnexpectedTensorShape;
+    for (0..elems) |i| {
+        const raw_u32 = std.mem.readInt(u32, blob.slice[i * 4 ..][0..4], .little);
+        const val: f32 = @bitCast(raw_u32);
+        std.mem.writeInt(u16, blob.slice[i * 2 ..][0..2], quant.f32ToBf16(val), .little);
+    }
+}
+
+fn loadNormBindingIntoArena(
+    source: AmfSource,
+    entry: *const amf.TensorEntry,
+    dim: u32,
+    arena: *arena_mod.WiredArena,
+    buf: metal.Buffer,
+    verify_crc: bool,
+) DraftLoadError!qwen3.NormBinding {
+    const out_dt = try validateNorm1D(entry, dim);
+    const blob = try loadBlobIntoArena(source, entry, arena, buf, verify_crc);
+    if ((try entry.dataType()) == .f32) {
+        try convertBlobF32ToBf16InPlace(blob, dim);
+        return .{
+            .binding = blob.asBinding(),
+            .dtype = out_dt,
+            .host_bytes = blob.slice[0 .. @as(usize, dim) * 2],
+        };
+    }
+    return blob.asNormBinding(out_dt);
+}
+
+const LoadedLinearResult = struct {
+    blob: LoadedBlob,
+    dtype: quant.WeightDType,
+    binding: qwen3.LinearBinding,
+};
+
+fn loadLinearBlobAndBindingIntoArena(
+    source: AmfSource,
+    entry: *const amf.TensorEntry,
+    n: u32,
+    k: u32,
+    arena: *arena_mod.WiredArena,
+    buf: metal.Buffer,
+    verify_crc: bool,
+) DraftLoadError!LoadedLinearResult {
+    const out_dt = try validateLinear2D(entry, n, k);
+    const blob = try loadBlobIntoArena(source, entry, arena, buf, verify_crc);
+    if ((try entry.dataType()) == .f32) {
+        const elems = std.math.mul(usize, n, k) catch return error.Overflow;
+        try convertBlobF32ToBf16InPlace(blob, elems);
+        return .{
+            .blob = blob,
+            .dtype = out_dt,
+            .binding = .{
+                .weight = blob.asBinding(),
+                .scale_bias = null,
+                .n = n,
+                .k = k,
+                .dtype = out_dt,
+                .amf_dtype = .bf16,
+                .group_size = 0,
+                .tensor_scale_per_row = false,
+                .alg_bytes = elems * 2,
+                .layout = .row_major,
+                .param_kind = .affine_scale_bias,
+                .sme_packed = null,
+                .weight_host = blob.slice[0 .. elems * 2],
+                .scale_bias_host = null,
+            },
+        };
+    }
+    return .{
+        .blob = blob,
+        .dtype = out_dt,
+        .binding = blob.asLinearBinding(out_dt),
     };
 }
 
@@ -4198,12 +4280,12 @@ fn loadInternal(
     }
 
     const embed_lin: qwen3.LinearBinding = if (embed_entry) |ee|
-        (try loadBlobIntoArena(source, ee, &weights_arena, weights_buf, options.verify_crcs)).asLinearBinding(try validateLinear2D(ee, config.vocab_size, h))
+        (try loadLinearBlobAndBindingIntoArena(source, ee, config.vocab_size, h, &weights_arena, weights_buf, options.verify_crcs)).binding
     else
         target.embed;
 
     const lm_head_lin: qwen3.LinearBinding = if (lm_head_entry) |le|
-        (try loadBlobIntoArena(source, le, &weights_arena, weights_buf, options.verify_crcs)).asLinearBinding(try validateLinear2D(le, config.draft_vocab_size, h))
+        (try loadLinearBlobAndBindingIntoArena(source, le, config.draft_vocab_size, h, &weights_arena, weights_buf, options.verify_crcs)).binding
     else
         target.lm_head;
 
@@ -4211,33 +4293,31 @@ fn loadInternal(
     var fc_dt_opt: ?quant.WeightDType = null;
     const fc_lin: ?qwen3.LinearBinding = if (fc_entry) |fe| blk: {
         const expected_k: u32 = if (config.format == .eagle3) 3 * h_tgt else 2 * h;
-        const fdt = try validateLinear2D(fe, h, expected_k);
-        const fblob = try loadBlobIntoArena(source, fe, &weights_arena, weights_buf, options.verify_crcs);
-        fc_blob_opt = fblob;
-        fc_dt_opt = fdt;
-        break :blk fblob.asLinearBinding(fdt);
+        const fres = try loadLinearBlobAndBindingIntoArena(source, fe, h, expected_k, &weights_arena, weights_buf, options.verify_crcs);
+        fc_blob_opt = fres.blob;
+        fc_dt_opt = fres.dtype;
+        break :blk fres.binding;
     } else null;
 
     var enorm_b: ?qwen3.NormBinding = if (enorm_entry) |ee|
-        (try loadBlobIntoArena(source, ee, &weights_arena, weights_buf, options.verify_crcs)).asNormBinding(try validateNorm1D(ee, h))
+        try loadNormBindingIntoArena(source, ee, h, &weights_arena, weights_buf, options.verify_crcs)
     else
         null;
     var hnorm_b: ?qwen3.NormBinding = if (hnorm_entry) |he|
-        (try loadBlobIntoArena(source, he, &weights_arena, weights_buf, options.verify_crcs)).asNormBinding(try validateNorm1D(he, h))
+        try loadNormBindingIntoArena(source, he, h, &weights_arena, weights_buf, options.verify_crcs)
     else
         null;
     var eh_blob_opt: ?LoadedBlob = null;
     var eh_dt_opt: ?quant.WeightDType = null;
     var eh_proj_b: ?qwen3.LinearBinding = if (eh_proj_entry) |pe| blk: {
-        const edt = try validateLinear2D(pe, h, 2 * h);
-        const eblob = try loadBlobIntoArena(source, pe, &weights_arena, weights_buf, options.verify_crcs);
-        eh_blob_opt = eblob;
-        eh_dt_opt = edt;
-        break :blk eblob.asLinearBinding(edt);
+        const eres = try loadLinearBlobAndBindingIntoArena(source, pe, h, 2 * h, &weights_arena, weights_buf, options.verify_crcs);
+        eh_blob_opt = eres.blob;
+        eh_dt_opt = eres.dtype;
+        break :blk eres.binding;
     } else null;
 
     var final_norm_opt: ?qwen3.NormBinding = if (root_final_norm_entry) |fne|
-        (try loadBlobIntoArena(source, fne, &weights_arena, weights_buf, options.verify_crcs)).asNormBinding(try validateNorm1D(fne, h))
+        try loadNormBindingIntoArena(source, fne, h, &weights_arena, weights_buf, options.verify_crcs)
     else
         null;
 
@@ -4270,40 +4350,39 @@ fn loadInternal(
         if (chained_mtp) {
             const sen_e = parsed.find(std.fmt.bufPrint(&name_buf, "layers.{d}.enorm.weight", .{l}) catch unreachable) orelse
                 try findRequired(parsed, "enorm.weight");
-            stage_enorm_b = (try loadBlobIntoArena(source, sen_e, &weights_arena, weights_buf, options.verify_crcs)).asNormBinding(try validateNorm1D(sen_e, h));
+            stage_enorm_b = try loadNormBindingIntoArena(source, sen_e, h, &weights_arena, weights_buf, options.verify_crcs);
 
             const shn_e = parsed.find(std.fmt.bufPrint(&name_buf, "layers.{d}.hnorm.weight", .{l}) catch unreachable) orelse
                 try findRequired(parsed, "hnorm.weight");
-            stage_hnorm_b = (try loadBlobIntoArena(source, shn_e, &weights_arena, weights_buf, options.verify_crcs)).asNormBinding(try validateNorm1D(shn_e, h));
+            stage_hnorm_b = try loadNormBindingIntoArena(source, shn_e, h, &weights_arena, weights_buf, options.verify_crcs);
 
             const seh_e = findLinearOpt(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.eh_proj", .{l}) catch unreachable) orelse
                 try findLinearReq(parsed, "eh_proj");
-            const seh_dt = try validateLinear2D(seh_e, h, 2 * h);
-            const seh_blob = try loadBlobIntoArena(source, seh_e, &weights_arena, weights_buf, options.verify_crcs);
-            stage_eh_proj_b = seh_blob.asLinearBinding(seh_dt);
+            const seh_res = try loadLinearBlobAndBindingIntoArena(source, seh_e, h, 2 * h, &weights_arena, weights_buf, options.verify_crcs);
+            stage_eh_proj_b = seh_res.binding;
             if (l < MAX_MTP_STAGES) {
-                stage_eh_blobs[l] = seh_blob;
-                stage_eh_dts[l] = seh_dt;
+                stage_eh_blobs[l] = seh_res.blob;
+                stage_eh_dts[l] = seh_res.dtype;
             }
             if (l == 0) {
                 enorm_b = stage_enorm_b;
                 hnorm_b = stage_hnorm_b;
                 eh_proj_b = stage_eh_proj_b;
-                eh_blob_opt = seh_blob;
-                eh_dt_opt = seh_dt;
+                eh_blob_opt = seh_res.blob;
+                eh_dt_opt = seh_res.dtype;
             }
             if (parsed.find(std.fmt.bufPrint(&name_buf, "layers.{d}.final_layernorm.weight", .{l}) catch unreachable)) |sfn_e| {
-                stage_final_norm_b = (try loadBlobIntoArena(source, sfn_e, &weights_arena, weights_buf, options.verify_crcs)).asNormBinding(try validateNorm1D(sfn_e, h));
+                stage_final_norm_b = try loadNormBindingIntoArena(source, sfn_e, h, &weights_arena, weights_buf, options.verify_crcs);
                 if (final_norm_opt == null) final_norm_opt = stage_final_norm_b;
             }
         }
 
         const in_ln_e = try findRequired(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.input_layernorm.weight", .{l}) catch unreachable);
-        const in_ln_b = (try loadBlobIntoArena(source, in_ln_e, &weights_arena, weights_buf, options.verify_crcs)).asNormBinding(try validateNorm1D(in_ln_e, h));
+        const in_ln_b = try loadNormBindingIntoArena(source, in_ln_e, h, &weights_arena, weights_buf, options.verify_crcs);
 
         const hid_ln_b: ?qwen3.NormBinding = if (config.format == .eagle3 and l == 0) blk: {
             const hn_e = try findRequired(parsed, "layers.0.hidden_norm.weight");
-            break :blk (try loadBlobIntoArena(source, hn_e, &weights_arena, weights_buf, options.verify_crcs)).asNormBinding(try validateNorm1D(hn_e, h));
+            break :blk try loadNormBindingIntoArena(source, hn_e, h, &weights_arena, weights_buf, options.verify_crcs);
         } else null;
 
         var q_b: qwen3.LinearBinding = undefined;
@@ -4312,23 +4391,23 @@ fn loadInternal(
         var mla_w: ?MtpMlaLayerWeights = null;
         if (is_mla) {
             const qa_e = try findLinearReq(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.self_attn.q_a_proj", .{l}) catch unreachable);
-            const qa_b = (try loadBlobIntoArena(source, qa_e, &weights_arena, weights_buf, options.verify_crcs)).asLinearBinding(try validateLinear2D(qa_e, config.q_lora_rank, h));
+            const qa_b = (try loadLinearBlobAndBindingIntoArena(source, qa_e, config.q_lora_rank, h, &weights_arena, weights_buf, options.verify_crcs)).binding;
 
             const qan_e = try findRequired(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.self_attn.q_a_layernorm.weight", .{l}) catch unreachable);
-            const qan_b = (try loadBlobIntoArena(source, qan_e, &weights_arena, weights_buf, options.verify_crcs)).asNormBinding(try validateNorm1D(qan_e, config.q_lora_rank));
+            const qan_b = try loadNormBindingIntoArena(source, qan_e, config.q_lora_rank, &weights_arena, weights_buf, options.verify_crcs);
 
             const qb_e = try findLinearReq(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.self_attn.q_b_proj", .{l}) catch unreachable);
-            const qb_b = (try loadBlobIntoArena(source, qb_e, &weights_arena, weights_buf, options.verify_crcs)).asLinearBinding(try validateLinear2D(qb_e, q_dim, config.q_lora_rank));
+            const qb_b = (try loadLinearBlobAndBindingIntoArena(source, qb_e, q_dim, config.q_lora_rank, &weights_arena, weights_buf, options.verify_crcs)).binding;
 
             const kva_e = try findLinearReq(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.self_attn.kv_a_proj_with_mqa", .{l}) catch unreachable);
-            const kva_b = (try loadBlobIntoArena(source, kva_e, &weights_arena, weights_buf, options.verify_crcs)).asLinearBinding(try validateLinear2D(kva_e, config.kv_lora_rank + config.qk_rope_head_dim, h));
+            const kva_b = (try loadLinearBlobAndBindingIntoArena(source, kva_e, config.kv_lora_rank + config.qk_rope_head_dim, h, &weights_arena, weights_buf, options.verify_crcs)).binding;
 
             const kvan_e = try findRequired(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.self_attn.kv_a_layernorm.weight", .{l}) catch unreachable);
-            const kvan_b = (try loadBlobIntoArena(source, kvan_e, &weights_arena, weights_buf, options.verify_crcs)).asNormBinding(try validateNorm1D(kvan_e, config.kv_lora_rank));
+            const kvan_b = try loadNormBindingIntoArena(source, kvan_e, config.kv_lora_rank, &weights_arena, weights_buf, options.verify_crcs);
 
             const kvb_n = config.num_attention_heads * (config.qk_nope_head_dim + config.effectiveVHeadDim());
             const kvb_e = try findLinearReq(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.self_attn.kv_b_proj", .{l}) catch unreachable);
-            const kvb_b = (try loadBlobIntoArena(source, kvb_e, &weights_arena, weights_buf, options.verify_crcs)).asLinearBinding(try validateLinear2D(kvb_e, kvb_n, config.kv_lora_rank));
+            const kvb_b = (try loadLinearBlobAndBindingIntoArena(source, kvb_e, kvb_n, config.kv_lora_rank, &weights_arena, weights_buf, options.verify_crcs)).binding;
 
             mla_w = .{
                 .q_a_proj = qa_b,
@@ -4343,22 +4422,21 @@ fn loadInternal(
             v_b = kvb_b;
         } else {
             const q_e = try findLinearReq(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.self_attn.q_proj", .{l}) catch unreachable);
-            q_b = (try loadBlobIntoArena(source, q_e, &weights_arena, weights_buf, options.verify_crcs)).asLinearBinding(try validateLinear2D(q_e, q_dim, qkv_in));
+            q_b = (try loadLinearBlobAndBindingIntoArena(source, q_e, q_dim, qkv_in, &weights_arena, weights_buf, options.verify_crcs)).binding;
 
             const k_e = try findLinearReq(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.self_attn.k_proj", .{l}) catch unreachable);
-            k_b = (try loadBlobIntoArena(source, k_e, &weights_arena, weights_buf, options.verify_crcs)).asLinearBinding(try validateLinear2D(k_e, kv_dim, qkv_in));
+            k_b = (try loadLinearBlobAndBindingIntoArena(source, k_e, kv_dim, qkv_in, &weights_arena, weights_buf, options.verify_crcs)).binding;
 
             const v_e = try findLinearReq(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.self_attn.v_proj", .{l}) catch unreachable);
-            v_b = (try loadBlobIntoArena(source, v_e, &weights_arena, weights_buf, options.verify_crcs)).asLinearBinding(try validateLinear2D(v_e, v_dim, qkv_in));
+            v_b = (try loadLinearBlobAndBindingIntoArena(source, v_e, v_dim, qkv_in, &weights_arena, weights_buf, options.verify_crcs)).binding;
         }
 
         const o_e = try findLinearReq(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.self_attn.o_proj", .{l}) catch unreachable);
-        const o_dt = try validateLinear2D(o_e, h, o_in_dim);
-        const o_blob = try loadBlobIntoArena(source, o_e, &weights_arena, weights_buf, options.verify_crcs);
-        const o_b = o_blob.asLinearBinding(o_dt);
+        const o_res = try loadLinearBlobAndBindingIntoArena(source, o_e, h, o_in_dim, &weights_arena, weights_buf, options.verify_crcs);
+        const o_b = o_res.binding;
         if (l == 0) {
-            l0_o_proj_blob = o_blob;
-            l0_o_proj_dtype = o_dt;
+            l0_o_proj_blob = o_res.blob;
+            l0_o_proj_dtype = o_res.dtype;
         }
 
         var q_norm_bind: ?metal.BufferBinding = null;
@@ -4366,11 +4444,14 @@ fn loadInternal(
         var qk_norm_dtype: quant.FloatDType = .f16;
         if (!is_mla) {
             if (parsed.find(std.fmt.bufPrint(&name_buf, "layers.{d}.self_attn.q_norm.weight", .{l}) catch unreachable)) |qn_e| {
-                qk_norm_dtype = try validateNorm1D(qn_e, config.head_dim);
-                q_norm_bind = (try loadBlobIntoArena(source, qn_e, &weights_arena, weights_buf, options.verify_crcs)).asBinding();
+                const qnb = try loadNormBindingIntoArena(source, qn_e, config.head_dim, &weights_arena, weights_buf, options.verify_crcs);
+                qk_norm_dtype = qnb.dtype;
+                q_norm_bind = qnb.binding;
             }
             if (parsed.find(std.fmt.bufPrint(&name_buf, "layers.{d}.self_attn.k_norm.weight", .{l}) catch unreachable)) |kn_e| {
-                k_norm_bind = (try loadBlobIntoArena(source, kn_e, &weights_arena, weights_buf, options.verify_crcs)).asBinding();
+                const knb = try loadNormBindingIntoArena(source, kn_e, config.head_dim, &weights_arena, weights_buf, options.verify_crcs);
+                if (knb.dtype != qk_norm_dtype) return error.UnexpectedTensorDType;
+                k_norm_bind = knb.binding;
             }
         }
 
@@ -4382,7 +4463,7 @@ fn loadInternal(
         }
 
         const pln_e = try findLayerPostNormReq(parsed, l, &name_buf);
-        const pln_b = (try loadBlobIntoArena(source, pln_e, &weights_arena, weights_buf, options.verify_crcs)).asNormBinding(try validateNorm1D(pln_e, h));
+        const pln_b = try loadNormBindingIntoArena(source, pln_e, h, &weights_arena, weights_buf, options.verify_crcs);
 
         var gp_b: qwen3.LinearBinding = undefined;
         var up_b: qwen3.LinearBinding = undefined;
@@ -4390,7 +4471,7 @@ fn loadInternal(
         var moe_w: ?MtpMoeLayerWeights = null;
         if (is_moe) {
             const rt_e = try findLinearReq(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.gate", .{l}) catch unreachable);
-            const rt_b = (try loadBlobIntoArena(source, rt_e, &weights_arena, weights_buf, options.verify_crcs)).asLinearBinding(try validateLinear2D(rt_e, config.num_experts, h));
+            const rt_b = (try loadLinearBlobAndBindingIntoArena(source, rt_e, config.num_experts, h, &weights_arena, weights_buf, options.verify_crcs)).binding;
 
             var rb_bind: ?metal.BufferBinding = null;
             var rb_dtype: u32 = 2;
@@ -4405,11 +4486,11 @@ fn loadInternal(
             var s_inter: u32 = 0;
             if (findLinearOpt(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.shared_experts.gate_proj", .{l}) catch unreachable)) |sg_e| {
                 s_inter = sg_e.shape[0];
-                sg_b = (try loadBlobIntoArena(source, sg_e, &weights_arena, weights_buf, options.verify_crcs)).asLinearBinding(try validateLinear2D(sg_e, s_inter, h));
+                sg_b = (try loadLinearBlobAndBindingIntoArena(source, sg_e, s_inter, h, &weights_arena, weights_buf, options.verify_crcs)).binding;
                 const su_e = try findLinearReq(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.shared_experts.up_proj", .{l}) catch unreachable);
-                su_b = (try loadBlobIntoArena(source, su_e, &weights_arena, weights_buf, options.verify_crcs)).asLinearBinding(try validateLinear2D(su_e, s_inter, h));
+                su_b = (try loadLinearBlobAndBindingIntoArena(source, su_e, s_inter, h, &weights_arena, weights_buf, options.verify_crcs)).binding;
                 const sd_e = try findLinearReq(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.shared_experts.down_proj", .{l}) catch unreachable);
-                sd_b = (try loadBlobIntoArena(source, sd_e, &weights_arena, weights_buf, options.verify_crcs)).asLinearBinding(try validateLinear2D(sd_e, h, s_inter));
+                sd_b = (try loadLinearBlobAndBindingIntoArena(source, sd_e, h, s_inter, &weights_arena, weights_buf, options.verify_crcs)).binding;
             }
 
             const meta_raw = try weights_arena.allocAligned(@as(usize, config.num_experts) * @sizeOf(MtpExpertMeta), 64);
@@ -4418,18 +4499,15 @@ fn loadInternal(
             var exp_gs: u32 = 64;
             for (0..config.num_experts) |e_idx| {
                 const eg_e = try findLinearReq(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.experts.{d}.gate_proj", .{ l, e_idx }) catch unreachable);
-                const eg_dt = try validateLinear2D(eg_e, config.moe_intermediate_size, h);
-                const eg_b = (try loadBlobIntoArena(source, eg_e, &weights_arena, weights_buf, options.verify_crcs)).asLinearBinding(eg_dt);
+                const eg_res = try loadLinearBlobAndBindingIntoArena(source, eg_e, config.moe_intermediate_size, h, &weights_arena, weights_buf, options.verify_crcs);
 
                 const eu_e = try findLinearReq(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.experts.{d}.up_proj", .{ l, e_idx }) catch unreachable);
-                const eu_dt = try validateLinear2D(eu_e, config.moe_intermediate_size, h);
-                const eu_b = (try loadBlobIntoArena(source, eu_e, &weights_arena, weights_buf, options.verify_crcs)).asLinearBinding(eu_dt);
+                const eu_res = try loadLinearBlobAndBindingIntoArena(source, eu_e, config.moe_intermediate_size, h, &weights_arena, weights_buf, options.verify_crcs);
 
                 const ed_e = try findLinearReq(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.experts.{d}.down_proj", .{ l, e_idx }) catch unreachable);
-                const ed_dt = try validateLinear2D(ed_e, h, config.moe_intermediate_size);
-                const ed_b = (try loadBlobIntoArena(source, ed_e, &weights_arena, weights_buf, options.verify_crcs)).asLinearBinding(ed_dt);
+                const ed_res = try loadLinearBlobAndBindingIntoArena(source, ed_e, h, config.moe_intermediate_size, &weights_arena, weights_buf, options.verify_crcs);
 
-                const dt_u32: u32 = switch (eg_dt) {
+                const dt_u32: u32 = switch (eg_res.dtype) {
                     .f16 => 0,
                     .bf16 => 1,
                     .q4_affine => 2,
@@ -4442,15 +4520,15 @@ fn loadInternal(
                 } else if (dt_u32 != exp_w_dt) {
                     return error.UnexpectedTensorDType;
                 }
-                if (eu_dt != eg_dt or ed_dt != eg_dt) return error.UnexpectedTensorDType;
+                if (eu_res.dtype != eg_res.dtype or ed_res.dtype != eg_res.dtype) return error.UnexpectedTensorDType;
 
                 meta_slice[e_idx] = .{
-                    .gate_off = eg_b.weight.offset,
-                    .up_off = eu_b.weight.offset,
-                    .down_off = ed_b.weight.offset,
-                    .gate_sb_off = if (eg_b.scale_bias) |sb| sb.offset else 0,
-                    .up_sb_off = if (eu_b.scale_bias) |sb| sb.offset else 0,
-                    .down_sb_off = if (ed_b.scale_bias) |sb| sb.offset else 0,
+                    .gate_off = eg_res.binding.weight.offset,
+                    .up_off = eu_res.binding.weight.offset,
+                    .down_off = ed_res.binding.weight.offset,
+                    .gate_sb_off = if (eg_res.binding.scale_bias) |sb| sb.offset else 0,
+                    .up_sb_off = if (eu_res.binding.scale_bias) |sb| sb.offset else 0,
+                    .down_sb_off = if (ed_res.binding.scale_bias) |sb| sb.offset else 0,
                 };
             }
 
@@ -4471,13 +4549,13 @@ fn loadInternal(
             dp_b = rt_b;
         } else {
             const gp_e = try findLinearReq(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.gate_proj", .{l}) catch unreachable);
-            gp_b = (try loadBlobIntoArena(source, gp_e, &weights_arena, weights_buf, options.verify_crcs)).asLinearBinding(try validateLinear2D(gp_e, config.intermediate_size, h));
+            gp_b = (try loadLinearBlobAndBindingIntoArena(source, gp_e, config.intermediate_size, h, &weights_arena, weights_buf, options.verify_crcs)).binding;
 
             const up_e = try findLinearReq(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.up_proj", .{l}) catch unreachable);
-            up_b = (try loadBlobIntoArena(source, up_e, &weights_arena, weights_buf, options.verify_crcs)).asLinearBinding(try validateLinear2D(up_e, config.intermediate_size, h));
+            up_b = (try loadLinearBlobAndBindingIntoArena(source, up_e, config.intermediate_size, h, &weights_arena, weights_buf, options.verify_crcs)).binding;
 
             const dp_e = try findLinearReq(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.down_proj", .{l}) catch unreachable);
-            dp_b = (try loadBlobIntoArena(source, dp_e, &weights_arena, weights_buf, options.verify_crcs)).asLinearBinding(try validateLinear2D(dp_e, h, config.intermediate_size));
+            dp_b = (try loadLinearBlobAndBindingIntoArena(source, dp_e, h, config.intermediate_size, &weights_arena, weights_buf, options.verify_crcs)).binding;
         }
 
         layers[l] = .{
