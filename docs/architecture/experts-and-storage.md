@@ -29,8 +29,22 @@ pub const ExpertSource = union(enum) {
   online; pinned in the wired arena.
 - **Cold set**: stays in `.amf` files on NVMe and is read into a ring of
   preallocated 16 KiB-aligned slots, each wrapped once as an `MTLBuffer`.
-- **Eviction** (Draft): least-frequently-used with recency decay; experts
-  referenced by an in-flight verification pass are never evicted.
+- **Two-tier session LFU promotion (`C27`, lossless)**: both `ExpertCache`
+  (`src/storage/cache.zig`) and `M82ColdExpertCache`
+  (`src/model/m82_runtime.zig`) partition cold slots into a scan-resistant
+  probation ring (`FIFO`/`LRU`) and a session-local working-set ring (`LFU`
+  promotion on `>= 2` accesses via in-place slot tagging with zero `memcpy`
+  page relocations). Experts referenced by an in-flight verification pass are
+  never evicted, isolating one-shot scan bursts without polluting hot-session
+  working sets.
+- **Opt-in cold-tail weight threshold (`C27`, `--cold-expert-min-weight`)**:
+  defaults to `0.0` (strictly lossless). When configured in `[0.0, 1.0)` via
+  CLI (`decode`, `spec-decode`, `bench-decode`, `chat`, `serve`,
+  `quality-gate`) or C/Python SDK
+  (`ami_sdk_engine_set_cold_expert_min_weight`), only non-resident NVMe-cold
+  tail experts whose normalized router weight falls below the threshold are
+  skipped while every wired hot and resident/promoted cold expert still executes
+  unconditionally; see [../benchmarks/results.md](../benchmarks/results.md#m93-ling-31-flash-1019-w27g28d15-c27-moe-tiering-and-w24-kl-calibration).
 - **Sizing**: the wired budget
   ([ADR-0012](../decisions/0012-wired-memory-budget-headroom.md)) bounds the
   hot set plus the slot ring.

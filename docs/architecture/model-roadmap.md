@@ -240,15 +240,19 @@ operator axes without sacrificing runtime alignment or conversion fidelity:
 ## Staged `M9.1`–`M9.5` frontier deep-optimization, real-HF parity, and universal multi-LoRA roadmap (`ADR-0025`, `ADR-0015`, `ADR-0022`)
 
 Following `M8.2`, `M8.3` (`C28`), `M9.5` (`W30`), `M9.6` (`C29`), `M9.7` (`W20`),
-and **`M9.1` (`MiMo-V2.6`, `W25`/`G26`/`D15` — implemented and verified on M4
-for `MiMo-V2.6-Distill-Qwen-9B` + `27L` ViT, `synth-mimo`/`bench-m91`, and
-staged `Flash`/`Pro` metadata)**, stages `M9.2`–`M9.4`
+**`M9.1` (`MiMo-V2.6`, `W25`/`G26`/`D15` — implemented and verified on M4 for
+`MiMo-V2.6-Distill-Qwen-9B` + `27L` ViT, `synth-mimo`/`bench-m91`, and staged
+`Flash`/`Pro` metadata)**, **`M9.2` (`GLM-5`, `W26`/`G27`/`D15` — implemented and
+verified on M4 for `glm-moe-dsa-tiny-random`, `glm5-next-tiny-random` + `ViT`,
+`synth-glm5`/`bench-m92`, and staged HF metadata)**, and **`M9.3` (`Ling-3.1` &
+`C27`, `W27`/`G28`/`D15`/`C27` — implemented and verified on M4 for
+`ling3-tiny-synth`, `inkling-2-mini.amf` cold tiering, `bench-m93`, and staged
+`Ling-3.1` metadata)**, stage `M9.4`
 ([ADR-0025](../decisions/0025-staged-frontier-deep-optimization-inkling2-mimo-glm5-ling3.md),
 [ADR-0015](../decisions/0015-tiered-frontier-model-roadmap.md),
 [ADR-0022](../decisions/0022-native-c-python-sdk-and-full-protocol-parity.md);
 capabilities `W25`–`W28`, `W30`, `G26`–`G28`, `D15`, `C27` in
-[../status.md](../status.md)) extend model-specific co-design across
-`GLM-5`, `Ling-3.1`, and real-HF `Qwen3.8-Flash-Next` /
+[../status.md](../status.md)) aligns real-HF `Qwen3.8-Flash-Next` and
 `DeepSeek-V4.1-Flash-1017` checkpoints with zero primitive rework. Across the
 four model-family stages (`M9.1`–`M9.4`),
 a mandatory safetensors JSON header pre-flight gate (`W28`) validates
@@ -284,14 +288,23 @@ before converter implementation:
   `CandidateSelector`, `B = 8..16`). Full `320B`/`753B` checkpoints remain gated
   on local weight storage and `128–512 GB` hardware; see
   [status](../status.md) and [benchmark results](../benchmarks/results.md).
-- **`M9.3` — `Ling-3.1-flash-1019` (`572B` `bailing_hybrid`) & `C27` dynamic MoE tiering:**
+- **`M9.3` — `Ling-3.1-flash-1019` (`572B` `bailing_hybrid`) & `C27` dynamic MoE tiering — Implemented on M4 (`5755d33`, `bf11dc6`, `f395f89`, `6c8507e`):**
   Adds `63`-layer `KDA` (`Kernel Delta Attention`, `kda_lower_bound = -5.0`,
-  `kda_safe_gate`, `k = 4` short conv) + `9`-layer Gated `MLA` (`g_proj`) +
-  `SME2`-offloaded `eh_proj` `1L` MTP, applies `RCO-Q3` to dense `KDA` projections
-  to double `24 GB` M4 hot-expert cache (`3.4 GiB → ~7.1 GiB`, `~172 GiB` full-wired
-  on `256 GB` Studio), and introduces `C27` across all cold-NVMe MoEs: lossless
-  session-local hot-expert working-set promotion in `WiredArena` plus opt-in
-  `--cold-expert-min-weight <float>` (default `0.0` lossless) cold-tail skipping.
+  `kda_safe_gate`, `k = 4` short conv, `no_kda_lora = true`) + `9`-layer
+  head-wise Gated `MLA` (`sigmoid(g_proj)`) + `512E` `n_group=8, topk_group=4`
+  top-2-sum MoE + per-layer `swiglu_limit_list` + `SME2`-offloaded `eh_proj`
+  `1L` `MTP` (`gpu_eh_proj_dispatches = 0`, `D7` `512E` pruning), applies
+  `RCO-Q3` (`22.22%` `KDA` byte reduction) to shrink `24.51B` always-active +
+  `MTP` weights from `13.08 GiB` to `9.73 GiB` (doubling `24 GB` M4 hot-expert
+  cache from `3.17 GiB` to `6.52 GiB`, `169.84 GiB` full-wired `GSQ-RCO` on
+  `256 GB` Studio), and introduces `C27` across all cold-NVMe MoEs: lossless
+  two-tier session-local hot-expert working-set promotion in `ExpertCache` &
+  `M82ColdExpertCache` (`0` `memcpy` relocations) plus opt-in
+  `--cold-expert-min-weight <float>` (`0.0` default lossless, C/Python SDK
+  `ami_sdk_engine_set_cold_expert_min_weight`) cold-tail skipping calibrated in
+  [../benchmarks/results.md](../benchmarks/results.md#m93-ling-31-flash-1019-w27g28d15-c27-moe-tiering-and-w24-kl-calibration).
+  Full `572B` execution remains gated on `307.4 GiB` weight storage and `256 GB`
+  Studio / NVMe hardware.
 - **`M9.4` — Real Hugging Face checkpoint schema & `24 GB` M4 cold-tier parity (`Qwen3.8-Flash-Next` & `DeepSeek-V4.1-Flash-1017`, `W28`):**
   Aligns `qwen4_exp` (`< 47 B` name compaction eliminating all `300` long
   `hyper_connection` names, full `hc_count = 4` mixer projections, dense PLE
