@@ -47,6 +47,7 @@ pub const QSA_MAX_TOP_K_BLOCKS: u32 = 64;
 pub const GR_NUM_BRANCHES: u32 = 4;
 /// Maximum MLA compressed latent dimension (`kv_lora_rank`, multiples of 32; `1536` for `deepseek41`).
 pub const MAX_MLA_LATENT_DIM: u32 = 2048;
+pub const M94_DS_INDEXER_MAX_TOPK: u32 = 2048;
 /// Maximum MLA decoupled RoPE key dimension (`qk_rope_dim`, even).
 pub const MAX_MLA_ROPE_DIM: u32 = 256;
 /// Channels per `E4M3` FP8 scale in MLA `FP4` (`E2M1` + `E4M3`) latent KV (`R7`, `G11`).
@@ -899,6 +900,7 @@ pub const GdnDecodeArgs = struct {
     l2_eps: f32 = 1e-6,
     rms_eps: f32 = 1e-6,
     apply_l2_norm: bool = true,
+    out_gate_sigmoid: bool = false,
 };
 
 pub const GdnPrefillArgs = struct {
@@ -938,6 +940,7 @@ pub const GdnPrefillArgs = struct {
     /// Optional first token index emitted to `out` (e.g. `seq_len - 1` for
     /// `P0-B1` final-chunk `M = 1` tail narrowing). Defaults to `0` (all rows).
     out_start_token: u32 = 0,
+    out_gate_sigmoid: bool = false,
 };
 
 pub const GdnTreeVerifyArgs = struct {
@@ -976,6 +979,7 @@ pub const GdnTreeVerifyArgs = struct {
     l2_eps: f32 = 1e-6,
     rms_eps: f32 = 1e-6,
     apply_l2_norm: bool = true,
+    out_gate_sigmoid: bool = false,
 };
 
 pub const GdnCommitTreeArgs = struct {
@@ -1142,10 +1146,12 @@ pub const HybridKvRing = struct {
                 k_tiles[i].close();
             }
         }
+        const aligned_k_dim = std.mem.alignForward(u32, spec.head_dim, metal.KV_TILE_ROW_ALIGN_F16);
+        const aligned_v_dim = std.mem.alignForward(u32, eff_v_head_dim, metal.KV_TILE_ROW_ALIGN_F16);
         for (0..spec.num_tiles) |i| {
-            k_tiles[i] = try metal.KvTile.init(device, spec.head_dim, rows, .{});
+            k_tiles[i] = try metal.KvTile.init(device, aligned_k_dim, rows, .{});
             errdefer k_tiles[i].close();
-            v_tiles[i] = try metal.KvTile.init(device, eff_v_head_dim, rows, .{});
+            v_tiles[i] = try metal.KvTile.init(device, aligned_v_dim, rows, .{});
             tile_table[i] = attention.KvTilePair.fromTiles(k_tiles[i], v_tiles[i], .rgba16f);
             created += 1;
         }
@@ -1325,6 +1331,7 @@ pub const QsaRopeKvWriteArgs = struct {
     slot_in_chunk: u32,
     rms_eps: f32 = 1e-6,
     rope_theta: f32 = 1_000_000.0,
+    qk_norm_unit_offset: bool = false,
 };
 
 pub const QsaTreeRopeArgs = struct {
@@ -1347,6 +1354,7 @@ pub const QsaTreeRopeArgs = struct {
     yarn: YarnConfig = .{},
     rms_eps: f32 = 1e-6,
     rope_theta: f32 = 1_000_000.0,
+    qk_norm_unit_offset: bool = false,
 };
 
 pub const QsaKvTreeCommitArgs = struct {
@@ -1504,6 +1512,7 @@ pub const QsaPrefillRopeArgs = struct {
     write_to_tiles: bool = true,
     rms_eps: f32 = 1e-6,
     rope_theta: f32 = 1_000_000.0,
+    qk_norm_unit_offset: bool = false,
 };
 
 pub const QsaPrefillKvCommitArgs = struct {
@@ -1776,6 +1785,7 @@ pub const GdnBatchDecodeArgs = struct {
     apply_l2_norm: bool = true,
     per_head_norm: bool = false,
     norm_dtype: quant.FloatDType = .f16,
+    out_gate_sigmoid: bool = false,
 };
 
 pub const GdnCloneStateArgs = struct {
@@ -2809,6 +2819,26 @@ pub const HybridPipelines = struct {
     g28_mla_full_attend: metal.Pipeline,
     g28_mla_out_gate: metal.Pipeline,
 
+    // M9.4: Real-HF `Qwen3.8-Flash-Next` (`qwen4_exp`) & `DeepSeek-V4.1-Flash-1017` (`deepseek_v41`).
+    qwen4_hc_norm: metal.Pipeline,
+    qwen4_hc_scale_silu: metal.Pipeline,
+    qwen4_hc_mix_reduce: metal.Pipeline,
+    qwen4_hc_inject: metal.Pipeline,
+    qwen4_ple_gate: metal.Pipeline,
+    qwen4_ple_dilated_conv_add: metal.Pipeline,
+    qwen4_ple_conv_commit: metal.Pipeline,
+    qsa_real_idx_prep: metal.Pipeline,
+    qsa_real_idx_pool_commit: metal.Pipeline,
+    qsa_real_idx_select: metal.Pipeline,
+    m94_mhc_init_pre_mix: metal.Pipeline,
+    m94_mhc_pre_sinkhorn_handoff: [2][2]metal.Pipeline,
+    m94_mhc_collapse_pre_mix: [2]metal.Pipeline,
+    m94_rope_complex: metal.Pipeline,
+    m94_ds_compressor_pool: metal.Pipeline,
+    m94_ds_indexer_select: metal.Pipeline,
+    m94_ds_latent_attn: metal.Pipeline,
+    m94_ds_engram_gate_add: [2]metal.Pipeline,
+
     pub fn init(device: metal.Device, library: metal.Library) metal.Error!HybridPipelines {
         const gdn_decode_d64_f16 = try metal.Pipeline.initSpecialized(device, library, "ami_gdn_decode", &.{
             .{ .index = 0, .value = .{ .u32 = 64 } },
@@ -3295,6 +3325,82 @@ pub const HybridPipelines = struct {
         const g28_mla_out_gate = try metal.Pipeline.init(device, library, "ami_g28_mla_out_gate");
         errdefer g28_mla_out_gate.close();
 
+        const qwen4_hc_norm = try metal.Pipeline.init(device, library, "ami_qwen4_hc_norm");
+        errdefer qwen4_hc_norm.close();
+        const qwen4_hc_scale_silu = try metal.Pipeline.init(device, library, "ami_qwen4_hc_scale_silu");
+        errdefer qwen4_hc_scale_silu.close();
+        const qwen4_hc_mix_reduce = try metal.Pipeline.init(device, library, "ami_qwen4_hc_mix_reduce");
+        errdefer qwen4_hc_mix_reduce.close();
+        const qwen4_hc_inject = try metal.Pipeline.init(device, library, "ami_qwen4_hc_inject");
+        errdefer qwen4_hc_inject.close();
+        const qwen4_ple_gate = try metal.Pipeline.init(device, library, "ami_qwen4_ple_gate");
+        errdefer qwen4_ple_gate.close();
+        const qwen4_ple_dilated_conv_add = try metal.Pipeline.init(device, library, "ami_qwen4_ple_dilated_conv_add");
+        errdefer qwen4_ple_dilated_conv_add.close();
+        const qwen4_ple_conv_commit = try metal.Pipeline.init(device, library, "ami_qwen4_ple_conv_commit");
+        errdefer qwen4_ple_conv_commit.close();
+        const qsa_real_idx_prep = try metal.Pipeline.init(device, library, "ami_qsa_real_idx_prep");
+        errdefer qsa_real_idx_prep.close();
+        const qsa_real_idx_pool_commit = try metal.Pipeline.init(device, library, "ami_qsa_real_idx_pool_commit");
+        errdefer qsa_real_idx_pool_commit.close();
+        const qsa_real_idx_select = try metal.Pipeline.init(device, library, "ami_qsa_real_idx_select");
+        errdefer qsa_real_idx_select.close();
+        const m94_mhc_init_pre_mix = try metal.Pipeline.init(device, library, "ami_m94_mhc_init_pre_mix");
+        errdefer m94_mhc_init_pre_mix.close();
+        var m94_mhc_pre_sinkhorn_handoff: [2][2]metal.Pipeline = undefined;
+        var m94_mhc_built: usize = 0;
+        errdefer {
+            for (0..m94_mhc_built) |bi| {
+                m94_mhc_pre_sinkhorn_handoff[bi / 2][bi % 2].close();
+            }
+        }
+        for (0..2) |sb| {
+            for (0..2) |ab| {
+                m94_mhc_pre_sinkhorn_handoff[sb][ab] = try metal.Pipeline.initSpecialized(
+                    device,
+                    library,
+                    "ami_m94_mhc_pre_sinkhorn_handoff",
+                    &.{
+                        .{ .index = 3, .value = .{ .bool = sb == 1 } },
+                        .{ .index = 4, .value = .{ .bool = ab == 1 } },
+                    },
+                );
+                m94_mhc_built += 1;
+            }
+        }
+        var m94_mhc_collapse_pre_mix: [2]metal.Pipeline = undefined;
+        var m94_col_built: usize = 0;
+        errdefer for (0..m94_col_built) |bi| m94_mhc_collapse_pre_mix[bi].close();
+        for (0..2) |sb| {
+            m94_mhc_collapse_pre_mix[sb] = try metal.Pipeline.initSpecialized(
+                device,
+                library,
+                "ami_m94_mhc_collapse_pre_mix",
+                &.{.{ .index = 3, .value = .{ .bool = sb == 1 } }},
+            );
+            m94_col_built += 1;
+        }
+        const m94_rope_complex = try metal.Pipeline.init(device, library, "ami_m94_rope_complex");
+        errdefer m94_rope_complex.close();
+        const m94_ds_compressor_pool = try metal.Pipeline.init(device, library, "ami_m94_ds_compressor_pool");
+        errdefer m94_ds_compressor_pool.close();
+        const m94_ds_indexer_select = try metal.Pipeline.init(device, library, "ami_m94_ds_indexer_select");
+        errdefer m94_ds_indexer_select.close();
+        const m94_ds_latent_attn = try metal.Pipeline.init(device, library, "ami_m94_ds_latent_attn");
+        errdefer m94_ds_latent_attn.close();
+        var m94_ds_engram_gate_add: [2]metal.Pipeline = undefined;
+        var m94_eng_built: usize = 0;
+        errdefer for (0..m94_eng_built) |bi| m94_ds_engram_gate_add[bi].close();
+        for (0..2) |sb| {
+            m94_ds_engram_gate_add[sb] = try metal.Pipeline.initSpecialized(
+                device,
+                library,
+                "ami_m94_ds_engram_gate_add",
+                &.{.{ .index = 3, .value = .{ .bool = sb == 1 } }},
+            );
+            m94_eng_built += 1;
+        }
+
         return .{
             .gdn_decode_d64_f16 = gdn_decode_d64_f16,
             .gdn_decode_d64_bf16 = gdn_decode_d64_bf16,
@@ -3394,10 +3500,48 @@ pub const HybridPipelines = struct {
             .g27_mla_sparse_attend = g27_mla_sparse_attend,
             .g28_mla_full_attend = g28_mla_full_attend,
             .g28_mla_out_gate = g28_mla_out_gate,
+            .qwen4_hc_norm = qwen4_hc_norm,
+            .qwen4_hc_scale_silu = qwen4_hc_scale_silu,
+            .qwen4_hc_mix_reduce = qwen4_hc_mix_reduce,
+            .qwen4_hc_inject = qwen4_hc_inject,
+            .qwen4_ple_gate = qwen4_ple_gate,
+            .qwen4_ple_dilated_conv_add = qwen4_ple_dilated_conv_add,
+            .qwen4_ple_conv_commit = qwen4_ple_conv_commit,
+            .qsa_real_idx_prep = qsa_real_idx_prep,
+            .qsa_real_idx_pool_commit = qsa_real_idx_pool_commit,
+            .qsa_real_idx_select = qsa_real_idx_select,
+            .m94_mhc_init_pre_mix = m94_mhc_init_pre_mix,
+            .m94_mhc_pre_sinkhorn_handoff = m94_mhc_pre_sinkhorn_handoff,
+            .m94_mhc_collapse_pre_mix = m94_mhc_collapse_pre_mix,
+            .m94_rope_complex = m94_rope_complex,
+            .m94_ds_compressor_pool = m94_ds_compressor_pool,
+            .m94_ds_indexer_select = m94_ds_indexer_select,
+            .m94_ds_latent_attn = m94_ds_latent_attn,
+            .m94_ds_engram_gate_add = m94_ds_engram_gate_add,
         };
     }
 
     pub fn close(self: HybridPipelines) void {
+        for (0..2) |sb| self.m94_ds_engram_gate_add[sb].close();
+        self.m94_ds_latent_attn.close();
+        self.m94_ds_indexer_select.close();
+        self.m94_ds_compressor_pool.close();
+        self.m94_rope_complex.close();
+        for (0..2) |sb| self.m94_mhc_collapse_pre_mix[sb].close();
+        for (0..2) |sb| {
+            for (0..2) |ab| self.m94_mhc_pre_sinkhorn_handoff[sb][ab].close();
+        }
+        self.m94_mhc_init_pre_mix.close();
+        self.qsa_real_idx_select.close();
+        self.qsa_real_idx_pool_commit.close();
+        self.qsa_real_idx_prep.close();
+        self.qwen4_ple_conv_commit.close();
+        self.qwen4_ple_dilated_conv_add.close();
+        self.qwen4_ple_gate.close();
+        self.qwen4_hc_inject.close();
+        self.qwen4_hc_mix_reduce.close();
+        self.qwen4_hc_scale_silu.close();
+        self.qwen4_hc_norm.close();
         self.g28_mla_out_gate.close();
         self.g28_mla_full_attend.close();
         self.g27_mla_sparse_attend.close();
@@ -3542,7 +3686,7 @@ pub const HybridPipelines = struct {
             .rms_eps = args.rms_eps,
             .apply_l2_norm = if (args.apply_l2_norm) 1 else 0,
             .apply_out_norm = if (args.norm_w != null) 1 else 0,
-            .apply_out_gate = if (args.z != null) 1 else 0,
+            .apply_out_gate = if (args.z != null) (if (args.out_gate_sigmoid) @as(u32, 2) else 1) else 0,
             .per_head_norm = if (args.per_head_norm) 1 else 0,
         };
         const pipe = switch (args.head_k_dim) {
@@ -3598,7 +3742,7 @@ pub const HybridPipelines = struct {
             .rms_eps = args.rms_eps,
             .apply_l2_norm = if (args.apply_l2_norm) 1 else 0,
             .apply_out_norm = if (args.norm_w != null) 1 else 0,
-            .apply_out_gate = if (args.z != null) 1 else 0,
+            .apply_out_gate = if (args.z != null) (if (args.out_gate_sigmoid) @as(u32, 2) else 1) else 0,
             .per_head_norm = if (args.per_head_norm) 1 else 0,
         };
         const pipe = switch (args.head_k_dim) {
@@ -3703,7 +3847,7 @@ pub const HybridPipelines = struct {
             .q_scale = q_scale,
             .l2_eps = args.l2_eps,
             .apply_l2_norm = if (args.apply_l2_norm) 1 else 0,
-            .apply_out_gate = if (!args.write_state_only and !need_post_norm and args.z != null) 1 else 0,
+            .apply_out_gate = if (!args.write_state_only and !need_post_norm and args.z != null) (if (args.out_gate_sigmoid) @as(u32, 2) else 1) else 0,
             .chunk_size = if (args.chunk_size > 0) args.chunk_size else 64,
             .write_state_only = if (args.write_state_only) 1 else 0,
             .out_start_token = if (args.write_state_only) 0 else args.out_start_token,
@@ -3746,7 +3890,7 @@ pub const HybridPipelines = struct {
                 .head_v_dim = args.head_v_dim,
                 .rms_eps = args.rms_eps,
                 .apply_out_norm = 1,
-                .apply_out_gate = if (args.z != null) 1 else 0,
+                .apply_out_gate = if (args.z != null) (if (args.out_gate_sigmoid) @as(u32, 2) else 1) else 0,
                 .per_head_norm = if (args.per_head_norm) 1 else 0,
             };
             const norm_pipe = if (args.norm_dtype == .bf16) self.gdn_out_norm_gate_bf16 else self.gdn_out_norm_gate_f16;
@@ -3789,7 +3933,7 @@ pub const HybridPipelines = struct {
             .q_scale = q_scale,
             .l2_eps = args.l2_eps,
             .apply_l2_norm = if (args.apply_l2_norm) 1 else 0,
-            .apply_out_gate = if (!need_post_norm and args.z != null) 1 else 0,
+            .apply_out_gate = if (!need_post_norm and args.z != null) (if (args.out_gate_sigmoid) @as(u32, 2) else 1) else 0,
             .scratch_leaf_node = args.scratch_leaf_node orelse 0xFFFF_FFFF,
         };
         const pipe = switch (args.head_k_dim) {
@@ -3825,7 +3969,7 @@ pub const HybridPipelines = struct {
                 .head_v_dim = args.head_v_dim,
                 .rms_eps = args.rms_eps,
                 .apply_out_norm = 1,
-                .apply_out_gate = if (args.z != null) 1 else 0,
+                .apply_out_gate = if (args.z != null) (if (args.out_gate_sigmoid) @as(u32, 2) else 1) else 0,
                 .per_head_norm = if (args.per_head_norm) 1 else 0,
             };
             const norm_pipe = if (args.norm_dtype == .bf16) self.gdn_out_norm_gate_bf16 else self.gdn_out_norm_gate_f16;
@@ -3970,7 +4114,7 @@ pub const HybridPipelines = struct {
             .yarn_beta_fast = args.yarn.beta_fast,
             .yarn_beta_slow = args.yarn.beta_slow,
             .original_max_pos = args.yarn.original_max_pos,
-            .apply_qk_norm = if (apply_norm) 1 else 0,
+            .apply_qk_norm = if (apply_norm) (if (args.qk_norm_unit_offset) @as(u32, 2) else 1) else 0,
         };
         const pipe = if (args.norm_dtype == .bf16) self.qsa_rope_kv_write_bf16 else self.qsa_rope_kv_write_f16;
         try frame.encodeThreadgroupsWithTextures(
@@ -4025,7 +4169,7 @@ pub const HybridPipelines = struct {
             .yarn_beta_fast = args.yarn.beta_fast,
             .yarn_beta_slow = args.yarn.beta_slow,
             .original_max_pos = args.yarn.original_max_pos,
-            .apply_qk_norm = if (apply_norm) 1 else 0,
+            .apply_qk_norm = if (apply_norm) (if (args.qk_norm_unit_offset) @as(u32, 2) else 1) else 0,
         };
         const pipe = if (args.norm_dtype == .bf16) self.qsa_tree_rope_bf16 else self.qsa_tree_rope_f16;
         try frame.encodeThreadgroups(
@@ -4383,7 +4527,7 @@ pub const HybridPipelines = struct {
             .mrope_s1 = args.mrope.section[1],
             .mrope_s2 = args.mrope.section[2],
             .use_positions_3d = if (args.positions_3d != null) 1 else 0,
-            .apply_qk_norm = if (apply_norm) 1 else 0,
+            .apply_qk_norm = if (apply_norm) (if (args.qk_norm_unit_offset) @as(u32, 2) else 1) else 0,
             .kv_only = if (args.kv_only) 1 else 0,
             .write_to_tiles = if (args.write_to_tiles) 1 else 0,
             .rms_eps = args.rms_eps,
@@ -5650,6 +5794,7 @@ pub const HybridPipelines = struct {
             .down_groups_x_q8 = args.down_groups_x_q8,
             .routed_scaling_factor = args.routed_scaling_factor,
             .group_score_topk = args.group_score_topk,
+            .score_mode = args.score_mode,
         };
         const pipe = if (args.logits_f16) self.g26_moe_route_sigmoid_f16 else self.g26_moe_route_sigmoid_f32;
         try frame.encodeThreadgroups(
@@ -6396,6 +6541,619 @@ pub const HybridPipelines = struct {
             &.{ args.attn_out, args.gate },
             std.mem.asBytes(&params),
             .{ groups_x, 1, 1 },
+            .{ 256, 1, 1 },
+            insert_barrier_before,
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // M9.4 Encoders: Real-HF `Qwen3.8-Flash-Next` & `DeepSeek-V4.1-Flash-1017`
+    // -----------------------------------------------------------------------
+
+    pub fn encodeQwen4HcNorm(
+        self: HybridPipelines,
+        frame: *metal.Compute.Frame,
+        args: M94HcNormArgs,
+        insert_barrier_before: bool,
+    ) EncodeError!void {
+        if (args.m == 0 or args.num_groups == 0 or args.group_size == 0) return error.ZeroDimension;
+        const params: M94HcNormParams = .{
+            .m = args.m,
+            .num_groups = args.num_groups,
+            .group_size = args.group_size,
+            .w_dtype = @backingInt(args.w_dtype),
+            .unit_offset = if (args.unit_offset) 1 else 0,
+            .rms_eps = args.rms_eps,
+        };
+        try frame.encodeThreadgroups(
+            self.qwen4_hc_norm,
+            &.{ args.x, args.w, args.y },
+            std.mem.asBytes(&params),
+            .{ args.num_groups, args.m, 1 },
+            .{ 256, 1, 1 },
+            insert_barrier_before,
+        );
+    }
+
+    pub fn encodeQwen4HcScaleSilu(
+        self: HybridPipelines,
+        frame: *metal.Compute.Frame,
+        x: metal.BufferBinding,
+        count: u32,
+        scale: f32,
+        insert_barrier_before: bool,
+    ) EncodeError!void {
+        if (count == 0) return error.ZeroDimension;
+        const params: M94ScaleSiluParams = .{ .count = count, .scale = scale };
+        const groups_x: u64 = (@as(u64, count) + 255) / 256;
+        try frame.encodeThreadgroups(
+            self.qwen4_hc_scale_silu,
+            &.{x},
+            std.mem.asBytes(&params),
+            .{ groups_x, 1, 1 },
+            .{ 256, 1, 1 },
+            insert_barrier_before,
+        );
+    }
+
+    pub fn encodeQwen4HcMixReduce(
+        self: HybridPipelines,
+        frame: *metal.Compute.Frame,
+        args: M94HcMixArgs,
+        insert_barrier_before: bool,
+    ) EncodeError!void {
+        if (args.m == 0 or args.hc_count == 0 or args.hidden_size == 0) return error.ZeroDimension;
+        const params: M94HcMixParams = .{
+            .m = args.m,
+            .hc_count = args.hc_count,
+            .hidden_size = args.hidden_size,
+            .has_inj = if (args.inj_raw != null and args.inj_out != null) 1 else 0,
+            .inv_hc_count = 1.0 / @as(f32, @floatFromInt(args.hc_count)),
+        };
+        try frame.encodeThreadgroups(
+            self.qwen4_hc_mix_reduce,
+            &.{
+                args.h_normed,
+                args.w_mix,
+                args.inj_raw orelse args.w_mix,
+                args.mixed_out,
+                args.inj_out orelse args.mixed_out,
+            },
+            std.mem.asBytes(&params),
+            .{ args.m, 1, 1 },
+            .{ 256, 1, 1 },
+            insert_barrier_before,
+        );
+    }
+
+    pub fn encodeQwen4HcInject(
+        self: HybridPipelines,
+        frame: *metal.Compute.Frame,
+        args: M94HcInjectArgs,
+        insert_barrier_before: bool,
+    ) EncodeError!void {
+        if (args.m == 0 or args.hc_count == 0 or args.hidden_size == 0) return error.ZeroDimension;
+        const params: M94HcInjectParams = .{
+            .m = args.m,
+            .hc_count = args.hc_count,
+            .hidden_size = args.hidden_size,
+        };
+        try frame.encodeThreadgroups(
+            self.qwen4_hc_inject,
+            &.{ args.h_streams, args.sub_out, args.inj },
+            std.mem.asBytes(&params),
+            .{ args.m, 1, 1 },
+            .{ 256, 1, 1 },
+            insert_barrier_before,
+        );
+    }
+
+    pub fn encodeQwen4PleGate(
+        self: HybridPipelines,
+        frame: *metal.Compute.Frame,
+        args: M94PleGateArgs,
+        insert_barrier_before: bool,
+    ) EncodeError!void {
+        if (args.m == 0 or args.hc_count == 0 or args.hidden_size == 0) return error.ZeroDimension;
+        const params: M94PleGateParams = .{
+            .m = args.m,
+            .hc_count = args.hc_count,
+            .hidden_size = args.hidden_size,
+            .norm_dtype = @backingInt(args.norm_dtype),
+            .rms_eps = args.rms_eps,
+            .inv_sqrt_h = 1.0 / @sqrt(@as(f32, @floatFromInt(args.hidden_size))),
+        };
+        try frame.encodeThreadgroups(
+            self.qwen4_ple_gate,
+            &.{
+                args.h_streams,
+                args.k_raw,
+                args.value_in,
+                args.norm_key_w,
+                args.norm_query_w,
+                args.norm_conv_w,
+                args.gv_out,
+                args.gv_normed_out,
+            },
+            std.mem.asBytes(&params),
+            .{ args.hc_count, args.m, 1 },
+            .{ 256, 1, 1 },
+            insert_barrier_before,
+        );
+    }
+
+    pub fn encodeQwen4PleDilatedConvAdd(
+        self: HybridPipelines,
+        frame: *metal.Compute.Frame,
+        args: M94PleConvArgs,
+        insert_barrier_before: bool,
+    ) EncodeError!void {
+        if (args.m == 0 or args.channels == 0 or args.kernel_size == 0) return error.ZeroDimension;
+        if (args.kernel_size > 8) return error.InvalidConfig;
+        const params: M94PleConvParams = .{
+            .m = args.m,
+            .channels = args.channels,
+            .kernel_size = args.kernel_size,
+            .dilation = args.dilation,
+            .state_len = (args.kernel_size - 1) * args.dilation,
+            .w_dtype = @backingInt(args.w_dtype),
+            .is_tree = if (args.is_tree) 1 else 0,
+        };
+        const groups_x: u64 = (@as(u64, args.channels) + 255) / 256;
+        try frame.encodeThreadgroups(
+            self.qwen4_ple_dilated_conv_add,
+            &.{
+                args.h_streams,
+                args.gv_in,
+                args.gv_normed,
+                args.conv_w,
+                args.conv_state_in,
+                args.ancestor_masks orelse args.h_streams,
+            },
+            std.mem.asBytes(&params),
+            .{ groups_x, args.m, 1 },
+            .{ 256, 1, 1 },
+            insert_barrier_before,
+        );
+    }
+
+    pub fn encodeQwen4PleConvCommit(
+        self: HybridPipelines,
+        frame: *metal.Compute.Frame,
+        args: M94PleConvCommitArgs,
+        insert_barrier_before: bool,
+    ) EncodeError!void {
+        if (args.channels == 0 or args.state_len == 0 or args.accepted_nodes.len == 0) return error.ZeroDimension;
+        if (args.accepted_nodes.len > MAX_TREE_NODES) return error.InvalidNodeCount;
+        var params: M94PleConvCommitParams = .{
+            .channels = args.channels,
+            .state_len = args.state_len,
+            .accepted_count = @intCast(args.accepted_nodes.len),
+        };
+        for (args.accepted_nodes, 0..) |nid, i| params.inline_nodes[i] = nid;
+        const groups_x: u64 = (@as(u64, args.channels) + 255) / 256;
+        try frame.encodeThreadgroups(
+            self.qwen4_ple_conv_commit,
+            &.{ args.gv_normed, args.conv_state },
+            std.mem.asBytes(&params),
+            .{ groups_x, 1, 1 },
+            .{ 256, 1, 1 },
+            insert_barrier_before,
+        );
+    }
+
+    pub fn encodeQsaRealIdxPrep(
+        self: HybridPipelines,
+        frame: *metal.Compute.Frame,
+        args: M94QsaIdxPrepArgs,
+        insert_barrier_before: bool,
+    ) EncodeError!void {
+        if (args.num_tokens == 0 or args.idx_n_heads == 0 or args.idx_head_dim == 0) return error.ZeroDimension;
+        const rotary_dim = if (args.rotary_dim == 0) args.idx_head_dim else args.rotary_dim;
+        try args.mrope.validate(rotary_dim);
+        const params: M94QsaIdxPrepParams = .{
+            .num_tokens = args.num_tokens,
+            .idx_n_heads = args.idx_n_heads,
+            .idx_head_dim = args.idx_head_dim,
+            .rotary_dim = rotary_dim,
+            .start_pos = args.start_pos,
+            .use_positions_3d = if (args.positions_3d != null) 1 else 0,
+            .write_raw_to_cache = if (args.write_raw_to_cache) 1 else 0,
+            .mrope_s0 = args.mrope.section[0],
+            .mrope_s1 = args.mrope.section[1],
+            .mrope_s2 = args.mrope.section[2],
+            .norm_dtype = @backingInt(args.norm_dtype),
+            .unit_offset = if (args.unit_offset) 1 else 0,
+            .rms_eps = args.rms_eps,
+            .rope_theta = args.rope_theta,
+            .yarn_factor = args.yarn.factor,
+            .yarn_mscale = args.yarn.effectiveMscale(),
+            .yarn_beta_fast = args.yarn.beta_fast,
+            .yarn_beta_slow = args.yarn.beta_slow,
+            .original_max_pos = args.yarn.original_max_pos,
+        };
+        try frame.encodeThreadgroups(
+            self.qsa_real_idx_prep,
+            &.{
+                args.qk_in,
+                args.q_norm,
+                args.positions_3d orelse args.qk_in,
+                args.q_idx_out,
+                args.raw_k_dst,
+            },
+            std.mem.asBytes(&params),
+            .{ @as(u64, args.idx_n_heads) + 1, args.num_tokens, 1 },
+            .{ 32, 1, 1 },
+            insert_barrier_before,
+        );
+    }
+
+    pub fn encodeQsaRealIdxPoolCommit(
+        self: HybridPipelines,
+        frame: *metal.Compute.Frame,
+        args: M94QsaIdxPoolArgs,
+        insert_barrier_before: bool,
+    ) EncodeError!void {
+        if (args.num_blocks == 0 or args.compress_ratio == 0 or args.idx_head_dim == 0) return error.ZeroDimension;
+        const rotary_dim = if (args.rotary_dim == 0) args.idx_head_dim else args.rotary_dim;
+        try args.mrope.validate(rotary_dim);
+        const params: M94QsaIdxPoolParams = .{
+            .start_block = args.start_block,
+            .num_blocks = args.num_blocks,
+            .compress_ratio = args.compress_ratio,
+            .idx_head_dim = args.idx_head_dim,
+            .rotary_dim = rotary_dim,
+            .mrope_s0 = args.mrope.section[0],
+            .mrope_s1 = args.mrope.section[1],
+            .mrope_s2 = args.mrope.section[2],
+            .norm_dtype = @backingInt(args.norm_dtype),
+            .unit_offset = if (args.unit_offset) 1 else 0,
+            .rms_eps = args.rms_eps,
+            .rope_theta = args.rope_theta,
+            .yarn_factor = args.yarn.factor,
+            .yarn_mscale = args.yarn.effectiveMscale(),
+            .yarn_beta_fast = args.yarn.beta_fast,
+            .yarn_beta_slow = args.yarn.beta_slow,
+            .original_max_pos = args.yarn.original_max_pos,
+        };
+        try frame.encodeThreadgroups(
+            self.qsa_real_idx_pool_commit,
+            &.{ args.raw_k_cache, args.k_norm, args.pooled_k_cache },
+            std.mem.asBytes(&params),
+            .{ args.num_blocks, 1, 1 },
+            .{ 32, 1, 1 },
+            insert_barrier_before,
+        );
+    }
+
+    pub fn encodeQsaRealIdxSelect(
+        self: HybridPipelines,
+        frame: *metal.Compute.Frame,
+        args: M94QsaIdxSelectArgs,
+        insert_barrier_before: bool,
+    ) EncodeError!void {
+        if (args.num_nodes == 0 or args.idx_n_heads == 0 or args.idx_head_dim == 0 or
+            args.num_kv_heads == 0 or args.compress_ratio == 0)
+        {
+            return error.ZeroDimension;
+        }
+        const eff_cap: u32 = @min(args.block_topk, args.index_buf.spec.top_k_blocks);
+        const params: M94QsaIdxSelectParams = .{
+            .num_nodes = args.num_nodes,
+            .idx_n_heads = args.idx_n_heads,
+            .idx_head_dim = args.idx_head_dim,
+            .num_kv_heads = args.num_kv_heads,
+            .kv_len = args.kv_len,
+            .compress_ratio = args.compress_ratio,
+            .block_topk = eff_cap,
+            .top_k_blocks_cap = eff_cap,
+            .causal_q_start_pos = args.causal_q_start_pos orelse 0xFFFF_FFFF,
+            .inv_sqrt_d = 1.0 / @sqrt(@as(f32, @floatFromInt(args.idx_head_dim))),
+        };
+        try frame.encodeThreadgroups(
+            self.qsa_real_idx_select,
+            &.{
+                args.q_idx,
+                args.pooled_k_cache,
+                args.index_buf.blocksBinding(args.index_metal_buf),
+                args.index_buf.countsBinding(args.index_metal_buf),
+            },
+            std.mem.asBytes(&params),
+            .{ args.num_nodes, 1, 1 },
+            .{ 256, 1, 1 },
+            insert_barrier_before,
+        );
+    }
+
+    pub fn encodeM94MhcInitPreMix(
+        self: HybridPipelines,
+        frame: *metal.Compute.Frame,
+        pre_mix: metal.BufferBinding,
+        m: u32,
+        hc_mult: u32,
+        insert_barrier_before: bool,
+    ) EncodeError!void {
+        if (m == 0 or hc_mult == 0) return error.ZeroDimension;
+        const params: M94MhcInitParams = .{ .m = m, .hc_mult = hc_mult };
+        const groups_x: u64 = (@as(u64, m) * hc_mult + 255) / 256;
+        try frame.encodeThreadgroups(
+            self.m94_mhc_init_pre_mix,
+            &.{pre_mix},
+            std.mem.asBytes(&params),
+            .{ groups_x, 1, 1 },
+            .{ 256, 1, 1 },
+            insert_barrier_before,
+        );
+    }
+
+    pub fn encodeM94MhcPreSinkhornHandoff(
+        self: HybridPipelines,
+        frame: *metal.Compute.Frame,
+        args: M94MhcPreSinkhornHandoffArgs,
+        insert_barrier_before: bool,
+    ) EncodeError!void {
+        if (args.m == 0 or args.hidden_size == 0) return error.ZeroDimension;
+        const params: G27MhcSinkhornParams = .{
+            .m = args.m,
+            .hidden_size = args.hidden_size,
+            .sinkhorn_iters = args.sinkhorn_iters,
+            .flags = if (args.norm_w != null) 1 else 0,
+            .fn_dtype = @backingInt(args.fn_dtype),
+            .norm_dtype = @backingInt(args.norm_dtype),
+            .rms_eps = args.rms_eps,
+            .hc_eps = args.hc_eps,
+        };
+        const sb: usize = if (args.stream_dtype == .bf16) 1 else 0;
+        const ab: usize = if (args.act_dtype == .bf16) 1 else 0;
+        try frame.encodeThreadgroups(
+            self.m94_mhc_pre_sinkhorn_handoff[sb][ab],
+            &.{
+                args.streams,
+                args.fn_w,
+                args.base_w,
+                args.scale_w,
+                args.norm_w orelse args.streams,
+                args.branch_out,
+                args.coeffs_out,
+                args.pre_mix_in,
+                args.pre_mix_out,
+            },
+            std.mem.asBytes(&params),
+            .{ args.m, 1, 1 },
+            .{ 256, 1, 1 },
+            insert_barrier_before,
+        );
+    }
+
+    pub fn encodeM94MhcCollapsePreMix(
+        self: HybridPipelines,
+        frame: *metal.Compute.Frame,
+        args: M94MhcCollapseArgs,
+        insert_barrier_before: bool,
+    ) EncodeError!void {
+        if (args.m == 0 or args.hidden_size == 0) return error.ZeroDimension;
+        const params: M94MhcCollapseParams = .{
+            .m = args.m,
+            .hidden_size = args.hidden_size,
+            .has_norm_w = if (args.norm_w != null) 1 else 0,
+            .norm_dtype = @backingInt(args.norm_dtype),
+            .rms_eps = args.rms_eps,
+        };
+        const sb: usize = if (args.stream_dtype == .bf16) 1 else 0;
+        try frame.encodeThreadgroups(
+            self.m94_mhc_collapse_pre_mix[sb],
+            &.{
+                args.streams,
+                args.pre_mix,
+                args.norm_w orelse args.streams,
+                args.out,
+            },
+            std.mem.asBytes(&params),
+            .{ args.m, 1, 1 },
+            .{ 256, 1, 1 },
+            insert_barrier_before,
+        );
+    }
+
+    pub fn encodeM94RopeComplex(
+        self: HybridPipelines,
+        frame: *metal.Compute.Frame,
+        args: M94RopeComplexArgs,
+        insert_barrier_before: bool,
+    ) EncodeError!void {
+        if (args.num_tokens == 0 or args.num_heads == 0 or args.rot_dim < 2) return error.ZeroDimension;
+        const params: M94RopeComplexParams = .{
+            .num_tokens = args.num_tokens,
+            .num_heads = args.num_heads,
+            .head_stride = args.head_stride,
+            .rot_offset = args.rot_offset,
+            .rot_dim = args.rot_dim,
+            .base_pos = args.base_pos,
+            .use_pos_buf = if (args.positions != null) 1 else 0,
+            .inverse = if (args.inverse) 1 else 0,
+            .pos_stride = args.pos_stride,
+            .original_seq_len = args.original_seq_len,
+            .rope_theta = args.rope_theta,
+            .rope_factor = args.rope_factor,
+            .beta_fast = args.beta_fast,
+            .beta_slow = args.beta_slow,
+        };
+        try frame.encodeThreadgroups(
+            self.m94_rope_complex,
+            &.{ args.x, args.positions orelse args.x },
+            std.mem.asBytes(&params),
+            .{ args.num_heads, args.num_tokens, 1 },
+            .{ 32, 1, 1 },
+            insert_barrier_before,
+        );
+    }
+
+    pub fn encodeM94DsCompressorPool(
+        self: HybridPipelines,
+        frame: *metal.Compute.Frame,
+        args: M94DsCompressorArgs,
+        insert_barrier_before: bool,
+    ) EncodeError!void {
+        if (args.num_tokens == 0 or args.head_dim == 0 or args.ratio == 0) return error.ZeroDimension;
+        const end_pos = args.start_pos + args.num_tokens;
+        const out_count = (end_pos / args.ratio) - (args.start_pos / args.ratio);
+        const params: M94DsCompressorParams = .{
+            .num_tokens = args.num_tokens,
+            .start_pos = args.start_pos,
+            .head_dim = args.head_dim,
+            .ratio = args.ratio,
+            .gate_dim = args.gate_dim,
+            .norm_dtype = @backingInt(args.norm_dtype),
+            .rms_eps = args.rms_eps,
+            .write_state = if (args.write_state) 1 else 0,
+            .out_count = out_count,
+        };
+        try frame.encodeThreadgroups(
+            self.m94_ds_compressor_pool,
+            &.{
+                args.kv_in,
+                args.gate_in,
+                args.norm_w,
+                args.kv_state,
+                args.score_state,
+                args.latent_out,
+            },
+            std.mem.asBytes(&params),
+            .{ @max(out_count, 1), 1, 1 },
+            .{ 256, 1, 1 },
+            insert_barrier_before,
+        );
+    }
+
+    pub fn encodeM94DsIndexerSelect(
+        self: HybridPipelines,
+        frame: *metal.Compute.Frame,
+        args: M94DsIndexerArgs,
+        insert_barrier_before: bool,
+    ) EncodeError!void {
+        if (args.num_tokens == 0 or args.idx_n_heads == 0 or args.idx_head_dim == 0 or args.ratio == 0) {
+            return error.ZeroDimension;
+        }
+        const weight_scale = (1.0 / @sqrt(@as(f32, @floatFromInt(args.idx_head_dim)))) *
+            (1.0 / @sqrt(@as(f32, @floatFromInt(args.idx_n_heads))));
+        const params: M94DsIndexerParams = .{
+            .num_tokens = args.num_tokens,
+            .start_pos = args.start_pos,
+            .idx_n_heads = args.idx_n_heads,
+            .idx_head_dim = args.idx_head_dim,
+            .ratio = args.ratio,
+            .total_comp_len = args.total_comp_len,
+            .index_topk = args.index_topk,
+            .offset = args.offset,
+            .is_candidate_source = if (args.is_candidate_source) 1 else 0,
+            .uses_candidates = if (args.uses_candidates) 1 else 0,
+            .cand_topk_blocks = args.cand_topk_blocks,
+            .cand_block_size = args.cand_block_size,
+            .cand_num_blocks = args.cand_num_blocks,
+            .weight_scale = weight_scale,
+            .is_causal_prefill = if (args.is_causal_prefill) 1 else 0,
+        };
+        try frame.encodeThreadgroups(
+            self.m94_ds_indexer_select,
+            &.{
+                args.q_idx,
+                args.index_k_cache,
+                args.weights,
+                args.candidate_mask orelse args.topk_idxs_out,
+                args.topk_idxs_out,
+                args.scores_scratch,
+            },
+            std.mem.asBytes(&params),
+            .{ args.num_tokens, 1, 1 },
+            .{ 256, 1, 1 },
+            insert_barrier_before,
+        );
+    }
+
+    pub fn encodeM94DsLatentAttn(
+        self: HybridPipelines,
+        frame: *metal.Compute.Frame,
+        args: M94DsLatentAttnArgs,
+        insert_barrier_before: bool,
+    ) EncodeError!void {
+        if (args.num_q == 0 or args.n_heads == 0 or args.q_head_dim == 0 or args.kv_dim == 0 or args.v_head_dim == 0) {
+            return error.ZeroDimension;
+        }
+        const scale = args.scale orelse (1.0 / @sqrt(@as(f32, @floatFromInt(args.q_head_dim))));
+        const params: M94DsLatentAttnParams = .{
+            .num_q = args.num_q,
+            .n_heads = args.n_heads,
+            .q_head_dim = args.q_head_dim,
+            .kv_dim = args.kv_dim,
+            .v_head_dim = args.v_head_dim,
+            .nope_dim = args.nope_dim,
+            .rope_dim = args.rope_dim,
+            .window_size = @max(args.window_size, 1),
+            .start_pos = args.start_pos,
+            .has_compress = if (args.comp_kv_cache != null and args.topk_idxs != null and args.compress_topk > 0) 1 else 0,
+            .compress_topk = args.compress_topk,
+            .has_sink = if (args.attn_sink != null) 1 else 0,
+            .is_tree = if (args.ancestor_masks != null) 1 else 0,
+            .apply_inv_rope = if (args.apply_inv_rope) 1 else 0,
+            .original_seq_len = args.original_seq_len,
+            .scale = scale,
+            .rope_theta = args.rope_theta,
+            .rope_factor = args.rope_factor,
+            .beta_fast = args.beta_fast,
+            .beta_slow = args.beta_slow,
+        };
+        try frame.encodeThreadgroups(
+            self.m94_ds_latent_attn,
+            &.{
+                args.q,
+                args.win_kv_cache,
+                args.win_kv_cur,
+                args.comp_kv_cache orelse args.win_kv_cache,
+                args.topk_idxs orelse args.q,
+                args.attn_sink orelse args.q,
+                args.ancestor_masks orelse args.q,
+                args.out,
+            },
+            std.mem.asBytes(&params),
+            .{ args.n_heads, args.num_q, 1 },
+            .{ 256, 1, 1 },
+            insert_barrier_before,
+        );
+    }
+
+    pub fn encodeM94DsEngramGateAdd(
+        self: HybridPipelines,
+        frame: *metal.Compute.Frame,
+        args: M94DsEngramArgs,
+        insert_barrier_before: bool,
+    ) EncodeError!void {
+        if (args.m == 0 or args.hidden_size == 0 or args.wkv_out_dim == 0) return error.ZeroDimension;
+        const norm_d = if (args.wkv_out_dim >= 5 * args.hidden_size)
+            args.hidden_size
+        else
+            @max(@as(u32, 1), @min(args.hidden_size, @min(args.k_dim, args.emb_dim)));
+        const params: M94DsEngramParams = .{
+            .m = args.m,
+            .hidden_size = args.hidden_size,
+            .wkv_out_dim = args.wkv_out_dim,
+            .emb_dim = args.emb_dim,
+            .k_dim = args.k_dim,
+            .qk_dtype = @backingInt(args.qk_dtype),
+            .rms_eps = args.rms_eps,
+            .inv_sqrt_d = 1.0 / @sqrt(@as(f32, @floatFromInt(norm_d))),
+        };
+        const sb: usize = if (args.stream_dtype == .bf16) 1 else 0;
+        try frame.encodeThreadgroups(
+            self.m94_ds_engram_gate_add[sb],
+            &.{
+                args.streams,
+                args.wkv_out,
+                args.emb_in,
+                args.q_weight,
+                args.k_weight,
+            },
+            std.mem.asBytes(&params),
+            .{ 4, args.m, 1 },
             .{ 256, 1, 1 },
             insert_barrier_before,
         );
@@ -7365,7 +8123,7 @@ pub const G26MoeRouteSigmoidParams = extern struct {
     down_groups_x_q8: u32,
     routed_scaling_factor: f32,
     group_score_topk: u32 = 2,
-    _pad0: u32 = 0,
+    score_mode: u32 = 0,
     _pad1: u32 = 0,
     _pad2: u32 = 0,
 
@@ -7401,6 +8159,8 @@ pub const G26MoeRouteSigmoidArgs = struct {
     n_group: u32 = 1,
     topk_group: u32 = 1,
     group_score_topk: u32 = 2,
+    /// `0 = sigmoid` (MiMo/GLM/Ling), `1 = sqrt(softplus(x))` (DeepSeek-V4.1).
+    score_mode: u32 = 0,
     routed_scaling_factor: f32 = 1.0,
     gate_up_groups_x_q: u32,
     gate_up_groups_x_f: u32,
@@ -7435,6 +8195,569 @@ pub const G26TapRingCaptureArgs = struct {
     tap_idx: u32 = 0,
     src_stride_rows: u32 = 0,
     accepted_nodes: ?[]const u16 = null,
+};
+
+// ===========================================================================
+// M9.4 Parameter Payloads and Argument Structs (`Qwen3.8-Flash-Next` &
+// `DeepSeek-V4.1-Flash-1017` Real-HF Operators)
+// ===========================================================================
+
+pub const M94HcNormParams = extern struct {
+    m: u32,
+    num_groups: u32,
+    group_size: u32,
+    w_dtype: u32,
+    unit_offset: u32,
+    rms_eps: f32,
+    _pad0: u32 = 0,
+    _pad1: u32 = 0,
+
+    comptime {
+        if (@sizeOf(M94HcNormParams) != 32) @compileError("M94HcNormParams must be 32 bytes");
+    }
+};
+
+pub const M94HcNormArgs = struct {
+    x: metal.BufferBinding,
+    w: metal.BufferBinding,
+    y: metal.BufferBinding,
+    m: u32,
+    num_groups: u32,
+    group_size: u32,
+    w_dtype: ScalarDType = .bf16,
+    unit_offset: bool = true,
+    rms_eps: f32 = 1e-6,
+};
+
+pub const M94ScaleSiluParams = extern struct {
+    count: u32,
+    scale: f32,
+    _pad0: u32 = 0,
+    _pad1: u32 = 0,
+
+    comptime {
+        if (@sizeOf(M94ScaleSiluParams) != 16) @compileError("M94ScaleSiluParams must be 16 bytes");
+    }
+};
+
+pub const M94HcMixParams = extern struct {
+    m: u32,
+    hc_count: u32,
+    hidden_size: u32,
+    has_inj: u32,
+    inv_hc_count: f32,
+    _pad0: u32 = 0,
+    _pad1: u32 = 0,
+    _pad2: u32 = 0,
+
+    comptime {
+        if (@sizeOf(M94HcMixParams) != 32) @compileError("M94HcMixParams must be 32 bytes");
+    }
+};
+
+pub const M94HcMixArgs = struct {
+    h_normed: metal.BufferBinding,
+    w_mix: metal.BufferBinding,
+    inj_raw: ?metal.BufferBinding = null,
+    mixed_out: metal.BufferBinding,
+    inj_out: ?metal.BufferBinding = null,
+    m: u32,
+    hc_count: u32 = 4,
+    hidden_size: u32,
+};
+
+pub const M94HcInjectParams = extern struct {
+    m: u32,
+    hc_count: u32,
+    hidden_size: u32,
+    _pad0: u32 = 0,
+
+    comptime {
+        if (@sizeOf(M94HcInjectParams) != 16) @compileError("M94HcInjectParams must be 16 bytes");
+    }
+};
+
+pub const M94HcInjectArgs = struct {
+    h_streams: metal.BufferBinding,
+    sub_out: metal.BufferBinding,
+    inj: metal.BufferBinding,
+    m: u32,
+    hc_count: u32 = 4,
+    hidden_size: u32,
+};
+
+pub const M94PleGateParams = extern struct {
+    m: u32,
+    hc_count: u32,
+    hidden_size: u32,
+    norm_dtype: u32,
+    rms_eps: f32,
+    inv_sqrt_h: f32,
+    _pad0: u32 = 0,
+    _pad1: u32 = 0,
+
+    comptime {
+        if (@sizeOf(M94PleGateParams) != 32) @compileError("M94PleGateParams must be 32 bytes");
+    }
+};
+
+pub const M94PleGateArgs = struct {
+    h_streams: metal.BufferBinding,
+    k_raw: metal.BufferBinding,
+    value_in: metal.BufferBinding,
+    norm_key_w: metal.BufferBinding,
+    norm_query_w: metal.BufferBinding,
+    norm_conv_w: metal.BufferBinding,
+    gv_out: metal.BufferBinding,
+    gv_normed_out: metal.BufferBinding,
+    m: u32,
+    hc_count: u32 = 4,
+    hidden_size: u32,
+    norm_dtype: ScalarDType = .bf16,
+    rms_eps: f32 = 1e-6,
+};
+
+pub const M94PleConvParams = extern struct {
+    m: u32,
+    channels: u32,
+    kernel_size: u32,
+    dilation: u32,
+    state_len: u32,
+    w_dtype: u32,
+    is_tree: u32,
+    _pad0: u32 = 0,
+
+    comptime {
+        if (@sizeOf(M94PleConvParams) != 32) @compileError("M94PleConvParams must be 32 bytes");
+    }
+};
+
+pub const M94PleConvArgs = struct {
+    h_streams: metal.BufferBinding,
+    gv_in: metal.BufferBinding,
+    gv_normed: metal.BufferBinding,
+    conv_w: metal.BufferBinding,
+    conv_state_in: metal.BufferBinding,
+    ancestor_masks: ?metal.BufferBinding = null,
+    m: u32,
+    channels: u32,
+    kernel_size: u32 = 4,
+    dilation: u32 = 3,
+    w_dtype: ScalarDType = .bf16,
+    is_tree: bool = false,
+};
+
+pub const M94PleConvCommitParams = extern struct {
+    channels: u32,
+    state_len: u32,
+    accepted_count: u32,
+    _pad0: u32 = 0,
+    inline_nodes: [MAX_TREE_NODES]u16 = @splat(0),
+
+    comptime {
+        if (@sizeOf(M94PleConvCommitParams) != 144) @compileError("M94PleConvCommitParams must be 144 bytes");
+    }
+};
+
+pub const M94PleConvCommitArgs = struct {
+    gv_normed: metal.BufferBinding,
+    conv_state: metal.BufferBinding,
+    accepted_nodes: []const u16,
+    channels: u32,
+    state_len: u32 = 9,
+};
+
+pub const M94QsaIdxPrepParams = extern struct {
+    num_tokens: u32,
+    idx_n_heads: u32,
+    idx_head_dim: u32,
+    rotary_dim: u32,
+    start_pos: u32,
+    use_positions_3d: u32,
+    write_raw_to_cache: u32,
+    mrope_s0: u32,
+    mrope_s1: u32,
+    mrope_s2: u32,
+    norm_dtype: u32,
+    unit_offset: u32,
+    rms_eps: f32,
+    rope_theta: f32,
+    yarn_factor: f32,
+    yarn_mscale: f32,
+    yarn_beta_fast: f32,
+    yarn_beta_slow: f32,
+    original_max_pos: u32,
+    _pad0: u32 = 0,
+
+    comptime {
+        if (@sizeOf(M94QsaIdxPrepParams) != 80) @compileError("M94QsaIdxPrepParams must be 80 bytes");
+    }
+};
+
+pub const M94QsaIdxPrepArgs = struct {
+    qk_in: metal.BufferBinding,
+    q_norm: metal.BufferBinding,
+    positions_3d: ?metal.BufferBinding = null,
+    q_idx_out: metal.BufferBinding,
+    raw_k_dst: metal.BufferBinding,
+    num_tokens: u32,
+    idx_n_heads: u32,
+    idx_head_dim: u32,
+    rotary_dim: u32 = 0,
+    start_pos: u32,
+    write_raw_to_cache: bool = true,
+    mrope: MropeSection,
+    yarn: YarnConfig = .{},
+    norm_dtype: ScalarDType = .bf16,
+    unit_offset: bool = true,
+    rms_eps: f32 = 1e-6,
+    rope_theta: f32 = 10_000.0,
+};
+
+pub const M94QsaIdxPoolParams = extern struct {
+    start_block: u32,
+    num_blocks: u32,
+    compress_ratio: u32,
+    idx_head_dim: u32,
+    rotary_dim: u32,
+    mrope_s0: u32,
+    mrope_s1: u32,
+    mrope_s2: u32,
+    norm_dtype: u32,
+    unit_offset: u32,
+    rms_eps: f32,
+    rope_theta: f32,
+    yarn_factor: f32,
+    yarn_mscale: f32,
+    yarn_beta_fast: f32,
+    yarn_beta_slow: f32,
+    original_max_pos: u32,
+    _pad0: u32 = 0,
+    _pad1: u32 = 0,
+    _pad2: u32 = 0,
+
+    comptime {
+        if (@sizeOf(M94QsaIdxPoolParams) != 80) @compileError("M94QsaIdxPoolParams must be 80 bytes");
+    }
+};
+
+pub const M94QsaIdxPoolArgs = struct {
+    raw_k_cache: metal.BufferBinding,
+    k_norm: metal.BufferBinding,
+    pooled_k_cache: metal.BufferBinding,
+    start_block: u32,
+    num_blocks: u32,
+    compress_ratio: u32 = 4,
+    idx_head_dim: u32,
+    rotary_dim: u32 = 0,
+    mrope: MropeSection,
+    yarn: YarnConfig = .{},
+    norm_dtype: ScalarDType = .bf16,
+    unit_offset: bool = true,
+    rms_eps: f32 = 1e-6,
+    rope_theta: f32 = 10_000.0,
+};
+
+pub const M94QsaIdxSelectParams = extern struct {
+    num_nodes: u32,
+    idx_n_heads: u32,
+    idx_head_dim: u32,
+    num_kv_heads: u32,
+    kv_len: u32,
+    compress_ratio: u32,
+    block_topk: u32,
+    top_k_blocks_cap: u32,
+    causal_q_start_pos: u32,
+    inv_sqrt_d: f32,
+    _pad0: u32 = 0,
+    _pad1: u32 = 0,
+
+    comptime {
+        if (@sizeOf(M94QsaIdxSelectParams) != 48) @compileError("M94QsaIdxSelectParams must be 48 bytes");
+    }
+};
+
+pub const M94QsaIdxSelectArgs = struct {
+    q_idx: metal.BufferBinding,
+    pooled_k_cache: metal.BufferBinding,
+    index_buf: *const QsaIndexBuffer,
+    index_metal_buf: metal.Buffer,
+    num_nodes: u32,
+    idx_n_heads: u32,
+    idx_head_dim: u32,
+    num_kv_heads: u32,
+    kv_len: u32,
+    compress_ratio: u32 = 4,
+    block_topk: u32,
+    causal_q_start_pos: ?u32 = null,
+};
+
+pub const M94MhcInitParams = extern struct {
+    m: u32,
+    hc_mult: u32,
+    _pad0: u32 = 0,
+    _pad1: u32 = 0,
+
+    comptime {
+        if (@sizeOf(M94MhcInitParams) != 16) @compileError("M94MhcInitParams must be 16 bytes");
+    }
+};
+
+pub const M94MhcPreSinkhornHandoffArgs = struct {
+    streams: metal.BufferBinding,
+    fn_w: metal.BufferBinding,
+    base_w: metal.BufferBinding,
+    scale_w: metal.BufferBinding,
+    norm_w: ?metal.BufferBinding = null,
+    branch_out: metal.BufferBinding,
+    coeffs_out: metal.BufferBinding,
+    pre_mix_in: metal.BufferBinding,
+    pre_mix_out: metal.BufferBinding,
+    m: u32,
+    hidden_size: u32,
+    sinkhorn_iters: u32 = 20,
+    stream_dtype: quant.FloatDType = .f16,
+    act_dtype: quant.FloatDType = .f16,
+    fn_dtype: ScalarDType = .bf16,
+    norm_dtype: ScalarDType = .bf16,
+    rms_eps: f32 = 1e-20,
+    hc_eps: f32 = 1e-6,
+};
+
+pub const M94MhcCollapseParams = extern struct {
+    m: u32,
+    hidden_size: u32,
+    has_norm_w: u32,
+    norm_dtype: u32,
+    rms_eps: f32,
+    _pad0: u32 = 0,
+    _pad1: u32 = 0,
+    _pad2: u32 = 0,
+
+    comptime {
+        if (@sizeOf(M94MhcCollapseParams) != 32) @compileError("M94MhcCollapseParams must be 32 bytes");
+    }
+};
+
+pub const M94MhcCollapseArgs = struct {
+    streams: metal.BufferBinding,
+    pre_mix: metal.BufferBinding,
+    norm_w: ?metal.BufferBinding = null,
+    out: metal.BufferBinding,
+    m: u32,
+    hidden_size: u32,
+    stream_dtype: quant.FloatDType = .f16,
+    norm_dtype: ScalarDType = .bf16,
+    rms_eps: f32 = 1e-20,
+};
+
+pub const M94RopeComplexParams = extern struct {
+    num_tokens: u32,
+    num_heads: u32,
+    head_stride: u32,
+    rot_offset: u32,
+    rot_dim: u32,
+    base_pos: u32,
+    use_pos_buf: u32,
+    inverse: u32,
+    pos_stride: u32,
+    original_seq_len: u32,
+    rope_theta: f32,
+    rope_factor: f32,
+    beta_fast: f32,
+    beta_slow: f32,
+    _pad0: u32 = 0,
+    _pad1: u32 = 0,
+
+    comptime {
+        if (@sizeOf(M94RopeComplexParams) != 64) @compileError("M94RopeComplexParams must be 64 bytes");
+    }
+};
+
+pub const M94RopeComplexArgs = struct {
+    x: metal.BufferBinding,
+    positions: ?metal.BufferBinding = null,
+    num_tokens: u32,
+    num_heads: u32,
+    head_stride: u32,
+    rot_offset: u32,
+    rot_dim: u32,
+    base_pos: u32 = 0,
+    inverse: bool = false,
+    pos_stride: u32 = 1,
+    original_seq_len: u32 = 0,
+    rope_theta: f32 = 10_000.0,
+    rope_factor: f32 = 1.0,
+    beta_fast: f32 = 32.0,
+    beta_slow: f32 = 1.0,
+};
+
+pub const M94DsCompressorParams = extern struct {
+    num_tokens: u32,
+    start_pos: u32,
+    head_dim: u32,
+    ratio: u32,
+    gate_dim: u32,
+    norm_dtype: u32,
+    rms_eps: f32,
+    write_state: u32,
+    out_count: u32,
+    _pad0: u32 = 0,
+    _pad1: u32 = 0,
+    _pad2: u32 = 0,
+
+    comptime {
+        if (@sizeOf(M94DsCompressorParams) != 48) @compileError("M94DsCompressorParams must be 48 bytes");
+    }
+};
+
+pub const M94DsCompressorArgs = struct {
+    kv_in: metal.BufferBinding,
+    gate_in: metal.BufferBinding,
+    norm_w: metal.BufferBinding,
+    kv_state: metal.BufferBinding,
+    score_state: metal.BufferBinding,
+    latent_out: metal.BufferBinding,
+    num_tokens: u32,
+    start_pos: u32,
+    head_dim: u32,
+    ratio: u32,
+    gate_dim: u32,
+    norm_dtype: ScalarDType = .bf16,
+    rms_eps: f32 = 1e-20,
+    write_state: bool = true,
+};
+
+pub const M94DsIndexerParams = extern struct {
+    num_tokens: u32,
+    start_pos: u32,
+    idx_n_heads: u32,
+    idx_head_dim: u32,
+    ratio: u32,
+    total_comp_len: u32,
+    index_topk: u32,
+    offset: u32,
+    is_candidate_source: u32,
+    uses_candidates: u32,
+    cand_topk_blocks: u32,
+    cand_block_size: u32,
+    cand_num_blocks: u32,
+    weight_scale: f32,
+    is_causal_prefill: u32,
+    _pad0: u32 = 0,
+
+    comptime {
+        if (@sizeOf(M94DsIndexerParams) != 64) @compileError("M94DsIndexerParams must be 64 bytes");
+    }
+};
+
+pub const M94DsIndexerArgs = struct {
+    q_idx: metal.BufferBinding,
+    index_k_cache: metal.BufferBinding,
+    weights: metal.BufferBinding,
+    candidate_mask: ?metal.BufferBinding = null,
+    topk_idxs_out: metal.BufferBinding,
+    scores_scratch: metal.BufferBinding,
+    num_tokens: u32,
+    start_pos: u32,
+    idx_n_heads: u32,
+    idx_head_dim: u32,
+    ratio: u32,
+    total_comp_len: u32,
+    index_topk: u32,
+    offset: u32 = 0,
+    is_candidate_source: bool = false,
+    uses_candidates: bool = false,
+    cand_topk_blocks: u32 = 2048,
+    cand_block_size: u32 = 8,
+    cand_num_blocks: u32 = 0,
+    is_causal_prefill: bool = false,
+};
+
+pub const M94DsLatentAttnParams = extern struct {
+    num_q: u32,
+    n_heads: u32,
+    q_head_dim: u32,
+    kv_dim: u32,
+    v_head_dim: u32,
+    nope_dim: u32,
+    rope_dim: u32,
+    window_size: u32,
+    start_pos: u32,
+    has_compress: u32,
+    compress_topk: u32,
+    has_sink: u32,
+    is_tree: u32,
+    apply_inv_rope: u32,
+    original_seq_len: u32,
+    scale: f32,
+    rope_theta: f32,
+    rope_factor: f32,
+    beta_fast: f32,
+    beta_slow: f32,
+
+    comptime {
+        if (@sizeOf(M94DsLatentAttnParams) != 80) @compileError("M94DsLatentAttnParams must be 80 bytes");
+    }
+};
+
+pub const M94DsLatentAttnArgs = struct {
+    q: metal.BufferBinding,
+    win_kv_cache: metal.BufferBinding,
+    win_kv_cur: metal.BufferBinding,
+    comp_kv_cache: ?metal.BufferBinding = null,
+    topk_idxs: ?metal.BufferBinding = null,
+    attn_sink: ?metal.BufferBinding = null,
+    ancestor_masks: ?metal.BufferBinding = null,
+    out: metal.BufferBinding,
+    num_q: u32,
+    n_heads: u32,
+    q_head_dim: u32,
+    kv_dim: u32,
+    v_head_dim: u32,
+    nope_dim: u32,
+    rope_dim: u32,
+    window_size: u32,
+    start_pos: u32,
+    compress_topk: u32 = 0,
+    apply_inv_rope: bool = true,
+    original_seq_len: u32 = 0,
+    scale: ?f32 = null,
+    rope_theta: f32 = 10_000.0,
+    rope_factor: f32 = 1.0,
+    beta_fast: f32 = 32.0,
+    beta_slow: f32 = 1.0,
+};
+
+pub const M94DsEngramParams = extern struct {
+    m: u32,
+    hidden_size: u32,
+    wkv_out_dim: u32,
+    emb_dim: u32,
+    k_dim: u32,
+    qk_dtype: u32,
+    rms_eps: f32,
+    inv_sqrt_d: f32,
+
+    comptime {
+        if (@sizeOf(M94DsEngramParams) != 32) @compileError("M94DsEngramParams must be 32 bytes");
+    }
+};
+
+pub const M94DsEngramArgs = struct {
+    streams: metal.BufferBinding,
+    wkv_out: metal.BufferBinding,
+    emb_in: metal.BufferBinding,
+    q_weight: metal.BufferBinding,
+    k_weight: metal.BufferBinding,
+    m: u32,
+    hidden_size: u32,
+    wkv_out_dim: u32,
+    emb_dim: u32,
+    k_dim: u32,
+    stream_dtype: quant.FloatDType = .f16,
+    qk_dtype: ScalarDType = .bf16,
+    rms_eps: f32 = 1e-20,
 };
 
 // ===========================================================================
@@ -14390,5 +15713,558 @@ test "M9.3 G28: ami_g28_mla_full_attend + ami_g28_mla_out_gate (head_wise & elem
                 try std.testing.expectApproxEqAbs(acc, @as(f32, @floatCast(out_h[hd * kv_rank + d])), 3e-3);
             }
         }
+    }
+}
+
+test "M9.4 Qwen3.8 real-HF GPU ops (HC norm/mix/inject, GDN sigmoid gate, PLE gate+dilated conv1d) match CPU fp32 ref" {
+    const device = try metal.Device.open();
+    defer device.close();
+    const lib = try metal.Library.openEmbedded(device);
+    defer lib.close();
+    var compute = try metal.Compute.init(device);
+    defer compute.close();
+    const pipes = try HybridPipelines.init(device, lib);
+    defer pipes.close();
+
+    const arena_cap = try page.alignUp(1024 * 1024);
+    const budget = budget_mod.Budget.compute(.{
+        .memory_bytes = arena_cap + 4 * page.APPLE_PAGE_SIZE,
+        .user_wire_limit = arena_cap,
+        .global_user_wire_limit = arena_cap,
+        .gpu_working_set_bytes = arena_cap,
+        .configured_cap = null,
+        .headroom_bytes = page.APPLE_PAGE_SIZE,
+    });
+    var arena = try arena_mod.WiredArena.init(arena_cap, budget);
+    defer arena.deinit();
+    const buf = try metal.Buffer.wrap(device, arena.bytes());
+    defer buf.close();
+    try compute.makeResident(&.{buf});
+    defer compute.removeResident(&.{buf}) catch unreachable;
+
+    const bind = struct {
+        fn call(b: metal.Buffer, a: *const arena_mod.WiredArena, ptr: [*]const u8) metal.BufferBinding {
+            return .{ .buffer = b, .offset = a.offsetOf(ptr) };
+        }
+    }.call;
+
+    const m: u32 = 6;
+    const hc: u32 = 4;
+    const h: u32 = 64;
+    const total_hc = hc * h;
+
+    const h_raw = try arena.allocAligned(m * total_hc * 2, 64);
+    const hn_raw = try arena.allocAligned(m * total_hc * 2, 64);
+    const nw_raw = try arena.allocAligned(total_hc * 2, 64);
+    const wmix_raw = try arena.allocAligned(m * total_hc * 2, 64);
+    const inj_in_raw = try arena.allocAligned(m * hc * 2, 64);
+    const mixed_raw = try arena.allocAligned(m * h * 2, 64);
+    const inj_out_raw = try arena.allocAligned(m * hc * 4, 64);
+    const sub_raw = try arena.allocAligned(m * h * 2, 64);
+
+    const h_s: []f16 = @alignCast(std.mem.bytesAsSlice(f16, h_raw));
+    const hn_s: []f16 = @alignCast(std.mem.bytesAsSlice(f16, hn_raw));
+    const nw_s: []u16 = @alignCast(std.mem.bytesAsSlice(u16, nw_raw));
+    const wmix_s: []f16 = @alignCast(std.mem.bytesAsSlice(f16, wmix_raw));
+    const inj_in_s: []f16 = @alignCast(std.mem.bytesAsSlice(f16, inj_in_raw));
+    const mixed_s: []f16 = @alignCast(std.mem.bytesAsSlice(f16, mixed_raw));
+    const inj_out_s: []f32 = @alignCast(std.mem.bytesAsSlice(f32, inj_out_raw));
+    const sub_s: []f16 = @alignCast(std.mem.bytesAsSlice(f16, sub_raw));
+
+    var h_init: [m * total_hc]f32 = undefined;
+    for (0..m * total_hc) |i| {
+        const v: f32 = @sin(@as(f32, @floatFromInt(i + 1)) * 0.13) * 0.7;
+        h_s[i] = @floatCast(v);
+        h_init[i] = @floatCast(h_s[i]);
+        wmix_s[i] = @floatCast(@cos(@as(f32, @floatFromInt(i + 3)) * 0.17) * 1.1);
+    }
+    for (0..total_hc) |i| {
+        nw_s[i] = quant.f32ToBf16(@sin(@as(f32, @floatFromInt(i + 7)) * 0.09) * 0.25);
+    }
+    for (0..m * hc) |i| {
+        inj_in_s[i] = @floatCast(@sin(@as(f32, @floatFromInt(i + 11)) * 0.31) * 1.5);
+    }
+    for (0..m * h) |i| {
+        sub_s[i] = @floatCast(@cos(@as(f32, @floatFromInt(i + 5)) * 0.21) * 0.5);
+    }
+
+    // 1. Run `hc_norm` -> `hc_mix_reduce` -> `hc_inject` on GPU.
+    {
+        var frame = try compute.beginFrame(5000);
+        errdefer frame.abort();
+        try pipes.encodeQwen4HcNorm(&frame, .{
+            .x = bind(buf, &arena, h_raw.ptr),
+            .w = bind(buf, &arena, nw_raw.ptr),
+            .y = bind(buf, &arena, hn_raw.ptr),
+            .m = m,
+            .num_groups = hc,
+            .group_size = h,
+            .w_dtype = .bf16,
+            .unit_offset = true,
+            .rms_eps = 1e-6,
+        }, false);
+        try pipes.encodeQwen4HcMixReduce(&frame, .{
+            .h_normed = bind(buf, &arena, hn_raw.ptr),
+            .w_mix = bind(buf, &arena, wmix_raw.ptr),
+            .inj_raw = bind(buf, &arena, inj_in_raw.ptr),
+            .mixed_out = bind(buf, &arena, mixed_raw.ptr),
+            .inj_out = bind(buf, &arena, inj_out_raw.ptr),
+            .m = m,
+            .hc_count = hc,
+            .hidden_size = h,
+        }, true);
+        try pipes.encodeQwen4HcInject(&frame, .{
+            .h_streams = bind(buf, &arena, h_raw.ptr),
+            .sub_out = bind(buf, &arena, sub_raw.ptr),
+            .inj = bind(buf, &arena, inj_out_raw.ptr),
+            .m = m,
+            .hc_count = hc,
+            .hidden_size = h,
+        }, true);
+        const sig = try frame.commit();
+        try compute.wait(sig, 5000);
+    }
+
+    // CPU fp32 reference for HC norm, mix_reduce, and post-inject (`cos_sim >= 0.9999`).
+    var dot_ab: f64 = 0.0;
+    var na: f64 = 0.0;
+    var nb: f64 = 0.0;
+    for (0..m) |tok| {
+        var hn_ref: [total_hc]f32 = undefined;
+        for (0..hc) |b| {
+            var sq: f32 = 0.0;
+            for (0..h) |d| {
+                const v = h_init[tok * total_hc + b * h + d];
+                sq += v * v;
+            }
+            const inv_r = 1.0 / @sqrt(sq / @as(f32, @floatFromInt(h)) + 1e-6);
+            for (0..h) |d| {
+                const wt = 1.0 + quant.bf16ToF32(nw_s[b * h + d]);
+                hn_ref[b * h + d] = (h_init[tok * total_hc + b * h + d] * inv_r) * wt;
+                try std.testing.expectApproxEqAbs(hn_ref[b * h + d], @as(f32, @floatCast(hn_s[tok * total_hc + b * h + d])), 3e-3);
+            }
+        }
+        for (0..h) |d| {
+            var acc: f32 = 0.0;
+            for (0..hc) |b| {
+                const wm: f32 = @floatCast(wmix_s[tok * total_hc + b * h + d]);
+                acc += sigmoidF32(wm) * hn_ref[b * h + d];
+            }
+            const ref_m = acc * 0.25;
+            const got_m: f32 = @floatCast(mixed_s[tok * h + d]);
+            dot_ab += @as(f64, ref_m) * @as(f64, got_m);
+            na += @as(f64, ref_m) * @as(f64, ref_m);
+            nb += @as(f64, got_m) * @as(f64, got_m);
+        }
+        for (0..hc) |b| {
+            const ref_inj = 2.0 * sigmoidF32(@as(f32, @floatCast(inj_in_s[tok * hc + b])) * 0.25);
+            try std.testing.expectApproxEqAbs(ref_inj, inj_out_s[tok * hc + b], 1e-4);
+            for (0..h) |d| {
+                const ref_h = h_init[tok * total_hc + b * h + d] + ref_inj * @as(f32, @floatCast(sub_s[tok * h + d]));
+                const got_h: f32 = @floatCast(h_s[tok * total_hc + b * h + d]);
+                dot_ab += @as(f64, ref_h) * @as(f64, got_h);
+                na += @as(f64, ref_h) * @as(f64, ref_h);
+                nb += @as(f64, got_h) * @as(f64, got_h);
+            }
+        }
+    }
+    try std.testing.expect(dot_ab / @sqrt(na * nb) >= 0.9999);
+
+    // 2. PLE stream gate + causal dilated Conv1D (`K=4, dilation=3, state_len=9`): sequential vs tree parity!
+    const ple_k_raw = try arena.allocAligned(m * total_hc * 2, 64);
+    const ple_v_raw = try arena.allocAligned(m * h * 2, 64);
+    const ple_gv_raw = try arena.allocAligned(m * total_hc * 2, 64);
+    const ple_gvn_raw = try arena.allocAligned(m * total_hc * 2, 64);
+    const ple_cw_raw = try arena.allocAligned(total_hc * 4 * 2, 64);
+    const ple_cs_raw = try arena.allocAligned(9 * total_hc * 2, 64);
+    const h_seq_raw = try arena.allocAligned(m * total_hc * 2, 64);
+    const h_tree_raw = try arena.allocAligned(m * total_hc * 2, 64);
+    const masks_raw = try arena.allocAligned(m * 8, 64);
+
+    const ple_k_s: []f16 = @alignCast(std.mem.bytesAsSlice(f16, ple_k_raw));
+    const ple_v_s: []f16 = @alignCast(std.mem.bytesAsSlice(f16, ple_v_raw));
+    const ple_cw_s: []u16 = @alignCast(std.mem.bytesAsSlice(u16, ple_cw_raw));
+    const ple_cs_s: []f16 = @alignCast(std.mem.bytesAsSlice(f16, ple_cs_raw));
+    const h_seq_s: []f16 = @alignCast(std.mem.bytesAsSlice(f16, h_seq_raw));
+    const h_tree_s: []f16 = @alignCast(std.mem.bytesAsSlice(f16, h_tree_raw));
+    const masks_s: []u64 = @alignCast(std.mem.bytesAsSlice(u64, masks_raw));
+
+    for (0..m * total_hc) |i| {
+        ple_k_s[i] = @floatCast(@sin(@as(f32, @floatFromInt(i + 2)) * 0.19) * 0.8);
+        h_seq_s[i] = h_s[i];
+        h_tree_s[i] = h_s[i];
+    }
+    for (0..m * h) |i| ple_v_s[i] = @floatCast(@cos(@as(f32, @floatFromInt(i + 9)) * 0.11) * 0.6);
+    for (0..total_hc * 4) |i| ple_cw_s[i] = quant.f32ToBf16(@sin(@as(f32, @floatFromInt(i + 1)) * 0.07) * 0.3);
+    for (0..9 * total_hc) |i| ple_cs_s[i] = @floatCast(@cos(@as(f32, @floatFromInt(i + 4)) * 0.05) * 0.2);
+    for (0..m) |i| masks_s[i] = (@as(u64, 1) << @intCast(i + 1)) - 1;
+
+    {
+        var frame = try compute.beginFrame(5000);
+        errdefer frame.abort();
+        try pipes.encodeQwen4PleGate(&frame, .{
+            .h_streams = bind(buf, &arena, h_seq_raw.ptr),
+            .k_raw = bind(buf, &arena, ple_k_raw.ptr),
+            .value_in = bind(buf, &arena, ple_v_raw.ptr),
+            .norm_key_w = bind(buf, &arena, nw_raw.ptr),
+            .norm_query_w = bind(buf, &arena, nw_raw.ptr),
+            .norm_conv_w = bind(buf, &arena, nw_raw.ptr),
+            .gv_out = bind(buf, &arena, ple_gv_raw.ptr),
+            .gv_normed_out = bind(buf, &arena, ple_gvn_raw.ptr),
+            .m = m,
+            .hc_count = hc,
+            .hidden_size = h,
+            .norm_dtype = .bf16,
+            .rms_eps = 1e-6,
+        }, false);
+        try pipes.encodeQwen4PleDilatedConvAdd(&frame, .{
+            .h_streams = bind(buf, &arena, h_seq_raw.ptr),
+            .gv_in = bind(buf, &arena, ple_gv_raw.ptr),
+            .gv_normed = bind(buf, &arena, ple_gvn_raw.ptr),
+            .conv_w = bind(buf, &arena, ple_cw_raw.ptr),
+            .conv_state_in = bind(buf, &arena, ple_cs_raw.ptr),
+            .m = m,
+            .channels = total_hc,
+            .kernel_size = 4,
+            .dilation = 3,
+            .w_dtype = .bf16,
+            .is_tree = false,
+        }, true);
+        try pipes.encodeQwen4PleDilatedConvAdd(&frame, .{
+            .h_streams = bind(buf, &arena, h_tree_raw.ptr),
+            .gv_in = bind(buf, &arena, ple_gv_raw.ptr),
+            .gv_normed = bind(buf, &arena, ple_gvn_raw.ptr),
+            .conv_w = bind(buf, &arena, ple_cw_raw.ptr),
+            .conv_state_in = bind(buf, &arena, ple_cs_raw.ptr),
+            .ancestor_masks = bind(buf, &arena, masks_raw.ptr),
+            .m = m,
+            .channels = total_hc,
+            .kernel_size = 4,
+            .dilation = 3,
+            .w_dtype = .bf16,
+            .is_tree = true,
+        }, true);
+        const sig = try frame.commit();
+        try compute.wait(sig, 5000);
+    }
+    try std.testing.expectEqualSlices(f16, h_seq_s, h_tree_s);
+}
+
+test "M9.4 DeepSeek-V4.1 real-HF GPU ops (sqrtsoftplus router, mHC pre_mix handoff, complex RoPE, latent attn+sink, Engram) match CPU fp32 ref" {
+    const device = try metal.Device.open();
+    defer device.close();
+    const lib = try metal.Library.openEmbedded(device);
+    defer lib.close();
+    var compute = try metal.Compute.init(device);
+    defer compute.close();
+    const pipes = try HybridPipelines.init(device, lib);
+    defer pipes.close();
+
+    const arena_cap = try page.alignUp(1024 * 1024);
+    const budget = budget_mod.Budget.compute(.{
+        .memory_bytes = arena_cap + 4 * page.APPLE_PAGE_SIZE,
+        .user_wire_limit = arena_cap,
+        .global_user_wire_limit = arena_cap,
+        .gpu_working_set_bytes = arena_cap,
+        .configured_cap = null,
+        .headroom_bytes = page.APPLE_PAGE_SIZE,
+    });
+    var arena = try arena_mod.WiredArena.init(arena_cap, budget);
+    defer arena.deinit();
+    const buf = try metal.Buffer.wrap(device, arena.bytes());
+    defer buf.close();
+    try compute.makeResident(&.{buf});
+    defer compute.removeResident(&.{buf}) catch unreachable;
+
+    const bind = struct {
+        fn call(b: metal.Buffer, a: *const arena_mod.WiredArena, ptr: [*]const u8) metal.BufferBinding {
+            return .{ .buffer = b, .offset = a.offsetOf(ptr) };
+        }
+    }.call;
+
+    // 1. `sqrtsoftplus` + `noaux_tc` router (`score_mode = 1`).
+    {
+        const m_r: u32 = 2;
+        const n_exp: u32 = 8;
+        const top_k: u32 = 2;
+        const scale_r: f32 = 1.5;
+
+        const logits_raw = try arena.allocAligned(m_r * n_exp * 4, 64);
+        const bias_raw = try arena.allocAligned(n_exp * 4, 64);
+        const sched_raw = try arena.allocAligned(128, 64);
+        const uniq_raw = try arena.allocAligned(n_exp * 4, 64);
+        const off_raw = try arena.allocAligned((n_exp + 1) * 4, 64);
+        const tok_raw = try arena.allocAligned(m_r * top_k * 4, 64);
+        const rw_raw = try arena.allocAligned(m_r * top_k * 4, 64);
+        const sk_raw = try arena.allocAligned(m_r * top_k * 4, 64);
+        const top_e_raw = try arena.allocAligned(m_r * top_k * 4, 64);
+        const top_w_raw = try arena.allocAligned(m_r * top_k * 4, 64);
+
+        const logits_s: []f32 = @alignCast(std.mem.bytesAsSlice(f32, logits_raw));
+        const bias_s: []f32 = @alignCast(std.mem.bytesAsSlice(f32, bias_raw));
+        const top_e_s: []u32 = @alignCast(std.mem.bytesAsSlice(u32, top_e_raw));
+        const top_w_s: []f32 = @alignCast(std.mem.bytesAsSlice(f32, top_w_raw));
+
+        for (0..m_r * n_exp) |i| logits_s[i] = @sin(@as(f32, @floatFromInt(i + 1)) * 0.9) * 2.0;
+        for (0..n_exp) |e| bias_s[e] = if (e == 5) 2.5 else -0.1 * @as(f32, @floatFromInt(e));
+
+        var frame = try compute.beginFrame(5000);
+        errdefer frame.abort();
+        try pipes.encodeG26MoeRouteSigmoid(&frame, .{
+            .logits = bind(buf, &arena, logits_raw.ptr),
+            .logits_f16 = false,
+            .bias = bind(buf, &arena, bias_raw.ptr),
+            .bias_dtype = .f32,
+            .sched_hdr = bind(buf, &arena, sched_raw.ptr),
+            .unique_experts = bind(buf, &arena, uniq_raw.ptr),
+            .expert_token_offsets = bind(buf, &arena, off_raw.ptr),
+            .token_indices = bind(buf, &arena, tok_raw.ptr),
+            .routing_weights = bind(buf, &arena, rw_raw.ptr),
+            .slot_k_indices = bind(buf, &arena, sk_raw.ptr),
+            .scratch_topk_experts = bind(buf, &arena, top_e_raw.ptr),
+            .scratch_topk_weights = bind(buf, &arena, top_w_raw.ptr),
+            .m = m_r,
+            .num_experts = n_exp,
+            .top_k = top_k,
+            .norm_topk_prob = true,
+            .score_mode = 1,
+            .routed_scaling_factor = scale_r,
+            .gate_up_groups_x_q = 1,
+            .gate_up_groups_x_f = 1,
+            .down_groups_x = 1,
+            .down_groups_x_q8 = 1,
+        }, false);
+        const sig = try frame.commit();
+        try compute.wait(sig, 5000);
+
+        for (0..m_r) |tok| {
+            var scores: [n_exp]f32 = undefined;
+            for (0..n_exp) |e| {
+                const raw = logits_s[tok * n_exp + e];
+                scores[e] = @sqrt(@log(1.0 + @exp(raw)));
+            }
+            var chosen: [top_k]u32 = undefined;
+            var picked: [n_exp]bool = @splat(false);
+            var wsum: f32 = 0.0;
+            for (0..top_k) |k| {
+                var best_c: f32 = -std.math.inf(f32);
+                var best_e: u32 = 0;
+                for (0..n_exp) |e| {
+                    if (picked[e]) continue;
+                    const ch = scores[e] + bias_s[e];
+                    if (ch > best_c) {
+                        best_c = ch;
+                        best_e = @intCast(e);
+                    }
+                }
+                picked[best_e] = true;
+                chosen[k] = best_e;
+                wsum += scores[best_e];
+            }
+            for (0..top_k) |k| {
+                try std.testing.expectEqual(chosen[k], top_e_s[tok * top_k + k]);
+                const exp_w = (scores[chosen[k]] / (wsum + 1e-20)) * scale_r;
+                try std.testing.expectApproxEqAbs(exp_w, top_w_s[tok * top_k + k], 1e-5);
+            }
+        }
+    }
+
+    // 2. Complex RoPE forward + inverse roundtrip + Latent Attention with `attn_sink` + fused inverse RoPE.
+    {
+        const num_q: u32 = 3;
+        const n_heads: u32 = 4;
+        const d_dim: u32 = 64;
+        const rd: u32 = 16;
+        const win: u32 = 16;
+
+        const q_raw = try arena.allocAligned(num_q * n_heads * d_dim * 2, 64);
+        const kv_cache_raw = try arena.allocAligned(win * d_dim * 2, 64);
+        const kv_cur_raw = try arena.allocAligned(num_q * d_dim * 2, 64);
+        const sink_raw = try arena.allocAligned(n_heads * 4, 64);
+        const out_raw = try arena.allocAligned(num_q * n_heads * d_dim * 2, 64);
+
+        const q_s: []f16 = @alignCast(std.mem.bytesAsSlice(f16, q_raw));
+        const kv_cur_s: []f16 = @alignCast(std.mem.bytesAsSlice(f16, kv_cur_raw));
+        const sink_s: []f32 = @alignCast(std.mem.bytesAsSlice(f32, sink_raw));
+        const out_s: []f16 = @alignCast(std.mem.bytesAsSlice(f16, out_raw));
+
+        @memset(kv_cache_raw, 0);
+        for (0..num_q * n_heads * d_dim) |i| q_s[i] = @floatCast(@sin(@as(f32, @floatFromInt(i + 1)) * 0.17) * 0.5);
+        for (0..num_q * d_dim) |i| kv_cur_s[i] = @floatCast(@cos(@as(f32, @floatFromInt(i + 3)) * 0.13) * 0.5);
+        for (0..n_heads) |hd| sink_s[hd] = -0.3 + 0.25 * @as(f32, @floatFromInt(hd));
+
+        var frame = try compute.beginFrame(5000);
+        errdefer frame.abort();
+        try pipes.encodeM94RopeComplex(&frame, .{
+            .x = bind(buf, &arena, q_raw.ptr),
+            .num_tokens = num_q,
+            .num_heads = n_heads,
+            .head_stride = d_dim,
+            .rot_offset = d_dim - rd,
+            .rot_dim = rd,
+            .base_pos = 0,
+            .inverse = false,
+            .rope_theta = 10_000.0,
+        }, false);
+        try pipes.encodeM94RopeComplex(&frame, .{
+            .x = bind(buf, &arena, kv_cur_raw.ptr),
+            .num_tokens = num_q,
+            .num_heads = 1,
+            .head_stride = d_dim,
+            .rot_offset = d_dim - rd,
+            .rot_dim = rd,
+            .base_pos = 0,
+            .inverse = false,
+            .rope_theta = 10_000.0,
+        }, false);
+        try pipes.encodeM94DsLatentAttn(&frame, .{
+            .q = bind(buf, &arena, q_raw.ptr),
+            .win_kv_cache = bind(buf, &arena, kv_cache_raw.ptr),
+            .win_kv_cur = bind(buf, &arena, kv_cur_raw.ptr),
+            .attn_sink = bind(buf, &arena, sink_raw.ptr),
+            .out = bind(buf, &arena, out_raw.ptr),
+            .num_q = num_q,
+            .n_heads = n_heads,
+            .q_head_dim = d_dim,
+            .kv_dim = d_dim,
+            .v_head_dim = d_dim,
+            .nope_dim = d_dim - rd,
+            .rope_dim = rd,
+            .window_size = win,
+            .start_pos = 0,
+            .apply_inv_rope = true,
+            .rope_theta = 10_000.0,
+        }, true);
+        const sig = try frame.commit();
+        try compute.wait(sig, 5000);
+
+        // Verify CPU reference with `attn_sink` + inverse complex RoPE (`cos_sim >= 0.9999`).
+        const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(d_dim)));
+        var dot_ab: f64 = 0.0;
+        var na: f64 = 0.0;
+        var nb: f64 = 0.0;
+        for (0..num_q) |qi| {
+            for (0..n_heads) |hd| {
+                var scores: [num_q]f32 = undefined;
+                var mx: f32 = -1e30;
+                for (0..qi + 1) |ki| {
+                    var dv: f32 = 0.0;
+                    for (0..d_dim) |d| {
+                        dv += @as(f32, @floatCast(q_s[(qi * n_heads + hd) * d_dim + d])) *
+                            @as(f32, @floatCast(kv_cur_s[ki * d_dim + d]));
+                    }
+                    scores[ki] = dv * scale;
+                    mx = @max(mx, scores[ki]);
+                }
+                const m_fin = @max(mx, sink_s[hd]);
+                var den: f32 = @exp(sink_s[hd] - m_fin);
+                var ref_o: [d_dim]f32 = @splat(0.0);
+                for (0..qi + 1) |ki| {
+                    const w = @exp(scores[ki] - m_fin);
+                    den += w;
+                    for (0..d_dim) |d| ref_o[d] += w * @as(f32, @floatCast(kv_cur_s[ki * d_dim + d]));
+                }
+                for (0..d_dim) |d| ref_o[d] /= den;
+                // Inverse complex RoPE on last `rd` dims.
+                const ro = d_dim - rd;
+                for (0..rd / 2) |j| {
+                    const inv_f = @exp(-@log(@as(f32, 10_000.0)) * (@as(f32, @floatFromInt(2 * j)) / @as(f32, @floatFromInt(rd))));
+                    const ang = @as(f32, @floatFromInt(qi)) * inv_f;
+                    const c = @cos(ang);
+                    const s = -@sin(ang);
+                    const x0 = ref_o[ro + 2 * j];
+                    const x1 = ref_o[ro + 2 * j + 1];
+                    ref_o[ro + 2 * j] = x0 * c - x1 * s;
+                    ref_o[ro + 2 * j + 1] = x1 * c + x0 * s;
+                }
+                for (0..d_dim) |d| {
+                    const got: f32 = @floatCast(out_s[(qi * n_heads + hd) * d_dim + d]);
+                    dot_ab += @as(f64, ref_o[d]) * @as(f64, got);
+                    na += @as(f64, ref_o[d]) * @as(f64, ref_o[d]);
+                    nb += @as(f64, got) * @as(f64, got);
+                }
+            }
+        }
+        try std.testing.expect(dot_ab / @sqrt(na * nb) >= 0.9999);
+    }
+
+    // 3. Real-HF DeepSeek-V4.1 `Engram` per-stream `rstd` signed-sqrt sigmoid gate.
+    {
+        const m_e: u32 = 2;
+        const h_e: u32 = 64;
+        const st_raw = try arena.allocAligned(m_e * 4 * h_e * 2, 64);
+        const wkv_raw = try arena.allocAligned(m_e * 5 * h_e * 2, 64);
+        const qw_raw = try arena.allocAligned(4 * h_e * 2, 64);
+        const kw_raw = try arena.allocAligned(4 * h_e * 2, 64);
+
+        const st_s: []f16 = @alignCast(std.mem.bytesAsSlice(f16, st_raw));
+        const wkv_s: []f16 = @alignCast(std.mem.bytesAsSlice(f16, wkv_raw));
+        const qw_s: []u16 = @alignCast(std.mem.bytesAsSlice(u16, qw_raw));
+        const kw_s: []u16 = @alignCast(std.mem.bytesAsSlice(u16, kw_raw));
+        var st_init: [m_e * 4 * h_e]f32 = undefined;
+
+        for (0..m_e * 4 * h_e) |i| {
+            st_s[i] = @floatCast(@sin(@as(f32, @floatFromInt(i + 3)) * 0.11) * 0.8);
+            st_init[i] = @floatCast(st_s[i]);
+        }
+        for (0..m_e * 5 * h_e) |i| wkv_s[i] = @floatCast(@cos(@as(f32, @floatFromInt(i + 5)) * 0.09) * 0.7);
+        for (0..4 * h_e) |i| {
+            qw_s[i] = quant.f32ToBf16(1.0 + 0.1 * @sin(@as(f32, @floatFromInt(i))));
+            kw_s[i] = quant.f32ToBf16(1.0 + 0.1 * @cos(@as(f32, @floatFromInt(i))));
+        }
+
+        var frame = try compute.beginFrame(5000);
+        errdefer frame.abort();
+        try pipes.encodeM94DsEngramGateAdd(&frame, .{
+            .streams = bind(buf, &arena, st_raw.ptr),
+            .wkv_out = bind(buf, &arena, wkv_raw.ptr),
+            .emb_in = bind(buf, &arena, wkv_raw.ptr),
+            .q_weight = bind(buf, &arena, qw_raw.ptr),
+            .k_weight = bind(buf, &arena, kw_raw.ptr),
+            .m = m_e,
+            .hidden_size = h_e,
+            .wkv_out_dim = 5 * h_e,
+            .emb_dim = h_e,
+            .k_dim = h_e,
+            .stream_dtype = .f16,
+            .qk_dtype = .bf16,
+            .rms_eps = 1e-20,
+        }, false);
+        const sig = try frame.commit();
+        try compute.wait(sig, 5000);
+
+        var dot_ab: f64 = 0.0;
+        var na: f64 = 0.0;
+        var nb: f64 = 0.0;
+        for (0..m_e) |tok| {
+            for (0..4) |s| {
+                var sq_h: f32 = 0.0;
+                var sq_k: f32 = 0.0;
+                var dot_p: f32 = 0.0;
+                for (0..h_e) |d| {
+                    const hv = st_init[(tok * 4 + s) * h_e + d];
+                    const kv: f32 = @floatCast(wkv_s[tok * 5 * h_e + s * h_e + d]);
+                    const qw = quant.bf16ToF32(qw_s[s * h_e + d]);
+                    const kw = quant.bf16ToF32(kw_s[s * h_e + d]);
+                    sq_h += hv * hv;
+                    sq_k += kv * kv;
+                    dot_p += hv * qw * kw * kv;
+                }
+                const rstd = (1.0 / @sqrt(sq_h / @as(f32, @floatFromInt(h_e)) + 1e-20)) *
+                    (1.0 / @sqrt(sq_k / @as(f32, @floatFromInt(h_e)) + 1e-20));
+                const dv = dot_p * rstd / @sqrt(@as(f32, @floatFromInt(h_e)));
+                const sgn: f32 = if (dv < 0.0) -1.0 else 1.0;
+                const gate = sigmoidF32(sgn * @sqrt(@max(@abs(dv), 1e-6)));
+                for (0..h_e) |d| {
+                    const vv: f32 = @floatCast(wkv_s[tok * 5 * h_e + 4 * h_e + d]);
+                    const ref_v = st_init[(tok * 4 + s) * h_e + d] + gate * vv;
+                    const got_v: f32 = @floatCast(st_s[(tok * 4 + s) * h_e + d]);
+                    dot_ab += @as(f64, ref_v) * @as(f64, got_v);
+                    na += @as(f64, ref_v) * @as(f64, ref_v);
+                    nb += @as(f64, got_v) * @as(f64, got_v);
+                }
+            }
+        }
+        try std.testing.expect(dot_ab / @sqrt(na * nb) >= 0.9999);
     }
 }

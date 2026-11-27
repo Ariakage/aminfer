@@ -38,6 +38,156 @@ pub const ENGRAM_MAX_HEADS: u8 = 8;
 pub const ENGRAM_MIN_ORDER: u8 = 2;
 pub const ENGRAM_MAX_ORDER: u8 = 5;
 
+/// Maximum per-token N-gram hash heads across Qwen3.8 PLE (16) & DeepSeek-V4.1 Engram (24).
+pub const PLE_MAX_NGRAM_HEADS: u8 = 32;
+pub const PLE_MAX_NGRAM_SIZE: usize = 8;
+
+/// Unpacks Wave 1's `[N, 2]u32` little-endian 64-bit integer buffer (`layer_mult`,
+/// `ngram_offsets`, `ngram_vocabs`) into `out[0..n]`.
+pub fn unpackU32PairsToU64(raw_bytes: []const u8, out: []u64) Error!void {
+    const need = std.math.mul(usize, out.len, 8) catch return error.Overflow;
+    if (raw_bytes.len < need) return error.BufferTooSmall;
+    for (0..out.len) |i| {
+        const lo: u64 = std.mem.readInt(u32, raw_bytes[i * 8 + 0 ..][0..4], .little);
+        const hi: u64 = std.mem.readInt(u32, raw_bytes[i * 8 + 4 ..][0..4], .little);
+        out[i] = lo | (hi << 32);
+    }
+}
+
+/// Exact `Qwen4ExpTextNGramEmbedding` (`modeling_qwen4_exp.py`) multi-head N-gram row IDs.
+///
+/// `token_window` holds the causal prefix ending at the current token (`token_window[len - 1]`).
+/// Implements `_shift_right_ignore_eos`: lookback stops at sequence start or any earlier
+/// `eos_token_id` (falling back to `eos_token_id`), then computes per-order XOR hashes:
+///   `mixed = (shifted[0] * mult[0]) ^ ... ^ (shifted[ngram - 1] * mult[ngram - 1])`
+///   `row_id[h] = (mixed % ngram_vocabs[h]) + ngram_offsets[h]`.
+pub fn computeQwen4PleRowIds(
+    token_window: []const u32,
+    eos_token_id: u32,
+    layer_mult: []const u64,
+    ngram_offsets: []const u64,
+    ngram_vocabs: []const u64,
+    total_rows: u64,
+    out_row_ids: []u64,
+) Error!void {
+    if (layer_mult.len < 2 or layer_mult.len > PLE_MAX_NGRAM_SIZE) return error.InvalidNgramOrder;
+    const ngram_size = layer_mult.len;
+    const num_orders = ngram_size - 1;
+    const num_heads = ngram_vocabs.len;
+    if (num_heads == 0 or num_heads != ngram_offsets.len or out_row_ids.len < num_heads) {
+        return error.InvalidEngramHeads;
+    }
+    if ((num_heads % num_orders) != 0) return error.InvalidEngramHeads;
+    const heads_per_ngram = num_heads / num_orders;
+
+    // `_shift_right_ignore_eos` for `shift = 0..ngram_size - 1`.
+    var shifted: [PLE_MAX_NGRAM_SIZE]u32 = @splat(eos_token_id);
+    if (token_window.len > 0) {
+        const cur_idx = token_window.len - 1;
+        shifted[0] = token_window[cur_idx];
+        var hit_eos = false;
+        for (1..ngram_size) |shift| {
+            if (shift > cur_idx) {
+                shifted[shift] = eos_token_id;
+                continue;
+            }
+            const src_tok = token_window[cur_idx - shift];
+            if (src_tok == eos_token_id) {
+                hit_eos = true;
+            }
+            shifted[shift] = if (hit_eos) eos_token_id else src_tok;
+        }
+    }
+
+    for (2..ngram_size + 1) |ngram| {
+        const start_idx = (ngram - 2) * heads_per_ngram;
+        var mixed: u64 = @as(u64, shifted[0]) *% layer_mult[0];
+        for (1..ngram) |pos| {
+            mixed ^= @as(u64, shifted[pos]) *% layer_mult[pos];
+        }
+        for (0..heads_per_ngram) |hr| {
+            const h_idx = start_idx + hr;
+            const vocab = ngram_vocabs[h_idx];
+            const rem = if (vocab > 0) (mixed % vocab) else 0;
+            const raw_id = rem +% ngram_offsets[h_idx];
+            out_row_ids[h_idx] = if (total_rows > 0) (raw_id % total_rows) else raw_id;
+        }
+    }
+}
+
+fn isPrimeU64(v: u64) bool {
+    if (v < 2) return false;
+    if ((v & 1) == 0) return v == 2;
+    var d: u64 = 3;
+    while (d * d <= v) : (d += 2) {
+        if ((v % d) == 0) return false;
+    }
+    return true;
+}
+
+/// Exact `DeepSeek-V4.1` (`inference/engram.py`) prime bucket layout + XOR N-gram hashing.
+///
+/// Computes `num_orders * n_heads` row IDs (`num_orders = max_ngram_size - 1`) for one
+/// causal token window (`token_window[len - 1]` is current token; lookback stops at
+/// sequence start or `dead_token_id`, substituting `pad_id`). When `total_rows` is smaller
+/// than the full prime bucket span (e.g. compact synth bundles), wraps modulo `total_rows`.
+pub fn computeDeepSeek41EngramRowIds(
+    token_window: []const u32,
+    pad_id: u32,
+    layer_id: u32,
+    max_ngram_size: u8,
+    n_heads: u8,
+    base_vocab: u64,
+    total_rows: u64,
+    out_row_ids: []u64,
+) Error!void {
+    if (max_ngram_size < 2 or max_ngram_size > PLE_MAX_NGRAM_SIZE) return error.InvalidNgramOrder;
+    const num_orders: usize = max_ngram_size - 1;
+    const n_cols: usize = num_orders * n_heads;
+    if (n_heads == 0 or n_cols > PLE_MAX_NGRAM_HEADS or out_row_ids.len < n_cols) {
+        return error.InvalidEngramHeads;
+    }
+    const max_i64: u64 = @intCast(std.math.maxInt(i64));
+    const eff_base = if (base_vocab > 2) base_vocab else 1009;
+    const mult_bound: u64 = @max(@as(u64, 1), (max_i64 / eff_base) / 2);
+
+    // Deterministic odd multipliers per `(layer_id, shift)` via SplitMix64 seeded with `10007 * layer_id`.
+    var mults: [PLE_MAX_NGRAM_SIZE]u64 = @splat(1);
+    var seed: u64 = @as(u64, 10007) *% (@as(u64, layer_id) + 1);
+    for (0..max_ngram_size) |s| {
+        seed +%= 0x9e3779b97f4a7c15;
+        var z = seed;
+        z = (z ^ (z >> 30)) *% 0xbf58476d1ce4e5b9;
+        z = (z ^ (z >> 27)) *% 0x94d049bb133111eb;
+        z = z ^ (z >> 31);
+        mults[s] = 2 * (z % mult_bound) + 1;
+    }
+
+    var shifted: [PLE_MAX_NGRAM_SIZE]u64 = @splat(pad_id);
+    if (token_window.len > 0) {
+        const cur_idx = token_window.len - 1;
+        for (0..max_ngram_size) |shift| {
+            shifted[shift] = if (shift <= cur_idx) token_window[cur_idx - shift] else pad_id;
+        }
+    }
+
+    var rolling: u64 = shifted[0] *% mults[0];
+    var bucket_offset: u64 = 0;
+    var prime_cursor: u64 = eff_base -| 1;
+    var out_idx: usize = 0;
+    for (1..max_ngram_size) |ord| {
+        rolling ^= shifted[ord] *% mults[ord];
+        for (0..n_heads) |_| {
+            prime_cursor += 1;
+            while (!isPrimeU64(prime_cursor)) : (prime_cursor += 1) {}
+            const raw_id = (rolling % prime_cursor) +% bucket_offset;
+            out_row_ids[out_idx] = if (total_rows > 0) (raw_id % total_rows) else raw_id;
+            bucket_offset +%= prime_cursor;
+            out_idx += 1;
+        }
+    }
+}
+
 /// Sparse external memory table semantics stored in `.amf` `TensorKind.sparse_table`.
 ///
 /// - `ple_ngram`: M6 Per-Layer Embedding (single `[embed_dim]` vector per row).
@@ -865,6 +1015,23 @@ pub const LoopPleScratch = struct {
         return initInternal(allocator, max_layers, max_tokens, max_heads, packed_dim, .engram_conditional, budget_override);
     }
 
+    /// Allocates wired scratch for raw multi-head N-gram embedding rows
+    /// (`[max_layers, max_tokens, max_heads, embed_dim]f32`), used by real-HF
+    /// Qwen3.8 PLE (`16` heads) and DeepSeek-V4.1 Engram (`24` heads) under
+    /// mandatory `ADR-0019` `r >= 1` zero-NVMe-read loop isolation.
+    pub fn initMultiHead(
+        allocator: std.mem.Allocator,
+        max_layers: u16,
+        max_tokens: u16,
+        max_heads: u8,
+        embed_dim: u32,
+        table_kind: MemoryTableKind,
+        budget_override: ?budget_mod.Budget,
+    ) Error!LoopPleScratch {
+        if (max_heads == 0 or max_heads > PLE_MAX_NGRAM_HEADS) return error.InvalidEngramHeads;
+        return initInternal(allocator, max_layers, max_tokens, max_heads, embed_dim, table_kind, budget_override);
+    }
+
     fn initInternal(
         allocator: std.mem.Allocator,
         max_layers: u16,
@@ -1286,6 +1453,11 @@ pub const PleStore = struct {
         return lt.total_rows;
     }
 
+    pub fn hasLayer(self: *const PleStore, layer: u16) bool {
+        if (layer >= self.layers.len) return false;
+        return self.layers[layer].total_rows > 0 and self.layers[layer].shard_count > 0;
+    }
+
     pub fn layerShardCount(self: *const PleStore, layer: u16) Error!usize {
         const lt = try self.layerTable(layer);
         return lt.shard_count;
@@ -1526,6 +1698,35 @@ pub const PleStore = struct {
                     out_row[d] = quant.formats.e4m3ToF32(code_bytes[d]) * row_scale;
                 }
             },
+            .mxfp8_g32 => {
+                // Read per-32-element UE8M0 scales into scratch first so subsequent code page
+                // fetches can never evict the scale page even if cache_pages == 1.
+                const param_off = sh.blob_offset + sh.params_offset + res.local_row * sh.row_param_bytes;
+                const param_bytes = self.row_param_scratch[0..sh.row_param_bytes];
+                try self.readSpanInto(sh.file_idx, param_off, param_bytes);
+
+                const in_page: usize = @intCast(code_off % page.APPLE_PAGE_SIZE);
+                const code_bytes: []const u8 = if (in_page + sh.row_code_bytes <= page.APPLE_PAGE_SIZE) blk: {
+                    const fetched = try self.cache.fetchPage(fd, .{
+                        .file_idx = sh.file_idx,
+                        .page_idx = code_off / page.APPLE_PAGE_SIZE,
+                    });
+                    break :blk self.cache.pageSliceConst(fetched.slot_idx)[in_page .. in_page + sh.row_code_bytes];
+                } else blk: {
+                    const dst = self.row_code_scratch[0..sh.row_code_bytes];
+                    try self.readSpanInto(sh.file_idx, code_off, dst);
+                    break :blk dst;
+                };
+
+                const groups = @as(usize, self.embed_dim) / 32;
+                for (0..groups) |g| {
+                    const sc = quant.formats.ue8m0ToF32(param_bytes[g]);
+                    const base = g * 32;
+                    for (0..32) |j| {
+                        out_row[base + j] = quant.formats.e4m3ToF32(code_bytes[base + j]) * sc;
+                    }
+                }
+            },
             else => return error.UnsupportedDType,
         }
         if (self.layers[layer].aux_channel_scales) |chan_sc| {
@@ -1641,6 +1842,102 @@ pub const PleStore = struct {
             const dst = out_hidden[m_i * dim ..][0..dim];
             for (0..dim) |d| {
                 dst[d] += scale * cached_row[d];
+            }
+        }
+        scratch.loop_reuse_hits += 1;
+        self.cache.stats.loop_scratch_hits += 1;
+    }
+
+    /// Fetches `m * num_heads` arbitrary global rows for `layer` via `PlePageCache`/NVMe
+    /// and writes their dequantized FP32 vectors contiguously into `out_f32`
+    /// (`[m, num_heads, embed_dim]`). Works for arbitrary `m >= 1` with zero heap allocs.
+    pub fn lookupMultiHeadRaw(
+        self: *PleStore,
+        layer: u16,
+        row_ids_flat: []const u64,
+        m: usize,
+        num_heads: usize,
+        out_f32: []f32,
+    ) Error!void {
+        if (m == 0 or num_heads == 0) return error.InvalidBatchSize;
+        const total_rows_req = std.math.mul(usize, m, num_heads) catch return error.Overflow;
+        if (row_ids_flat.len < total_rows_req) return error.BufferTooSmall;
+        const dim: usize = self.embed_dim;
+        const need = std.math.mul(usize, total_rows_req, dim) catch return error.Overflow;
+        if (out_f32.len < need) return error.BufferTooSmall;
+        _ = try self.layerTable(layer);
+
+        if (total_rows_req > 1) {
+            for (0..total_rows_req) |idx| {
+                if (self.cache.async_reader.availableSlots() == 0) break;
+                _ = try self.prefetchRowPages(layer, row_ids_flat[idx]);
+            }
+        }
+        for (0..total_rows_req) |idx| {
+            try self.decodeRowF32(layer, row_ids_flat[idx], out_f32[idx * dim ..][0..dim]);
+        }
+    }
+
+    /// Loop-isolated (`ADR-0019` `r = 0` single-lookup) multi-head raw embedding fetch:
+    /// - `loop_step == 0`: fetches `m * num_heads` rows from `PlePageCache`/NVMe into
+    ///   `scratch` and copies them into `out_f32` (`[m, num_heads, embed_dim]`).
+    /// - `loop_step >= 1`: serves strictly from wired `scratch` (`nvme_reads_delta == 0`).
+    pub fn lookupMultiHeadRawForLoopStep(
+        self: *PleStore,
+        layer: u16,
+        row_ids_flat: []const u64,
+        m: usize,
+        num_heads: usize,
+        loop_step: u32,
+        scratch: *LoopPleScratch,
+        out_f32: []f32,
+    ) Error!void {
+        if (m == 0 or m > MAX_BATCH_TOKENS or num_heads == 0 or num_heads > PLE_MAX_NGRAM_HEADS) {
+            return error.InvalidBatchSize;
+        }
+        if (scratch.embed_dim != self.embed_dim or
+            layer >= scratch.max_layers or
+            m > scratch.max_tokens or
+            num_heads > scratch.max_heads)
+        {
+            return error.LoopScratchMismatch;
+        }
+        const total_rows_req = std.math.mul(usize, m, num_heads) catch return error.Overflow;
+        if (row_ids_flat.len < total_rows_req) return error.BufferTooSmall;
+        const dim: usize = self.embed_dim;
+        const need = std.math.mul(usize, total_rows_req, dim) catch return error.Overflow;
+        if (out_f32.len < need) return error.BufferTooSmall;
+
+        if (loop_step == 0) {
+            scratch.valid_tokens[layer] = 0;
+            scratch.valid_heads[layer] = 0;
+            _ = try self.layerTable(layer);
+            if (total_rows_req > 1) {
+                for (0..total_rows_req) |idx| {
+                    if (self.cache.async_reader.availableSlots() == 0) break;
+                    _ = try self.prefetchRowPages(layer, row_ids_flat[idx]);
+                }
+            }
+            for (0..m) |m_i| {
+                for (0..num_heads) |h_i| {
+                    const cached = scratch.engramRowSliceMut(layer, m_i, h_i);
+                    try self.decodeRowF32(layer, row_ids_flat[m_i * num_heads + h_i], cached);
+                    @memcpy(out_f32[(m_i * num_heads + h_i) * dim ..][0..dim], cached);
+                }
+            }
+            scratch.valid_tokens[layer] = @intCast(m);
+            scratch.valid_heads[layer] = @intCast(num_heads);
+            self.cache.stats.loop_scratch_fills += 1;
+            return;
+        }
+
+        if (scratch.valid_tokens[layer] != m or scratch.valid_heads[layer] != num_heads) {
+            return error.LoopScratchUnpopulated;
+        }
+        for (0..m) |m_i| {
+            for (0..num_heads) |h_i| {
+                const cached = scratch.engramRowSliceConst(layer, m_i, h_i);
+                @memcpy(out_f32[(m_i * num_heads + h_i) * dim ..][0..dim], cached);
             }
         }
         scratch.loop_reuse_hits += 1;
@@ -1952,6 +2249,10 @@ fn rowGeometry(dtype: amf.DType, embed_dim: u32) Error!struct { code_bytes: usiz
     return switch (dtype) {
         .f16, .bf16 => .{ .code_bytes = dim * 2, .param_bytes = 0 },
         .fp8_e4m3_row => .{ .code_bytes = dim, .param_bytes = 4 },
+        .mxfp8_g32 => if ((dim % 32) == 0)
+            .{ .code_bytes = dim, .param_bytes = dim / 32 }
+        else
+            error.InvalidShape,
         .q4_affine => .{
             .code_bytes = Q4.rowWeightBytes(dim) catch return error.InvalidShape,
             .param_bytes = Q4.scaleBiasBytes(1, dim) catch return error.InvalidShape,
@@ -2969,4 +3270,102 @@ test "C26 Hy4-flash fp8_e4m3_row Engram F_NOCACHE streaming, BF16/F32 aux scales
     try std.testing.expectEqualSlices(f32, &out_r0, &out_r1);
     try std.testing.expectEqual(reads_r0, store.stats().nvme_reads);
     try std.testing.expectEqual(@as(u64, 1), scratch.loop_reuse_hits);
+}
+
+test "M9.4 Qwen3.8 PLE multi-head hash with EOS reset and MXFP8_G32 Engram shard lookup" {
+    const gpa = std.testing.allocator;
+
+    // 1. Verify exact `Qwen4ExpTextNGramEmbedding` hash equation & EOS lookback clamp.
+    const mult_pairs = [_]u32{ 1000003, 0, 2000003, 0, 3000017, 0 };
+    var mults: [3]u64 = undefined;
+    try unpackU32PairsToU64(std.mem.sliceAsBytes(&mult_pairs), &mults);
+    try std.testing.expectEqualSlices(u64, &.{ 1000003, 2000003, 3000017 }, &mults);
+
+    const offsets = [_]u64{ 0, 16, 32, 48 };
+    const vocabs = [_]u64{ 16, 16, 16, 16 };
+    const eos: u32 = 2;
+    const win_after_eos = [_]u32{ 10, eos, 42 };
+    var ids_after_eos: [4]u64 = undefined;
+    try computeQwen4PleRowIds(&win_after_eos, eos, &mults, &offsets, &vocabs, 128, &ids_after_eos);
+    // `shifted = [42, eos=2, eos=2]` because token 10 is before EOS!
+    const exp_bi: u64 = (@as(u64, 42) *% 1000003) ^ (@as(u64, eos) *% 2000003);
+    const exp_tri: u64 = exp_bi ^ (@as(u64, eos) *% 3000017);
+    try std.testing.expectEqual((exp_bi % 16) + 0, ids_after_eos[0]);
+    try std.testing.expectEqual((exp_bi % 16) + 16, ids_after_eos[1]);
+    try std.testing.expectEqual((exp_tri % 16) + 32, ids_after_eos[2]);
+    try std.testing.expectEqual((exp_tri % 16) + 48, ids_after_eos[3]);
+
+    // 2. Verify staged `qwen4-tiny-random-bf16` PLE shards (if present) with r >= 1 zero-NVMe-read isolation.
+    const q4_p0: [:0]const u8 = "/Volumes/AriDisk/models/amf/qwen4-tiny-random-bf16/ple-shard-00-of-02.amf";
+    const q4_p1: [:0]const u8 = "/Volumes/AriDisk/models/amf/qwen4-tiny-random-bf16/ple-shard-01-of-02.amf";
+    if (std.c.access(q4_p0.ptr, std.c.F_OK) == 0 and std.c.access(q4_p1.ptr, std.c.F_OK) == 0) {
+        const paths = [_][:0]const u8{ q4_p0, q4_p1 };
+        var store = try PleStore.open(gpa, &paths, .{
+            .cache = .{ .cache_pages = 8, .budget_override = testBudget(16 * page.APPLE_PAGE_SIZE) },
+        });
+        defer store.deinit(gpa);
+        try std.testing.expect(store.hasLayer(1));
+        const dim = store.embed_dim;
+        var scratch = try LoopPleScratch.initMultiHead(gpa, 4, 8, 4, dim, .ple_ngram, testBudget(16 * page.APPLE_PAGE_SIZE));
+        defer scratch.deinit(gpa);
+
+        const rids = [_]u64{ 0, 7, 150, 200 };
+        const out0 = try gpa.alloc(f32, 4 * dim);
+        defer gpa.free(out0);
+        const out1 = try gpa.alloc(f32, 4 * dim);
+        defer gpa.free(out1);
+
+        try store.clearCache();
+        store.resetStats();
+        try store.lookupMultiHeadRawForLoopStep(1, &rids, 1, 4, 0, &scratch, out0);
+        const reads_r0 = store.stats().nvme_reads;
+        try std.testing.expect(reads_r0 > 0);
+        for (out0) |v| try std.testing.expect(std.math.isFinite(v));
+
+        try store.clearCache();
+        try store.lookupMultiHeadRawForLoopStep(1, &rids, 1, 4, 1, &scratch, out1);
+        try std.testing.expectEqualSlices(f32, out0, out1);
+        try std.testing.expectEqual(reads_r0, store.stats().nvme_reads);
+    }
+
+    // 3. Verify staged `deepseek41-real-hf-synth` MXFP8_G32 Engram shards (if present).
+    const ds_p0: [:0]const u8 = "/Volumes/AriDisk/models/amf/deepseek41-real-hf-synth/engram-shard-00-of-02.amf";
+    const ds_p1: [:0]const u8 = "/Volumes/AriDisk/models/amf/deepseek41-real-hf-synth/engram-shard-01-of-02.amf";
+    if (std.c.access(ds_p0.ptr, std.c.F_OK) == 0 and std.c.access(ds_p1.ptr, std.c.F_OK) == 0) {
+        const paths = [_][:0]const u8{ ds_p0, ds_p1 };
+        var store = try PleStore.open(gpa, &paths, .{
+            .cache = .{ .cache_pages = 8, .budget_override = testBudget(16 * page.APPLE_PAGE_SIZE) },
+        });
+        defer store.deinit(gpa);
+        try std.testing.expect(store.hasLayer(1));
+        const dim = store.embed_dim;
+        try std.testing.expectEqual(@as(u32, 64), dim);
+        var scratch = try LoopPleScratch.initMultiHead(gpa, 4, 8, 8, dim, .engram_conditional, testBudget(16 * page.APPLE_PAGE_SIZE));
+        defer scratch.deinit(gpa);
+
+        const win = [_]u32{ 5, 17, 29, 41 };
+        var rids: [8]u64 = undefined;
+        try computeDeepSeek41EngramRowIds(&win, 2, 1, 3, 4, 67, try store.layerTotalRows(1), &rids);
+        const out0 = try gpa.alloc(f32, 8 * dim);
+        defer gpa.free(out0);
+        const out1 = try gpa.alloc(f32, 8 * dim);
+        defer gpa.free(out1);
+
+        try store.clearCache();
+        store.resetStats();
+        try store.lookupMultiHeadRawForLoopStep(1, &rids, 1, 8, 0, &scratch, out0);
+        const reads_r0 = store.stats().nvme_reads;
+        try std.testing.expect(reads_r0 > 0);
+        var any_nonzero = false;
+        for (out0) |v| {
+            try std.testing.expect(std.math.isFinite(v));
+            if (@abs(v) > 1e-6) any_nonzero = true;
+        }
+        try std.testing.expect(any_nonzero);
+
+        try store.clearCache();
+        try store.lookupMultiHeadRawForLoopStep(1, &rids, 1, 8, 1, &scratch, out1);
+        try std.testing.expectEqualSlices(f32, out0, out1);
+        try std.testing.expectEqual(reads_r0, store.stats().nvme_reads);
+    }
 }

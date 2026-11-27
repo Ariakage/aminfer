@@ -38,6 +38,11 @@ static inline float hybrid_sigmoid(float x) {
     return 1.0f / (1.0f + exp(-x));
 }
 
+// GDN output gate mode: 1 = SiLU (legacy/Qwen3-Next), 2 = Sigmoid (real-HF Qwen3.8-Flash-Next).
+static inline float hybrid_gdn_out_gate(float z, uint mode) {
+    return (mode == 2u) ? hybrid_sigmoid(z) : hybrid_fast_silu(z);
+}
+
 static inline float hybrid_load_norm_w(const device uchar *raw, uint idx, bool is_bf16) {
     if (is_bf16) {
         return float(((const device bfloat *)raw)[idx]);
@@ -315,7 +320,7 @@ kernel void ami_gdn_decode(const device half *q [[buffer(0)]],
             val = (val * inv_rms) * hybrid_load_norm_w(norm_w, nw_base + dv, HYBRID_NORM_W_BF16);
         }
         if (p.apply_out_gate != 0u) {
-            val *= hybrid_fast_silu(float(z[v_head_base + dv]));
+            val *= hybrid_gdn_out_gate(float(z[v_head_base + dv]), p.apply_out_gate);
         }
         out[v_head_base + dv] = half(val);
     }
@@ -484,7 +489,7 @@ kernel void ami_gdn_prefill(const device half *q [[buffer(0)]],
                     float o_val = simd_sum(o_acc);
                     if (lane == 0u) {
                         if (p.apply_out_gate != 0u) {
-                            o_val *= hybrid_fast_silu(float(z[v_idx]));
+                            o_val *= hybrid_gdn_out_gate(float(z[v_idx]), p.apply_out_gate);
                         }
                         const ulong out_idx = (ulong(t - p.out_start_token) * p.num_v_heads + vh) * d_v + dv;
                         out[out_idx] = half(o_val);
@@ -723,7 +728,7 @@ kernel void ami_gdn_tree_verify(const device half *q [[buffer(0)]],
             const ulong out_idx = (ulong(node) * p.num_v_heads + vh) * d_v + dv;
             if (lane == 0u) {
                 if (p.apply_out_gate != 0u) {
-                    o_val *= hybrid_fast_silu(float(z[out_idx]));
+                    o_val *= hybrid_gdn_out_gate(float(z[out_idx]), p.apply_out_gate);
                 }
                 out[out_idx] = half(o_val);
             }
@@ -787,7 +792,7 @@ kernel void ami_gdn_out_norm_gate(device half *out [[buffer(0)]],
             val = (val * inv_rms) * hybrid_load_norm_w(norm_w, nw_base + dv, HYBRID_NORM_W_BF16);
         }
         if (p.apply_out_gate != 0u) {
-            val *= hybrid_fast_silu(float(z[base + dv]));
+            val *= hybrid_gdn_out_gate(float(z[base + dv]), p.apply_out_gate);
         }
         out[base + dv] = half(val);
     }
@@ -1138,8 +1143,9 @@ kernel void ami_qsa_qknorm_mrope_kv_write(device half *q [[buffer(0)]],
         const float total_sq = simd_sum(sum_sq);
         const float inv_rms = rsqrt(total_sq / float(d_dim) + p.rms_eps);
         const device uchar *nw = is_q ? q_norm : k_norm;
+        const float w_add = (p.apply_qk_norm == 2u) ? 1.0f : 0.0f;
         for (uint d = lane; d < d_dim; d += 32u) {
-            vec[d] = (vec[d] * inv_rms) * hybrid_load_norm_w(nw, d, HYBRID_NORM_W_BF16);
+            vec[d] = (vec[d] * inv_rms) * (w_add + hybrid_load_norm_w(nw, d, HYBRID_NORM_W_BF16));
         }
     }
     simdgroup_barrier(mem_flags::mem_threadgroup);
@@ -1227,8 +1233,9 @@ kernel void ami_qsa_tree_qknorm_mrope(device half *q [[buffer(0)]],
         const float total_sq = simd_sum(sum_sq);
         const float inv_rms = rsqrt(total_sq / float(d_dim) + p.rms_eps);
         const device uchar *nw = is_q ? q_norm : k_norm;
+        const float w_add = (p.apply_qk_norm == 2u) ? 1.0f : 0.0f;
         for (uint d = lane; d < d_dim; d += 32u) {
-            vec[d] = (vec[d] * inv_rms) * hybrid_load_norm_w(nw, d, HYBRID_NORM_W_BF16);
+            vec[d] = (vec[d] * inv_rms) * (w_add + hybrid_load_norm_w(nw, d, HYBRID_NORM_W_BF16));
         }
     }
     simdgroup_barrier(mem_flags::mem_threadgroup);
@@ -2657,7 +2664,7 @@ kernel void ami_gdn_batch_decode(const device half *q [[buffer(0)]],
             val = (val * inv_rms) * hybrid_load_norm_w(norm_w, nw_base + dv, HYBRID_NORM_W_BF16);
         }
         if (p.apply_out_gate != 0u) {
-            val *= hybrid_fast_silu(float(z[v_head_base + dv]));
+            val *= hybrid_gdn_out_gate(float(z[v_head_base + dv]), p.apply_out_gate);
         }
         out[v_head_base + dv] = half(val);
     }
@@ -2841,8 +2848,9 @@ kernel void ami_qsa_prefill_qknorm_mrope(device half *q [[buffer(0)]],
         const float total_sq = simd_sum(sum_sq);
         const float inv_rms = rsqrt(total_sq / float(d_dim) + p.rms_eps);
         const device uchar *nw = is_q ? q_norm : k_norm;
+        const float w_add = (p.apply_qk_norm == 2u) ? 1.0f : 0.0f;
         for (uint d = lane; d < d_dim; d += 32u) {
-            vec[d] = (vec[d] * inv_rms) * hybrid_load_norm_w(nw, d, HYBRID_NORM_W_BF16);
+            vec[d] = (vec[d] * inv_rms) * (w_add + hybrid_load_norm_w(nw, d, HYBRID_NORM_W_BF16));
         }
     }
     simdgroup_barrier(mem_flags::mem_threadgroup);
@@ -5800,10 +5808,18 @@ struct G26MoeRouteSigmoidParams {
     uint down_groups_x_q8;
     float routed_scaling_factor;
     uint group_score_topk; // 1 = max-1 per group; 0 or >= 2 = top-2 sum per group (DeepSeek-V3 / BailingMoeV3)
-    uint _pad0;
+    uint score_mode;       // 0 = sigmoid, 1 = sqrt(softplus(x)) (DeepSeek-V4.1)
     uint _pad1;
     uint _pad2;
 };
+
+static inline float g26_route_score(float raw, uint score_mode) {
+    if (score_mode == 1u) {
+        const float sp = (raw > 20.0f) ? raw : ((raw < -20.0f) ? exp(raw) : log(1.0f + exp(raw)));
+        return sqrt(max(sp, 0.0f));
+    }
+    return hybrid_sigmoid(raw);
+}
 
 static_assert(sizeof(G26MoeRouteSigmoidParams) == 80, "G26MoeRouteSigmoidParams must be 80 bytes");
 
@@ -5877,7 +5893,7 @@ kernel void ami_moe_route_topk_sigmoid(const device uchar *logits_raw [[buffer(0
                             : ((const device float *)logits_raw)[row_base + e];
                         float c_val = -INFINITY;
                         if (isfinite(raw) && raw > -1.0e29f) {
-                            const float sc = hybrid_sigmoid(raw);
+                            const float sc = g26_route_score(raw, p.score_mode);
                             const float b = (p.has_bias != 0u) ? g26_hybrid_load_scalar_f32(bias_raw, e, p.bias_dtype) : 0.0f;
                             c_val = sc + b;
                         }
@@ -5931,7 +5947,7 @@ kernel void ami_moe_route_topk_sigmoid(const device uchar *logits_raw [[buffer(0
                         float sc = 0.0f;
                         float ch = -INFINITY;
                         if (isfinite(raw) && raw > -1.0e29f) {
-                            sc = hybrid_sigmoid(raw);
+                            sc = g26_route_score(raw, p.score_mode);
                             const float b = (p.has_bias != 0u)
                                 ? g26_hybrid_load_scalar_f32(bias_raw, e, p.bias_dtype)
                                 : 0.0f;
@@ -8489,4 +8505,1656 @@ kernel void ami_g28_mla_out_gate(device half *attn_out [[buffer(0)]],
     const ulong gate_idx = (p.head_wise != 0u) ? (ulong(gid) / p.v_head_dim) : ulong(gid);
     const float g_val = hybrid_sigmoid(float(gate[gate_idx]));
     attn_out[gid] = half(float(attn_out[gid]) * g_val);
+}
+
+// ===========================================================================
+// Section J: M9.4 — Real-HF `Qwen3.8-Flash-Next` (`qwen4_exp`) &
+//            `DeepSeek-V4.1-Flash-1017` (`deepseek_v41`) Metal 4 Operators
+// Zero dynamic stack arrays (`-Wframe-larger-than=0`), 0 stack spills.
+// ===========================================================================
+
+struct M94HcNormParams {
+    uint m;
+    uint num_groups;
+    uint group_size;
+    uint w_dtype;     // 0 = f16, 1 = bf16, 2 = f32
+    uint unit_offset; // 1 = (1.0 + w), 0 = plain w
+    float rms_eps;
+    uint _pad0;
+    uint _pad1;
+};
+
+struct M94ScaleSiluParams {
+    uint count;
+    float scale;
+    uint _pad0;
+    uint _pad1;
+};
+
+struct M94HcMixParams {
+    uint m;
+    uint hc_count;
+    uint hidden_size;
+    uint has_inj;
+    float inv_hc_count;
+    uint _pad0;
+    uint _pad1;
+    uint _pad2;
+};
+
+struct M94HcInjectParams {
+    uint m;
+    uint hc_count;
+    uint hidden_size;
+    uint _pad0;
+};
+
+struct M94PleGateParams {
+    uint m;
+    uint hc_count;
+    uint hidden_size;
+    uint norm_dtype; // 0 = f16, 1 = bf16, 2 = f32
+    float rms_eps;
+    float inv_sqrt_h;
+    uint _pad0;
+    uint _pad1;
+};
+
+struct M94PleConvParams {
+    uint m;
+    uint channels;
+    uint kernel_size; // <= 8 (real-HF: 4)
+    uint dilation;    // real-HF: ngram_size = 3
+    uint state_len;   // (kernel_size - 1) * dilation (real-HF: 9)
+    uint w_dtype;     // 0 = f16, 1 = bf16, 2 = f32
+    uint is_tree;     // 0 = sequential, 1 = ancestor_masks tree
+    uint _pad0;
+};
+
+struct M94PleConvCommitParams {
+    uint channels;
+    uint state_len;
+    uint accepted_count;
+    uint _pad0;
+    ushort inline_nodes[64];
+};
+
+struct M94QsaIdxPrepParams {
+    uint num_tokens;
+    uint idx_n_heads;
+    uint idx_head_dim;
+    uint rotary_dim;
+    uint start_pos;
+    uint use_positions_3d;
+    uint write_raw_to_cache; // 1 = raw_k_dst[start_pos + tok], 0 = raw_k_dst[tok]
+    uint mrope_s0;
+    uint mrope_s1;
+    uint mrope_s2;
+    uint norm_dtype;     // 0 = f16, 1 = bf16, 2 = f32
+    uint unit_offset;    // 1 = (1 + w)
+    float rms_eps;
+    float rope_theta;
+    float yarn_factor;
+    float yarn_mscale;
+    float yarn_beta_fast;
+    float yarn_beta_slow;
+    uint original_max_pos;
+    uint _pad0;
+};
+
+struct M94QsaIdxPoolParams {
+    uint start_block;
+    uint num_blocks;
+    uint compress_ratio;
+    uint idx_head_dim;
+    uint rotary_dim;
+    uint mrope_s0;
+    uint mrope_s1;
+    uint mrope_s2;
+    uint norm_dtype;
+    uint unit_offset;
+    float rms_eps;
+    float rope_theta;
+    float yarn_factor;
+    float yarn_mscale;
+    float yarn_beta_fast;
+    float yarn_beta_slow;
+    uint original_max_pos;
+    uint _pad0;
+    uint _pad1;
+    uint _pad2;
+};
+
+struct M94QsaIdxSelectParams {
+    uint num_nodes;
+    uint idx_n_heads;
+    uint idx_head_dim;
+    uint num_kv_heads;
+    uint kv_len;             // committed KV tokens before current nodes
+    uint compress_ratio;
+    uint block_topk;
+    uint top_k_blocks_cap;   // QsaIndexBuffer capacity (<= 64)
+    uint causal_q_start_pos; // 0xFFFFFFFF = tree/decode over kv_len; else wide causal
+    float inv_sqrt_d;
+    uint _pad0;
+    uint _pad1;
+};
+
+struct M94MhcInitParams {
+    uint m;
+    uint hc_mult;
+    uint _pad0;
+    uint _pad1;
+};
+
+struct M94MhcCollapseParams {
+    uint m;
+    uint hidden_size;
+    uint has_norm_w;
+    uint norm_dtype; // 0 = f16, 1 = bf16, 2 = f32
+    float rms_eps;
+    uint _pad0;
+    uint _pad1;
+    uint _pad2;
+};
+
+struct M94RopeComplexParams {
+    uint num_tokens;
+    uint num_heads;
+    uint head_stride;
+    uint rot_offset;
+    uint rot_dim;
+    uint base_pos;
+    uint use_pos_buf;
+    uint inverse;          // 0 = forward, 1 = conjugate inverse
+    uint pos_stride;       // > 1 for compressed group positions (e.g. ratio)
+    uint original_seq_len; // 0 = standard RoPE, > 0 = YaRN frequency ramp
+    float rope_theta;
+    float rope_factor;
+    float beta_fast;
+    float beta_slow;
+    uint _pad0;
+    uint _pad1;
+};
+
+struct M94DsCompressorParams {
+    uint num_tokens;
+    uint start_pos;
+    uint head_dim;
+    uint ratio;
+    uint gate_dim;   // == head_dim (real-HF) or == ratio (synth)
+    uint norm_dtype; // 0 = f16, 1 = bf16, 2 = f32
+    float rms_eps;
+    uint write_state; // 1 = commit partial group state
+    uint out_count;
+    uint _pad0;
+    uint _pad1;
+    uint _pad2;
+};
+
+struct M94DsIndexerParams {
+    uint num_tokens;
+    uint start_pos;
+    uint idx_n_heads;
+    uint idx_head_dim;
+    uint ratio;
+    uint total_comp_len;
+    uint index_topk;
+    uint offset;
+    uint is_candidate_source;
+    uint uses_candidates;
+    uint cand_topk_blocks;
+    uint cand_block_size;
+    uint cand_num_blocks;
+    float weight_scale;
+    uint is_causal_prefill;
+    uint _pad0;
+};
+
+struct M94DsLatentAttnParams {
+    uint num_q;
+    uint n_heads;
+    uint q_head_dim;
+    uint kv_dim;
+    uint v_head_dim;
+    uint nope_dim;
+    uint rope_dim;
+    uint window_size;
+    uint start_pos;
+    uint has_compress;
+    uint compress_topk;
+    uint has_sink;
+    uint is_tree;
+    uint apply_inv_rope;
+    uint original_seq_len;
+    float scale;
+    float rope_theta;
+    float rope_factor;
+    float beta_fast;
+    float beta_slow;
+};
+
+struct M94DsEngramParams {
+    uint m;
+    uint hidden_size;
+    uint wkv_out_dim; // 5*H (real-HF) or H (synth)
+    uint emb_dim;
+    uint k_dim;       // H (real-HF) or emb_dim (synth)
+    uint qk_dtype;    // 0 = f16, 1 = bf16, 2 = f32
+    float rms_eps;
+    float inv_sqrt_d;
+};
+
+static_assert(sizeof(M94HcNormParams) == 32, "M94HcNormParams must be 32 bytes");
+static_assert(sizeof(M94ScaleSiluParams) == 16, "M94ScaleSiluParams must be 16 bytes");
+static_assert(sizeof(M94HcMixParams) == 32, "M94HcMixParams must be 32 bytes");
+static_assert(sizeof(M94HcInjectParams) == 16, "M94HcInjectParams must be 16 bytes");
+static_assert(sizeof(M94PleGateParams) == 32, "M94PleGateParams must be 32 bytes");
+static_assert(sizeof(M94PleConvParams) == 32, "M94PleConvParams must be 32 bytes");
+static_assert(sizeof(M94PleConvCommitParams) == 144, "M94PleConvCommitParams must be 144 bytes");
+static_assert(sizeof(M94QsaIdxPrepParams) == 80, "M94QsaIdxPrepParams must be 80 bytes");
+static_assert(sizeof(M94QsaIdxPoolParams) == 80, "M94QsaIdxPoolParams must be 80 bytes");
+static_assert(sizeof(M94QsaIdxSelectParams) == 48, "M94QsaIdxSelectParams must be 48 bytes");
+static_assert(sizeof(M94MhcInitParams) == 16, "M94MhcInitParams must be 16 bytes");
+static_assert(sizeof(M94MhcCollapseParams) == 32, "M94MhcCollapseParams must be 32 bytes");
+static_assert(sizeof(M94RopeComplexParams) == 64, "M94RopeComplexParams must be 64 bytes");
+static_assert(sizeof(M94DsCompressorParams) == 48, "M94DsCompressorParams must be 48 bytes");
+static_assert(sizeof(M94DsIndexerParams) == 64, "M94DsIndexerParams must be 64 bytes");
+static_assert(sizeof(M94DsLatentAttnParams) == 80, "M94DsLatentAttnParams must be 80 bytes");
+static_assert(sizeof(M94DsEngramParams) == 32, "M94DsEngramParams must be 32 bytes");
+
+// Exact DeepSeek-V4.1 `precompute_freqs_cis` frequency helper (with optional YaRN ramp).
+static inline float m94_ds_inv_freq(uint j,
+                                    uint rot_dim,
+                                    float rope_theta,
+                                    uint original_seq_len,
+                                    float rope_factor,
+                                    float beta_fast,
+                                    float beta_slow) {
+    const float dim_f = float(rot_dim);
+    float freq = exp(-log(rope_theta) * (float(2u * j) / dim_f));
+    if (original_seq_len > 0u && rope_factor > 1.0f) {
+        const float two_pi = 6.2831853071795864769f;
+        const float two_log_base = 2.0f * log(rope_theta);
+        const float orig_f = float(original_seq_len);
+        const float low_raw = dim_f * log(orig_f / (beta_fast * two_pi)) / two_log_base;
+        const float high_raw = dim_f * log(orig_f / (beta_slow * two_pi)) / two_log_base;
+        const float low = max(floor(low_raw), 0.0f);
+        const float high = min(ceil(high_raw), dim_f - 1.0f);
+        const float ramp = clamp((float(j) - low) / max(high - low, 1.0e-3f), 0.0f, 1.0f);
+        const float smooth = 1.0f - ramp;
+        freq = (freq / rope_factor) * (1.0f - smooth) + freq * smooth;
+    }
+    return freq;
+}
+
+// 1. Grouped RMSNorm (`(1.0 + w)` unit-offset when `unit_offset == 1`).
+// Grid: (num_groups, m, 1) threadgroups, 256 threads.
+kernel void ami_qwen4_hc_norm(const device half *x [[buffer(0)]],
+                              const device uchar *w [[buffer(1)]],
+                              device half *y [[buffer(2)]],
+                              constant M94HcNormParams &p [[buffer(3)]],
+                              uint2 tg_pos [[threadgroup_position_in_grid]],
+                              uint tid [[thread_index_in_threadgroup]],
+                              uint sg_id [[simdgroup_index_in_threadgroup]],
+                              uint lane [[thread_index_in_simdgroup]]) {
+    const uint grp = tg_pos.x;
+    const uint tok = tg_pos.y;
+    if (grp >= p.num_groups || tok >= p.m || p.group_size == 0u) {
+        return;
+    }
+    const ulong total_dim = ulong(p.num_groups) * p.group_size;
+    const ulong grp_off = ulong(grp) * p.group_size;
+    const ulong base = ulong(tok) * total_dim + grp_off;
+
+    threadgroup float tg_red[8];
+    float sq = 0.0f;
+    for (uint d = tid; d < p.group_size; d += 256u) {
+        const float v = float(x[base + d]);
+        sq = fma(v, v, sq);
+    }
+    const float sg_sq = simd_sum(sq);
+    if (lane == 0u) tg_red[sg_id] = sg_sq;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float total_sq = ((tg_red[0] + tg_red[1]) + (tg_red[2] + tg_red[3])) +
+                           ((tg_red[4] + tg_red[5]) + (tg_red[6] + tg_red[7]));
+    const float inv_rms = rsqrt(total_sq / float(p.group_size) + p.rms_eps);
+    const float w_add = (p.unit_offset != 0u) ? 1.0f : 0.0f;
+
+    for (uint d = tid; d < p.group_size; d += 256u) {
+        const float v = float(x[base + d]);
+        const float wt = w_add + g27_load_scalar_f32(w, grp_off + d, p.w_dtype);
+        y[base + d] = half((v * inv_rms) * wt);
+    }
+}
+
+// 2. In-place `silu(x * scale)` (`scale = 1.0 / hc_count = 0.25`).
+// Grid: ceil(count / 256), 256 threads.
+kernel void ami_qwen4_hc_scale_silu(device half *x [[buffer(0)]],
+                                    constant M94ScaleSiluParams &p [[buffer(1)]],
+                                    uint gid [[thread_position_in_grid]]) {
+    if (gid >= p.count) return;
+    x[gid] = half(hybrid_fast_silu(float(x[gid]) * p.scale));
+}
+
+// 3. Fused Qwen3.8 Hyper-Connection pre-mix reduction + optional injection gate:
+//    `mixed[tok, d] = inv_hc * sum_b(sigmoid(w_mix[tok, b*H + d]) * h_normed[tok, b*H + d])`
+//    `inj_out[tok, b] = 2.0 * sigmoid(inj_raw[tok, b] * inv_hc)` (f32).
+// Grid: (m, 1, 1) threadgroups, 256 threads.
+kernel void ami_qwen4_hc_mix_reduce(const device half *h_normed [[buffer(0)]],
+                                    const device half *w_mix [[buffer(1)]],
+                                    const device half *inj_raw [[buffer(2)]],
+                                    device half *mixed_out [[buffer(3)]],
+                                    device float *inj_out [[buffer(4)]],
+                                    constant M94HcMixParams &p [[buffer(5)]],
+                                    uint tg_x [[threadgroup_position_in_grid]],
+                                    uint tid [[thread_index_in_threadgroup]]) {
+    const uint tok = tg_x;
+    if (tok >= p.m) return;
+    const ulong h = ulong(p.hidden_size);
+    const ulong hc = ulong(p.hc_count);
+    const ulong tok_hc_base = ulong(tok) * hc * h;
+    const ulong tok_h_base = ulong(tok) * h;
+
+    for (uint d = tid; d < p.hidden_size; d += 256u) {
+        float acc = 0.0f;
+        for (uint b = 0u; b < p.hc_count; ++b) {
+            const ulong idx = tok_hc_base + ulong(b) * h + d;
+            acc = fma(hybrid_sigmoid(float(w_mix[idx])), float(h_normed[idx]), acc);
+        }
+        mixed_out[tok_h_base + d] = half(acc * p.inv_hc_count);
+    }
+    if (p.has_inj != 0u && tid < p.hc_count) {
+        const ulong i_idx = ulong(tok) * hc + tid;
+        inj_out[i_idx] = 2.0f * hybrid_sigmoid(float(inj_raw[i_idx]) * p.inv_hc_count);
+    }
+}
+
+// 4. Qwen3.8 Hyper-Connection post-inject: `h[tok, b*H + d] += inj[tok, b] * sub_out[tok, d]`.
+// Grid: (m, 1, 1) threadgroups, 256 threads.
+kernel void ami_qwen4_hc_inject(device half *h_streams [[buffer(0)]],
+                                const device half *sub_out [[buffer(1)]],
+                                const device float *inj [[buffer(2)]],
+                                constant M94HcInjectParams &p [[buffer(3)]],
+                                uint tg_x [[threadgroup_position_in_grid]],
+                                uint tid [[thread_index_in_threadgroup]]) {
+    const uint tok = tg_x;
+    if (tok >= p.m) return;
+    const ulong h = ulong(p.hidden_size);
+    const ulong hc = ulong(p.hc_count);
+    const ulong tok_hc_base = ulong(tok) * hc * h;
+    const ulong tok_h_base = ulong(tok) * h;
+    const ulong inj_base = ulong(tok) * hc;
+
+    for (uint d = tid; d < p.hidden_size; d += 256u) {
+        const float y = float(sub_out[tok_h_base + d]);
+        for (uint b = 0u; b < p.hc_count; ++b) {
+            const ulong idx = tok_hc_base + ulong(b) * h + d;
+            h_streams[idx] = half(fma(inj[inj_base + b], y, float(h_streams[idx])));
+        }
+    }
+}
+
+// 5. Fused `Qwen4ExpTextPLELayer` stream gating + `norm_conv`:
+//    k = norm_key(k_raw), q = norm_query(h_streams),
+//    dot = sum_d(k * q) / sqrt(H),
+//    gate = sigmoid(copysign(sqrt(max(|dot|, 1e-6)), dot)),
+//    gv = gate * value, gv_normed = norm_conv(gv).
+// Grid: (hc_count, m, 1) threadgroups, 256 threads.
+kernel void ami_qwen4_ple_gate(const device half *h_streams [[buffer(0)]],
+                               const device half *k_raw [[buffer(1)]],
+                               const device half *value_in [[buffer(2)]],
+                               const device uchar *norm_key_w [[buffer(3)]],
+                               const device uchar *norm_query_w [[buffer(4)]],
+                               const device uchar *norm_conv_w [[buffer(5)]],
+                               device half *gv_out [[buffer(6)]],
+                               device half *gv_normed_out [[buffer(7)]],
+                               constant M94PleGateParams &p [[buffer(8)]],
+                               uint2 tg_pos [[threadgroup_position_in_grid]],
+                               uint tid [[thread_index_in_threadgroup]],
+                               uint sg_id [[simdgroup_index_in_threadgroup]],
+                               uint lane [[thread_index_in_simdgroup]]) {
+    const uint b = tg_pos.x;
+    const uint tok = tg_pos.y;
+    if (b >= p.hc_count || tok >= p.m || p.hidden_size == 0u) return;
+
+    const ulong h = ulong(p.hidden_size);
+    const ulong total_dim = ulong(p.hc_count) * h;
+    const ulong grp_off = ulong(b) * h;
+    const ulong base = ulong(tok) * total_dim + grp_off;
+    const ulong v_base = ulong(tok) * h;
+
+    threadgroup float tg_red_a[8];
+    threadgroup float tg_red_b[8];
+
+    // Pass 1: RMS statistics for `k_raw[b]` and `h_streams[b]`.
+    float sq_k = 0.0f;
+    float sq_q = 0.0f;
+    for (uint d = tid; d < p.hidden_size; d += 256u) {
+        const float kv = float(k_raw[base + d]);
+        const float qv = float(h_streams[base + d]);
+        sq_k = fma(kv, kv, sq_k);
+        sq_q = fma(qv, qv, sq_q);
+    }
+    const float sg_k = simd_sum(sq_k);
+    const float sg_q = simd_sum(sq_q);
+    if (lane == 0u) {
+        tg_red_a[sg_id] = sg_k;
+        tg_red_b[sg_id] = sg_q;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float tot_k = ((tg_red_a[0] + tg_red_a[1]) + (tg_red_a[2] + tg_red_a[3])) +
+                        ((tg_red_a[4] + tg_red_a[5]) + (tg_red_a[6] + tg_red_a[7]));
+    const float tot_q = ((tg_red_b[0] + tg_red_b[1]) + (tg_red_b[2] + tg_red_b[3])) +
+                        ((tg_red_b[4] + tg_red_b[5]) + (tg_red_b[6] + tg_red_b[7]));
+    const float inv_rms_k = rsqrt(tot_k / float(p.hidden_size) + p.rms_eps);
+    const float inv_rms_q = rsqrt(tot_q / float(p.hidden_size) + p.rms_eps);
+
+    // Pass 2: dot product `(norm_key(k) * norm_query(q))` and `sum_sq(value)` (since `gv = gate * value`).
+    float dot_part = 0.0f;
+    float sq_v = 0.0f;
+    for (uint d = tid; d < p.hidden_size; d += 256u) {
+        const float kw = 1.0f + g27_load_scalar_f32(norm_key_w, grp_off + d, p.norm_dtype);
+        const float qw = 1.0f + g27_load_scalar_f32(norm_query_w, grp_off + d, p.norm_dtype);
+        const float kn = (float(k_raw[base + d]) * inv_rms_k) * kw;
+        const float qn = (float(h_streams[base + d]) * inv_rms_q) * qw;
+        dot_part = fma(kn, qn, dot_part);
+        const float vv = float(value_in[v_base + d]);
+        sq_v = fma(vv, vv, sq_v);
+    }
+    const float sg_dot = simd_sum(dot_part);
+    const float sg_v = simd_sum(sq_v);
+    if (lane == 0u) {
+        tg_red_a[sg_id] = sg_dot;
+        tg_red_b[sg_id] = sg_v;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float dot_val = (((tg_red_a[0] + tg_red_a[1]) + (tg_red_a[2] + tg_red_a[3])) +
+                           ((tg_red_a[4] + tg_red_a[5]) + (tg_red_a[6] + tg_red_a[7]))) * p.inv_sqrt_h;
+    const float tot_v = ((tg_red_b[0] + tg_red_b[1]) + (tg_red_b[2] + tg_red_b[3])) +
+                        ((tg_red_b[4] + tg_red_b[5]) + (tg_red_b[6] + tg_red_b[7]));
+    const float signed_sqrt = copysign(sqrt(max(fabs(dot_val), 1.0e-6f)), dot_val);
+    const float gate = hybrid_sigmoid(signed_sqrt);
+    const float inv_rms_gv = rsqrt((tot_v * gate * gate) / float(p.hidden_size) + p.rms_eps);
+
+    // Pass 3: write `gv` and `norm_conv(gv)`.
+    for (uint d = tid; d < p.hidden_size; d += 256u) {
+        const float gv = gate * float(value_in[v_base + d]);
+        const float cw = 1.0f + g27_load_scalar_f32(norm_conv_w, grp_off + d, p.norm_dtype);
+        gv_out[base + d] = half(gv);
+        gv_normed_out[base + d] = half((gv * inv_rms_gv) * cw);
+    }
+}
+
+// 6. Causal depthwise dilated Conv1D (`K <= 8`, `dilation = 3`) + SiLU + residual add into `h_streams`.
+//    `conv_state_in` layout: `[state_len, channels]` oldest-first (`state_len = (K - 1) * dilation`).
+// Grid: (ceil(channels / 256), m, 1) threadgroups, 256 threads.
+kernel void ami_qwen4_ple_dilated_conv_add(device half *h_streams [[buffer(0)]],
+                                           const device half *gv_in [[buffer(1)]],
+                                           const device half *gv_normed [[buffer(2)]],
+                                           const device uchar *conv_w [[buffer(3)]],
+                                           const device half *conv_state_in [[buffer(4)]],
+                                           const device ulong *ancestor_masks [[buffer(5)]],
+                                           constant M94PleConvParams &p [[buffer(6)]],
+                                           uint2 gid [[thread_position_in_grid]]) {
+    const uint c = gid.x;
+    const uint tok = gid.y;
+    if (c >= p.channels || tok >= p.m) return;
+
+    const ulong stride = ulong(p.channels);
+    const uint ksz = p.kernel_size;
+    const uint dil = p.dilation;
+    const uint slen = p.state_len;
+
+    float conv_acc = 0.0f;
+    if (p.is_tree == 0u) {
+        // Sequential chunk `[0..m)` appended after `conv_state_in[0..slen)`.
+        for (uint tap = 0u; tap < ksz; ++tap) {
+            const uint back = (ksz - 1u - tap) * dil;
+            float x_tap = 0.0f;
+            if (back <= tok) {
+                x_tap = float(gv_normed[ulong(tok - back) * stride + c]);
+            } else {
+                const uint hist_back = back - tok; // 1..slen
+                if (hist_back <= slen) {
+                    x_tap = float(conv_state_in[ulong(slen - hist_back) * stride + c]);
+                }
+            }
+            const float w_tap = g27_load_scalar_f32(conv_w, ulong(c) * ksz + tap, p.w_dtype);
+            conv_acc = fma(x_tap, w_tap, conv_acc);
+        }
+    } else {
+        // Speculative tree: walk strict ancestors in `ancestor_masks[tok]`.
+        const ulong mask = ancestor_masks[tok];
+        const ulong strict_anc = (tok > 0u) ? (mask & ((1ul << tok) - 1ul)) : 0ul;
+        const uint depth = uint(popcount(strict_anc));
+        for (uint tap = 0u; tap < ksz; ++tap) {
+            const uint back = (ksz - 1u - tap) * dil;
+            float x_tap = 0.0f;
+            if (back == 0u) {
+                x_tap = float(gv_normed[ulong(tok) * stride + c]);
+            } else if (back <= depth) {
+                // Find the `back`-th ancestor going backwards from `tok - 1`.
+                uint rem = back;
+                uint found = 0u;
+                for (int cand = int(tok) - 1; cand >= 0; --cand) {
+                    if (((strict_anc >> uint(cand)) & 1ul) != 0ul) {
+                        rem -= 1u;
+                        if (rem == 0u) {
+                            found = uint(cand);
+                            break;
+                        }
+                    }
+                }
+                x_tap = float(gv_normed[ulong(found) * stride + c]);
+            } else {
+                const uint hist_back = back - depth;
+                if (hist_back <= slen) {
+                    x_tap = float(conv_state_in[ulong(slen - hist_back) * stride + c]);
+                }
+            }
+            const float w_tap = g27_load_scalar_f32(conv_w, ulong(c) * ksz + tap, p.w_dtype);
+            conv_acc = fma(x_tap, w_tap, conv_acc);
+        }
+    }
+
+    const ulong idx = ulong(tok) * stride + c;
+    const float out_val = float(gv_in[idx]) + hybrid_fast_silu(conv_acc);
+    h_streams[idx] = half(float(h_streams[idx]) + out_val);
+}
+
+// 7. Commits accepted path `accepted_nodes[0..accepted_count)` into `conv_state [state_len, channels]`.
+// Grid: ceil(channels / 256), 256 threads.
+kernel void ami_qwen4_ple_conv_commit(const device half *gv_normed [[buffer(0)]],
+                                      device half *conv_state [[buffer(1)]],
+                                      constant M94PleConvCommitParams &p [[buffer(2)]],
+                                      uint gid [[thread_position_in_grid]]) {
+    const uint c = gid;
+    if (c >= p.channels || p.state_len == 0u || p.accepted_count == 0u) return;
+    const ulong stride = ulong(p.channels);
+    const uint slen = p.state_len;
+    const uint acc = p.accepted_count;
+
+    if (acc >= slen) {
+        const uint start = acc - slen;
+        for (uint s = 0u; s < slen; ++s) {
+            const uint node = uint(p.inline_nodes[start + s]);
+            conv_state[ulong(s) * stride + c] = gv_normed[ulong(node) * stride + c];
+        }
+    } else {
+        const uint keep = slen - acc;
+        for (uint s = 0u; s < keep; ++s) {
+            conv_state[ulong(s) * stride + c] = conv_state[ulong(s + acc) * stride + c];
+        }
+        for (uint s = 0u; s < acc; ++s) {
+            const uint node = uint(p.inline_nodes[s]);
+            conv_state[ulong(keep + s) * stride + c] = gv_normed[ulong(node) * stride + c];
+        }
+    }
+}
+
+// 8. Real-HF Qwen3.8 QSA Indexer Q norm + partial 3D MRoPE & raw_k extraction.
+//    `qk_in`: `[num_tokens, (idx_n_heads + 1) * idx_head_dim]`.
+// Grid: (idx_n_heads + 1, num_tokens, 1) threadgroups, 32 threads.
+kernel void ami_qsa_real_idx_prep(const device half *qk_in [[buffer(0)]],
+                                  const device uchar *q_norm [[buffer(1)]],
+                                  const device uint *positions_3d [[buffer(2)]],
+                                  device half *q_idx_out [[buffer(3)]],
+                                  device half *raw_k_dst [[buffer(4)]],
+                                  constant M94QsaIdxPrepParams &p [[buffer(5)]],
+                                  uint2 tg_pos [[threadgroup_position_in_grid]],
+                                  uint lane [[thread_index_in_simdgroup]]) {
+    const uint h = tg_pos.x;
+    const uint tok = tg_pos.y;
+    const uint total_h = p.idx_n_heads + 1u;
+    if (h >= total_h || tok >= p.num_tokens || p.idx_head_dim == 0u || p.idx_head_dim > 256u) {
+        return;
+    }
+    const uint d_dim = p.idx_head_dim;
+    const ulong in_off = (ulong(tok) * total_h + h) * d_dim;
+    if (h == p.idx_n_heads) {
+        // Store raw unrotated, unnormed key for block mean-pooling.
+        const ulong dst_tok = (p.write_raw_to_cache != 0u) ? ulong(p.start_pos + tok) : ulong(tok);
+        const ulong k_off = dst_tok * d_dim;
+        for (uint d = lane; d < d_dim; d += 32u) {
+            raw_k_dst[k_off + d] = qk_in[in_off + d];
+        }
+        return;
+    }
+
+    threadgroup float vec[256];
+    float sum_sq = 0.0f;
+    for (uint d = lane; d < d_dim; d += 32u) {
+        const float v = float(qk_in[in_off + d]);
+        vec[d] = v;
+        sum_sq = fma(v, v, sum_sq);
+    }
+    const float total_sq = simd_sum(sum_sq);
+    const float inv_rms = rsqrt(total_sq / float(d_dim) + p.rms_eps);
+    const float w_add = (p.unit_offset != 0u) ? 1.0f : 0.0f;
+    for (uint d = lane; d < d_dim; d += 32u) {
+        vec[d] = (vec[d] * inv_rms) * (w_add + g27_load_scalar_f32(q_norm, d, p.norm_dtype));
+    }
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+
+    const uint lin_pos = p.start_pos + tok;
+    const uint pos_t = (p.use_positions_3d != 0u) ? positions_3d[ulong(tok) * 3ul + 0ul] : lin_pos;
+    const uint pos_h = (p.use_positions_3d != 0u) ? positions_3d[ulong(tok) * 3ul + 1ul] : lin_pos;
+    const uint pos_w = (p.use_positions_3d != 0u) ? positions_3d[ulong(tok) * 3ul + 2ul] : lin_pos;
+    const uint half_rot = p.rotary_dim >> 1;
+    for (uint j = lane; j < half_rot; j += 32u) {
+        const uint axis = mrope_interleaved_axis(j, p.mrope_s0, p.mrope_s1, p.mrope_s2);
+        const uint axis_pos = (axis == 0u) ? pos_t : ((axis == 1u) ? pos_h : pos_w);
+        const float inv_f = yarn_inv_freq(
+            j, p.rotary_dim, p.rope_theta, p.yarn_factor,
+            p.yarn_beta_fast, p.yarn_beta_slow, p.original_max_pos);
+        const float angle = float(axis_pos) * inv_f;
+        const float c = cos(angle) * p.yarn_mscale;
+        const float s = sin(angle) * p.yarn_mscale;
+        const float x0 = vec[j];
+        const float x1 = vec[j + half_rot];
+        vec[j] = fma(x0, c, -x1 * s);
+        vec[j + half_rot] = fma(x1, c, x0 * s);
+    }
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+
+    const ulong out_off = (ulong(tok) * p.idx_n_heads + h) * d_dim;
+    for (uint d = lane; d < d_dim; d += 32u) {
+        q_idx_out[out_off + d] = half(vec[d]);
+    }
+}
+
+// 9. Pools completed compressed blocks from `raw_k_cache` -> `(1+k_norm)` RMSNorm ->
+//    partial 3D MRoPE at block start position `b * compress_ratio` -> `pooled_k_cache`.
+// Grid: (num_blocks, 1, 1) threadgroups, 32 threads.
+kernel void ami_qsa_real_idx_pool_commit(const device half *raw_k_cache [[buffer(0)]],
+                                         const device uchar *k_norm [[buffer(1)]],
+                                         device half *pooled_k_cache [[buffer(2)]],
+                                         constant M94QsaIdxPoolParams &p [[buffer(3)]],
+                                         uint tg_x [[threadgroup_position_in_grid]],
+                                         uint lane [[thread_index_in_simdgroup]]) {
+    if (tg_x >= p.num_blocks || p.idx_head_dim == 0u || p.idx_head_dim > 256u) return;
+    const uint blk = p.start_block + tg_x;
+    const uint d_dim = p.idx_head_dim;
+    const uint ratio = p.compress_ratio;
+    const uint start_tok = blk * ratio;
+    const float inv_r = 1.0f / float(ratio);
+
+    threadgroup float vec[256];
+    float sum_sq = 0.0f;
+    for (uint d = lane; d < d_dim; d += 32u) {
+        float acc = 0.0f;
+        for (uint r = 0u; r < ratio; ++r) {
+            acc += float(raw_k_cache[ulong(start_tok + r) * d_dim + d]);
+        }
+        const float pooled = float(half(acc * inv_r));
+        vec[d] = pooled;
+        sum_sq = fma(pooled, pooled, sum_sq);
+    }
+    const float total_sq = simd_sum(sum_sq);
+    const float inv_rms = rsqrt(total_sq / float(d_dim) + p.rms_eps);
+    const float w_add = (p.unit_offset != 0u) ? 1.0f : 0.0f;
+    for (uint d = lane; d < d_dim; d += 32u) {
+        vec[d] = (vec[d] * inv_rms) * (w_add + g27_load_scalar_f32(k_norm, d, p.norm_dtype));
+    }
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+
+    const uint half_rot = p.rotary_dim >> 1;
+    for (uint j = lane; j < half_rot; j += 32u) {
+        const float inv_f = yarn_inv_freq(
+            j, p.rotary_dim, p.rope_theta, p.yarn_factor,
+            p.yarn_beta_fast, p.yarn_beta_slow, p.original_max_pos);
+        const float angle = float(start_tok) * inv_f;
+        const float c = cos(angle) * p.yarn_mscale;
+        const float s = sin(angle) * p.yarn_mscale;
+        const float x0 = vec[j];
+        const float x1 = vec[j + half_rot];
+        vec[j] = fma(x0, c, -x1 * s);
+        vec[j + half_rot] = fma(x1, c, x0 * s);
+    }
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+
+    const ulong out_off = ulong(blk) * d_dim;
+    for (uint d = lane; d < d_dim; d += 32u) {
+        pooled_k_cache[out_off + d] = half(vec[d]);
+    }
+}
+
+// 10. Real-HF QSA Indexer block selection writing `QsaIndexBuffer` (`selected_blocks`, `selected_counts`).
+//     Computes `score[b] = sum_h(relu(q_idx[node, h] . pooled_k[b])) / sqrt(idx_hd)`,
+//     selects top-`min(block_topk, num_complete_blocks)` blocks plus trailing partial block.
+// Grid: (num_nodes, 1, 1) threadgroups, 256 threads (8 simdgroups). Zero stack spills.
+kernel void ami_qsa_real_idx_select(const device half *q_idx [[buffer(0)]],
+                                    const device half *pooled_k_cache [[buffer(1)]],
+                                    device uint *selected_blocks [[buffer(2)]],
+                                    device uint *selected_counts [[buffer(3)]],
+                                    constant M94QsaIdxSelectParams &p [[buffer(4)]],
+                                    uint tg_x [[threadgroup_position_in_grid]],
+                                    uint tid [[thread_index_in_threadgroup]],
+                                    uint sg_id [[simdgroup_index_in_threadgroup]],
+                                    uint lane [[thread_index_in_simdgroup]]) {
+    const uint node = tg_x;
+    if (node >= p.num_nodes) return;
+
+    const uint eff_kv_len = (p.causal_q_start_pos == 0xFFFFFFFFu)
+        ? p.kv_len
+        : min(p.kv_len, p.causal_q_start_pos + node + 1u);
+    const uint num_complete = eff_kv_len / p.compress_ratio;
+    const bool has_tail = ((eff_kv_len % p.compress_ratio) != 0u);
+    const uint cap = min(p.top_k_blocks_cap, 64u);
+    const uint tail_cnt = has_tail ? 1u : 0u;
+    const uint k_want = min(p.block_topk, cap - tail_cnt);
+    const uint k_sel = min(k_want, num_complete);
+
+    threadgroup float tg_top_s[64];
+    threadgroup uint tg_top_b[64];
+    threadgroup float tg_sg_s[8];
+    threadgroup uint tg_sg_b[8];
+
+    if (tid < 64u) {
+        tg_top_s[tid] = -INFINITY;
+        tg_top_b[tid] = 0xFFFFFFFFu;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const uint d_dim = p.idx_head_dim;
+    const uint n_ih = p.idx_n_heads;
+    const ulong q_node_base = ulong(node) * n_ih * d_dim;
+
+    // Fast path: all complete blocks fit within budget.
+    if (num_complete <= k_want) {
+        if (tid < num_complete) {
+            tg_top_b[tid] = tid;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    } else if (k_sel > 0u) {
+        // Streaming top-`k_sel` via iterative argmax over complete blocks (0 dynamic arrays).
+        for (uint k = 0u; k < k_sel; ++k) {
+            float best_s = -INFINITY;
+            uint best_b = 0xFFFFFFFFu;
+            for (uint b = sg_id; b < num_complete; b += 8u) {
+                bool already = false;
+                for (uint prev = 0u; prev < k; ++prev) {
+                    if (tg_top_b[prev] == b) {
+                        already = true;
+                        break;
+                    }
+                }
+                if (already) continue;
+                const ulong k_off = ulong(b) * d_dim;
+                float sc = 0.0f;
+                for (uint ih = 0u; ih < n_ih; ++ih) {
+                    float dot = 0.0f;
+                    const ulong q_off = q_node_base + ulong(ih) * d_dim;
+                    for (uint d = lane; d < d_dim; d += 32u) {
+                        dot = fma(float(q_idx[q_off + d]), float(pooled_k_cache[k_off + d]), dot);
+                    }
+                    const float hdot = simd_sum(dot);
+                    sc += max(hdot, 0.0f);
+                }
+                sc *= p.inv_sqrt_d;
+                if (lane == 0u && (sc > best_s || (sc == best_s && b < best_b))) {
+                    best_s = sc;
+                    best_b = b;
+                }
+            }
+            if (lane == 0u) {
+                tg_sg_s[sg_id] = best_s;
+                tg_sg_b[sg_id] = best_b;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (tid == 0u) {
+                float gs = -INFINITY;
+                uint gb = 0xFFFFFFFFu;
+                for (uint s = 0u; s < 8u; ++s) {
+                    if (tg_sg_s[s] > gs || (tg_sg_s[s] == gs && tg_sg_b[s] < gb)) {
+                        gs = tg_sg_s[s];
+                        gb = tg_sg_b[s];
+                    }
+                }
+                tg_top_s[k] = gs;
+                tg_top_b[k] = gb;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+
+    const uint total_out = k_sel + tail_cnt;
+    if (tid == 0u && has_tail && k_sel < cap) {
+        tg_top_b[k_sel] = num_complete;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Replicate selected blocks across all KV heads for `ami_qsa_sparse_attn`.
+    for (uint kh = 0u; kh < p.num_kv_heads; ++kh) {
+        const ulong cnt_idx = ulong(node) * p.num_kv_heads + kh;
+        const ulong sel_base = cnt_idx * p.top_k_blocks_cap;
+        if (tid < total_out) {
+            selected_blocks[sel_base + tid] = tg_top_b[tid];
+        } else if (tid < p.top_k_blocks_cap) {
+            selected_blocks[sel_base + tid] = 0xFFFFFFFFu;
+        }
+        if (tid == 0u) {
+            selected_counts[cnt_idx] = total_out;
+        }
+    }
+}
+
+// 11. DeepSeek-V4.1 `make_identity_pre_mix`: writes `[1, 0, ..., 0]` per token (`f32`).
+// Grid: ceil((m * hc_mult) / 256), 256 threads.
+kernel void ami_m94_mhc_init_pre_mix(device float *pre_mix [[buffer(0)]],
+                                     constant M94MhcInitParams &p [[buffer(1)]],
+                                     uint gid [[thread_position_in_grid]]) {
+    const uint total = p.m * p.hc_mult;
+    if (gid >= total) return;
+    const uint lane_s = gid % p.hc_mult;
+    pre_mix[gid] = (lane_s == 0u) ? 1.0f : 0.0f;
+}
+
+// 12. DeepSeek-V4.1 exact 20-step Sinkhorn `mHC` with `pre_mix` handoff:
+//     Computes `(pre_new, post, comb) = hc_mixes(streams, fn_w, scale_w, base_w)`,
+//     stores `post + comb` into `coeffs_out [M, 20]`, stores `pre_new` into `pre_mix_out [M, 4]`,
+//     and collapses `streams` with INCOMING `pre_mix_in [M, 4]` + optional RMSNorm into `branch_out`!
+// Grid: (m, 1, 1) threadgroups, 256 threads (8 simdgroups). Zero stack spills.
+kernel void ami_m94_mhc_pre_sinkhorn_handoff(const device uchar *streams [[buffer(0)]],
+                                             const device uchar *fn_w [[buffer(1)]],
+                                             const device float *base_w [[buffer(2)]],
+                                             const device float *scale_w [[buffer(3)]],
+                                             const device uchar *norm_w [[buffer(4)]],
+                                             device uchar *branch_out [[buffer(5)]],
+                                             device float *coeffs_out [[buffer(6)]],
+                                             const device float *pre_mix_in [[buffer(7)]],
+                                             device float *pre_mix_out [[buffer(8)]],
+                                             constant G27MhcSinkhornParams &p [[buffer(9)]],
+                                             uint tg_x [[threadgroup_position_in_grid]],
+                                             uint tid [[thread_index_in_threadgroup]],
+                                             uint sg_id [[simdgroup_index_in_threadgroup]],
+                                             uint lane [[thread_index_in_simdgroup]]) {
+    const uint tok = tg_x;
+    if (tok >= p.m || p.hidden_size == 0u) return;
+
+    const uint total_dim = 4u * p.hidden_size;
+    const ulong tok_stream_base = ulong(tok) * total_dim;
+
+    threadgroup float tg_raw[24];
+    threadgroup float tg_pre_in[4];
+    threadgroup float tg_reduce[8];
+    threadgroup float tg_inv_rms[1];
+
+    const uint r0 = sg_id * 3u + 0u;
+    const uint r1 = sg_id * 3u + 1u;
+    const uint r2 = sg_id * 3u + 2u;
+    const ulong fn_off0 = ulong(r0) * total_dim;
+    const ulong fn_off1 = ulong(r1) * total_dim;
+    const ulong fn_off2 = ulong(r2) * total_dim;
+
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+    float acc2 = 0.0f;
+    float sq_sum = 0.0f;
+    for (uint j = lane; j < total_dim; j += 32u) {
+        const float sv = hybrid_load_f16_or_bf16(streams, tok_stream_base + j, GR_STREAM_BF16);
+        if (sg_id == 0u) sq_sum = fma(sv, sv, sq_sum);
+        acc0 = fma(sv, g27_load_scalar_f32(fn_w, fn_off0 + j, p.fn_dtype), acc0);
+        acc1 = fma(sv, g27_load_scalar_f32(fn_w, fn_off1 + j, p.fn_dtype), acc1);
+        acc2 = fma(sv, g27_load_scalar_f32(fn_w, fn_off2 + j, p.fn_dtype), acc2);
+    }
+
+    const float sum0 = simd_sum(acc0);
+    const float sum1 = simd_sum(acc1);
+    const float sum2 = simd_sum(acc2);
+    const float total_sq = (sg_id == 0u) ? simd_sum(sq_sum) : 0.0f;
+    if (lane == 0u) {
+        tg_raw[r0] = sum0;
+        tg_raw[r1] = sum1;
+        tg_raw[r2] = sum2;
+        if (sg_id == 0u) tg_inv_rms[0] = rsqrt(total_sq / float(total_dim) + p.rms_eps);
+    }
+    if (tid < 4u) {
+        tg_pre_in[tid] = pre_mix_in[ulong(tok) * 4u + tid];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tid == 0u) {
+        const float inv_rms = tg_inv_rms[0];
+        const float eps = p.hc_eps;
+        const float s_pre = scale_w[0] * inv_rms;
+        const float s_post = scale_w[1] * inv_rms;
+        const float s_comb = scale_w[2] * inv_rms;
+
+        device float *dst_pre = pre_mix_out + ulong(tok) * 4u;
+        dst_pre[0] = hybrid_sigmoid(fma(tg_raw[0], s_pre, base_w[0])) + eps;
+        dst_pre[1] = hybrid_sigmoid(fma(tg_raw[1], s_pre, base_w[1])) + eps;
+        dst_pre[2] = hybrid_sigmoid(fma(tg_raw[2], s_pre, base_w[2])) + eps;
+        dst_pre[3] = hybrid_sigmoid(fma(tg_raw[3], s_pre, base_w[3])) + eps;
+
+        const float p0 = 2.0f * hybrid_sigmoid(fma(tg_raw[4], s_post, base_w[4]));
+        const float p1 = 2.0f * hybrid_sigmoid(fma(tg_raw[5], s_post, base_w[5]));
+        const float p2 = 2.0f * hybrid_sigmoid(fma(tg_raw[6], s_post, base_w[6]));
+        const float p3 = 2.0f * hybrid_sigmoid(fma(tg_raw[7], s_post, base_w[7]));
+
+        float4 c0 = g27_softmax4_plus_eps(float4(
+            fma(tg_raw[8],  s_comb, base_w[8]),
+            fma(tg_raw[9],  s_comb, base_w[9]),
+            fma(tg_raw[10], s_comb, base_w[10]),
+            fma(tg_raw[11], s_comb, base_w[11])), eps);
+        float4 c1 = g27_softmax4_plus_eps(float4(
+            fma(tg_raw[12], s_comb, base_w[12]),
+            fma(tg_raw[13], s_comb, base_w[13]),
+            fma(tg_raw[14], s_comb, base_w[14]),
+            fma(tg_raw[15], s_comb, base_w[15])), eps);
+        float4 c2 = g27_softmax4_plus_eps(float4(
+            fma(tg_raw[16], s_comb, base_w[16]),
+            fma(tg_raw[17], s_comb, base_w[17]),
+            fma(tg_raw[18], s_comb, base_w[18]),
+            fma(tg_raw[19], s_comb, base_w[19])), eps);
+        float4 c3 = g27_softmax4_plus_eps(float4(
+            fma(tg_raw[20], s_comb, base_w[20]),
+            fma(tg_raw[21], s_comb, base_w[21]),
+            fma(tg_raw[22], s_comb, base_w[22]),
+            fma(tg_raw[23], s_comb, base_w[23])), eps);
+
+        if (p.sinkhorn_iters > 0u) {
+            const float4 inv_c0 = 1.0f / (c0 + c1 + c2 + c3 + eps);
+            c0 *= inv_c0; c1 *= inv_c0; c2 *= inv_c0; c3 *= inv_c0;
+            for (uint it = 1u; it < p.sinkhorn_iters; ++it) {
+                c0 *= g27_row_norm4(c0, eps);
+                c1 *= g27_row_norm4(c1, eps);
+                c2 *= g27_row_norm4(c2, eps);
+                c3 *= g27_row_norm4(c3, eps);
+                const float4 inv_c = 1.0f / (c0 + c1 + c2 + c3 + eps);
+                c0 *= inv_c; c1 *= inv_c; c2 *= inv_c; c3 *= inv_c;
+            }
+        }
+
+        device float *dst_c = coeffs_out + ulong(tok) * 20u;
+        dst_c[0] = p0; dst_c[1] = p1; dst_c[2] = p2; dst_c[3] = p3;
+        dst_c[4] = c0.x; dst_c[5] = c0.y; dst_c[6] = c0.z; dst_c[7] = c0.w;
+        dst_c[8] = c1.x; dst_c[9] = c1.y; dst_c[10] = c1.z; dst_c[11] = c1.w;
+        dst_c[12] = c2.x; dst_c[13] = c2.y; dst_c[14] = c2.z; dst_c[15] = c2.w;
+        dst_c[16] = c3.x; dst_c[17] = c3.y; dst_c[18] = c3.z; dst_c[19] = c3.w;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const float pre0 = tg_pre_in[0];
+    const float pre1 = tg_pre_in[1];
+    const float pre2 = tg_pre_in[2];
+    const float pre3 = tg_pre_in[3];
+    const bool has_norm_w = ((p.flags & 1u) != 0u);
+    const ulong h = ulong(p.hidden_size);
+    const ulong tok_out_base = ulong(tok) * h;
+
+    float inv_rms_sub = 1.0f;
+    if (has_norm_w) {
+        float sq_partial = 0.0f;
+        for (uint d = tid; d < p.hidden_size; d += 256u) {
+            const float s0 = hybrid_load_f16_or_bf16(streams, tok_stream_base + 0ul * h + d, GR_STREAM_BF16);
+            const float s1 = hybrid_load_f16_or_bf16(streams, tok_stream_base + 1ul * h + d, GR_STREAM_BF16);
+            const float s2 = hybrid_load_f16_or_bf16(streams, tok_stream_base + 2ul * h + d, GR_STREAM_BF16);
+            const float s3 = hybrid_load_f16_or_bf16(streams, tok_stream_base + 3ul * h + d, GR_STREAM_BF16);
+            const float mix = fma(pre0, s0, fma(pre1, s1, fma(pre2, s2, pre3 * s3)));
+            sq_partial = fma(mix, mix, sq_partial);
+        }
+        const float sg_sq = simd_sum(sq_partial);
+        if (lane == 0u) tg_reduce[sg_id] = sg_sq;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        const float sub_sq = ((tg_reduce[0] + tg_reduce[1]) + (tg_reduce[2] + tg_reduce[3])) +
+                             ((tg_reduce[4] + tg_reduce[5]) + (tg_reduce[6] + tg_reduce[7]));
+        inv_rms_sub = rsqrt(sub_sq / float(p.hidden_size) + p.rms_eps);
+    }
+
+    for (uint d = tid; d < p.hidden_size; d += 256u) {
+        const float s0 = hybrid_load_f16_or_bf16(streams, tok_stream_base + 0ul * h + d, GR_STREAM_BF16);
+        const float s1 = hybrid_load_f16_or_bf16(streams, tok_stream_base + 1ul * h + d, GR_STREAM_BF16);
+        const float s2 = hybrid_load_f16_or_bf16(streams, tok_stream_base + 2ul * h + d, GR_STREAM_BF16);
+        const float s3 = hybrid_load_f16_or_bf16(streams, tok_stream_base + 3ul * h + d, GR_STREAM_BF16);
+        float mix = fma(pre0, s0, fma(pre1, s1, fma(pre2, s2, pre3 * s3)));
+        if (has_norm_w) {
+            mix = (mix * inv_rms_sub) * g27_load_scalar_f32(norm_w, d, p.norm_dtype);
+        }
+        hybrid_store_f16_or_bf16(branch_out, tok_out_base + d, mix, GR_ACT_BF16);
+    }
+}
+
+// 13. DeepSeek-V4.1 final `hc_pre(h, pre_mix)` collapse + optional RMSNorm (`norm.weight`).
+// Grid: (m, 1, 1) threadgroups, 256 threads.
+kernel void ami_m94_mhc_collapse_pre_mix(const device uchar *streams [[buffer(0)]],
+                                         const device float *pre_mix [[buffer(1)]],
+                                         const device uchar *norm_w [[buffer(2)]],
+                                         device half *out [[buffer(3)]],
+                                         constant M94MhcCollapseParams &p [[buffer(4)]],
+                                         uint tg_x [[threadgroup_position_in_grid]],
+                                         uint tid [[thread_index_in_threadgroup]],
+                                         uint sg_id [[simdgroup_index_in_threadgroup]],
+                                         uint lane [[thread_index_in_simdgroup]]) {
+    const uint tok = tg_x;
+    if (tok >= p.m || p.hidden_size == 0u) return;
+
+    const ulong h = ulong(p.hidden_size);
+    const ulong tok_stream_base = ulong(tok) * 4ul * h;
+    const ulong tok_out_base = ulong(tok) * h;
+
+    threadgroup float tg_pre[4];
+    threadgroup float tg_red[8];
+    if (tid < 4u) tg_pre[tid] = pre_mix[ulong(tok) * 4u + tid];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const float p0 = tg_pre[0];
+    const float p1 = tg_pre[1];
+    const float p2 = tg_pre[2];
+    const float p3 = tg_pre[3];
+
+    float inv_rms = 1.0f;
+    if (p.has_norm_w != 0u) {
+        float sq = 0.0f;
+        for (uint d = tid; d < p.hidden_size; d += 256u) {
+            const float s0 = hybrid_load_f16_or_bf16(streams, tok_stream_base + 0ul * h + d, GR_STREAM_BF16);
+            const float s1 = hybrid_load_f16_or_bf16(streams, tok_stream_base + 1ul * h + d, GR_STREAM_BF16);
+            const float s2 = hybrid_load_f16_or_bf16(streams, tok_stream_base + 2ul * h + d, GR_STREAM_BF16);
+            const float s3 = hybrid_load_f16_or_bf16(streams, tok_stream_base + 3ul * h + d, GR_STREAM_BF16);
+            const float v = fma(p0, s0, fma(p1, s1, fma(p2, s2, p3 * s3)));
+            sq = fma(v, v, sq);
+        }
+        const float sg_sq = simd_sum(sq);
+        if (lane == 0u) tg_red[sg_id] = sg_sq;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        const float tot_sq = ((tg_red[0] + tg_red[1]) + (tg_red[2] + tg_red[3])) +
+                             ((tg_red[4] + tg_red[5]) + (tg_red[6] + tg_red[7]));
+        inv_rms = rsqrt(tot_sq / float(p.hidden_size) + p.rms_eps);
+    }
+
+    for (uint d = tid; d < p.hidden_size; d += 256u) {
+        const float s0 = hybrid_load_f16_or_bf16(streams, tok_stream_base + 0ul * h + d, GR_STREAM_BF16);
+        const float s1 = hybrid_load_f16_or_bf16(streams, tok_stream_base + 1ul * h + d, GR_STREAM_BF16);
+        const float s2 = hybrid_load_f16_or_bf16(streams, tok_stream_base + 2ul * h + d, GR_STREAM_BF16);
+        const float s3 = hybrid_load_f16_or_bf16(streams, tok_stream_base + 3ul * h + d, GR_STREAM_BF16);
+        float v = fma(p0, s0, fma(p1, s1, fma(p2, s2, p3 * s3)));
+        if (p.has_norm_w != 0u) {
+            v = (v * inv_rms) * g27_load_scalar_f32(norm_w, d, p.norm_dtype);
+        }
+        out[tok_out_base + d] = half(v);
+    }
+}
+
+// 14. Exact DeepSeek-V4.1 complex-pair RoPE (`apply_rotary_emb`, forward or `inverse`, optional YaRN).
+//     Keeps adjacent-pair layout: `(x[2j], x[2j+1]) * exp(±i * pos * freq[j])`.
+// Grid: (num_heads, num_tokens, 1) threadgroups, 32 threads.
+kernel void ami_m94_rope_complex(device half *x [[buffer(0)]],
+                                 const device uint *positions [[buffer(1)]],
+                                 constant M94RopeComplexParams &p [[buffer(2)]],
+                                 uint2 tg_pos [[threadgroup_position_in_grid]],
+                                 uint lane [[thread_index_in_simdgroup]]) {
+    const uint head = tg_pos.x;
+    const uint tok = tg_pos.y;
+    if (head >= p.num_heads || tok >= p.num_tokens || p.rot_dim < 2u) return;
+
+    const uint half_d = p.rot_dim >> 1;
+    const uint stride_pos = (p.pos_stride > 0u) ? p.pos_stride : 1u;
+    const uint pos = (p.use_pos_buf != 0u) ? positions[tok] : (p.base_pos + tok * stride_pos);
+    const ulong base = (ulong(tok) * p.num_heads + head) * p.head_stride + p.rot_offset;
+
+    for (uint j = lane; j < half_d; j += 32u) {
+        const float x0 = float(x[base + 2u * j]);
+        const float x1 = float(x[base + 2u * j + 1u]);
+        const float inv_f = m94_ds_inv_freq(
+            j, p.rot_dim, p.rope_theta, p.original_seq_len, p.rope_factor, p.beta_fast, p.beta_slow);
+        const float angle = float(pos) * inv_f;
+        const float c = cos(angle);
+        const float s = (p.inverse != 0u) ? -sin(angle) : sin(angle);
+        x[base + 2u * j]      = half(fma(x0, c, -x1 * s));
+        x[base + 2u * j + 1u] = half(fma(x1, c,  x0 * s));
+    }
+}
+
+// 15. DeepSeek-V4.1 `Compressor` softmax-gated group pooling (`ratio >= 2`) + RMSNorm.
+//     Supports both real-HF (`gate_dim == head_dim`) and synth (`gate_dim == ratio`),
+//     handling both prefill (`num_tokens >= 1` starting at `start_pos`) and decode (`num_tokens == 1`).
+// Grid: (max(out_count, 1), 1, 1) threadgroups, 256 threads.
+kernel void ami_m94_ds_compressor_pool(const device half *kv_in [[buffer(0)]],
+                                       const device half *gate_in [[buffer(1)]],
+                                       const device uchar *norm_w [[buffer(2)]],
+                                       device float *kv_state [[buffer(3)]],
+                                       device float *score_state [[buffer(4)]],
+                                       device half *latent_out [[buffer(5)]],
+                                       constant M94DsCompressorParams &p [[buffer(6)]],
+                                       uint tg_x [[threadgroup_position_in_grid]],
+                                       uint tid [[thread_index_in_threadgroup]],
+                                       uint sg_id [[simdgroup_index_in_threadgroup]],
+                                       uint lane [[thread_index_in_simdgroup]]) {
+    const uint d_dim = p.head_dim;
+    const uint ratio = p.ratio;
+    if (d_dim == 0u || ratio == 0u) return;
+
+    // Group `g_idx = tg_x` produces `latent_out[g_idx]` for completed group starting at
+    // global token index `g_tok_start = ((start_pos / ratio) + g_idx) * ratio`?
+    // Caller ensures `out_count = (start_pos + num_tokens) / ratio - (start_pos / ratio)`.
+    // First update partial group state on threadgroup 0 for trailing remainder (if `write_state != 0`).
+    const uint end_pos = p.start_pos + p.num_tokens;
+    const uint first_complete_group = p.start_pos / ratio;
+    const uint end_complete_group = end_pos / ratio;
+    const uint num_out = end_complete_group - first_complete_group;
+
+    threadgroup float tg_red[8];
+
+    if (tg_x < num_out) {
+        const uint grp = first_complete_group + tg_x;
+        const uint grp_tok0 = grp * ratio;
+
+        float sq_part = 0.0f;
+        for (uint d = tid; d < d_dim; d += 256u) {
+            float max_sc = -INFINITY;
+            for (uint r = 0u; r < ratio; ++r) {
+                const uint gpos = grp_tok0 + r;
+                float sc = 0.0f;
+                if (gpos < p.start_pos) {
+                    sc = score_state[ulong(r) * d_dim + d];
+                } else {
+                    const uint local_t = gpos - p.start_pos;
+                    const uint g_col = (p.gate_dim >= d_dim) ? d : (r % p.gate_dim);
+                    sc = float(gate_in[ulong(local_t) * p.gate_dim + g_col]);
+                }
+                max_sc = max(max_sc, sc);
+            }
+            float denom = 0.0f;
+            float acc = 0.0f;
+            for (uint r = 0u; r < ratio; ++r) {
+                const uint gpos = grp_tok0 + r;
+                float sc = 0.0f;
+                float kv = 0.0f;
+                if (gpos < p.start_pos) {
+                    sc = score_state[ulong(r) * d_dim + d];
+                    kv = kv_state[ulong(r) * d_dim + d];
+                } else {
+                    const uint local_t = gpos - p.start_pos;
+                    const uint g_col = (p.gate_dim >= d_dim) ? d : (r % p.gate_dim);
+                    sc = float(gate_in[ulong(local_t) * p.gate_dim + g_col]);
+                    kv = float(kv_in[ulong(local_t) * d_dim + d]);
+                }
+                const float w = exp(sc - max_sc);
+                denom += w;
+                acc = fma(w, kv, acc);
+            }
+            const float pooled = float(half(acc / max(denom, 1.0e-20f)));
+            latent_out[ulong(tg_x) * d_dim + d] = half(pooled);
+            sq_part = fma(pooled, pooled, sq_part);
+        }
+        const float sg_sq = simd_sum(sq_part);
+        if (lane == 0u) tg_red[sg_id] = sg_sq;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        const float tot_sq = ((tg_red[0] + tg_red[1]) + (tg_red[2] + tg_red[3])) +
+                             ((tg_red[4] + tg_red[5]) + (tg_red[6] + tg_red[7]));
+        const float inv_rms = rsqrt(tot_sq / float(d_dim) + p.rms_eps);
+        for (uint d = tid; d < d_dim; d += 256u) {
+            const float v = float(latent_out[ulong(tg_x) * d_dim + d]);
+            const float nw = g27_load_scalar_f32(norm_w, d, p.norm_dtype);
+            latent_out[ulong(tg_x) * d_dim + d] = half((v * inv_rms) * nw);
+        }
+    }
+
+    // Commit trailing partial group into `(kv_state, score_state)` on threadgroup 0.
+    if (tg_x == 0u && p.write_state != 0u) {
+        const uint rem_start = end_complete_group * ratio;
+        if (rem_start < end_pos) {
+            const uint first_new = max(rem_start, p.start_pos);
+            for (uint gpos = first_new; gpos < end_pos; ++gpos) {
+                const uint slot = gpos - rem_start;
+                const uint local_t = gpos - p.start_pos;
+                for (uint d = tid; d < d_dim; d += 256u) {
+                    const uint g_col = (p.gate_dim >= d_dim) ? d : (slot % p.gate_dim);
+                    kv_state[ulong(slot) * d_dim + d] = float(kv_in[ulong(local_t) * d_dim + d]);
+                    score_state[ulong(slot) * d_dim + d] = float(gate_in[ulong(local_t) * p.gate_dim + g_col]);
+                }
+            }
+        }
+    }
+}
+
+// 16. DeepSeek-V4.1 two-level `Indexer` scoring, candidate block mask, and top-k selection.
+//     Computes `score[t] = sum_h (relu(q_idx[tok, h] . index_k[t]) * weights[tok, h] * weight_scale)`.
+//     Optional Level-1 (`is_candidate_source`): max-pools scores per `cand_block_size`, pins last
+//     reachable block `(compress_len - 1) / cand_block_size` to `+inf`, writes `candidate_mask`.
+//     Optional Level-2 (`uses_candidates`): masks scores outside `candidate_mask`.
+//     Outputs top-`min(index_topk, total_comp_len)` indices (sorted ascending, `+ offset`, `-1` unreachable).
+// Grid: (num_tokens, 1, 1) threadgroups, 256 threads (8 simdgroups). Zero stack spills.
+kernel void ami_m94_ds_indexer_select(const device half *q_idx [[buffer(0)]],
+                                      const device half *index_k_cache [[buffer(1)]],
+                                      const device half *weights [[buffer(2)]],
+                                      device uchar *candidate_mask [[buffer(3)]],
+                                      device int *topk_idxs_out [[buffer(4)]],
+                                      device float *scores_scratch [[buffer(5)]],
+                                      constant M94DsIndexerParams &p [[buffer(6)]],
+                                      uint tg_x [[threadgroup_position_in_grid]],
+                                      uint tid [[thread_index_in_threadgroup]],
+                                      uint sg_id [[simdgroup_index_in_threadgroup]],
+                                      uint lane [[thread_index_in_simdgroup]]) {
+    const uint tok = tg_x;
+    if (tok >= p.num_tokens) return;
+
+    const uint comp_len = p.is_causal_prefill != 0u
+        ? ((p.start_pos + tok + 1u) / p.ratio)
+        : p.total_comp_len;
+    const uint total_c = p.total_comp_len;
+    const uint topk = min(p.index_topk, total_c);
+    device float *row_scores = scores_scratch + ulong(tok) * max(total_c, 1u);
+
+    // Pass 1: score every compressed key position `t in 0..total_c-1`.
+    const uint n_h = p.idx_n_heads;
+    const uint d_dim = p.idx_head_dim;
+    const ulong q_tok_base = ulong(tok) * n_h * d_dim;
+    const ulong w_tok_base = ulong(tok) * n_h;
+
+    for (uint t = sg_id; t < total_c; t += 8u) {
+        if (t >= comp_len) {
+            if (lane == 0u) row_scores[t] = -INFINITY;
+            continue;
+        }
+        const ulong k_off = ulong(t) * d_dim;
+        float total_s = 0.0f;
+        for (uint h = 0u; h < n_h; ++h) {
+            const ulong q_off = q_tok_base + ulong(h) * d_dim;
+            float dot = 0.0f;
+            for (uint d = lane; d < d_dim; d += 32u) {
+                dot = fma(float(q_idx[q_off + d]), float(index_k_cache[k_off + d]), dot);
+            }
+            const float hdot = simd_sum(dot);
+            if (lane == 0u) {
+                const float w_h = float(weights[w_tok_base + h]) * p.weight_scale;
+                total_s = fma(max(hdot, 0.0f), w_h, total_s);
+            }
+        }
+        if (lane == 0u) {
+            row_scores[t] = total_s;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
+
+    // Optional Level-1 (`candidate_source_layer`): select `cand_topk_blocks` blocks, always pinning last block.
+    if (p.is_candidate_source != 0u && p.cand_block_size > 0u && p.cand_num_blocks > 0u) {
+        device uchar *cm_row = candidate_mask + ulong(tok) * p.cand_num_blocks;
+        const uint last_blk = (comp_len > 0u) ? ((comp_len - 1u) / p.cand_block_size) : 0xFFFFFFFFu;
+        const uint k_blk = min(p.cand_topk_blocks, p.cand_num_blocks);
+        for (uint b = tid; b < p.cand_num_blocks; b += 256u) {
+            cm_row[b] = (p.cand_num_blocks <= k_blk && b * p.cand_block_size < comp_len) ? 1u : 0u;
+        }
+        threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
+
+        if (p.cand_num_blocks > k_blk && comp_len > 0u) {
+            threadgroup float tg_bs[8];
+            threadgroup uint tg_bi[8];
+            for (uint pick = 0u; pick < k_blk; ++pick) {
+                float best_s = -INFINITY;
+                uint best_b = 0xFFFFFFFFu;
+                for (uint b = tid; b < p.cand_num_blocks; b += 256u) {
+                    if (cm_row[b] != 0u) continue;
+                    const uint t0 = b * p.cand_block_size;
+                    if (t0 >= comp_len) continue;
+                    float bs = (b == last_blk) ? INFINITY : -INFINITY;
+                    if (b != last_blk) {
+                        const uint t1 = min(t0 + p.cand_block_size, comp_len);
+                        for (uint t = t0; t < t1; ++t) {
+                            bs = max(bs, row_scores[t]);
+                        }
+                    }
+                    if (bs > best_s || (bs == best_s && b < best_b)) {
+                        best_s = bs;
+                        best_b = b;
+                    }
+                }
+                // Simdgroup reduce.
+                for (ushort off = 16u; off > 0u; off >>= 1u) {
+                    const float os = simd_shuffle_down(best_s, off);
+                    const uint ob = simd_shuffle_down(best_b, off);
+                    if (os > best_s || (os == best_s && ob < best_b)) {
+                        best_s = os;
+                        best_b = ob;
+                    }
+                }
+                if (lane == 0u) {
+                    tg_bs[sg_id] = best_s;
+                    tg_bi[sg_id] = best_b;
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                if (tid == 0u) {
+                    float gs = -INFINITY;
+                    uint gb = 0xFFFFFFFFu;
+                    for (uint s = 0u; s < 8u; ++s) {
+                        if (tg_bs[s] > gs || (tg_bs[s] == gs && tg_bi[s] < gb)) {
+                            gs = tg_bs[s];
+                            gb = tg_bi[s];
+                        }
+                    }
+                    if (gb < p.cand_num_blocks && gs > -INFINITY) {
+                        cm_row[gb] = 1u;
+                    }
+                }
+                threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
+            }
+        }
+    } else if (p.uses_candidates != 0u && p.cand_block_size > 0u && p.cand_num_blocks > 0u) {
+        const device uchar *cm_row = candidate_mask + ulong(tok) * p.cand_num_blocks;
+        for (uint t = tid; t < total_c; t += 256u) {
+            const uint b = t / p.cand_block_size;
+            if (b >= p.cand_num_blocks || cm_row[b] == 0u) {
+                row_scores[t] = -INFINITY;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
+    }
+
+    // Pass 2: select `topk` highest-scoring positions (exact match to `topk(..., sorted=False)` + `sort()`).
+    device int *out_row = topk_idxs_out + ulong(tok) * max(topk, 1u);
+    if (topk == 0u) return;
+
+    if (total_c <= topk) {
+        for (uint k = tid; k < topk; k += 256u) {
+            out_row[k] = (k < comp_len && row_scores[k] > -INFINITY) ? int(k + p.offset) : -1;
+        }
+        return;
+    }
+
+    threadgroup float tg_s[8];
+    threadgroup uint tg_i[8];
+    for (uint k = 0u; k < topk; ++k) {
+        float best_s = -INFINITY;
+        uint best_t = 0xFFFFFFFFu;
+        for (uint t = tid; t < total_c; t += 256u) {
+            const float sc = row_scores[t];
+            if (sc > best_s || (sc == best_s && t < best_t)) {
+                best_s = sc;
+                best_t = t;
+            }
+        }
+        for (ushort off = 16u; off > 0u; off >>= 1u) {
+            const float os = simd_shuffle_down(best_s, off);
+            const uint ot = simd_shuffle_down(best_t, off);
+            if (os > best_s || (os == best_s && ot < best_t)) {
+                best_s = os;
+                best_t = ot;
+            }
+        }
+        if (lane == 0u) {
+            tg_s[sg_id] = best_s;
+            tg_i[sg_id] = best_t;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tid == 0u) {
+            float gs = -INFINITY;
+            uint gt = 0xFFFFFFFFu;
+            for (uint s = 0u; s < 8u; ++s) {
+                if (tg_s[s] > gs || (tg_s[s] == gs && tg_i[s] < gt)) {
+                    gs = tg_s[s];
+                    gt = tg_i[s];
+                }
+            }
+            if (gt < comp_len && gs > -INFINITY) {
+                out_row[k] = int(gt + p.offset);
+                row_scores[gt] = -INFINITY;
+            } else {
+                out_row[k] = -1;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
+    }
+}
+
+// 17. DeepSeek-V4.1 shared-KV sparse latent attention over sliding window + compressed
+//     latent KV with exact FP32 `attn_sink` and fused inverse complex RoPE on `out[..., -rd:]`.
+//     Supports real-HF (`q_head_dim == kv_dim == v_head_dim <= 512`) and synth compact shapes.
+// Grid: (n_heads, num_q, 1) threadgroups, 256 threads (8 simdgroups). Zero stack spills.
+kernel void ami_m94_ds_latent_attn(const device half *q [[buffer(0)]],
+                                   const device half *win_kv_cache [[buffer(1)]],
+                                   const device half *win_kv_cur [[buffer(2)]],
+                                   const device half *comp_kv_cache [[buffer(3)]],
+                                   const device int *topk_idxs [[buffer(4)]],
+                                   const device float *attn_sink [[buffer(5)]],
+                                   const device ulong *ancestor_masks [[buffer(6)]],
+                                   device half *out [[buffer(7)]],
+                                   constant M94DsLatentAttnParams &p [[buffer(8)]],
+                                   uint2 tg_pos [[threadgroup_position_in_grid]],
+                                   uint tid [[thread_index_in_threadgroup]],
+                                   uint sg_id [[simdgroup_index_in_threadgroup]],
+                                   uint lane [[thread_index_in_simdgroup]]) {
+    const uint head = tg_pos.x;
+    const uint q_idx = tg_pos.y;
+    if (head >= p.n_heads || q_idx >= p.num_q || p.kv_dim > 512u || p.q_head_dim > 512u) return;
+
+    threadgroup float tg_q[512];
+    threadgroup float tg_red[8];
+
+    const ulong q_base = (ulong(q_idx) * p.n_heads + head) * p.q_head_dim;
+    for (uint d = tid; d < p.q_head_dim; d += 256u) {
+        tg_q[d] = float(q[q_base + d]);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Two FP32 register accumulators per thread cover `v_head_dim <= 512` with 0 stack spills.
+    const uint d0 = tid;
+    const uint d1 = tid + 256u;
+    float o0 = 0.0f;
+    float o1 = 0.0f;
+    float m_val = -1.0e30f;
+    float l_val = 0.0f;
+
+    const bool split_q_kv = (p.q_head_dim != p.kv_dim);
+    const uint kv_rope_off = p.kv_dim - p.rope_dim;
+
+    // Helper: attend to one KV vector `kv_ptr` of length `p.kv_dim`.
+    // Phase A: committed sliding-window positions in `win_kv_cache` (`[0, p.start_pos)` within window).
+    const uint q_global_pos = p.start_pos + q_idx;
+    const uint win_lo = (q_global_pos + 1u > p.window_size) ? (q_global_pos + 1u - p.window_size) : 0u;
+    const uint win_committed_end = min(p.start_pos, q_global_pos + 1u);
+
+    for (uint pos = win_lo; pos < win_committed_end; ++pos) {
+        const uint slot = pos % p.window_size;
+        const device half *kv_ptr = win_kv_cache + ulong(slot) * p.kv_dim;
+        float dot_p = 0.0f;
+        if (!split_q_kv) {
+            if (d0 < p.kv_dim) dot_p = fma(tg_q[d0], float(kv_ptr[d0]), dot_p);
+            if (d1 < p.kv_dim) dot_p = fma(tg_q[d1], float(kv_ptr[d1]), dot_p);
+        } else {
+            if (d0 < p.nope_dim) dot_p = fma(tg_q[d0], float(kv_ptr[d0]), dot_p);
+            if (d0 < p.rope_dim) dot_p = fma(tg_q[p.nope_dim + d0], float(kv_ptr[kv_rope_off + d0]), dot_p);
+        }
+        const float sg_dot = simd_sum(dot_p);
+        if (lane == 0u) tg_red[sg_id] = sg_dot;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        const float score = (((tg_red[0] + tg_red[1]) + (tg_red[2] + tg_red[3])) +
+                             ((tg_red[4] + tg_red[5]) + (tg_red[6] + tg_red[7]))) * p.scale;
+
+        const float m_new = max(m_val, score);
+        const float alpha = exp(m_val - m_new);
+        const float w = exp(score - m_new);
+        l_val = fma(l_val, alpha, w);
+        m_val = m_new;
+        if (d0 < p.v_head_dim) o0 = fma(w, float(kv_ptr[d0]), o0 * alpha);
+        if (d1 < p.v_head_dim) o1 = fma(w, float(kv_ptr[d1]), o1 * alpha);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // Phase B: current-chunk / tree uncommitted window positions in `win_kv_cur`.
+    const ulong anc_mask = (p.is_tree != 0u) ? ancestor_masks[q_idx] : 0ul;
+    const uint cur_lo = (win_lo > p.start_pos) ? (win_lo - p.start_pos) : 0u;
+    for (uint k_i = cur_lo; k_i <= q_idx; ++k_i) {
+        if (p.is_tree != 0u && (((anc_mask >> k_i) & 1ul) == 0ul)) continue;
+        const device half *kv_ptr = win_kv_cur + ulong(k_i) * p.kv_dim;
+        float dot_p = 0.0f;
+        if (!split_q_kv) {
+            if (d0 < p.kv_dim) dot_p = fma(tg_q[d0], float(kv_ptr[d0]), dot_p);
+            if (d1 < p.kv_dim) dot_p = fma(tg_q[d1], float(kv_ptr[d1]), dot_p);
+        } else {
+            if (d0 < p.nope_dim) dot_p = fma(tg_q[d0], float(kv_ptr[d0]), dot_p);
+            if (d0 < p.rope_dim) dot_p = fma(tg_q[p.nope_dim + d0], float(kv_ptr[kv_rope_off + d0]), dot_p);
+        }
+        const float sg_dot = simd_sum(dot_p);
+        if (lane == 0u) tg_red[sg_id] = sg_dot;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        const float score = (((tg_red[0] + tg_red[1]) + (tg_red[2] + tg_red[3])) +
+                             ((tg_red[4] + tg_red[5]) + (tg_red[6] + tg_red[7]))) * p.scale;
+
+        const float m_new = max(m_val, score);
+        const float alpha = exp(m_val - m_new);
+        const float w = exp(score - m_new);
+        l_val = fma(l_val, alpha, w);
+        m_val = m_new;
+        if (d0 < p.v_head_dim) o0 = fma(w, float(kv_ptr[d0]), o0 * alpha);
+        if (d1 < p.v_head_dim) o1 = fma(w, float(kv_ptr[d1]), o1 * alpha);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // Phase C: selected compressed latent KV positions (`comp_kv_cache[idx]`).
+    if (p.has_compress != 0u && p.compress_topk > 0u) {
+        const device int *row_idx = topk_idxs + ulong(q_idx) * p.compress_topk;
+        for (uint k = 0u; k < p.compress_topk; ++k) {
+            const int c_slot = row_idx[k];
+            if (c_slot < 0) continue;
+            const device half *kv_ptr = comp_kv_cache + ulong(uint(c_slot)) * p.kv_dim;
+            float dot_p = 0.0f;
+            if (!split_q_kv) {
+                if (d0 < p.kv_dim) dot_p = fma(tg_q[d0], float(kv_ptr[d0]), dot_p);
+                if (d1 < p.kv_dim) dot_p = fma(tg_q[d1], float(kv_ptr[d1]), dot_p);
+            } else {
+                if (d0 < p.nope_dim) dot_p = fma(tg_q[d0], float(kv_ptr[d0]), dot_p);
+                if (d0 < p.rope_dim) dot_p = fma(tg_q[p.nope_dim + d0], float(kv_ptr[kv_rope_off + d0]), dot_p);
+            }
+            const float sg_dot = simd_sum(dot_p);
+            if (lane == 0u) tg_red[sg_id] = sg_dot;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            const float score = (((tg_red[0] + tg_red[1]) + (tg_red[2] + tg_red[3])) +
+                                 ((tg_red[4] + tg_red[5]) + (tg_red[6] + tg_red[7]))) * p.scale;
+
+            const float m_new = max(m_val, score);
+            const float alpha = exp(m_val - m_new);
+            const float w = exp(score - m_new);
+            l_val = fma(l_val, alpha, w);
+            m_val = m_new;
+            if (d0 < p.v_head_dim) o0 = fma(w, float(kv_ptr[d0]), o0 * alpha);
+            if (d1 < p.v_head_dim) o1 = fma(w, float(kv_ptr[d1]), o1 * alpha);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+
+    // Exact FP32 `attn_sink` contribution (numerically stable even if `sink > m_val`).
+    if (p.has_sink != 0u) {
+        const float sink_s = attn_sink[head];
+        const float m_new = max(m_val, sink_s);
+        const float alpha = exp(m_val - m_new);
+        o0 *= alpha;
+        o1 *= alpha;
+        l_val = fma(l_val, alpha, exp(sink_s - m_new));
+    }
+
+    const float inv_l = (l_val > 0.0f) ? (1.0f / l_val) : 0.0f;
+    // Reuse `tg_q` to stage normalized output when fused inverse complex RoPE is requested.
+    if (p.apply_inv_rope != 0u && p.rope_dim >= 2u && p.v_head_dim >= p.rope_dim) {
+        if (d0 < p.v_head_dim) tg_q[d0] = o0 * inv_l;
+        if (d1 < p.v_head_dim) tg_q[d1] = o1 * inv_l;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        const uint out_rope_off = p.v_head_dim - p.rope_dim;
+        const uint half_rd = p.rope_dim >> 1;
+        if (tid < half_rd) {
+            const float x0 = tg_q[out_rope_off + 2u * tid];
+            const float x1 = tg_q[out_rope_off + 2u * tid + 1u];
+            const float inv_f = m94_ds_inv_freq(
+                tid, p.rope_dim, p.rope_theta, p.original_seq_len, p.rope_factor, p.beta_fast, p.beta_slow);
+            const float angle = float(q_global_pos) * inv_f;
+            const float c = cos(angle);
+            const float s = -sin(angle); // conjugate inverse
+            tg_q[out_rope_off + 2u * tid]      = fma(x0, c, -x1 * s);
+            tg_q[out_rope_off + 2u * tid + 1u] = fma(x1, c,  x0 * s);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        const ulong out_base = (ulong(q_idx) * p.n_heads + head) * p.v_head_dim;
+        if (d0 < p.v_head_dim) out[out_base + d0] = half(tg_q[d0]);
+        if (d1 < p.v_head_dim) out[out_base + d1] = half(tg_q[d1]);
+    } else {
+        const ulong out_base = (ulong(q_idx) * p.n_heads + head) * p.v_head_dim;
+        if (d0 < p.v_head_dim) out[out_base + d0] = half(o0 * inv_l);
+        if (d1 < p.v_head_dim) out[out_base + d1] = half(o1 * inv_l);
+    }
+}
+
+// 18. DeepSeek-V4.1 real-HF `Engram` per-stream `rstd` signed-sqrt sigmoid gate + value residual add.
+//     Supports both real-HF (`wkv_out_dim == 5 * H`, `k_dim == H`) and synth (`wkv_out_dim == H`, `k_dim == emb_dim`).
+// Grid: (4, m, 1) threadgroups, 256 threads (8 simdgroups). Zero stack spills.
+kernel void ami_m94_ds_engram_gate_add(device uchar *streams [[buffer(0)]],
+                                       const device half *wkv_out [[buffer(1)]],
+                                       const device half *emb_in [[buffer(2)]],
+                                       const device uchar *q_weight [[buffer(3)]],
+                                       const device uchar *k_weight [[buffer(4)]],
+                                       constant M94DsEngramParams &p [[buffer(5)]],
+                                       uint2 tg_pos [[threadgroup_position_in_grid]],
+                                       uint tid [[thread_index_in_threadgroup]],
+                                       uint sg_id [[simdgroup_index_in_threadgroup]],
+                                       uint lane [[thread_index_in_simdgroup]]) {
+    const uint s = tg_pos.x;
+    const uint tok = tg_pos.y;
+    if (s >= 4u || tok >= p.m || p.hidden_size == 0u) return;
+
+    const ulong h = ulong(p.hidden_size);
+    const ulong st_base = (ulong(tok) * 4ul + s) * h;
+    const ulong wkv_base = ulong(tok) * p.wkv_out_dim;
+    const bool real_hf_wkv = (p.wkv_out_dim >= 5u * p.hidden_size);
+
+    threadgroup float tg_a[8];
+    threadgroup float tg_b[8];
+    threadgroup float tg_c[8];
+
+    float sq_h = 0.0f;
+    float sq_k = 0.0f;
+    float dot_p = 0.0f;
+
+    if (real_hf_wkv) {
+        const ulong key_base = wkv_base + ulong(s) * h;
+        const ulong w_off = ulong(s) * h;
+        for (uint d = tid; d < p.hidden_size; d += 256u) {
+            const float hv = hybrid_load_f16_or_bf16(streams, st_base + d, GR_STREAM_BF16);
+            const float kv = float(wkv_out[key_base + d]);
+            const float qw = g27_load_scalar_f32(q_weight, w_off + d, p.qk_dtype);
+            const float kw = g27_load_scalar_f32(k_weight, w_off + d, p.qk_dtype);
+            sq_h = fma(hv, hv, sq_h);
+            sq_k = fma(kv, kv, sq_k);
+            dot_p = fma(hv * qw, kw * kv, dot_p);
+        }
+    } else {
+        const uint k_len = min(p.hidden_size, min(p.k_dim, p.emb_dim));
+        const ulong emb_base = ulong(tok) * p.emb_dim;
+        const ulong qw_off = ulong(s) * h;
+        const ulong kw_off = ulong(s) * p.k_dim;
+        for (uint d = tid; d < k_len; d += 256u) {
+            const float hv = hybrid_load_f16_or_bf16(streams, st_base + d, GR_STREAM_BF16);
+            const float kv = float(emb_in[emb_base + d]);
+            const float qw = g27_load_scalar_f32(q_weight, qw_off + d, p.qk_dtype);
+            const float kw = g27_load_scalar_f32(k_weight, kw_off + d, p.qk_dtype);
+            sq_h = fma(hv, hv, sq_h);
+            sq_k = fma(kv, kv, sq_k);
+            dot_p = fma(hv * qw, kw * kv, dot_p);
+        }
+    }
+
+    const float sh = simd_sum(sq_h);
+    const float sk = simd_sum(sq_k);
+    const float sd = simd_sum(dot_p);
+    if (lane == 0u) {
+        tg_a[sg_id] = sh;
+        tg_b[sg_id] = sk;
+        tg_c[sg_id] = sd;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const float norm_len = real_hf_wkv ? float(p.hidden_size) : float(max(1u, min(p.hidden_size, min(p.k_dim, p.emb_dim))));
+    const float tot_h = ((tg_a[0] + tg_a[1]) + (tg_a[2] + tg_a[3])) + ((tg_a[4] + tg_a[5]) + (tg_a[6] + tg_a[7]));
+    const float tot_k = ((tg_b[0] + tg_b[1]) + (tg_b[2] + tg_b[3])) + ((tg_b[4] + tg_b[5]) + (tg_b[6] + tg_b[7]));
+    const float tot_d = ((tg_c[0] + tg_c[1]) + (tg_c[2] + tg_c[3])) + ((tg_c[4] + tg_c[5]) + (tg_c[6] + tg_c[7]));
+    const float rstd = rsqrt(tot_h / norm_len + p.rms_eps) * rsqrt(tot_k / norm_len + p.rms_eps);
+    const float dot_val = tot_d * rstd * p.inv_sqrt_d;
+    const float gate = hybrid_sigmoid(copysign(sqrt(max(fabs(dot_val), 1.0e-6f)), dot_val));
+
+    const ulong val_base = real_hf_wkv ? (wkv_base + 4ul * h) : wkv_base;
+    for (uint d = tid; d < p.hidden_size; d += 256u) {
+        const float hv = hybrid_load_f16_or_bf16(streams, st_base + d, GR_STREAM_BF16);
+        const float vv = float(wkv_out[val_base + d]);
+        hybrid_store_f16_or_bf16(streams, st_base + d, fma(gate, vv, hv), GR_STREAM_BF16);
+    }
 }
