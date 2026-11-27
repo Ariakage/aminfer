@@ -973,6 +973,12 @@ pub const MoELayerArgs = struct {
     shared_gate_dtype: RouterWeightDType = .f16,
     /// Optional SwiGLU clamp (`0.0` = disabled; `> 0.0` = `silu(min(gate, limit)) * clamp(up, -limit, limit)`).
     swiglu_limit: f32 = 0.0,
+    /// Optional separate SwiGLU clamp for the shared expert (`null` inherits `swiglu_limit`,
+    /// supporting per-layer `share_expert_swiglu_limit_list` on `Ling-3.1` `bailing_hybrid`).
+    shared_swiglu_limit: ?f32 = null,
+    /// When `true`, `workspace` CSR schedule is already populated (e.g. cold-expert pre-routing
+    /// + `C27` cold-tail filtering); skip router projection and `route_topk` kernels.
+    skip_routing: bool = false,
 };
 
 /// Alias spelling used by M2.5 integration code.
@@ -1964,10 +1970,13 @@ pub const MoePipelines = struct {
         args: MoELayerArgs,
         insert_barrier_before: bool,
     ) EncodeError!void {
-        try self.encodeRouting(frame, args, insert_barrier_before);
+        if (!args.skip_routing) {
+            try self.encodeRouting(frame, args, insert_barrier_before);
+        }
 
         // M7.8 G20 M=1 static-grid guard: homogeneous M==1 stays on direct dispatch.
-        const use_indirect = shouldUseIndirectDispatch(args.m, 1);
+        const use_indirect = !args.skip_routing and shouldUseIndirectDispatch(args.m, 1);
+        const gu_barrier = if (args.skip_routing) insert_barrier_before else true;
 
         try self.encodeGateUpSwiglu(frame, bits, .{
             .x = args.x,
@@ -1982,7 +1991,7 @@ pub const MoePipelines = struct {
             .intermediate_size = args.intermediate_size,
             .use_indirect = use_indirect,
             .swiglu_limit = args.swiglu_limit,
-        }, true);
+        }, gu_barrier);
 
         try self.encodeDownProj(frame, bits, .{
             .weights_base = args.weights_base,
@@ -2114,6 +2123,7 @@ pub const MoePipelines = struct {
                     },
                     else => unreachable,
                 };
+                const shared_lim = args.shared_swiglu_limit orelse args.swiglu_limit;
                 const params: MoeSharedGateUpParams = .{
                     .gate_qweight_offset = se.gate_qweight_offset,
                     .gate_sb_offset = se.gate_sb_offset,
@@ -2124,7 +2134,7 @@ pub const MoePipelines = struct {
                     .intermediate_size = se_inter,
                     .num_groups = @intCast(num_groups),
                     .row_bytes = @intCast(row_bytes),
-                    .swiglu_limit = args.swiglu_limit,
+                    .swiglu_limit = shared_lim,
                 };
                 const groups_x: u64 = (@as(u64, se_inter) + 7) / 8;
                 const groups_y: u64 = (@as(u64, args.m) + 3) / 4;
@@ -2140,6 +2150,7 @@ pub const MoePipelines = struct {
             .f16, .bf16 => {
                 if (args.hidden_size % 4 != 0) return error.UnalignedK;
                 const pipe = if (se_dtype == .bf16) self.shared_gate_up_bf16 else self.shared_gate_up_f16;
+                const shared_lim = args.shared_swiglu_limit orelse args.swiglu_limit;
                 const params: MoeSharedGateUpParams = .{
                     .gate_qweight_offset = se.gate_qweight_offset,
                     .gate_sb_offset = 0,
@@ -2150,7 +2161,7 @@ pub const MoePipelines = struct {
                     .intermediate_size = se_inter,
                     .num_groups = 0,
                     .row_bytes = 0,
-                    .swiglu_limit = args.swiglu_limit,
+                    .swiglu_limit = shared_lim,
                 };
                 const groups_x: u64 = (@as(u64, se_inter) + 3) / 4;
                 try frame.encodeThreadgroups(
@@ -2530,8 +2541,10 @@ pub const MoePipelines = struct {
         args: MoELayerHeteroArgs,
         insert_barrier_before: bool,
     ) EncodeError!void {
-        try self.encodeRoutingBucketed(frame, args, insert_barrier_before);
-        try self.encodeGateUpDownHetero(frame, args.base, args.scheme_counts, false, true);
+        if (!args.base.skip_routing) {
+            try self.encodeRoutingBucketed(frame, args, insert_barrier_before);
+        }
+        try self.encodeGateUpDownHetero(frame, args.base, args.scheme_counts, false, if (args.base.skip_routing) insert_barrier_before else true);
         try self.encodeReduceAndOptionalShared(frame, args.base, .q4_affine);
     }
 
@@ -2681,15 +2694,17 @@ pub const MoePipelines = struct {
     ) EncodeError!void {
         const base = args.base;
         if (args.is_heterogeneous) {
-            const es = args.expert_schemes orelse return error.InvalidArgument;
-            try self.encodeRoutingBucketed(frame, .{
-                .base = base,
-                .expert_schemes = es,
-                .scheme_counts = args.scheme_counts,
-            }, insert_barrier_before);
+            if (!base.skip_routing) {
+                const es = args.expert_schemes orelse return error.InvalidArgument;
+                try self.encodeRoutingBucketed(frame, .{
+                    .base = base,
+                    .expert_schemes = es,
+                    .scheme_counts = args.scheme_counts,
+                }, insert_barrier_before);
+            }
 
             const num_buckets = countActiveSchemeBuckets(args.scheme_counts);
-            const use_indirect = shouldUseIndirectDispatch(base.m, num_buckets);
+            const use_indirect = !base.skip_routing and shouldUseIndirectDispatch(base.m, num_buckets);
 
             var first_gu = true;
             for (0..NUM_SCHEME_BUCKETS) |s_idx| {
@@ -2698,7 +2713,7 @@ pub const MoePipelines = struct {
                 const scheme: quant.WeightDType = @fromBackingInt(@intCast(s_idx));
                 const desc = args.scheme_descs[s_idx];
                 var x_eff = base.x;
-                var gu_barrier = first_gu;
+                var gu_barrier = if (first_gu) (if (base.skip_routing) insert_barrier_before else true) else false;
                 const aq_gu = args.act_quant_policy.resolveForTensor(desc.gate_up_dtype, base.hidden_size);
                 if (aq_gu != .none) {
                     const need = std.math.mul(u64, @as(u64, base.m) * base.hidden_size, @sizeOf(f16)) catch return error.Overflow;
@@ -2723,11 +2738,13 @@ pub const MoePipelines = struct {
 
             try self.encodeDownAndReduceMultiFormat(frame, args, true);
         } else {
-            try self.encodeRouting(frame, base, insert_barrier_before);
+            if (!base.skip_routing) {
+                try self.encodeRouting(frame, base, insert_barrier_before);
+            }
             const desc = args.scheme_descs[0];
-            const use_indirect = shouldUseIndirectDispatch(base.m, 1);
+            const use_indirect = !base.skip_routing and shouldUseIndirectDispatch(base.m, 1);
             var x_eff = base.x;
-            var gu_barrier = true;
+            var gu_barrier = if (base.skip_routing) insert_barrier_before else true;
             const aq_gu = args.act_quant_policy.resolveForTensor(desc.gate_up_dtype, base.hidden_size);
             if (aq_gu != .none) {
                 const need = std.math.mul(u64, @as(u64, base.m) * base.hidden_size, @sizeOf(f16)) catch return error.Overflow;
@@ -2764,7 +2781,7 @@ pub const MoePipelines = struct {
         const base = args.base;
         if (args.is_heterogeneous) {
             const num_buckets = countActiveSchemeBuckets(args.scheme_counts);
-            const use_indirect = shouldUseIndirectDispatch(base.m, num_buckets);
+            const use_indirect = !base.skip_routing and shouldUseIndirectDispatch(base.m, num_buckets);
             var first_dn = insert_barrier_before;
             for (0..NUM_SCHEME_BUCKETS) |s_idx| {
                 const cap = args.scheme_counts[s_idx];
@@ -2777,7 +2794,7 @@ pub const MoePipelines = struct {
             }
         } else {
             const desc = args.scheme_descs[0];
-            const use_indirect = shouldUseIndirectDispatch(base.m, 1);
+            const use_indirect = !base.skip_routing and shouldUseIndirectDispatch(base.m, 1);
             var inter_eff = metal.BufferBinding{ .buffer = base.workspace_buf, .offset = base.workspace.inter_off };
             var dn_barrier = insert_barrier_before;
             const aq_dn = args.act_quant_policy.resolveForTensor(desc.down_dtype, base.intermediate_size);
@@ -2881,7 +2898,7 @@ pub const MoePipelines = struct {
                 .up = up_bind,
                 .out = gate_bind,
                 .count = @intCast(gate_elems),
-                .swiglu_limit = base.swiglu_limit,
+                .swiglu_limit = base.shared_swiglu_limit orelse base.swiglu_limit,
             }, true);
             if (base.m == 1) {
                 try qf.encodeGemv(frame, qf_dt, args.shared_expert_group_size, .{
@@ -3125,10 +3142,13 @@ pub const MoePipelines = struct {
         insert_barrier_before: bool,
     ) EncodeError!void {
         if (args.hidden_size % 4 != 0 or args.intermediate_size % 4 != 0) return error.UnalignedK;
-        try self.encodeRouting(frame, args, insert_barrier_before);
+        if (!args.skip_routing) {
+            try self.encodeRouting(frame, args, insert_barrier_before);
+        }
 
         // M7.8 G20 M=1 static-grid guard: homogeneous M==1 stays on direct dispatch.
-        const use_indirect = shouldUseIndirectDispatch(args.m, 1);
+        const use_indirect = !args.skip_routing and shouldUseIndirectDispatch(args.m, 1);
+        const gu_barrier = if (args.skip_routing) insert_barrier_before else true;
 
         try self.encodeGateUpSwigluFloat(frame, dtype, .{
             .x = args.x,
@@ -3143,7 +3163,7 @@ pub const MoePipelines = struct {
             .intermediate_size = args.intermediate_size,
             .use_indirect = use_indirect,
             .swiglu_limit = args.swiglu_limit,
-        }, true);
+        }, gu_barrier);
 
         try self.encodeDownProjFloat(frame, dtype, .{
             .weights_base = args.weights_base,

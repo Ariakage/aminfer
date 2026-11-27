@@ -410,6 +410,14 @@ pub const M82Stats = struct {
     cold_expert_cache_hits: u64 = 0,
     cold_expert_bytes_read: u64 = 0,
     cold_expert_io_ns: u64 = 0,
+    /// `C27`: O(1) zero-copy metadata promotions from Streaming Probation into Session LFU Working-Set.
+    session_promotions: u64 = 0,
+    /// `C27`: zero-I/O wired RAM hits served directly from the promoted Session LFU Working-Set Tier.
+    promoted_hits: u64 = 0,
+    /// `C27`: evictions absorbed by the Streaming Probation / LRU Tier without touching the Working-Set Tier.
+    probation_evictions: u64 = 0,
+    /// `C27`: opt-in low-weight uncached cold tail misses skipped (`cold_expert_min_weight > 0.0`).
+    cold_skipped_min_weight: u64 = 0,
 
     pub fn resetCounters(self: *M82Stats) void {
         const swa = self.inkling2_swa_kv_bytes;
@@ -462,12 +470,33 @@ pub const M82ColdExpertMeta = struct {
     w2_k: u32,
 };
 
+pub const ColdSlotTier = enum(u8) {
+    probation,
+    lfu_working_set,
+};
+
+const M82_INVALID_SLOT: u32 = std.math.maxInt(u32);
+
 const ColdSlotState = struct {
     valid: bool = false,
+    tier: ColdSlotTier = .probation,
     layer: u16 = 0,
     expert: u16 = 0,
+    session_freq: u32 = 0,
     last_use: u64 = 0,
 };
+
+fn computeM82WorkingSetCap(num_slots: u32, max_topk: u32) u32 {
+    if (num_slots <= 1) return 0;
+    const eff_min_prob: u32 = if (max_topk > 0)
+        max_topk
+    else
+        @max(@as(u32, 1), @min(@as(u32, 8), num_slots / 3));
+    if (num_slots <= eff_min_prob) return 0;
+    const max_ws: u32 = num_slots - eff_min_prob;
+    const desired: u32 = (num_slots * 70) / 100;
+    return @max(@as(u32, 1), @min(max_ws, desired));
+}
 
 const ColdSlotBindings = struct {
     w1: qwen3.LinearBinding,
@@ -490,16 +519,26 @@ pub const M82ColdExpertCache = struct {
     pool_arena: arena_mod.WiredArena,
     pool_buf: metal.Buffer,
     num_slots: u32,
+    num_layers: u32 = 0,
+    num_experts: u32 = 0,
+    working_set_cap: u32 = 0,
+    working_set_count: u32 = 0,
+    decay_interval: u64 = 1024,
     slot_w1_bytes: usize,
     slot_w_up_bytes: usize,
     slot_w2_bytes: usize,
     slot_stride_bytes: usize,
     slots: []ColdSlotState,
     slot_pinned: []bool,
+    /// Preallocated flat `[num_layers * num_experts]` session frequency counters (`C27`, `0` hot-path allocs).
+    session_freq: []u32,
+    /// Preallocated flat `[num_layers * num_experts]` O(1) slot lookup (`M82_INVALID_SLOT` if not resident).
+    slot_index: []u32,
     req_buf: []aio.ReadRequest,
     miss_slots: []u32,
     miss_metas: []M82ColdExpertMeta,
     clock: u64 = 0,
+    access_count: u64 = 0,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -511,6 +550,36 @@ pub const M82ColdExpertCache = struct {
         max_w_up_bytes: usize,
         max_w2_bytes: usize,
         budget: budget_mod.Budget,
+    ) !M82ColdExpertCache {
+        return initWithTiering(
+            allocator,
+            device,
+            compute,
+            amf_path,
+            num_slots,
+            max_w1_bytes,
+            max_w_up_bytes,
+            max_w2_bytes,
+            budget,
+            0,
+            0,
+            0,
+        );
+    }
+
+    pub fn initWithTiering(
+        allocator: std.mem.Allocator,
+        device: metal.Device,
+        compute: metal.Compute,
+        amf_path: [:0]const u8,
+        num_slots: u32,
+        max_w1_bytes: usize,
+        max_w_up_bytes: usize,
+        max_w2_bytes: usize,
+        budget: budget_mod.Budget,
+        num_layers: u32,
+        num_experts: u32,
+        max_topk: u32,
     ) !M82ColdExpertCache {
         var amf_file = try amf.AmfFile.open(allocator, amf_path);
         errdefer amf_file.close(allocator);
@@ -538,6 +607,18 @@ pub const M82ColdExpertCache = struct {
         errdefer allocator.free(slot_pinned);
         @memset(slot_pinned, false);
 
+        const total_exp: usize = if (num_layers > 0 and num_experts > 0)
+            @as(usize, num_layers) * @as(usize, num_experts)
+        else
+            0;
+        const session_freq = try allocator.alloc(u32, total_exp);
+        errdefer allocator.free(session_freq);
+        if (total_exp > 0) @memset(session_freq, 0);
+
+        const slot_index = try allocator.alloc(u32, total_exp);
+        errdefer allocator.free(slot_index);
+        if (total_exp > 0) @memset(slot_index, M82_INVALID_SLOT);
+
         const req_buf = try allocator.alloc(aio.ReadRequest, @as(usize, num_slots) * 3);
         errdefer allocator.free(req_buf);
 
@@ -553,12 +634,18 @@ pub const M82ColdExpertCache = struct {
             .pool_arena = pool_arena,
             .pool_buf = pool_buf,
             .num_slots = num_slots,
+            .num_layers = num_layers,
+            .num_experts = num_experts,
+            .working_set_cap = computeM82WorkingSetCap(num_slots, max_topk),
+            .working_set_count = 0,
             .slot_w1_bytes = w1_al,
             .slot_w_up_bytes = wu_al,
             .slot_w2_bytes = w2_al,
             .slot_stride_bytes = stride,
             .slots = slots,
             .slot_pinned = slot_pinned,
+            .session_freq = session_freq,
+            .slot_index = slot_index,
             .req_buf = req_buf,
             .miss_slots = miss_slots,
             .miss_metas = miss_metas,
@@ -576,12 +663,165 @@ pub const M82ColdExpertCache = struct {
         allocator.free(self.miss_metas);
         allocator.free(self.miss_slots);
         allocator.free(self.req_buf);
+        allocator.free(self.slot_index);
+        allocator.free(self.session_freq);
         allocator.free(self.slot_pinned);
         allocator.free(self.slots);
     }
 
     pub fn totalWiredBytes(self: *const M82ColdExpertCache) u64 {
         return self.pool_arena.bytes().len;
+    }
+
+    fn flatKey(self: *const M82ColdExpertCache, layer: u16, expert: u16) ?usize {
+        if (self.num_layers == 0 or self.num_experts == 0) return null;
+        if (layer >= self.num_layers or expert >= self.num_experts) return null;
+        return @as(usize, layer) * @as(usize, self.num_experts) + @as(usize, expert);
+    }
+
+    pub fn findSlot(self: *const M82ColdExpertCache, layer: u16, expert: u16) ?usize {
+        if (self.flatKey(layer, expert)) |fi| {
+            const s = self.slot_index[fi];
+            if (s != M82_INVALID_SLOT and s < self.slots.len) {
+                const st = self.slots[s];
+                if (st.valid and st.layer == layer and st.expert == expert) return s;
+            }
+            return null;
+        }
+        for (self.slots, 0..) |s, idx| {
+            if (s.valid and s.layer == layer and s.expert == expert) return idx;
+        }
+        return null;
+    }
+
+    pub fn isResident(self: *const M82ColdExpertCache, layer: u16, expert: u16) bool {
+        return self.findSlot(layer, expert) != null;
+    }
+
+    fn freqOf(self: *const M82ColdExpertCache, slot_idx: usize) u32 {
+        const s = self.slots[slot_idx];
+        if (self.flatKey(s.layer, s.expert)) |fi| {
+            return self.session_freq[fi];
+        }
+        return s.session_freq;
+    }
+
+    fn bumpAccessAndFreq(self: *M82ColdExpertCache, slot_idx: usize, layer: u16, expert: u16) u32 {
+        self.access_count += 1;
+        if (self.decay_interval > 0 and (self.access_count % self.decay_interval) == 0) {
+            for (self.session_freq) |*f| f.* >>= 1;
+            for (self.slots) |*sl| {
+                if (sl.valid) sl.session_freq >>= 1;
+            }
+        }
+        self.slots[slot_idx].session_freq +|= 1;
+        if (self.flatKey(layer, expert)) |fi| {
+            self.session_freq[fi] +|= 1;
+            self.slots[slot_idx].session_freq = self.session_freq[fi];
+            return self.session_freq[fi];
+        }
+        return self.slots[slot_idx].session_freq;
+    }
+
+    fn maybePromoteSlot(
+        self: *M82ColdExpertCache,
+        slot_idx: usize,
+        freq: u32,
+        check_pinned: bool,
+        stats: *M82Stats,
+    ) void {
+        if (self.working_set_cap == 0 or freq < 2) return;
+        const slot = &self.slots[slot_idx];
+        if (!slot.valid or slot.tier == .lfu_working_set) return;
+
+        if (self.working_set_count < self.working_set_cap) {
+            slot.tier = .lfu_working_set;
+            self.working_set_count += 1;
+            stats.session_promotions += 1;
+            return;
+        }
+
+        var min_idx: ?usize = null;
+        var min_freq: u32 = std.math.maxInt(u32);
+        var min_tick: u64 = std.math.maxInt(u64);
+        for (self.slots, 0..) |cand, ci| {
+            if (!cand.valid or cand.tier != .lfu_working_set) continue;
+            if (check_pinned and self.slot_pinned[ci]) continue;
+            const cf = self.freqOf(ci);
+            if (min_idx == null or cf < min_freq or (cf == min_freq and cand.last_use < min_tick)) {
+                min_idx = ci;
+                min_freq = cf;
+                min_tick = cand.last_use;
+            }
+        }
+        if (min_idx) |demote| {
+            if (freq > min_freq) {
+                self.slots[demote].tier = .probation;
+                slot.tier = .lfu_working_set;
+                stats.session_promotions += 1;
+            }
+        }
+    }
+
+    fn selectEvictionVictim(self: *const M82ColdExpertCache, check_pinned: bool) ?usize {
+        for (self.slots, 0..) |s, idx| {
+            if (check_pinned and self.slot_pinned[idx]) continue;
+            if (!s.valid) return idx;
+        }
+        if (self.working_set_cap > 0) {
+            var prob_best: ?usize = null;
+            var prob_oldest: u64 = std.math.maxInt(u64);
+            for (self.slots, 0..) |s, idx| {
+                if (check_pinned and self.slot_pinned[idx]) continue;
+                if (s.tier != .probation) continue;
+                if (prob_best == null or s.last_use < prob_oldest) {
+                    prob_oldest = s.last_use;
+                    prob_best = idx;
+                }
+            }
+            if (prob_best != null) return prob_best;
+
+            var ws_best: ?usize = null;
+            var ws_freq: u32 = std.math.maxInt(u32);
+            var ws_oldest: u64 = std.math.maxInt(u64);
+            for (self.slots, 0..) |s, idx| {
+                if (check_pinned and self.slot_pinned[idx]) continue;
+                const sf = self.freqOf(idx);
+                if (ws_best == null or sf < ws_freq or (sf == ws_freq and s.last_use < ws_oldest)) {
+                    ws_freq = sf;
+                    ws_oldest = s.last_use;
+                    ws_best = idx;
+                }
+            }
+            return ws_best;
+        }
+        var victim_opt: ?usize = null;
+        var oldest: u64 = std.math.maxInt(u64);
+        for (self.slots, 0..) |s, idx| {
+            if (check_pinned and self.slot_pinned[idx]) continue;
+            if (s.last_use < oldest) {
+                oldest = s.last_use;
+                victim_opt = idx;
+            }
+        }
+        return victim_opt;
+    }
+
+    fn evictSlotForLoad(self: *M82ColdExpertCache, victim: usize, stats: *M82Stats) void {
+        const s = &self.slots[victim];
+        if (s.valid) {
+            if (self.flatKey(s.layer, s.expert)) |fi| {
+                if (self.slot_index[fi] == victim) self.slot_index[fi] = M82_INVALID_SLOT;
+            }
+            if (s.tier == .lfu_working_set) {
+                self.working_set_count -|= 1;
+            } else {
+                stats.probation_evictions += 1;
+            }
+            s.valid = false;
+            s.tier = .probation;
+            s.session_freq = 0;
+        }
     }
 
     /// Starts asynchronous `F_NOCACHE` prefetch for a window of `metas` (`metas.len <= num_slots`),
@@ -601,43 +841,35 @@ pub const M82ColdExpertCache = struct {
         var is_hit: [256]bool = @splat(false);
         if (metas.len > is_hit.len) return error.InvalidArgument;
 
-        // Pass 1: resolve and pin all cache hits in this window first.
+        // Pass 1: resolve and pin all cache hits in this window first (`O(1)` when indexed).
         for (metas, 0..) |meta, mi| {
-            for (self.slots, 0..) |*s, idx| {
-                if (s.valid and s.layer == meta.layer and s.expert == meta.expert) {
-                    s.last_use = self.clock;
-                    self.slot_pinned[idx] = true;
-                    is_hit[mi] = true;
-                    stats.cold_expert_cache_hits += 1;
-                    out_bindings[mi] = self.bindingsForSlot(@intCast(idx), meta);
-                    break;
+            if (self.findSlot(meta.layer, meta.expert)) |idx| {
+                const s = &self.slots[idx];
+                const was_promoted = (s.tier == .lfu_working_set);
+                s.last_use = self.clock;
+                self.slot_pinned[idx] = true;
+                is_hit[mi] = true;
+                const freq = self.bumpAccessAndFreq(idx, meta.layer, meta.expert);
+                stats.cold_expert_cache_hits += 1;
+                if (was_promoted) {
+                    stats.promoted_hits += 1;
+                } else {
+                    self.maybePromoteSlot(idx, freq, true, stats);
                 }
+                out_bindings[mi] = self.bindingsForSlot(@intCast(idx), meta);
             }
         }
 
-        // Pass 2: assign unpinned LRU victim slots for all misses and queue F_NOCACHE reads.
+        // Pass 2: assign unpinned probation-LRU (then fallback WS-LFU) victim slots for all misses.
         var handle: ColdPrefetchHandle = .{
             .t0 = std.Io.Timestamp.now(std.Options.debug_io, .awake),
         };
         const pool_bytes = self.pool_arena.bytes();
         for (metas, 0..) |meta, mi| {
             if (is_hit[mi]) continue;
-            var victim_opt: ?usize = null;
-            var oldest: u64 = std.math.maxInt(u64);
-            for (self.slots, 0..) |s, idx| {
-                if (self.slot_pinned[idx]) continue;
-                if (!s.valid) {
-                    victim_opt = idx;
-                    break;
-                }
-                if (s.last_use < oldest) {
-                    oldest = s.last_use;
-                    victim_opt = idx;
-                }
-            }
-            const victim = victim_opt orelse return error.InvalidArgument;
+            const victim = self.selectEvictionVictim(true) orelse return error.InvalidArgument;
             self.slot_pinned[victim] = true;
-            self.slots[victim].valid = false;
+            self.evictSlotForLoad(victim, stats);
             self.miss_slots[handle.miss_count] = @intCast(victim);
             self.miss_metas[handle.miss_count] = meta;
             handle.miss_count += 1;
@@ -719,10 +951,17 @@ pub const M82ColdExpertCache = struct {
             const meta = self.miss_metas[mi];
             self.slots[slot_idx] = .{
                 .valid = true,
+                .tier = .probation,
                 .layer = meta.layer,
                 .expert = meta.expert,
+                .session_freq = 0,
                 .last_use = self.clock,
             };
+            if (self.flatKey(meta.layer, meta.expert)) |fi| {
+                self.slot_index[fi] = slot_idx;
+            }
+            const freq = self.bumpAccessAndFreq(slot_idx, meta.layer, meta.expert);
+            self.maybePromoteSlot(slot_idx, freq, true, stats);
         }
         @memset(self.slot_pinned, false);
         stats.cold_expert_fetches += handle.miss_count;
@@ -736,27 +975,23 @@ pub const M82ColdExpertCache = struct {
         stats: *M82Stats,
     ) !ColdSlotBindings {
         self.clock += 1;
-        // 1. Cache lookup
-        for (self.slots, 0..) |*s, idx| {
-            if (s.valid and s.layer == meta.layer and s.expert == meta.expert) {
-                s.last_use = self.clock;
-                stats.cold_expert_cache_hits += 1;
-                return self.bindingsForSlot(@intCast(idx), meta);
+        // 1. O(1) cache lookup
+        if (self.findSlot(meta.layer, meta.expert)) |idx| {
+            const s = &self.slots[idx];
+            const was_promoted = (s.tier == .lfu_working_set);
+            s.last_use = self.clock;
+            const freq = self.bumpAccessAndFreq(idx, meta.layer, meta.expert);
+            stats.cold_expert_cache_hits += 1;
+            if (was_promoted) {
+                stats.promoted_hits += 1;
+            } else {
+                self.maybePromoteSlot(idx, freq, false, stats);
             }
+            return self.bindingsForSlot(@intCast(idx), meta);
         }
-        // 2. Evict LRU slot
-        var victim: usize = 0;
-        var oldest: u64 = std.math.maxInt(u64);
-        for (self.slots, 0..) |s, idx| {
-            if (!s.valid) {
-                victim = idx;
-                break;
-            }
-            if (s.last_use < oldest) {
-                oldest = s.last_use;
-                victim = idx;
-            }
-        }
+        // 2. Evict probation-LRU victim (or fallback working-set LFU)
+        const victim = self.selectEvictionVictim(false) orelse 0;
+        self.evictSlotForLoad(victim, stats);
 
         const base_off: usize = victim * self.slot_stride_bytes;
         const pool_bytes = self.pool_arena.bytes();
@@ -818,10 +1053,17 @@ pub const M82ColdExpertCache = struct {
 
         self.slots[victim] = .{
             .valid = true,
+            .tier = .probation,
             .layer = meta.layer,
             .expert = meta.expert,
+            .session_freq = 0,
             .last_use = self.clock,
         };
+        if (self.flatKey(meta.layer, meta.expert)) |fi| {
+            self.slot_index[fi] = @intCast(victim);
+        }
+        const freq = self.bumpAccessAndFreq(victim, meta.layer, meta.expert);
+        self.maybePromoteSlot(victim, freq, false, stats);
         stats.cold_expert_fetches += 1;
         stats.cold_expert_bytes_read += total_read;
         stats.cold_expert_io_ns += dt_ns;
@@ -1093,6 +1335,7 @@ pub const M82LoadContext = struct {
     chunk_tokens: u32,
     wired_budget: budget_mod.Budget,
     cold_slot_count: u32,
+    cold_expert_min_weight: f32 = 0.0,
     use_sme2_controllers: bool = false,
     enable_router_trace: bool = false,
 };
@@ -1114,8 +1357,9 @@ pub const M82Runtime = struct {
     sconv_pos: u32 = 0,
     stats: M82Stats = .{},
 
-    // Optional cold-expert NVMe streaming cache (`C3`-`C5`)
+    // Optional cold-expert NVMe streaming cache (`C3`-`C5`, `C27`)
     cold_cache: ?M82ColdExpertCache = null,
+    cold_expert_min_weight: f32 = 0.0,
     sme_dispatcher: ?sme.SmeDispatcher = null,
 
     // Inkling 2 state
@@ -1551,7 +1795,7 @@ pub const M82Runtime = struct {
                 break :blk @min(@as(u32, 104), max_by_mem);
             } else @max(@as(u32, 32), min_slots);
             const n_slots: u32 = if (ctx.cold_slot_count > 0) @max(ctx.cold_slot_count, min_slots) else @max(auto_target, min_slots);
-            cold_cache = try M82ColdExpertCache.init(
+            cold_cache = try M82ColdExpertCache.initWithTiering(
                 allocator,
                 ctx.device,
                 ctx.compute,
@@ -1561,6 +1805,9 @@ pub const M82Runtime = struct {
                 max_cold_w_up,
                 max_cold_w2,
                 ctx.wired_budget,
+                cfg.num_hidden_layers,
+                @max(cfg.num_experts, @as(u32, 1)),
+                @max(cfg.num_experts_per_tok, @as(u32, 1)),
             );
         }
 
@@ -1585,6 +1832,7 @@ pub const M82Runtime = struct {
             .use_sme2_controllers = ctx.use_sme2_controllers,
             .enable_router_trace = ctx.enable_router_trace,
             .cold_cache = cold_cache,
+            .cold_expert_min_weight = @max(@as(f32, 0.0), ctx.cold_expert_min_weight),
         };
         errdefer {
             // Avoid double-free of fields transferred into `rt`
@@ -2714,6 +2962,13 @@ pub const M82Runtime = struct {
                 self.router_trace_valid[eff_step] = true;
             }
 
+            // Opt-in `C27` cold-tail skipping (`cold_expert_min_weight > 0.0`):
+            // unconditionally keep ALL hot & cached/promoted cold experts; skip only low-weight uncached NVMe misses.
+            var skipped_slots: [1024]bool = @splat(false);
+            if (self.cold_expert_min_weight > 0.0 and self.cold_cache != null) {
+                self.filterColdTailTopK(layer.experts, m, top_k, h, self.exp_out_off, cfg.norm_topk_prob, &skipped_slots);
+            }
+
             // Deduplicate active experts across all `m * top_k` assignments and partition into hot vs cold,
             // packing disjoint `(tok_idx, dst_slot)` slices so each active expert streams ONCE per step (`M_e` rows).
             const total_assign = @as(usize, m) * top_k;
@@ -2722,6 +2977,7 @@ pub const M82Runtime = struct {
             var unique_eids: [256]u32 = undefined;
             var unique_cnt: usize = 0;
             for (0..total_assign) |ai| {
+                if (ai < skipped_slots.len and skipped_slots[ai]) continue;
                 const eid = topk_ids[ai];
                 if (eid >= layer.experts.len) return error.InvalidArgument;
                 var seen = false;
@@ -2756,6 +3012,7 @@ pub const M82Runtime = struct {
                 for (0..m) |tok| {
                     for (0..top_k) |ki| {
                         const slot_idx: u32 = @intCast(tok * top_k + ki);
+                        if (slot_idx < skipped_slots.len and skipped_slots[slot_idx]) continue;
                         if (topk_ids[slot_idx] != eid) continue;
                         tok_idx_all[cursor] = @intCast(tok);
                         dst_slot_all[cursor] = slot_idx;
@@ -3858,9 +4115,14 @@ pub const M82Runtime = struct {
             const exp_row_bytes: u64 = @as(u64, exp_dim) * 2;
 
             const total_assign = @as(usize, m) * top_k;
+            var skipped_slots: [1024]bool = @splat(false);
+            if (self.cold_expert_min_weight > 0.0 and self.cold_cache != null) {
+                self.filterColdTailTopK(layer.experts, m, top_k, exp_dim, exp_out_base_off, cfg.norm_topk_prob, &skipped_slots);
+            }
             var unique_eids: [256]u32 = undefined;
             var unique_cnt: usize = 0;
             for (0..total_assign) |ai| {
+                if (ai < skipped_slots.len and skipped_slots[ai]) continue;
                 const eid = topk_ids[ai];
                 if (eid >= layer.experts.len) return error.InvalidArgument;
                 var seen = false;
@@ -3893,7 +4155,9 @@ pub const M82Runtime = struct {
                         .offset = exp_in_base.offset + @as(u64, tok) * exp_row_bytes,
                     };
                     for (0..top_k) |ki| {
-                        if (topk_ids[tok * top_k + ki] != eid) continue;
+                        const slot_flat = tok * top_k + ki;
+                        if (slot_flat < skipped_slots.len and skipped_slots[slot_flat]) continue;
+                        if (topk_ids[slot_flat] != eid) continue;
                         const out_slot = self.bindAt(exp_out_base_off + @as(u64, tok * top_k + ki) * exp_row_bytes);
                         if (resolved.w_up) |wu| {
                             try model.encodeLinearGemv(f, resolved.w1, x_tok_bind, self.bindAt(self.exp_gate_up_off), true);
@@ -4362,6 +4626,97 @@ pub const M82Runtime = struct {
 
     inline fn bindAt(self: *const M82Runtime, offset: u64) metal.BufferBinding {
         return .{ .buffer = self.buf, .offset = offset };
+    }
+
+    pub fn setColdExpertMinWeight(self: *M82Runtime, min_weight: f32) void {
+        self.cold_expert_min_weight = @max(@as(f32, 0.0), min_weight);
+    }
+
+    pub fn coldExpertMinWeight(self: *const M82Runtime) f32 {
+        return self.cold_expert_min_weight;
+    }
+
+    /// Opt-in `C27` cold-tail skipping over M8.2 top-k routing buffers (`0` heap allocs).
+    /// Keeps ALL hot and currently resident/promoted cold experts unconditionally; skips ONLY
+    /// uncached NVMe-miss cold tail experts with normalized weight `< cold_expert_min_weight`
+    /// (never skipping the top-1 expert), zeroes skipped `exp_out` rows + weights, and renormalizes.
+    fn filterColdTailTopK(
+        self: *M82Runtime,
+        experts: anytype,
+        m: u32,
+        top_k: u32,
+        exp_dim: u32,
+        exp_out_base_off: u64,
+        norm_topk_prob: bool,
+        skipped_slots: []bool,
+    ) void {
+        if (self.cold_expert_min_weight <= 0.0 or m == 0 or top_k == 0) return;
+        const cc_opt: ?*const M82ColdExpertCache = if (self.cold_cache) |*cc| cc else null;
+        const total_assign = @as(usize, m) * top_k;
+        const topk_ids = self.sliceU32(self.topk_ids_off, total_assign);
+        const topk_w = self.sliceF32(self.topk_w_off, total_assign);
+        const exp_out_f16 = self.sliceF16(exp_out_base_off, total_assign * @as(usize, exp_dim));
+        const tk_u: usize = @min(@as(usize, top_k), moe.MAX_TOP_K);
+
+        for (0..m) |tok| {
+            const base = tok * tk_u;
+            var orig_sum: f32 = 0.0;
+            var best_k: usize = 0;
+            var best_w: f32 = -std.math.inf(f32);
+            for (0..tk_u) |k| {
+                const wk = topk_w[base + k];
+                orig_sum += wk;
+                if (wk > best_w) {
+                    best_w = wk;
+                    best_k = k;
+                }
+            }
+
+            var keep: [moe.MAX_TOP_K]bool = @splat(true);
+            var kept_cnt: usize = 0;
+            var tok_skipped: u64 = 0;
+            for (0..tk_u) |k| {
+                const eid = topk_ids[base + k];
+                const keep_uncond = if (eid < experts.len) switch (experts[eid]) {
+                    .hot => true,
+                    .cold => |cm| if (cc_opt) |cc| cc.isResident(cm.layer, cm.expert) else false,
+                } else true;
+                const w_norm: f32 = if (orig_sum > 0.0) (topk_w[base + k] / orig_sum) else 0.0;
+                if (!keep_uncond and w_norm < self.cold_expert_min_weight) {
+                    keep[k] = false;
+                    tok_skipped += 1;
+                } else {
+                    kept_cnt += 1;
+                }
+            }
+            if (kept_cnt == 0) {
+                keep[best_k] = true;
+                kept_cnt = 1;
+                tok_skipped -|= 1;
+            }
+            if (tok_skipped > 0) {
+                self.stats.cold_skipped_min_weight += tok_skipped;
+                var kept_sum: f32 = 0.0;
+                for (0..tk_u) |k| {
+                    if (keep[k]) kept_sum += topk_w[base + k];
+                }
+                const renorm: f32 = if (norm_topk_prob and kept_sum > 0.0 and orig_sum > 0.0)
+                    (orig_sum / kept_sum)
+                else
+                    1.0;
+                for (0..tk_u) |k| {
+                    const slot_flat = base + k;
+                    if (keep[k]) {
+                        topk_w[slot_flat] *= renorm;
+                    } else {
+                        if (slot_flat < skipped_slots.len) skipped_slots[slot_flat] = true;
+                        topk_w[slot_flat] = 0.0;
+                        const row_start = slot_flat * @as(usize, exp_dim);
+                        @memset(exp_out_f16[row_start .. row_start + exp_dim], @as(f16, 0.0));
+                    }
+                }
+            }
+        }
     }
 
     inline fn sliceF16(self: *const M82Runtime, offset: u64, count: usize) []f16 {

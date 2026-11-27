@@ -2805,6 +2805,10 @@ pub const HybridPipelines = struct {
     g27_dsa_select_topk: metal.Pipeline,
     g27_mla_sparse_attend: metal.Pipeline,
 
+    // M9.3 (`G28`): Full-causal absorbed MLA + head-wise/element-wise sigmoid output gate (`bailing_hybrid`).
+    g28_mla_full_attend: metal.Pipeline,
+    g28_mla_out_gate: metal.Pipeline,
+
     pub fn init(device: metal.Device, library: metal.Library) metal.Error!HybridPipelines {
         const gdn_decode_d64_f16 = try metal.Pipeline.initSpecialized(device, library, "ami_gdn_decode", &.{
             .{ .index = 0, .value = .{ .u32 = 64 } },
@@ -3286,6 +3290,10 @@ pub const HybridPipelines = struct {
         errdefer g27_dsa_select_topk.close();
         const g27_mla_sparse_attend = try metal.Pipeline.init(device, library, "ami_g27_mla_sparse_attend");
         errdefer g27_mla_sparse_attend.close();
+        const g28_mla_full_attend = try metal.Pipeline.init(device, library, "ami_g28_mla_full_attend");
+        errdefer g28_mla_full_attend.close();
+        const g28_mla_out_gate = try metal.Pipeline.init(device, library, "ami_g28_mla_out_gate");
+        errdefer g28_mla_out_gate.close();
 
         return .{
             .gdn_decode_d64_f16 = gdn_decode_d64_f16,
@@ -3384,10 +3392,14 @@ pub const HybridPipelines = struct {
             .g27_dsa_scores = g27_dsa_scores,
             .g27_dsa_select_topk = g27_dsa_select_topk,
             .g27_mla_sparse_attend = g27_mla_sparse_attend,
+            .g28_mla_full_attend = g28_mla_full_attend,
+            .g28_mla_out_gate = g28_mla_out_gate,
         };
     }
 
     pub fn close(self: HybridPipelines) void {
+        self.g28_mla_out_gate.close();
+        self.g28_mla_full_attend.close();
         self.g27_mla_sparse_attend.close();
         self.g27_dsa_select_topk.close();
         self.g27_dsa_scores.close();
@@ -5637,6 +5649,7 @@ pub const HybridPipelines = struct {
             .down_groups_x = args.down_groups_x,
             .down_groups_x_q8 = args.down_groups_x_q8,
             .routed_scaling_factor = args.routed_scaling_factor,
+            .group_score_topk = args.group_score_topk,
         };
         const pipe = if (args.logits_f16) self.g26_moe_route_sigmoid_f16 else self.g26_moe_route_sigmoid_f32;
         try frame.encodeThreadgroups(
@@ -6316,6 +6329,77 @@ pub const HybridPipelines = struct {
             insert_barrier_before,
         );
     }
+
+    /// Encodes `ami_g28_mla_full_attend`: full-causal absorbed MLA attention without
+    /// sparse indexer (`Ling-3.1` `bailing_hybrid`), supporting decode, wide prefill,
+    /// and `verifyTree` with `ancestor_masks`. Zero heap allocation.
+    pub fn encodeG28MlaFullAttn(
+        self: HybridPipelines,
+        frame: *metal.Compute.Frame,
+        args: G28MlaFullAttnArgs,
+        insert_barrier_before: bool,
+    ) EncodeError!void {
+        if (args.num_rows == 0 or args.num_q_heads == 0 or args.kv_lora_rank == 0) {
+            return error.ZeroDimension;
+        }
+        if (args.is_tree and args.num_rows > MAX_TREE_NODES) return error.InvalidNodeCount;
+        const params: G28MlaFullAttnParams = .{
+            .num_rows = args.num_rows,
+            .num_q_heads = args.num_q_heads,
+            .kv_lora_rank = args.kv_lora_rank,
+            .qk_rope_head_dim = args.qk_rope_head_dim,
+            .committed_kv_len = args.committed_kv_len,
+            .causal_base_pos = args.causal_base_pos,
+            .is_tree = if (args.is_tree) 1 else 0,
+            .scale = args.scale,
+        };
+        try frame.encodeThreadgroups(
+            self.g28_mla_full_attend,
+            &.{
+                args.q_nope,
+                args.q_pe orelse args.q_nope,
+                args.kv_cache,
+                args.kv_tree_latent orelse args.kv_cache,
+                args.kv_tree_rope orelse args.kv_cache,
+                args.ancestor_masks orelse args.q_nope,
+                args.out,
+            },
+            std.mem.asBytes(&params),
+            .{ args.num_q_heads, args.num_rows, 1 },
+            .{ 256, 1, 1 },
+            insert_barrier_before,
+        );
+    }
+
+    /// Encodes `ami_g28_mla_out_gate`: in-place `attn_out *= sigmoid(float(gate))`
+    /// (head-wise `[num_rows, num_heads]` or element-wise `[num_rows, num_heads * v_head_dim]`)
+    /// applied to MLA output before `self_attn.o_proj`. Zero heap allocation.
+    pub fn encodeG28MlaOutGate(
+        self: HybridPipelines,
+        frame: *metal.Compute.Frame,
+        args: G28MlaOutGateArgs,
+        insert_barrier_before: bool,
+    ) EncodeError!void {
+        if (args.num_rows == 0 or args.num_heads == 0 or args.v_head_dim == 0) {
+            return error.ZeroDimension;
+        }
+        const total: u64 = @as(u64, args.num_rows) * args.num_heads * args.v_head_dim;
+        const params: G28MlaOutGateParams = .{
+            .num_rows = args.num_rows,
+            .num_heads = args.num_heads,
+            .v_head_dim = args.v_head_dim,
+            .head_wise = if (args.head_wise) 1 else 0,
+        };
+        const groups_x: u64 = (total + 255) / 256;
+        try frame.encodeThreadgroups(
+            self.g28_mla_out_gate,
+            &.{ args.attn_out, args.gate },
+            std.mem.asBytes(&params),
+            .{ groups_x, 1, 1 },
+            .{ 256, 1, 1 },
+            insert_barrier_before,
+        );
+    }
 };
 
 /// Element scalar dtype tag shared by `G26` sink bias and MoE router bias buffers.
@@ -6853,6 +6937,59 @@ pub const G27MlaSparseAttnArgs = struct {
     scale: f32,
 };
 
+pub const G28MlaFullAttnParams = extern struct {
+    num_rows: u32,
+    num_q_heads: u32,
+    kv_lora_rank: u32,
+    qk_rope_head_dim: u32,
+    committed_kv_len: u32,
+    causal_base_pos: u32,
+    is_tree: u32,
+    scale: f32,
+
+    comptime {
+        if (@sizeOf(G28MlaFullAttnParams) != 32) @compileError("G28MlaFullAttnParams must be 32 bytes");
+    }
+};
+
+pub const G28MlaFullAttnArgs = struct {
+    q_nope: metal.BufferBinding,
+    q_pe: ?metal.BufferBinding = null,
+    kv_cache: metal.BufferBinding,
+    kv_tree_latent: ?metal.BufferBinding = null,
+    kv_tree_rope: ?metal.BufferBinding = null,
+    ancestor_masks: ?metal.BufferBinding = null,
+    out: metal.BufferBinding,
+    num_rows: u32,
+    num_q_heads: u32,
+    kv_lora_rank: u32,
+    qk_rope_head_dim: u32 = 0,
+    committed_kv_len: u32,
+    causal_base_pos: u32,
+    is_tree: bool = false,
+    scale: f32,
+};
+
+pub const G28MlaOutGateParams = extern struct {
+    num_rows: u32,
+    num_heads: u32,
+    v_head_dim: u32,
+    head_wise: u32,
+
+    comptime {
+        if (@sizeOf(G28MlaOutGateParams) != 16) @compileError("G28MlaOutGateParams must be 16 bytes");
+    }
+};
+
+pub const G28MlaOutGateArgs = struct {
+    attn_out: metal.BufferBinding,
+    gate: metal.BufferBinding,
+    num_rows: u32,
+    num_heads: u32,
+    v_head_dim: u32,
+    head_wise: bool = true,
+};
+
 /// Wired preallocated FP16 compressed latent (+ optional RoPE) KV arena for
 /// `GLM-5.2/5.3` (`glm_moe_dsa`) and `GLM-5.3-Flash` (`glm5_next` NoPE MLA).
 pub const G27MlaKvSpec = struct {
@@ -7227,9 +7364,13 @@ pub const G26MoeRouteSigmoidParams = extern struct {
     down_groups_x: u32,
     down_groups_x_q8: u32,
     routed_scaling_factor: f32,
+    group_score_topk: u32 = 2,
+    _pad0: u32 = 0,
+    _pad1: u32 = 0,
+    _pad2: u32 = 0,
 
     comptime {
-        if (@sizeOf(G26MoeRouteSigmoidParams) != 64) @compileError("G26MoeRouteSigmoidParams must be 64 bytes");
+        if (@sizeOf(G26MoeRouteSigmoidParams) != 80) @compileError("G26MoeRouteSigmoidParams must be 80 bytes");
     }
 };
 
@@ -7259,6 +7400,7 @@ pub const G26MoeRouteSigmoidArgs = struct {
     norm_topk_prob: bool = true,
     n_group: u32 = 1,
     topk_group: u32 = 1,
+    group_score_topk: u32 = 2,
     routed_scaling_factor: f32 = 1.0,
     gate_up_groups_x_q: u32,
     gate_up_groups_x_f: u32,
@@ -13756,6 +13898,497 @@ test "G27 GlmMoeDsaIndexer + radix Top-K + Sparse MLA AND NoPE-MLA index_kpool=4
                 acc += (scores_cpu[si] / denom) * @as(f32, @floatCast(lat_in_h[tidx * kv_rank + d]));
             }
             try std.testing.expectApproxEqAbs(acc, @as(f32, @floatCast(out_h[hd * kv_rank + d])), 2e-3);
+        }
+    }
+}
+
+test "M9.3 G28: ami_moe_route_topk_sigmoid 512E group-limited top-2 sum vs max-1 (n_group=8, topk_group=4, scale=2.5) vs CPU fp32 ref" {
+    const device = try metal.Device.open();
+    defer device.close();
+    const library = try metal.Library.openEmbedded(device);
+    defer library.close();
+    const pipes = try HybridPipelines.init(device, library);
+    defer pipes.close();
+
+    const num_e: u32 = 512;
+    const m: u32 = 3;
+    const top_k: u32 = 8;
+    const n_group: u32 = 8;
+    const topk_group: u32 = 4;
+    const scale: f32 = 2.5;
+
+    const arena_cap = try page.alignUp(256 * 1024);
+    const budget = budget_mod.Budget.compute(.{
+        .memory_bytes = arena_cap + 4 * page.APPLE_PAGE_SIZE,
+        .user_wire_limit = arena_cap,
+        .global_user_wire_limit = arena_cap,
+        .gpu_working_set_bytes = arena_cap,
+        .configured_cap = null,
+        .headroom_bytes = page.APPLE_PAGE_SIZE,
+    });
+    var arena = try arena_mod.WiredArena.init(arena_cap, budget);
+    defer arena.deinit();
+
+    const logits_raw = try arena.allocAligned(m * num_e * @sizeOf(f32), 64);
+    const bias_raw = try arena.allocAligned(num_e * @sizeOf(f32), 64);
+    const hdr_raw = try arena.allocAligned(64, 64);
+    const uniq_raw = try arena.allocAligned(num_e * @sizeOf(u32), 64);
+    const offs_raw = try arena.allocAligned((num_e + 1) * @sizeOf(u32), 64);
+    const toks_raw = try arena.allocAligned(m * top_k * @sizeOf(u32), 64);
+    const wts_raw = try arena.allocAligned(m * top_k * @sizeOf(f32), 64);
+    const slots_raw = try arena.allocAligned(m * top_k * @sizeOf(u32), 64);
+    const sk_e_raw = try arena.allocAligned(m * top_k * @sizeOf(u32), 64);
+    const sk_w_raw = try arena.allocAligned(m * top_k * @sizeOf(f32), 64);
+
+    const logits_f32: []f32 = @alignCast(std.mem.bytesAsSlice(f32, logits_raw[0 .. m * num_e * 4]));
+    const bias_f32: []f32 = @alignCast(std.mem.bytesAsSlice(f32, bias_raw[0 .. num_e * 4]));
+    const hdr_u32: []u32 = @alignCast(std.mem.bytesAsSlice(u32, hdr_raw[0..64]));
+    const uniq_u32: []u32 = @alignCast(std.mem.bytesAsSlice(u32, uniq_raw[0 .. num_e * 4]));
+    const offs_u32: []u32 = @alignCast(std.mem.bytesAsSlice(u32, offs_raw[0 .. (num_e + 1) * 4]));
+    const toks_u32: []u32 = @alignCast(std.mem.bytesAsSlice(u32, toks_raw[0 .. m * top_k * 4]));
+    const wts_f32: []f32 = @alignCast(std.mem.bytesAsSlice(f32, wts_raw[0 .. m * top_k * 4]));
+    const sk_e_u32: []u32 = @alignCast(std.mem.bytesAsSlice(u32, sk_e_raw[0 .. m * top_k * 4]));
+    const sk_w_f32: []f32 = @alignCast(std.mem.bytesAsSlice(f32, sk_w_raw[0 .. m * top_k * 4]));
+
+    for (0..num_e) |ei| {
+        bias_f32[ei] = synthF32(7100 + ei, 0.30);
+    }
+    for (0..m) |ti| {
+        for (0..num_e) |ei| {
+            logits_f32[ti * num_e + ei] = synthF32(9100 + ti * 521 + ei, 1.9);
+        }
+        // Engineer group 0 to have one very high spike + low 2nd best, and group 1 to have two strong experts
+        // so `group_score_topk = 2` (BailingMoeV3Gate top-2 sum) and `group_score_topk = 1` (max-1) diverge!
+        logits_f32[ti * num_e + 0] = 5.0;
+        for (1..64) |j| logits_f32[ti * num_e + j] = -6.0;
+        logits_f32[ti * num_e + 64] = 3.2;
+        logits_f32[ti * num_e + 65] = 3.1;
+        // Also test -inf cold-mask safety inside group 2.
+        logits_f32[ti * num_e + 128 + ti] = -std.math.inf(f32);
+    }
+
+    const buf = try metal.Buffer.wrap(device, arena.bytes());
+    defer buf.close();
+    var compute = try metal.Compute.initWithFrames(device, 2);
+    defer compute.close();
+    try compute.makeResident(&.{buf});
+
+    var mode2_e0: [top_k]u32 = undefined;
+    var mode1_e0: [top_k]u32 = undefined;
+
+    for ([_]u32{ 2, 1 }) |gs_topk| {
+        var frame = try compute.beginFrame(5000);
+        errdefer frame.abort();
+        try pipes.encodeG26MoeRouteSigmoid(&frame, .{
+            .logits = .{ .buffer = buf, .offset = arena.offsetOf(logits_raw.ptr) },
+            .logits_f16 = false,
+            .bias = .{ .buffer = buf, .offset = arena.offsetOf(bias_raw.ptr) },
+            .bias_dtype = .f32,
+            .sched_hdr = .{ .buffer = buf, .offset = arena.offsetOf(hdr_raw.ptr) },
+            .unique_experts = .{ .buffer = buf, .offset = arena.offsetOf(uniq_raw.ptr) },
+            .expert_token_offsets = .{ .buffer = buf, .offset = arena.offsetOf(offs_raw.ptr) },
+            .token_indices = .{ .buffer = buf, .offset = arena.offsetOf(toks_raw.ptr) },
+            .routing_weights = .{ .buffer = buf, .offset = arena.offsetOf(wts_raw.ptr) },
+            .slot_k_indices = .{ .buffer = buf, .offset = arena.offsetOf(slots_raw.ptr) },
+            .scratch_topk_experts = .{ .buffer = buf, .offset = arena.offsetOf(sk_e_raw.ptr) },
+            .scratch_topk_weights = .{ .buffer = buf, .offset = arena.offsetOf(sk_w_raw.ptr) },
+            .m = m,
+            .num_experts = num_e,
+            .top_k = top_k,
+            .n_group = n_group,
+            .topk_group = topk_group,
+            .group_score_topk = gs_topk,
+            .norm_topk_prob = true,
+            .routed_scaling_factor = scale,
+            .gate_up_groups_x_q = 8,
+            .gate_up_groups_x_f = 4,
+            .down_groups_x = 8,
+            .down_groups_x_q8 = 16,
+        }, false);
+        const sig = try frame.commit();
+        try compute.wait(sig, 5000);
+
+        if (gs_topk == 2) {
+            @memcpy(&mode2_e0, sk_e_u32[0..top_k]);
+        } else {
+            @memcpy(&mode1_e0, sk_e_u32[0..top_k]);
+        }
+
+        // Exact CPU FP32 BailingMoeV3Gate reference (`group_limited_topk`)
+        const g_size = num_e / n_group;
+        for (0..m) |ti| {
+            var g_scores: [n_group]f32 = undefined;
+            for (0..n_group) |g| {
+                var m1: f32 = -std.math.inf(f32);
+                var m2: f32 = -std.math.inf(f32);
+                for (0..g_size) |j| {
+                    const ei = g * g_size + j;
+                    const lg = logits_f32[ti * num_e + ei];
+                    const ch: f32 = if (std.math.isNegativeInf(lg)) -std.math.inf(f32) else sigmoidF32(lg) + bias_f32[ei];
+                    if (ch > m1) {
+                        m2 = m1;
+                        m1 = ch;
+                    } else if (ch > m2) {
+                        m2 = ch;
+                    }
+                }
+                g_scores[g] = if (gs_topk == 1) m1 else (if (std.math.isFinite(m2)) m1 + m2 else m1);
+            }
+            var g_allowed: [n_group]bool = @splat(false);
+            for (0..topk_group) |_| {
+                var bg: usize = 0;
+                var bv: f32 = -std.math.inf(f32);
+                for (0..n_group) |g| {
+                    if (!g_allowed[g] and g_scores[g] > bv) {
+                        bv = g_scores[g];
+                        bg = g;
+                    }
+                }
+                g_allowed[bg] = true;
+            }
+
+            var chosen_e: [top_k]u32 = undefined;
+            var chosen_w: [top_k]f32 = undefined;
+            var used: [num_e]bool = @splat(false);
+            var sum_w: f32 = 0.0;
+            for (0..top_k) |ki| {
+                var best_e: u32 = 0;
+                var best_ch: f32 = -std.math.inf(f32);
+                var best_unbiased: f32 = 0.0;
+                for (0..num_e) |ei| {
+                    if (used[ei] or !g_allowed[ei / g_size]) continue;
+                    const lg = logits_f32[ti * num_e + ei];
+                    const sv: f32 = if (std.math.isNegativeInf(lg)) 0.0 else sigmoidF32(lg);
+                    const ch: f32 = if (std.math.isNegativeInf(lg)) -std.math.inf(f32) else sv + bias_f32[ei];
+                    if (ch > best_ch) {
+                        best_ch = ch;
+                        best_e = @intCast(ei);
+                        best_unbiased = sv;
+                    }
+                }
+                used[best_e] = true;
+                chosen_e[ki] = best_e;
+                chosen_w[ki] = best_unbiased;
+                sum_w += best_unbiased;
+            }
+            for (0..top_k) |ki| {
+                chosen_w[ki] = (chosen_w[ki] / (sum_w + 1e-20)) * scale;
+                try std.testing.expectEqual(chosen_e[ki], sk_e_u32[ti * top_k + ki]);
+                try std.testing.expectApproxEqAbs(chosen_w[ki], sk_w_f32[ti * top_k + ki], 1e-5);
+            }
+        }
+
+        const num_u = hdr_u32[0];
+        try std.testing.expectEqual(m * top_k, offs_u32[num_u]);
+        for (0..num_u) |ui| {
+            const eid = uniq_u32[ui];
+            for (offs_u32[ui]..offs_u32[ui + 1]) |si| {
+                const tok = toks_u32[si];
+                var found = false;
+                for (0..top_k) |ki| {
+                    if (sk_e_u32[tok * top_k + ki] == eid) {
+                        try std.testing.expectApproxEqAbs(sk_w_f32[tok * top_k + ki], wts_f32[si], 1e-5);
+                        found = true;
+                        break;
+                    }
+                }
+                try std.testing.expect(found);
+            }
+        }
+    }
+    // Confirm top-2 sum vs max-1 actually exercise distinct group selection on this input.
+    try std.testing.expect(!std.mem.eql(u32, &mode2_e0, &mode1_e0));
+}
+
+test "M9.3 G28: ami_g28_mla_full_attend + ami_g28_mla_out_gate (head_wise & elem_wise, decode/prefill/tree) vs CPU fp32 ref" {
+    const device = try metal.Device.open();
+    defer device.close();
+    const library = try metal.Library.openEmbedded(device);
+    defer library.close();
+    const pipes = try HybridPipelines.init(device, library);
+    defer pipes.close();
+
+    const n_heads: u32 = 4;
+    const kv_rank: u32 = 64;
+    const d_rope: u32 = 32;
+    const max_seq: u32 = 16;
+    const m_prefill: u32 = 4;
+    const m_tree: u32 = 4;
+
+    const arena_cap = try page.alignUp(256 * 1024);
+    const budget = budget_mod.Budget.compute(.{
+        .memory_bytes = arena_cap + 4 * page.APPLE_PAGE_SIZE,
+        .user_wire_limit = arena_cap,
+        .global_user_wire_limit = arena_cap,
+        .gpu_working_set_bytes = arena_cap,
+        .configured_cap = null,
+        .headroom_bytes = page.APPLE_PAGE_SIZE,
+    });
+    var arena = try arena_mod.WiredArena.init(arena_cap, budget);
+    defer arena.deinit();
+
+    var mla_kv = try G27MlaKvArena.init(&arena, .{
+        .num_layers = 2,
+        .max_seq_len = max_seq,
+        .kv_lora_rank = kv_rank,
+        .qk_rope_head_dim = d_rope,
+    });
+    const lat_raw = try arena.allocAligned(max_seq * kv_rank * 2, 64);
+    const rope_raw = try arena.allocAligned(max_seq * d_rope * 2, 64);
+    const qn_raw = try arena.allocAligned(m_prefill * n_heads * kv_rank * 2, 64);
+    const qp_raw = try arena.allocAligned(m_prefill * n_heads * d_rope * 2, 64);
+    const tlat_raw = try arena.allocAligned(m_tree * kv_rank * 2, 64);
+    const trope_raw = try arena.allocAligned(m_tree * d_rope * 2, 64);
+    const masks_raw = try arena.allocAligned(m_tree * @sizeOf(u64), 64);
+    const out_raw = try arena.allocAligned(m_prefill * n_heads * kv_rank * 2, 64);
+    const gate_hw_raw = try arena.allocAligned(m_prefill * n_heads * 2, 64);
+    const gate_ew_raw = try arena.allocAligned(m_prefill * n_heads * kv_rank * 2, 64);
+
+    const lat_h: []f16 = @alignCast(std.mem.bytesAsSlice(f16, lat_raw[0 .. max_seq * kv_rank * 2]));
+    const rope_h: []f16 = @alignCast(std.mem.bytesAsSlice(f16, rope_raw[0 .. max_seq * d_rope * 2]));
+    const qn_h: []f16 = @alignCast(std.mem.bytesAsSlice(f16, qn_raw[0 .. m_prefill * n_heads * kv_rank * 2]));
+    const qp_h: []f16 = @alignCast(std.mem.bytesAsSlice(f16, qp_raw[0 .. m_prefill * n_heads * d_rope * 2]));
+    const tlat_h: []f16 = @alignCast(std.mem.bytesAsSlice(f16, tlat_raw[0 .. m_tree * kv_rank * 2]));
+    const trope_h: []f16 = @alignCast(std.mem.bytesAsSlice(f16, trope_raw[0 .. m_tree * d_rope * 2]));
+    const masks_u64: []u64 = @alignCast(std.mem.bytesAsSlice(u64, masks_raw[0 .. m_tree * 8]));
+    const out_h: []f16 = @alignCast(std.mem.bytesAsSlice(f16, out_raw[0 .. m_prefill * n_heads * kv_rank * 2]));
+    const gate_hw_h: []f16 = @alignCast(std.mem.bytesAsSlice(f16, gate_hw_raw[0 .. m_prefill * n_heads * 2]));
+    const gate_ew_h: []f16 = @alignCast(std.mem.bytesAsSlice(f16, gate_ew_raw[0 .. m_prefill * n_heads * kv_rank * 2]));
+
+    for (lat_h, 0..) |*v, i| v.* = @floatCast(synthF32(3100 + i, 0.35));
+    for (rope_h, 0..) |*v, i| v.* = @floatCast(synthF32(3400 + i, 0.35));
+    for (qn_h, 0..) |*v, i| v.* = @floatCast(synthF32(3700 + i, 0.35));
+    for (qp_h, 0..) |*v, i| v.* = @floatCast(synthF32(4100 + i, 0.35));
+    for (tlat_h, 0..) |*v, i| v.* = @floatCast(synthF32(4400 + i, 0.35));
+    for (trope_h, 0..) |*v, i| v.* = @floatCast(synthF32(4700 + i, 0.35));
+    for (gate_hw_h, 0..) |*v, i| v.* = @floatCast(synthF32(5100 + i, 1.4));
+    for (gate_ew_h, 0..) |*v, i| v.* = @floatCast(synthF32(5400 + i, 1.4));
+    masks_u64[0] = 0b0001;
+    masks_u64[1] = 0b0011;
+    masks_u64[2] = 0b0101;
+    masks_u64[3] = 0b1011;
+
+    const buf = try metal.Buffer.wrap(device, arena.bytes());
+    defer buf.close();
+    var compute = try metal.Compute.initWithFrames(device, 2);
+    defer compute.close();
+    try compute.makeResident(&.{buf});
+
+    const bind = struct {
+        fn at(b: metal.Buffer, a: *const arena_mod.WiredArena, ptr: [*]u8) metal.BufferBinding {
+            return .{ .buffer = b, .offset = a.offsetOf(ptr) };
+        }
+    }.at;
+
+    const attn_scale = 1.0 / @sqrt(@as(f32, @floatFromInt(kv_rank + d_rope)));
+
+    // 1. Causal prefill (`m = 4`, positions `0..3`) + head_wise `g_proj` output gate
+    {
+        var frame = try compute.beginFrame(5000);
+        errdefer frame.abort();
+        try pipes.encodeG27MlaKvWrite(&frame, .{
+            .latent_in = bind(buf, &arena, lat_raw.ptr),
+            .rope_in = bind(buf, &arena, rope_raw.ptr),
+            .kv_cache = try mla_kv.layerBinding(buf, 0),
+            .num_tokens = 5,
+            .kv_lora_rank = kv_rank,
+            .qk_rope_head_dim = d_rope,
+            .start_pos = 0,
+        }, false);
+        try pipes.encodeG28MlaFullAttn(&frame, .{
+            .q_nope = bind(buf, &arena, qn_raw.ptr),
+            .q_pe = bind(buf, &arena, qp_raw.ptr),
+            .kv_cache = try mla_kv.layerBinding(buf, 0),
+            .out = bind(buf, &arena, out_raw.ptr),
+            .num_rows = m_prefill,
+            .num_q_heads = n_heads,
+            .kv_lora_rank = kv_rank,
+            .qk_rope_head_dim = d_rope,
+            .committed_kv_len = m_prefill,
+            .causal_base_pos = 0,
+            .is_tree = false,
+            .scale = attn_scale,
+        }, true);
+        try pipes.encodeG28MlaOutGate(&frame, .{
+            .attn_out = bind(buf, &arena, out_raw.ptr),
+            .gate = bind(buf, &arena, gate_hw_raw.ptr),
+            .num_rows = m_prefill,
+            .num_heads = n_heads,
+            .v_head_dim = kv_rank,
+            .head_wise = true,
+        }, true);
+        const sig = try frame.commit();
+        try compute.wait(sig, 5000);
+    }
+
+    var dot_ab: f64 = 0.0;
+    var norm_a: f64 = 0.0;
+    var norm_b: f64 = 0.0;
+    for (0..m_prefill) |r| {
+        for (0..n_heads) |hd| {
+            var scores: [4]f32 = undefined;
+            var mx: f32 = -std.math.inf(f32);
+            for (0..r + 1) |k| {
+                var dv: f32 = 0.0;
+                for (0..kv_rank) |d| dv += @as(f32, @floatCast(qn_h[(r * n_heads + hd) * kv_rank + d])) * @as(f32, @floatCast(lat_h[k * kv_rank + d]));
+                for (0..d_rope) |d| dv += @as(f32, @floatCast(qp_h[(r * n_heads + hd) * d_rope + d])) * @as(f32, @floatCast(rope_h[k * d_rope + d]));
+                scores[k] = dv * attn_scale;
+                mx = @max(mx, scores[k]);
+            }
+            var den: f32 = 0.0;
+            for (0..r + 1) |k| {
+                scores[k] = @exp(scores[k] - mx);
+                den += scores[k];
+            }
+            const g_val = sigmoidF32(@as(f32, @floatCast(gate_hw_h[r * n_heads + hd])));
+            for (0..kv_rank) |d| {
+                var acc: f32 = 0.0;
+                for (0..r + 1) |k| acc += (scores[k] / den) * @as(f32, @floatCast(lat_h[k * kv_rank + d]));
+                const ref_v = acc * g_val;
+                const got_v: f32 = @floatCast(out_h[(r * n_heads + hd) * kv_rank + d]);
+                try std.testing.expectApproxEqAbs(ref_v, got_v, 3e-3);
+                dot_ab += @as(f64, ref_v) * @as(f64, got_v);
+                norm_a += @as(f64, ref_v) * @as(f64, ref_v);
+                norm_b += @as(f64, got_v) * @as(f64, got_v);
+            }
+        }
+    }
+    try std.testing.expect(dot_ab / @sqrt(norm_a * norm_b) >= 0.9999);
+
+    // 2. Branching speculative tree verify (`m = 4`, committed `5` + `ancestor_masks`) + element-wise gate
+    {
+        var frame = try compute.beginFrame(5000);
+        errdefer frame.abort();
+        try pipes.encodeG28MlaFullAttn(&frame, .{
+            .q_nope = bind(buf, &arena, qn_raw.ptr),
+            .q_pe = bind(buf, &arena, qp_raw.ptr),
+            .kv_cache = try mla_kv.layerBinding(buf, 0),
+            .kv_tree_latent = bind(buf, &arena, tlat_raw.ptr),
+            .kv_tree_rope = bind(buf, &arena, trope_raw.ptr),
+            .ancestor_masks = bind(buf, &arena, masks_raw.ptr),
+            .out = bind(buf, &arena, out_raw.ptr),
+            .num_rows = m_tree,
+            .num_q_heads = n_heads,
+            .kv_lora_rank = kv_rank,
+            .qk_rope_head_dim = d_rope,
+            .committed_kv_len = 5,
+            .causal_base_pos = 5,
+            .is_tree = true,
+            .scale = attn_scale,
+        }, false);
+        try pipes.encodeG28MlaOutGate(&frame, .{
+            .attn_out = bind(buf, &arena, out_raw.ptr),
+            .gate = bind(buf, &arena, gate_ew_raw.ptr),
+            .num_rows = m_tree,
+            .num_heads = n_heads,
+            .v_head_dim = kv_rank,
+            .head_wise = false,
+        }, true);
+        const sig = try frame.commit();
+        try compute.wait(sig, 5000);
+    }
+
+    dot_ab = 0.0;
+    norm_a = 0.0;
+    norm_b = 0.0;
+    for (0..m_tree) |r| {
+        const mask = masks_u64[r];
+        for (0..n_heads) |hd| {
+            var scores: [9]f32 = undefined;
+            var active: [9]bool = @splat(false);
+            var mx: f32 = -std.math.inf(f32);
+            for (0..5) |k| {
+                var dv: f32 = 0.0;
+                for (0..kv_rank) |d| dv += @as(f32, @floatCast(qn_h[(r * n_heads + hd) * kv_rank + d])) * @as(f32, @floatCast(lat_h[k * kv_rank + d]));
+                for (0..d_rope) |d| dv += @as(f32, @floatCast(qp_h[(r * n_heads + hd) * d_rope + d])) * @as(f32, @floatCast(rope_h[k * d_rope + d]));
+                scores[k] = dv * attn_scale;
+                active[k] = true;
+                mx = @max(mx, scores[k]);
+            }
+            for (0..m_tree) |j| {
+                if (((mask >> @intCast(j)) & 1) == 0) continue;
+                var dv: f32 = 0.0;
+                for (0..kv_rank) |d| dv += @as(f32, @floatCast(qn_h[(r * n_heads + hd) * kv_rank + d])) * @as(f32, @floatCast(tlat_h[j * kv_rank + d]));
+                for (0..d_rope) |d| dv += @as(f32, @floatCast(qp_h[(r * n_heads + hd) * d_rope + d])) * @as(f32, @floatCast(trope_h[j * d_rope + d]));
+                scores[5 + j] = dv * attn_scale;
+                active[5 + j] = true;
+                mx = @max(mx, scores[5 + j]);
+            }
+            var den: f32 = 0.0;
+            for (0..9) |idx| {
+                if (!active[idx]) continue;
+                scores[idx] = @exp(scores[idx] - mx);
+                den += scores[idx];
+            }
+            for (0..kv_rank) |d| {
+                var acc: f32 = 0.0;
+                for (0..5) |k| acc += (scores[k] / den) * @as(f32, @floatCast(lat_h[k * kv_rank + d]));
+                for (0..m_tree) |j| {
+                    if (!active[5 + j]) continue;
+                    acc += (scores[5 + j] / den) * @as(f32, @floatCast(tlat_h[j * kv_rank + d]));
+                }
+                const g_idx = (r * n_heads + hd) * kv_rank + d;
+                const ref_v = acc * sigmoidF32(@as(f32, @floatCast(gate_ew_h[g_idx])));
+                const got_v: f32 = @floatCast(out_h[g_idx]);
+                try std.testing.expectApproxEqAbs(ref_v, got_v, 3e-3);
+                dot_ab += @as(f64, ref_v) * @as(f64, got_v);
+                norm_a += @as(f64, ref_v) * @as(f64, ref_v);
+                norm_b += @as(f64, got_v) * @as(f64, got_v);
+            }
+        }
+    }
+    try std.testing.expect(dot_ab / @sqrt(norm_a * norm_b) >= 0.9999);
+
+    // 3. Single-token decode (`m = 1`, `d_rope = 0` NoPE guard)
+    {
+        const nope_scale = 1.0 / @sqrt(@as(f32, @floatFromInt(kv_rank)));
+        var frame = try compute.beginFrame(5000);
+        errdefer frame.abort();
+        try pipes.encodeG27MlaKvWrite(&frame, .{
+            .latent_in = bind(buf, &arena, lat_raw.ptr),
+            .rope_in = null,
+            .kv_cache = try mla_kv.layerBinding(buf, 1),
+            .num_tokens = 5,
+            .kv_lora_rank = kv_rank,
+            .qk_rope_head_dim = 0,
+            .start_pos = 0,
+        }, false);
+        try pipes.encodeG28MlaFullAttn(&frame, .{
+            .q_nope = bind(buf, &arena, qn_raw.ptr),
+            .q_pe = null,
+            .kv_cache = try mla_kv.layerBinding(buf, 1),
+            .out = bind(buf, &arena, out_raw.ptr),
+            .num_rows = 1,
+            .num_q_heads = n_heads,
+            .kv_lora_rank = kv_rank,
+            .qk_rope_head_dim = 0,
+            .committed_kv_len = 5,
+            .causal_base_pos = 4,
+            .is_tree = false,
+            .scale = nope_scale,
+        }, true);
+        const sig = try frame.commit();
+        try compute.wait(sig, 5000);
+
+        for (0..n_heads) |hd| {
+            var scores: [5]f32 = undefined;
+            var mx: f32 = -std.math.inf(f32);
+            for (0..5) |k| {
+                var dv: f32 = 0.0;
+                for (0..kv_rank) |d| dv += @as(f32, @floatCast(qn_h[hd * kv_rank + d])) * @as(f32, @floatCast(lat_h[k * kv_rank + d]));
+                scores[k] = dv * nope_scale;
+                mx = @max(mx, scores[k]);
+            }
+            var den: f32 = 0.0;
+            for (0..5) |k| {
+                scores[k] = @exp(scores[k] - mx);
+                den += scores[k];
+            }
+            for (0..kv_rank) |d| {
+                var acc: f32 = 0.0;
+                for (0..5) |k| acc += (scores[k] / den) * @as(f32, @floatCast(lat_h[k * kv_rank + d]));
+                try std.testing.expectApproxEqAbs(acc, @as(f32, @floatCast(out_h[hd * kv_rank + d])), 3e-3);
+            }
         }
     }
 }

@@ -21,6 +21,7 @@ const budget_mod = @import("../mem/budget.zig");
 const metal = @import("../bridge/metal.zig");
 const expert = @import("../expert/source.zig");
 const amf = @import("../format/amf.zig");
+const quant = @import("../quant/spec.zig");
 const moe = @import("../gpu/moe.zig");
 const vmstat = @import("../platform/vmstat.zig");
 const paths = @import("../platform/paths.zig");
@@ -331,12 +332,26 @@ pub const CacheError = error{
 pub const CacheConfig = struct {
     num_layers: u16,
     num_experts: u16,
-    /// Number of cache accesses between periodic LFU halvings (`0` disables decay).
+    /// Number of cache accesses between periodic LFU & session-frequency halvings (`0` disables decay).
     decay_interval: u64 = 1024,
     /// Fixed-point LFU score increment per access (`LFU_SCALE = 256` for smooth halving).
     lfu_increment: u32 = 256,
     /// Maximum time to wait for an in-flight or synchronous cold-expert read.
     io_timeout_ms: u64 = 10_000,
+    /// Target percentage (`0..95`) of wired `ExpertSlotPool` slots reserved for the
+    /// `C27` mutable Session LFU Working-Set Tier (`0` disables two-tier partitioning).
+    working_set_ratio_pct: u8 = 70,
+    /// Minimum number of slots kept in the Streaming Probation / LRU Tier (`0` auto-sizes
+    /// to `max(1, min(8, num_slots / 3))`; callers with known `max_topk` should pass `max_topk`
+    /// so a single step's uncached misses never evict promoted hot working-set slots).
+    min_probation_slots: u32 = 0,
+};
+
+/// Logical residency tier of a wired `ExpertSlotPool` slot (`C27`).
+/// Promotion/demotion between tiers is strictly O(1) metadata (`0` `memcpy` of `16 KiB` pages).
+pub const SlotTier = enum(u8) {
+    probation,
+    lfu_working_set,
 };
 
 pub const PrefetchOutcome = enum {
@@ -389,6 +404,14 @@ pub const Telemetry = struct {
     prefetch_wait_ns: u64 = 0,
     sync_miss_wait_ns: u64 = 0,
     io_errors: u64 = 0,
+    /// `C27`: O(1) zero-copy metadata promotions from Streaming Probation into Session LFU Working-Set.
+    session_promotions: u64 = 0,
+    /// `C27`: zero-I/O wired RAM hits served directly from the promoted Session LFU Working-Set Tier.
+    promoted_hits: u64 = 0,
+    /// `C27`: evictions absorbed by the Streaming Probation / LRU Tier without touching the Working-Set Tier.
+    probation_evictions: u64 = 0,
+    /// `C27`: opt-in low-weight uncached cold tail misses skipped (`cold_expert_min_weight > 0.0`).
+    cold_skipped_min_weight: u64 = 0,
 
     pub fn prefetchWaitUs(self: Telemetry) f64 {
         return @as(f64, @floatFromInt(self.prefetch_wait_ns)) / 1000.0;
@@ -424,6 +447,7 @@ const SlotState = enum(u8) {
 
 const SlotMeta = struct {
     state: SlotState = .empty,
+    tier: SlotTier = .probation,
     key: ExpertKey = .{ .layer = 0, .expert = 0 },
     pin_count: u32 = 0,
     lfu_score: u32 = 0,
@@ -439,7 +463,23 @@ const ExpertRecord = struct {
     placement: ?ExpertPlacement = null,
     /// Slot index in `ExpertSlotPool`, or `INVALID_SLOT` when not resident/in-flight.
     slot: u32 = INVALID_SLOT,
+    /// Preallocated per-`(layer, expert)` session access frequency counter (`C27`),
+    /// periodically halved (`>>= 1`) every `decay_interval` accesses (`0` hot-path allocs).
+    session_freq: u32 = 0,
 };
+
+pub fn computeWorkingSetCap(num_slots: u32, ratio_pct: u8, min_probation_slots: u32) u32 {
+    if (ratio_pct == 0 or num_slots <= 1) return 0;
+    const eff_min_prob: u32 = if (min_probation_slots > 0)
+        min_probation_slots
+    else
+        @max(@as(u32, 1), @min(@as(u32, 8), num_slots / 3));
+    if (num_slots <= eff_min_prob) return 0;
+    const max_ws: u32 = num_slots - eff_min_prob;
+    const clamped_pct: u32 = @min(@as(u32, ratio_pct), 95);
+    const desired: u32 = (num_slots * clamped_pct) / 100;
+    return @max(@as(u32, 1), @min(max_ws, desired));
+}
 
 /// Wired cold-expert cache and async prefetch coordinator.
 ///
@@ -452,6 +492,8 @@ pub const ExpertCache = struct {
     decay_interval: u64,
     lfu_increment: u32,
     io_timeout_ms: u64,
+    working_set_cap: u32,
+    working_set_count: u32,
 
     pool: *ExpertSlotPool,
     reader: *aio.AsyncExpertReader,
@@ -479,6 +521,7 @@ pub const ExpertCache = struct {
 
         const total_experts = std.math.mul(usize, config.num_layers, config.num_experts) catch return error.InvalidDimensions;
         const num_slots: usize = pool.numSlots();
+        const ws_cap = computeWorkingSetCap(@intCast(num_slots), config.working_set_ratio_pct, config.min_probation_slots);
 
         const records = try allocator.alloc(ExpertRecord, total_experts);
         errdefer allocator.free(records);
@@ -497,6 +540,8 @@ pub const ExpertCache = struct {
             .decay_interval = config.decay_interval,
             .lfu_increment = config.lfu_increment,
             .io_timeout_ms = config.io_timeout_ms,
+            .working_set_cap = ws_cap,
+            .working_set_count = 0,
             .pool = pool,
             .reader = reader,
             .records = records,
@@ -613,6 +658,187 @@ pub const ExpertCache = struct {
         return @intCast(self.slots.len);
     }
 
+    pub fn workingSetCap(self: *const ExpertCache) u32 {
+        return self.working_set_cap;
+    }
+
+    pub fn workingSetCount(self: *const ExpertCache) u32 {
+        return self.working_set_count;
+    }
+
+    pub fn slotTier(self: *const ExpertCache, layer: u16, expert_idx: u16) ?SlotTier {
+        if (layer >= self.num_layers or expert_idx >= self.num_experts) return null;
+        const rec = self.records[@as(usize, layer) * self.num_experts + expert_idx];
+        if (rec.slot == INVALID_SLOT) return null;
+        const slot = self.slots[rec.slot];
+        if (slot.state != .ready and slot.state != .inflight) return null;
+        return slot.tier;
+    }
+
+    pub fn sessionFreq(self: *const ExpertCache, layer: u16, expert_idx: u16) u32 {
+        if (layer >= self.num_layers or expert_idx >= self.num_experts) return 0;
+        return self.records[@as(usize, layer) * self.num_experts + expert_idx].session_freq;
+    }
+
+    pub fn recordColdSkipped(self: *ExpertCache, skipped: u64) void {
+        self.stats.cold_skipped_min_weight += skipped;
+    }
+
+    /// Opt-in `C27` approximate cold-tail skipping (`min_weight > 0.0`) directly
+    /// over a populated `moe.MoeWorkspace` CSR schedule (`0` heap allocations!).
+    ///
+    /// - Default `min_weight <= 0.0`: strictly `0` experts skipped (`100%` lossless).
+    /// - Keeps ALL wired `.hot` experts AND ALL currently resident/in-flight cold
+    ///   experts (`.cached_ready`, `.cached_inflight`) unconditionally.
+    /// - Skips ONLY uncached NVMe-miss cold tail experts (`.cold_nvme`) whose
+    ///   normalized per-token routing weight `< min_weight` (never skipping the
+    ///   top-1 expert if every selected expert for a token was an uncached miss).
+    /// - Renormalizes remaining per-token routing weights when `norm_topk_prob` is
+    ///   active, rebuilds the CSR schedule (+ optional heterogeneous buckets), and
+    ///   zeroes `ws.down_out` for every skipped `(tok, k)` slot so `ami_moe_reduce_f16`
+    ///   adds exact `0.0f`.
+    pub fn filterColdTailWorkspace(
+        self: *ExpertCache,
+        layer: u16,
+        ws: *moe.MoeWorkspace,
+        m: u32,
+        top_k: u32,
+        hidden_size: u32,
+        norm_topk_prob: bool,
+        min_weight: f32,
+        expert_dtypes: ?[]const quant.WeightDType,
+    ) u64 {
+        if (min_weight <= 0.0 or m == 0 or top_k == 0) return 0;
+        const m_u: usize = m;
+        const tk_u: usize = @min(@as(usize, top_k), moe.MAX_TOP_K);
+        const h_u: usize = hidden_size;
+        const n_exp: usize = @min(@as(usize, self.num_experts), moe.MAX_EXPERTS);
+
+        var counts: [moe.MAX_EXPERTS]u32 = @splat(0);
+        var cursors: [moe.MAX_EXPERTS]u32 = @splat(0);
+        var total_skipped: u64 = 0;
+
+        // Pass 1: evaluate per-token skip decisions, keep hot + resident unconditionally,
+        // guard top-1, renormalize kept weights, zero skipped `down_out` rows, and mark
+        // skipped entries with temporary sentinel `-1.0` in `scratch_topk_weights`.
+        for (0..m_u) |tok| {
+            const base = tok * tk_u;
+            const e_row = ws.scratch_topk_experts[base .. base + tk_u];
+            const w_row = ws.scratch_topk_weights[base .. base + tk_u];
+
+            var orig_sum: f32 = 0.0;
+            var best_k: usize = 0;
+            var best_w: f32 = -std.math.inf(f32);
+            for (0..tk_u) |k| {
+                const wk = w_row[k];
+                orig_sum += wk;
+                if (wk > best_w) {
+                    best_w = wk;
+                    best_k = k;
+                }
+            }
+
+            var keep: [moe.MAX_TOP_K]bool = @splat(true);
+            var kept_cnt: usize = 0;
+            var tok_skipped: u64 = 0;
+            for (0..tk_u) |k| {
+                const eid = e_row[k];
+                const keep_uncond = if (eid < n_exp) switch (self.residencyState(layer, @intCast(eid))) {
+                    .hot, .cached_ready, .cached_inflight => true,
+                    else => false,
+                } else true;
+                const w_norm: f32 = if (orig_sum > 0.0) (w_row[k] / orig_sum) else 0.0;
+                if (!keep_uncond and w_norm < min_weight) {
+                    keep[k] = false;
+                    tok_skipped += 1;
+                } else {
+                    kept_cnt += 1;
+                }
+            }
+
+            // Safety guard: never skip all `top_k` experts for a token.
+            if (kept_cnt == 0) {
+                keep[best_k] = true;
+                kept_cnt = 1;
+                tok_skipped -|= 1;
+            }
+
+            if (tok_skipped > 0) {
+                total_skipped += tok_skipped;
+                var kept_sum: f32 = 0.0;
+                for (0..tk_u) |k| {
+                    if (keep[k]) kept_sum += w_row[k];
+                }
+                const renorm: f32 = if (norm_topk_prob and kept_sum > 0.0 and orig_sum > 0.0)
+                    (orig_sum / kept_sum)
+                else
+                    1.0;
+                for (0..tk_u) |k| {
+                    if (keep[k]) {
+                        w_row[k] *= renorm;
+                        if (e_row[k] < n_exp) counts[e_row[k]] += 1;
+                    } else {
+                        w_row[k] = -1.0; // Temporary sentinel cleared in Pass 2.
+                        const d_base = (base + k) * h_u;
+                        if (d_base + h_u <= ws.down_out.len) {
+                            @memset(ws.down_out[d_base .. d_base + h_u], 0.0);
+                        }
+                    }
+                }
+            } else {
+                for (0..tk_u) |k| {
+                    if (e_row[k] < n_exp) counts[e_row[k]] += 1;
+                }
+            }
+        }
+
+        if (total_skipped == 0) return 0;
+
+        // Pass 2: rebuild dense CSR arrays with only kept assignments.
+        var num_u: u32 = 0;
+        var total_a: u32 = 0;
+        for (0..n_exp) |e| {
+            const c = counts[e];
+            if (c == 0) continue;
+            ws.unique_experts[num_u] = @intCast(e);
+            ws.expert_token_offsets[num_u] = total_a;
+            cursors[e] = total_a;
+            total_a += c;
+            num_u += 1;
+        }
+        ws.expert_token_offsets[num_u] = total_a;
+
+        for (0..m_u) |tok| {
+            const base = tok * tk_u;
+            const e_row = ws.scratch_topk_experts[base .. base + tk_u];
+            const w_row = ws.scratch_topk_weights[base .. base + tk_u];
+            for (0..tk_u) |k| {
+                const wk = w_row[k];
+                if (wk < 0.0) {
+                    w_row[k] = 0.0;
+                    continue;
+                }
+                const eid = e_row[k];
+                if (eid >= n_exp) continue;
+                const pos = cursors[eid];
+                cursors[eid] = pos + 1;
+                ws.token_indices[pos] = @intCast(tok);
+                ws.routing_weights[pos] = wk;
+                ws.slot_k_indices[pos] = @intCast(k);
+            }
+        }
+
+        ws.schedule_header.num_unique_experts = num_u;
+        ws.schedule_header.total_assignments = total_a;
+        ws.schedule_header.m = m;
+        ws.schedule_header.top_k = top_k;
+        if (expert_dtypes) |ed| {
+            ws.rebuildSchemeBucketsCpu(ed);
+        }
+        self.stats.cold_skipped_min_weight += total_skipped;
+        return total_skipped;
+    }
+
     pub fn residentColdCount(self: *const ExpertCache) usize {
         var count: usize = 0;
         for (self.slots) |slot| {
@@ -667,13 +893,16 @@ pub const ExpertCache = struct {
         return count;
     }
 
-    /// Explicitly halves every non-empty slot's LFU score (also triggered
-    /// automatically every `decay_interval` accesses).
+    /// Explicitly halves every non-empty slot's LFU score and every `(layer, expert)`
+    /// session frequency counter (also triggered automatically every `decay_interval` accesses).
     pub fn decayAll(self: *ExpertCache) void {
         for (self.slots) |*slot| {
             if (slot.state != .empty) {
                 slot.lfu_score >>= 1;
             }
+        }
+        for (self.records) |*rec| {
+            rec.session_freq >>= 1;
         }
     }
 
@@ -800,12 +1029,19 @@ pub const ExpertCache = struct {
                     switch (slot.state) {
                         .ready => {
                             self.pinSlot(s);
+                            const was_promoted = (slot.tier == .lfu_working_set);
                             self.touchSlot(s);
+                            self.bumpSessionFreq(idx);
                             if (slot.prefetched_unused) {
                                 slot.prefetched_unused = false;
                                 self.stats.prefetch_hits += 1;
                             } else {
                                 self.stats.cache_hits += 1;
+                            }
+                            if (was_promoted) {
+                                self.stats.promoted_hits += 1;
+                            } else {
+                                self.maybePromoteSlot(s, idx);
                             }
                             return self.buildColdPinnedSlot(key, s, cold);
                         },
@@ -826,12 +1062,14 @@ pub const ExpertCache = struct {
                                 return err;
                             }
                             self.touchSlot(s);
+                            self.bumpSessionFreq(idx);
                             if (slot.prefetched_unused) {
                                 slot.prefetched_unused = false;
                                 self.stats.prefetch_hits += 1;
                             } else {
                                 self.stats.cache_hits += 1;
                             }
+                            self.maybePromoteSlot(s, idx);
                             return self.buildColdPinnedSlot(key, s, cold);
                         },
                         .failed => {
@@ -889,7 +1127,9 @@ pub const ExpertCache = struct {
                 }
 
                 self.touchSlot(s);
+                self.bumpSessionFreq(idx);
                 self.stats.sync_misses += 1;
+                self.maybePromoteSlot(s, idx);
                 return self.buildColdPinnedSlot(key, s, cold);
             },
         }
@@ -935,6 +1175,58 @@ pub const ExpertCache = struct {
         slot.last_access_tick = tick;
     }
 
+    fn bumpSessionFreq(self: *ExpertCache, rec_idx: usize) void {
+        const cur = self.records[rec_idx].session_freq;
+        self.records[rec_idx].session_freq = @min(cur +| 1, MAX_LFU_SCORE);
+    }
+
+    /// O(1) metadata-only promotion (`0` `memcpy` of `16 KiB` pages!) from
+    /// `.probation` into `.lfu_working_set` whenever an expert reaches `>= 2`
+    /// session hits with free working-set capacity, or exceeds the coldest
+    /// working-set resident's session frequency (swapping tier tags only).
+    fn maybePromoteSlot(self: *ExpertCache, slot_idx: u32, rec_idx: usize) void {
+        if (self.working_set_cap == 0) return;
+        const slot = &self.slots[slot_idx];
+        if (slot.tier == .lfu_working_set) return;
+        const freq = self.records[rec_idx].session_freq;
+        if (freq < 2) return;
+
+        if (self.working_set_count < self.working_set_cap) {
+            slot.tier = .lfu_working_set;
+            self.working_set_count += 1;
+            self.stats.session_promotions += 1;
+            return;
+        }
+
+        // Working-set full: find lowest-frequency unpinned `.ready` working-set member.
+        var min_idx: ?u32 = null;
+        var min_freq: u32 = std.math.maxInt(u32);
+        var min_lfu: u32 = std.math.maxInt(u32);
+        var min_tick: u64 = std.math.maxInt(u64);
+        for (self.slots, 0..) |cand, ci| {
+            if (cand.state != .ready or cand.tier != .lfu_working_set or cand.pin_count > 0) continue;
+            const c_rec = @as(usize, cand.key.layer) * @as(usize, self.num_experts) + @as(usize, cand.key.expert);
+            const c_freq = self.records[c_rec].session_freq;
+            if (min_idx == null or
+                c_freq < min_freq or
+                (c_freq == min_freq and cand.lfu_score < min_lfu) or
+                (c_freq == min_freq and cand.lfu_score == min_lfu and cand.last_access_tick < min_tick))
+            {
+                min_idx = @intCast(ci);
+                min_freq = c_freq;
+                min_lfu = cand.lfu_score;
+                min_tick = cand.last_access_tick;
+            }
+        }
+        if (min_idx) |demote_idx| {
+            if (freq > min_freq or (freq == min_freq and slot.lfu_score > min_lfu)) {
+                self.slots[demote_idx].tier = .probation;
+                slot.tier = .lfu_working_set;
+                self.stats.session_promotions += 1;
+            }
+        }
+    }
+
     fn pinSlot(self: *ExpertCache, slot_idx: u32) void {
         const slot = &self.slots[slot_idx];
         if (slot.pin_count == 0) {
@@ -961,12 +1253,59 @@ pub const ExpertCache = struct {
     }
 
     fn selectEvictionVictim(self: *const ExpertCache) ?u32 {
+        // 1. Always prefer an empty slot first.
+        for (self.slots, 0..) |slot, i| {
+            if (slot.state == .empty) return @intCast(i);
+        }
+
+        if (self.working_set_cap > 0) {
+            // 2. Scan-resistant Streaming Probation / LRU Tier first so single-hit
+            //    cold tail misses never thrash the promoted Session LFU Working-Set!
+            var prob_best: ?u32 = null;
+            var prob_tick: u64 = std.math.maxInt(u64);
+            var prob_score: u32 = std.math.maxInt(u32);
+            for (self.slots, 0..) |slot, i| {
+                if (slot.state != .ready or slot.pin_count > 0 or slot.tier != .probation) continue;
+                if (prob_best == null or
+                    slot.last_access_tick < prob_tick or
+                    (slot.last_access_tick == prob_tick and slot.lfu_score < prob_score))
+                {
+                    prob_best = @intCast(i);
+                    prob_tick = slot.last_access_tick;
+                    prob_score = slot.lfu_score;
+                }
+            }
+            if (prob_best != null) return prob_best;
+
+            // 3. Fallback (only if every probation slot is currently pinned/inflight):
+            //    evict lowest session frequency in working-set tier.
+            var ws_best: ?u32 = null;
+            var ws_freq: u32 = std.math.maxInt(u32);
+            var ws_score: u32 = std.math.maxInt(u32);
+            var ws_tick: u64 = std.math.maxInt(u64);
+            for (self.slots, 0..) |slot, i| {
+                if (slot.state != .ready or slot.pin_count > 0) continue;
+                const rec_idx = @as(usize, slot.key.layer) * @as(usize, self.num_experts) + @as(usize, slot.key.expert);
+                const freq = self.records[rec_idx].session_freq;
+                if (ws_best == null or
+                    freq < ws_freq or
+                    (freq == ws_freq and slot.lfu_score < ws_score) or
+                    (freq == ws_freq and slot.lfu_score == ws_score and slot.last_access_tick < ws_tick))
+                {
+                    ws_best = @intCast(i);
+                    ws_freq = freq;
+                    ws_score = slot.lfu_score;
+                    ws_tick = slot.last_access_tick;
+                }
+            }
+            return ws_best;
+        }
+
         var best: ?u32 = null;
         var best_score: u32 = std.math.maxInt(u32);
         var best_tick: u64 = std.math.maxInt(u64);
 
         for (self.slots, 0..) |slot, i| {
-            if (slot.state == .empty) return @intCast(i);
             if (slot.state != .ready or slot.pin_count > 0) continue;
             if (best == null or
                 slot.lfu_score < best_score or
@@ -988,11 +1327,17 @@ pub const ExpertCache = struct {
             if (self.records[old_idx].slot == slot_idx) {
                 self.records[old_idx].slot = INVALID_SLOT;
             }
+            if (slot.tier == .lfu_working_set) {
+                self.working_set_count -|= 1;
+            } else {
+                self.stats.probation_evictions += 1;
+            }
             self.stats.evictions += 1;
             if (slot.prefetched_unused) {
                 self.stats.unused_prefetched_experts += 1;
             }
             slot.state = .empty;
+            slot.tier = .probation;
             slot.prefetched_unused = false;
         }
     }
@@ -1018,6 +1363,7 @@ pub const ExpertCache = struct {
         const gen = slot.generation;
 
         slot.state = .inflight;
+        slot.tier = .probation;
         slot.key = key;
         slot.pending_blobs = BLOBS_PER_EXPERT;
         slot.io_err_code = 0;
@@ -1737,5 +2083,262 @@ test "ExpertCache async prefetch delivers zero-miss hits on both kqueue_aio and 
         cache.releasePins();
         try std.testing.expectEqual(@as(u64, 8), cache.telemetry().cache_hits);
         try std.testing.expectEqual(@as(u64, 0), cache.telemetry().sync_misses);
+    }
+}
+
+test "C27 two-tier session LFU promotion resists scan thrashing with 0 memcpy and 100% lossless payloads" {
+    const gpa = std.testing.allocator;
+    const blob_bytes = 2 * page.APPLE_PAGE_SIZE; // 32 KiB per blob, 96 KiB per expert
+    const num_experts: u16 = 54; // 6 hot working-set experts + 48 strictly one-shot tail experts
+    const num_slots: u32 = 12;
+
+    var pack = try SyntheticColdPack.create("c27_tier", 1, num_experts, blob_bytes);
+    defer pack.deinit();
+
+    const spec: PoolSpec = .{
+        .num_slots = num_slots,
+        .gate_blob_bytes = blob_bytes,
+        .up_blob_bytes = blob_bytes,
+        .down_blob_bytes = blob_bytes,
+    };
+
+    const runWorkload = struct {
+        fn run(
+            alloc: std.mem.Allocator,
+            sp: PoolSpec,
+            pk: *const SyntheticColdPack,
+            ws_ratio_pct: u8,
+            min_prob: u32,
+            check_promotion_invariants: bool,
+        ) !Telemetry {
+            var pool = try ExpertSlotPool.initOwned(testBudget(try sp.totalBytes()), null, sp);
+            defer pool.deinit();
+
+            var reader = try aio.AsyncExpertReader.init(alloc, .{
+                .backend = .ecore_pread,
+                .max_inflight = 16,
+                .worker_count = 2,
+            });
+            defer reader.deinit(alloc);
+
+            var cache = try ExpertCache.init(alloc, &pool, &reader, .{
+                .num_layers = 1,
+                .num_experts = num_experts,
+                // Short decay interval exercises scan-decay inversion: single-tier LFU halves hot scores
+                // during a 12-expert scan and evicts them, whereas C27's Session LFU Working-Set Tier
+                // absorbs all one-shot scans strictly in the Streaming Probation Tier!
+                .decay_interval = 16,
+                .working_set_ratio_pct = ws_ratio_pct,
+                .min_probation_slots = min_prob,
+            });
+            defer cache.deinit(alloc);
+
+            for (0..num_experts) |e| {
+                try cache.registerCold(0, @intCast(e), try pk.tripleFor(0, @intCast(e)));
+            }
+
+            // Warm up 6 Zipf hot working-set cold experts (`0..5`) twice so they
+            // promote from `.probation` -> `.lfu_working_set` in-place (0 memcpy).
+            var initial_slots: [6]u32 = undefined;
+            for (0..6) |e| {
+                const p1 = try cache.acquirePinned(0, @intCast(e));
+                try pk.expectSlotMatches(p1);
+                initial_slots[e] = p1.slot_index.?;
+                if (check_promotion_invariants) {
+                    try std.testing.expectEqual(@as(?SlotTier, .probation), cache.slotTier(0, @intCast(e)));
+                }
+            }
+            cache.releasePins();
+
+            for (0..6) |e| {
+                const p2 = try cache.acquirePinned(0, @intCast(e));
+                try pk.expectSlotMatches(p2);
+                if (check_promotion_invariants) {
+                    // O(1) metadata-only promotion: physical 16 KiB slot index NEVER changes (`0` memcpy!).
+                    try std.testing.expectEqual(initial_slots[e], p2.slot_index.?);
+                    try std.testing.expectEqual(@as(?SlotTier, .lfu_working_set), cache.slotTier(0, @intCast(e)));
+                }
+            }
+            cache.releasePins();
+            if (check_promotion_invariants) {
+                try std.testing.expectEqual(@as(u32, 6), cache.workingSetCount());
+            }
+
+            // Interleave 4 bursts of one-shot cold tail scans (`6..31`) with repeated
+            // accesses to the 6 working-set experts (`0..5`).
+            var tail_cursor: u16 = 6;
+            for (0..4) |_| {
+                // Burst of 12 one-shot tail experts (exceeds probation cap and full pool size!).
+                for (0..12) |_| {
+                    const te = tail_cursor;
+                    tail_cursor = if (tail_cursor + 1 >= num_experts) 6 else tail_cursor + 1;
+                    const pt = try cache.acquirePinned(0, te);
+                    try pk.expectSlotMatches(pt);
+                    cache.releasePins();
+                }
+
+                // Re-access all 6 working-set experts: under C27 two-tier promotion,
+                // all 6 remain resident in `.lfu_working_set` with 0 NVMe re-reads!
+                const misses_before = cache.telemetry().sync_misses;
+                for (0..6) |e| {
+                    const ph = try cache.acquirePinned(0, @intCast(e));
+                    try pk.expectSlotMatches(ph);
+                    if (check_promotion_invariants) {
+                        try std.testing.expectEqual(initial_slots[e], ph.slot_index.?);
+                        try std.testing.expectEqual(@as(?SlotTier, .lfu_working_set), cache.slotTier(0, @intCast(e)));
+                    }
+                }
+                cache.releasePins();
+                if (check_promotion_invariants) {
+                    try std.testing.expectEqual(misses_before, cache.telemetry().sync_misses);
+                }
+            }
+
+            return cache.telemetry();
+        }
+    }.run;
+
+    const c27_stats = try runWorkload(gpa, spec, &pack, 65, 4, true);
+    const plain_stats = try runWorkload(gpa, spec, &pack, 0, 0, false);
+
+    try std.testing.expect(c27_stats.session_promotions >= 6);
+    try std.testing.expect(c27_stats.promoted_hits >= 24);
+    try std.testing.expect(c27_stats.probation_evictions > 0);
+    // C27 two-tier promotion achieves markedly higher hit rate and fewer NVMe misses than single-tier!
+    try std.testing.expect(c27_stats.sync_misses < plain_stats.sync_misses);
+    try std.testing.expect(c27_stats.coldHitRate() > plain_stats.coldHitRate() + 0.15);
+}
+
+test "C27 filterColdTailWorkspace lossless default 0.0 and opt-in skipping preserves hot, resident, top-1, and weight scale" {
+    const gpa = std.testing.allocator;
+    const blob_bytes = page.APPLE_PAGE_SIZE;
+    var pack = try SyntheticColdPack.create("c27_skip", 1, 8, blob_bytes);
+    defer pack.deinit();
+
+    const spec: PoolSpec = .{
+        .num_slots = 4,
+        .gate_blob_bytes = blob_bytes,
+        .up_blob_bytes = blob_bytes,
+        .down_blob_bytes = blob_bytes,
+    };
+    var pool = try ExpertSlotPool.initOwned(testBudget(try spec.totalBytes()), null, spec);
+    defer pool.deinit();
+
+    var reader = try aio.AsyncExpertReader.init(gpa, .{
+        .backend = .ecore_pread,
+        .max_inflight = 8,
+        .worker_count = 1,
+    });
+    defer reader.deinit(gpa);
+
+    var cache = try ExpertCache.init(gpa, &pool, &reader, .{ .num_layers = 1, .num_experts = 8 });
+    defer cache.deinit(gpa);
+
+    const hot_region = try page.WiredRegion.init(3 * page.APPLE_PAGE_SIZE);
+    defer hot_region.deinit();
+    const hot_triple: HotExpertTriple = .{
+        .gate = try expert.WiredExpert.init(hot_region.bytes[0..page.APPLE_PAGE_SIZE]),
+        .up = try expert.WiredExpert.init(hot_region.bytes[page.APPLE_PAGE_SIZE .. 2 * page.APPLE_PAGE_SIZE]),
+        .down = try expert.WiredExpert.init(hot_region.bytes[2 * page.APPLE_PAGE_SIZE .. 3 * page.APPLE_PAGE_SIZE]),
+        .weights = .{
+            .gate_qweight_offset = 0,
+            .gate_sb_offset = 0,
+            .up_qweight_offset = page.APPLE_PAGE_SIZE,
+            .up_sb_offset = 0,
+            .down_qweight_offset = 2 * page.APPLE_PAGE_SIZE,
+            .down_sb_offset = 0,
+        },
+    };
+    // Experts 0, 1: wired hot. Experts 2..7: cold NVMe, with expert 2 pre-resident in wired cache!
+    try cache.registerHot(0, 0, hot_triple);
+    try cache.registerHot(0, 1, hot_triple);
+    for (2..8) |e| {
+        try cache.registerCold(0, @intCast(e), try pack.tripleFor(0, @intCast(e)));
+    }
+    _ = try cache.acquirePinned(0, 2);
+    cache.releasePins();
+    try std.testing.expectEqual(ResidencyState.cached_ready, cache.residencyState(0, 2));
+    try std.testing.expectEqual(ResidencyState.cold_nvme, cache.residencyState(0, 4));
+
+    const ws_spec: moe.WorkspaceSpec = .{
+        .max_tokens = 3,
+        .num_experts = 8,
+        .top_k = 4,
+        .hidden_size = 16,
+        .intermediate_size = 16,
+    };
+    const ws_bytes = try page.alignUp(try moe.MoeWorkspace.requiredBytes(ws_spec));
+    var ws_arena = try arena_mod.WiredArena.init(ws_bytes, testBudget(ws_bytes));
+    defer ws_arena.deinit();
+    var ws = try moe.MoeWorkspace.init(&ws_arena, ws_spec);
+
+    // Fill `down_out` with canary `99.0` to verify skipped slots get explicitly zeroed!
+    @memset(ws.down_out, 99.0);
+    // Token 0: e0(hot,0.02), e2(cached,0.03), e3(cold,1.45), e4(cold,0.05) -> orig_sum=1.55
+    // Token 1: all 4 uncached cold with weights [0.25, 0.26, 0.24, 0.25] -> top-1 guard keeps k=1 (e4)!
+    // Token 2: e0(hot,1.25), e2(cached,1.25), e1(hot,0.0), e7(cold,0.0) -> orig_sum=2.50, skips e7!
+    const init_e = [_]u32{
+        0, 2, 3, 4,
+        3, 4, 5, 6,
+        0, 2, 1, 7,
+    };
+    const init_w = [_]f32{
+        0.02, 0.03, 1.45, 0.05,
+        0.25, 0.26, 0.24, 0.25,
+        1.25, 1.25, 0.00, 0.00,
+    };
+    @memcpy(ws.scratch_topk_experts[0..12], &init_e);
+    @memcpy(ws.scratch_topk_weights[0..12], &init_w);
+
+    // 1. Default `min_weight = 0.0` is strictly lossless (`0` skipped).
+    const skipped0 = cache.filterColdTailWorkspace(0, &ws, 3, 4, 16, true, 0.0, null);
+    try std.testing.expectEqual(@as(u64, 0), skipped0);
+    try std.testing.expectEqual(@as(u64, 0), cache.telemetry().cold_skipped_min_weight);
+
+    // 2. Opt-in `min_weight = 0.30`: skips tok0:k3(e4), tok1:k0,k2,k3(e3,e5,e6), tok2:k3(e7) = 5 skipped!
+    const skipped = cache.filterColdTailWorkspace(0, &ws, 3, 4, 16, true, 0.30, null);
+    try std.testing.expectEqual(@as(u64, 5), skipped);
+    try std.testing.expectEqual(@as(u64, 5), cache.telemetry().cold_skipped_min_weight);
+
+    // Token 0 kept e0(hot), e2(cached_ready), e3(cold above threshold); skipped e4. Sum preserved == 1.55!
+    try std.testing.expect(ws.scratch_topk_weights[0] > 0.0);
+    try std.testing.expect(ws.scratch_topk_weights[1] > 0.0);
+    try std.testing.expect(ws.scratch_topk_weights[2] > 0.0);
+    try std.testing.expectEqual(@as(f32, 0.0), ws.scratch_topk_weights[3]);
+    try std.testing.expectApproxEqAbs(
+        @as(f32, 1.55),
+        ws.scratch_topk_weights[0] + ws.scratch_topk_weights[1] + ws.scratch_topk_weights[2],
+        1e-5,
+    );
+
+    // Token 1 top-1 guard kept ONLY k=1 (e4), renormalized to orig_sum = 1.0!
+    try std.testing.expectEqual(@as(f32, 0.0), ws.scratch_topk_weights[4]);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), ws.scratch_topk_weights[5], 1e-5);
+    try std.testing.expectEqual(@as(f32, 0.0), ws.scratch_topk_weights[6]);
+    try std.testing.expectEqual(@as(f32, 0.0), ws.scratch_topk_weights[7]);
+
+    // Token 2 kept e0, e2, e1 (all hot/cached), skipped e7; scale 2.50 preserved!
+    try std.testing.expectEqual(@as(f32, 0.0), ws.scratch_topk_weights[11]);
+    try std.testing.expectApproxEqAbs(
+        @as(f32, 2.50),
+        ws.scratch_topk_weights[8] + ws.scratch_topk_weights[9] + ws.scratch_topk_weights[10],
+        1e-5,
+    );
+
+    // Verify skipped `down_out` rows were zeroed and kept rows remain untouched!
+    const skipped_flat = [_]usize{ 3, 4, 6, 7, 11 };
+    for (skipped_flat) |sf| {
+        for (ws.down_out[sf * 16 .. (sf + 1) * 16]) |v| {
+            try std.testing.expectEqual(@as(f32, 0.0), v);
+        }
+    }
+    try std.testing.expectEqual(@as(f32, 99.0), ws.down_out[0]);
+    try std.testing.expectEqual(@as(f32, 99.0), ws.down_out[5 * 16]);
+
+    // Verify rebuilt CSR has exactly `12 - 5 = 7` active assignments and excludes e5, e6, e7!
+    const num_u = ws.schedule_header.num_unique_experts;
+    try std.testing.expectEqual(@as(u32, 7), ws.expert_token_offsets[num_u]);
+    for (ws.unique_experts[0..num_u]) |ue| {
+        try std.testing.expect(ue != 5 and ue != 6 and ue != 7);
     }
 }

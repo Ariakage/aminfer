@@ -428,6 +428,9 @@ pub const LoadOptions = struct {
     heat_profile_json: ?[]const u8 = null,
     /// Preallocated 16 KiB-aligned cold-expert slot count in `ExpertSlotPool`.
     cold_slot_count: u32 = 64,
+    /// Opt-in `C27` approximate cold-tail skipping threshold (`0.0` default = `100%` lossless;
+    /// when `> 0.0`, skips only uncached NVMe-miss cold experts with normalized routing weight `< threshold`).
+    cold_expert_min_weight: f32 = 0.0,
     /// Async direct I/O backend (`auto`, `kqueue_aio`, `ecore_pread`).
     io_backend: aio.IoBackend = .auto,
     /// Enables ANE cross-layer MoE expert prediction driving async NVMe cold-expert prefetch (`A2`).
@@ -1056,6 +1059,7 @@ pub const Qwen3Model = struct {
 
     // M4 Cold-Expert NVMe Streaming + ANE Predictor & Hybrid Wavefront Prefill runtimes
     cold_rt: ?*ColdRuntime,
+    cold_expert_min_weight: f32 = 0.0,
     hybrid_rt: ?*HybridPrefillRuntime,
 
     // M4.5 Single-Owner SME2 Weight Ownership & L2-Resident Tree Router Runtime (`W15`, `C11`-`C13`)
@@ -1831,6 +1835,14 @@ pub const Qwen3Model = struct {
 
     pub fn resetColdTelemetry(self: *Qwen3Model) void {
         if (self.cold_rt) |crt| crt.expert_cache.resetTelemetry();
+    }
+
+    pub fn setColdExpertMinWeight(self: *Qwen3Model, min_weight: f32) void {
+        self.cold_expert_min_weight = @max(@as(f32, 0.0), min_weight);
+    }
+
+    pub fn coldExpertMinWeight(self: *const Qwen3Model) f32 {
+        return self.cold_expert_min_weight;
     }
 
     /// Populates `out_cold_masks[0..sampled]` with bitsets of currently non-resident
@@ -5488,6 +5500,23 @@ pub const Qwen3Model = struct {
         m: u32,
     ) StepError!struct { weights_buf: metal.Buffer, num_unique: u32 } {
         const layer = self.layers[l];
+        if (self.cold_expert_min_weight > 0.0) {
+            const n_exp_f: usize = self.config.num_experts;
+            const ed_opt: ?[]const quant.WeightDType = if (layer.is_heterogeneous_moe)
+                self.expert_dtypes[l * n_exp_f .. (l + 1) * n_exp_f]
+            else
+                null;
+            _ = crt.expert_cache.filterColdTailWorkspace(
+                @intCast(l),
+                ws,
+                m,
+                self.config.num_experts_per_tok,
+                self.config.hidden_size,
+                self.config.norm_topk_prob,
+                self.cold_expert_min_weight,
+                ed_opt,
+            );
+        }
         const num_unique: u32 = ws.schedule_header.num_unique_experts;
         const active = ws.unique_experts[0..num_unique];
 
@@ -9732,6 +9761,7 @@ fn loadCore(
             .num_layers = @intCast(num_layers),
             .num_experts = @intCast(config.num_experts),
             .io_timeout_ms = options.timeout_ms,
+            .min_probation_slots = config.num_experts_per_tok,
         });
         cold_masks_owned = false;
         layer_has_cold_owned = false;
@@ -10486,6 +10516,7 @@ fn loadCore(
         .expert_bytes = expert_bytes,
         .expert_bytes_u32 = expert_bytes_u32,
         .cold_rt = cold_rt,
+        .cold_expert_min_weight = @max(@as(f32, 0.0), options.cold_expert_min_weight),
         .hybrid_rt = null,
         .has_sme2_weights = has_sme2_weights,
         .has_pure_cpu_sme2_dense = false,

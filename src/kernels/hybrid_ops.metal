@@ -5799,9 +5799,13 @@ struct G26MoeRouteSigmoidParams {
     uint down_groups_x;
     uint down_groups_x_q8;
     float routed_scaling_factor;
+    uint group_score_topk; // 1 = max-1 per group; 0 or >= 2 = top-2 sum per group (DeepSeek-V3 / BailingMoeV3)
+    uint _pad0;
+    uint _pad1;
+    uint _pad2;
 };
 
-static_assert(sizeof(G26MoeRouteSigmoidParams) == 64, "G26MoeRouteSigmoidParams must be 64 bytes");
+static_assert(sizeof(G26MoeRouteSigmoidParams) == 80, "G26MoeRouteSigmoidParams must be 80 bytes");
 
 // Single threadgroup (256 threads / 8 simdgroups). Supports num_experts <= 1024,
 // top_k <= 16, n_group <= 32. Zero stack spills (`-Wframe-larger-than=0`).
@@ -5895,7 +5899,10 @@ kernel void ami_moe_route_topk_sigmoid(const device uchar *logits_raw [[buffer(0
                             top2 = o1;
                         }
                     }
-                    const float g_score = simd_broadcast_first(top1 + ((top2 > -1.0e30f) ? top2 : 0.0f));
+                    const float g_score = simd_broadcast_first(
+                        (p.group_score_topk == 1u)
+                            ? top1
+                            : (top1 + ((top2 > -1.0e30f) ? top2 : 0.0f)));
                     if (g_score > best_gs || (g_score == best_gs && g < best_g)) {
                         best_gs = g_score;
                         best_g = g;
@@ -8264,4 +8271,222 @@ kernel void ami_g27_mla_sparse_attend(const device half *q_nope [[buffer(0)]],
             }
         }
     }
+}
+
+// ===========================================================================
+// M9.3 (`G28`): Full-Causal Absorbed MLA + Head-Wise/Element-Wise Output Gate
+// (`Ling-3.1-flash-1019` `bailing_hybrid`: `64H`, `kv_lora_rank=512`, `qk_rope=64`,
+// `v_head_dim=128`, `g_proj` sigmoid gate before `o_proj`). Zero stack spills.
+// ===========================================================================
+
+struct G28MlaFullAttnParams {
+    uint num_rows;
+    uint num_q_heads;
+    uint kv_lora_rank;
+    uint qk_rope_head_dim;
+    uint committed_kv_len;
+    uint causal_base_pos;
+    uint is_tree;
+    float scale;
+};
+
+struct G28MlaOutGateParams {
+    uint num_rows;
+    uint num_heads;
+    uint v_head_dim;
+    uint head_wise; // 1 = gate [num_rows, num_heads]; 0 = gate [num_rows, num_heads * v_head_dim]
+};
+
+static_assert(sizeof(G28MlaFullAttnParams) == 32, "G28MlaFullAttnParams must be 32 bytes");
+static_assert(sizeof(G28MlaOutGateParams) == 16, "G28MlaOutGateParams must be 16 bytes");
+
+// Full-causal absorbed MLA attention without sparse indexer.
+// Supports decode (`num_rows=1`), wide prefill (`is_tree=0`), and speculative tree
+// verification (`is_tree=1` with `ancestor_masks`), plus both `d_rope > 0` and `d_rope == 0`.
+// Grid: (num_q_heads, num_rows, 1), 256 threads (8 simdgroups). Zero stack spills.
+kernel void ami_g28_mla_full_attend(const device half *q_nope [[buffer(0)]],
+                                    const device half *q_pe [[buffer(1)]],
+                                    const device half *kv_cache [[buffer(2)]],
+                                    const device half *kv_tree_latent [[buffer(3)]],
+                                    const device half *kv_tree_rope [[buffer(4)]],
+                                    const device ulong *ancestor_masks [[buffer(5)]],
+                                    device half *out [[buffer(6)]],
+                                    constant G28MlaFullAttnParams &p [[buffer(7)]],
+                                    uint2 tg_pos [[threadgroup_position_in_grid]],
+                                    uint tid [[thread_index_in_threadgroup]],
+                                    uint sg_id [[simdgroup_index_in_threadgroup]],
+                                    uint lane [[thread_index_in_simdgroup]]) {
+    const uint q_head = tg_pos.x;
+    const uint tok = tg_pos.y;
+    if (q_head >= p.num_q_heads || tok >= p.num_rows) {
+        return;
+    }
+
+    const uint d_lat = p.kv_lora_rank;
+    const uint d_rope = p.qk_rope_head_dim;
+    const uint kv_stride = d_lat + d_rope;
+    const ulong qn_base = (ulong(tok) * p.num_q_heads + q_head) * d_lat;
+    const ulong qp_base = (ulong(tok) * p.num_q_heads + q_head) * d_rope;
+    device half *out_row = out + qn_base;
+
+    const uint total_steps = (p.is_tree != 0u)
+        ? (p.committed_kv_len + p.num_rows)
+        : min(p.causal_base_pos + tok + 1u, p.committed_kv_len);
+    const ulong tree_mask = (p.is_tree != 0u) ? ancestor_masks[tok] : 0ul;
+
+    if (total_steps == 0u) {
+        for (uint d = tid; d < d_lat; d += 256u) {
+            out_row[d] = half(0.0f);
+        }
+        return;
+    }
+
+    threadgroup float tg_qn[1024];
+    threadgroup float tg_qp[256];
+    threadgroup float tg_red[8];
+
+    if (d_lat <= 1024u) {
+        for (uint d = tid; d < d_lat; d += 256u) {
+            tg_qn[d] = float(q_nope[qn_base + d]);
+        }
+    }
+    if (d_rope > 0u) {
+        for (uint r = tid; r < d_rope; r += 256u) {
+            tg_qp[r] = float(q_pe[qp_base + r]);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (d_lat <= 1024u) {
+        float m_val = -INFINITY;
+        float l_val = 0.0f;
+        float o0 = 0.0f, o1 = 0.0f, o2 = 0.0f, o3 = 0.0f;
+
+        const uint d0 = tid;
+        const uint d1 = tid + 256u;
+        const uint d2 = tid + 512u;
+        const uint d3 = tid + 768u;
+        const float q0 = (d0 < d_lat) ? tg_qn[d0] : 0.0f;
+        const float q1 = (d1 < d_lat) ? tg_qn[d1] : 0.0f;
+        const float q2 = (d2 < d_lat) ? tg_qn[d2] : 0.0f;
+        const float q3 = (d3 < d_lat) ? tg_qn[d3] : 0.0f;
+        const float qr = (d_rope > 0u && tid < d_rope) ? tg_qp[tid] : 0.0f;
+
+        for (uint step = 0u; step < total_steps; ++step) {
+            const bool is_tree_tok = (p.is_tree != 0u && step >= p.committed_kv_len);
+            if (is_tree_tok) {
+                const uint j = step - p.committed_kv_len;
+                if (((tree_mask >> j) & 1ul) == 0ul) {
+                    continue;
+                }
+            }
+            const device half *k_lat_ptr = is_tree_tok
+                ? (kv_tree_latent + ulong(step - p.committed_kv_len) * d_lat)
+                : (kv_cache + ulong(step) * kv_stride);
+            const device half *k_rope_ptr = is_tree_tok
+                ? (kv_tree_rope + ulong(step - p.committed_kv_len) * d_rope)
+                : (kv_cache + ulong(step) * kv_stride + d_lat);
+
+            const float k0 = (d0 < d_lat) ? float(k_lat_ptr[d0]) : 0.0f;
+            const float k1 = (d1 < d_lat) ? float(k_lat_ptr[d1]) : 0.0f;
+            const float k2 = (d2 < d_lat) ? float(k_lat_ptr[d2]) : 0.0f;
+            const float k3 = (d3 < d_lat) ? float(k_lat_ptr[d3]) : 0.0f;
+
+            float part = fma(q0, k0, fma(q1, k1, fma(q2, k2, q3 * k3)));
+            if (d_rope > 0u && tid < d_rope) {
+                part = fma(qr, float(k_rope_ptr[tid]), part);
+            }
+
+            const float sg_dot = simd_sum(part);
+            if (lane == 0u) tg_red[sg_id] = sg_dot;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            const float score = (((tg_red[0] + tg_red[1]) + (tg_red[2] + tg_red[3])) +
+                                 ((tg_red[4] + tg_red[5]) + (tg_red[6] + tg_red[7]))) * p.scale;
+
+            const float m_new = max(m_val, score);
+            const float alpha = (m_val == -INFINITY) ? 0.0f : exp(m_val - m_new);
+            const float w = exp(score - m_new);
+            l_val = fma(l_val, alpha, w);
+            m_val = m_new;
+
+            o0 = fma(w, k0, o0 * alpha);
+            o1 = fma(w, k1, o1 * alpha);
+            o2 = fma(w, k2, o2 * alpha);
+            o3 = fma(w, k3, o3 * alpha);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        const float inv_l = (l_val > 0.0f) ? (1.0f / l_val) : 0.0f;
+        if (d0 < d_lat) out_row[d0] = half(o0 * inv_l);
+        if (d1 < d_lat) out_row[d1] = half(o1 * inv_l);
+        if (d2 < d_lat) out_row[d2] = half(o2 * inv_l);
+        if (d3 < d_lat) out_row[d3] = half(o3 * inv_l);
+    } else {
+        for (uint d_base = 0u; d_base < d_lat; d_base += 256u) {
+            const uint d_cur = d_base + tid;
+            float m_val = -INFINITY;
+            float l_val = 0.0f;
+            float o_acc = 0.0f;
+
+            for (uint step = 0u; step < total_steps; ++step) {
+                const bool is_tree_tok = (p.is_tree != 0u && step >= p.committed_kv_len);
+                if (is_tree_tok) {
+                    const uint j = step - p.committed_kv_len;
+                    if (((tree_mask >> j) & 1ul) == 0ul) {
+                        continue;
+                    }
+                }
+                const device half *k_lat_ptr = is_tree_tok
+                    ? (kv_tree_latent + ulong(step - p.committed_kv_len) * d_lat)
+                    : (kv_cache + ulong(step) * kv_stride);
+                const device half *k_rope_ptr = is_tree_tok
+                    ? (kv_tree_rope + ulong(step - p.committed_kv_len) * d_rope)
+                    : (kv_cache + ulong(step) * kv_stride + d_lat);
+
+                float part = 0.0f;
+                for (uint d = tid; d < d_lat; d += 256u) {
+                    part = fma(float(q_nope[qn_base + d]), float(k_lat_ptr[d]), part);
+                }
+                if (d_rope > 0u && tid < d_rope) {
+                    part = fma(tg_qp[tid], float(k_rope_ptr[tid]), part);
+                }
+                const float sg_dot = simd_sum(part);
+                if (lane == 0u) tg_red[sg_id] = sg_dot;
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                const float score = (((tg_red[0] + tg_red[1]) + (tg_red[2] + tg_red[3])) +
+                                     ((tg_red[4] + tg_red[5]) + (tg_red[6] + tg_red[7]))) * p.scale;
+
+                const float m_new = max(m_val, score);
+                const float alpha = (m_val == -INFINITY) ? 0.0f : exp(m_val - m_new);
+                const float w = exp(score - m_new);
+                l_val = fma(l_val, alpha, w);
+                m_val = m_new;
+
+                const float kv_d = (d_cur < d_lat) ? float(k_lat_ptr[d_cur]) : 0.0f;
+                o_acc = fma(w, kv_d, o_acc * alpha);
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+
+            const float inv_l = (l_val > 0.0f) ? (1.0f / l_val) : 0.0f;
+            if (d_cur < d_lat) {
+                out_row[d_cur] = half(o_acc * inv_l);
+            }
+        }
+    }
+}
+
+// In-place head-wise or element-wise sigmoid output gate applied to MLA output
+// before `self_attn.o_proj` (`BailingMoeV3MultiLatentAttention.g_proj`).
+// Grid: ceil((num_rows * num_heads * v_head_dim) / 256), 256 threads. Zero stack spills.
+kernel void ami_g28_mla_out_gate(device half *attn_out [[buffer(0)]],
+                                 const device half *gate [[buffer(1)]],
+                                 constant G28MlaOutGateParams &p [[buffer(2)]],
+                                 uint gid [[thread_position_in_grid]]) {
+    const ulong total = ulong(p.num_rows) * p.num_heads * p.v_head_dim;
+    if (ulong(gid) >= total) {
+        return;
+    }
+    const ulong gate_idx = (p.head_wise != 0u) ? (ulong(gid) / p.v_head_dim) : ulong(gid);
+    const float g_val = hybrid_sigmoid(float(gate[gate_idx]));
+    attn_out[gid] = half(float(attn_out[gid]) * g_val);
 }
