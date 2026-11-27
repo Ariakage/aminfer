@@ -144,6 +144,10 @@ pub const MoeGateUpParams = extern struct {
     intermediate_size: u32,
     num_groups: u32,
     row_bytes: u32,
+    swiglu_limit: f32 = 0.0,
+    _pad_sw0: u32 = 0,
+    _pad_sw1: u32 = 0,
+    _pad_sw2: u32 = 0,
 };
 
 pub const MoeDownParams = extern struct {
@@ -164,6 +168,7 @@ pub const MoeReduceParams = extern struct {
 
 pub const ElemParams = extern struct {
     count: u32,
+    swiglu_limit: f32 = 0.0,
 };
 
 pub const ArgmaxParams = extern struct {
@@ -228,6 +233,8 @@ pub const MoePerSlotParams = extern struct {
     row_bytes: u32,
     m: u32,
     top_k: u32,
+    swiglu_limit: f32 = 0.0,
+    _pad_sw: u32 = 0,
 };
 
 /// Uniform payload matching `struct CopyStridedParams` in `moe_ffn.metal`.
@@ -285,7 +292,7 @@ pub const MoeSharedGateUpParams = extern struct {
     intermediate_size: u32,
     num_groups: u32,
     row_bytes: u32,
-    _pad0: u32 = 0,
+    swiglu_limit: f32 = 0.0,
     _pad1: u32 = 0,
     _pad2: u32 = 0,
 };
@@ -309,17 +316,17 @@ comptime {
     if (@sizeOf(ScheduleHeader) != 16) @compileError("ScheduleHeader must be 16 bytes");
     if (@sizeOf(RouterProjParams) != 16) @compileError("RouterProjParams must be 16 bytes");
     if (@sizeOf(RouteParams) != 32) @compileError("RouteParams must be 32 bytes");
-    if (@sizeOf(MoeGateUpParams) != 16) @compileError("MoeGateUpParams must be 16 bytes");
+    if (@sizeOf(MoeGateUpParams) != 32) @compileError("MoeGateUpParams must be 32 bytes");
     if (@sizeOf(MoeDownParams) != 24) @compileError("MoeDownParams must be 24 bytes");
     if (@sizeOf(MoeReduceParams) != 16) @compileError("MoeReduceParams must be 16 bytes");
-    if (@sizeOf(ElemParams) != 4) @compileError("ElemParams must be 4 bytes");
+    if (@sizeOf(ElemParams) != 8) @compileError("ElemParams must be 8 bytes");
     if (@sizeOf(ArgmaxParams) != 8) @compileError("ArgmaxParams must be 8 bytes");
     if (@sizeOf(RouterQParams) != 32) @compileError("RouterQParams must be 32 bytes");
     if (@sizeOf(EmbedParams) != 32) @compileError("EmbedParams must be 32 bytes");
     if (@sizeOf(ArgmaxRowsParams) != 16) @compileError("ArgmaxRowsParams must be 16 bytes");
     if (@sizeOf(TopKCandidate) != 16) @compileError("TopKCandidate must be 16 bytes");
     if (@sizeOf(TopKLogitsRowsParams) != 16) @compileError("TopKLogitsRowsParams must be 16 bytes");
-    if (@sizeOf(MoePerSlotParams) != 24) @compileError("MoePerSlotParams must be 24 bytes");
+    if (@sizeOf(MoePerSlotParams) != 32) @compileError("MoePerSlotParams must be 32 bytes");
     if (@sizeOf(CopyStridedParams) != 32) @compileError("CopyStridedParams must be 32 bytes");
     if (@sizeOf(GatherRowsParams) != 16) @compileError("GatherRowsParams must be 16 bytes");
     if (@sizeOf(BucketRouteParams) != 48) @compileError("BucketRouteParams must be 48 bytes");
@@ -801,6 +808,8 @@ pub const GateUpSwigluArgs = struct {
     max_active_override: ?u32 = null,
     /// Optional G20 indirect dispatch override; when null, applies `shouldUseIndirectDispatch`.
     use_indirect: ?bool = null,
+    /// Optional SwiGLU clamp (`0.0` = disabled; `> 0.0` = `silu(min(gate, limit)) * clamp(up, -limit, limit)`).
+    swiglu_limit: f32 = 0.0,
 };
 
 pub const DownProjArgs = struct {
@@ -962,6 +971,8 @@ pub const MoELayerArgs = struct {
     shared_gate_weight: ?metal.BufferBinding = null,
     /// Storage dtype of `shared_gate_weight` (`.f16`, `.bf16`, or `.f32`).
     shared_gate_dtype: RouterWeightDType = .f16,
+    /// Optional SwiGLU clamp (`0.0` = disabled; `> 0.0` = `silu(min(gate, limit)) * clamp(up, -limit, limit)`).
+    swiglu_limit: f32 = 0.0,
 };
 
 /// Alias spelling used by M2.5 integration code.
@@ -1003,6 +1014,7 @@ pub const SiluMulArgs = struct {
     up: metal.BufferBinding,
     out: metal.BufferBinding,
     count: u32,
+    swiglu_limit: f32 = 0.0,
 };
 
 pub const ResidualAddArgs = struct {
@@ -1769,6 +1781,7 @@ pub const MoePipelines = struct {
             .intermediate_size = args.intermediate_size,
             .num_groups = @intCast(num_groups),
             .row_bytes = @intCast(row_bytes),
+            .swiglu_limit = args.swiglu_limit,
         };
         const groups_x: u64 = (@as(u64, args.intermediate_size) + 7) / 8;
         const cap_active: u64 = if (args.max_active_override) |cap| @min(@as(u64, cap), args.num_experts) else args.num_experts;
@@ -1968,6 +1981,7 @@ pub const MoePipelines = struct {
             .hidden_size = args.hidden_size,
             .intermediate_size = args.intermediate_size,
             .use_indirect = use_indirect,
+            .swiglu_limit = args.swiglu_limit,
         }, true);
 
         try self.encodeDownProj(frame, bits, .{
@@ -2110,6 +2124,7 @@ pub const MoePipelines = struct {
                     .intermediate_size = se_inter,
                     .num_groups = @intCast(num_groups),
                     .row_bytes = @intCast(row_bytes),
+                    .swiglu_limit = args.swiglu_limit,
                 };
                 const groups_x: u64 = (@as(u64, se_inter) + 7) / 8;
                 const groups_y: u64 = (@as(u64, args.m) + 3) / 4;
@@ -2135,6 +2150,7 @@ pub const MoePipelines = struct {
                     .intermediate_size = se_inter,
                     .num_groups = 0,
                     .row_bytes = 0,
+                    .swiglu_limit = args.swiglu_limit,
                 };
                 const groups_x: u64 = (@as(u64, se_inter) + 3) / 4;
                 try frame.encodeThreadgroups(
@@ -2457,6 +2473,7 @@ pub const MoePipelines = struct {
                 .scheme_bucket = scheme,
                 .max_active_override = cap,
                 .use_indirect = use_indirect,
+                .swiglu_limit = base.swiglu_limit,
             };
             switch (scheme) {
                 .f16 => try self.encodeGateUpSwigluFloat(frame, .f16, gu_args, barrier),
@@ -2545,6 +2562,7 @@ pub const MoePipelines = struct {
                 .scheme_bucket = scheme_bucket,
                 .max_active_override = cap,
                 .use_indirect = use_indirect,
+                .swiglu_limit = base.swiglu_limit,
             };
             switch (desc.gate_up_dtype) {
                 .f16 => try self.encodeGateUpSwigluFloat(frame, .f16, gu_args, insert_barrier_before),
@@ -2580,6 +2598,7 @@ pub const MoePipelines = struct {
             .intermediate_size = base.intermediate_size,
             .tensor_scale_per_row = desc.gate_up_tensor_scale_per_row,
             .indirect_args = if (use_indirect) .{ .buffer = wb, .offset = ws.scheduleIndirectOffset(scheme_bucket, INDIRECT_GATE_UP_Q_OFFSET) } else null,
+            .swiglu_limit = base.swiglu_limit,
         }, insert_barrier_before);
     }
 
@@ -2862,6 +2881,7 @@ pub const MoePipelines = struct {
                 .up = up_bind,
                 .out = gate_bind,
                 .count = @intCast(gate_elems),
+                .swiglu_limit = base.swiglu_limit,
             }, true);
             if (base.m == 1) {
                 try qf.encodeGemv(frame, qf_dt, args.shared_expert_group_size, .{
@@ -2969,6 +2989,7 @@ pub const MoePipelines = struct {
             .intermediate_size = args.intermediate_size,
             .num_groups = 0,
             .row_bytes = args.hidden_size * 2,
+            .swiglu_limit = args.swiglu_limit,
         };
         const groups_x: u64 = (@as(u64, args.intermediate_size) + 15) / 16;
         const cap_active: u64 = if (args.max_active_override) |cap| @min(@as(u64, cap), args.num_experts) else args.num_experts;
@@ -3121,6 +3142,7 @@ pub const MoePipelines = struct {
             .hidden_size = args.hidden_size,
             .intermediate_size = args.intermediate_size,
             .use_indirect = use_indirect,
+            .swiglu_limit = args.swiglu_limit,
         }, true);
 
         try self.encodeDownProjFloat(frame, dtype, .{
@@ -3205,7 +3227,7 @@ pub const MoePipelines = struct {
         insert_barrier_before: bool,
     ) EncodeError!void {
         if (args.count == 0) return error.ZeroDimension;
-        const params: ElemParams = .{ .count = args.count };
+        const params: ElemParams = .{ .count = args.count, .swiglu_limit = args.swiglu_limit };
         const groups_x: u64 = (@as(u64, args.count) + 255) / 256;
         try frame.encodeThreadgroups(
             self.silu_mul_f16,
@@ -3377,6 +3399,7 @@ pub const MoePipelines = struct {
             .row_bytes = @intCast(row_bytes),
             .m = args.m,
             .top_k = args.top_k,
+            .swiglu_limit = args.swiglu_limit,
         };
         const groups_x: u64 = (@as(u64, args.intermediate_size) + 7) / 8;
         const total_slots: u64 = @as(u64, args.m) * args.top_k;

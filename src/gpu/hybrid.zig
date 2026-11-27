@@ -2774,6 +2774,37 @@ pub const HybridPipelines = struct {
     g26_moe_route_sigmoid_f16: metal.Pipeline,
     g26_capture_tap_ring: metal.Pipeline,
 
+    // M9.2 (`G27`): GLM-5.2/5.3 (`glm_moe_dsa`) & GLM-5.3-Flash (`glm5_next`)
+    // Single-kernel 20-step `hc_mult = 4` mHC Sinkhorn, Kimi Delta Attention (KDA),
+    // and `GlmMoeDsaIndexer` + `NoPE MLA` (`index_kpool = 4`) sparse attention.
+    g27_mhc_pre_sinkhorn: [2][2]metal.Pipeline,
+    g27_mhc_post_mix: [2][2]metal.Pipeline,
+    kda_conv1d_silu: metal.Pipeline,
+    kda_compute_gates: metal.Pipeline,
+    kda_decode_d64_f16: metal.Pipeline,
+    kda_decode_d64_bf16: metal.Pipeline,
+    kda_decode_d128_f16: metal.Pipeline,
+    kda_decode_d128_bf16: metal.Pipeline,
+    kda_decode_dyn_f16: metal.Pipeline,
+    kda_decode_dyn_bf16: metal.Pipeline,
+    kda_prefill_d64: metal.Pipeline,
+    kda_prefill_d128: metal.Pipeline,
+    kda_prefill_dyn: metal.Pipeline,
+    kda_tree_verify_d64: metal.Pipeline,
+    kda_tree_verify_d128: metal.Pipeline,
+    kda_tree_verify_dyn: metal.Pipeline,
+    kda_out_norm_gate_f16: metal.Pipeline,
+    kda_out_norm_gate_bf16: metal.Pipeline,
+    kda_commit_tree: metal.Pipeline,
+    g27_rope_interleave: metal.Pipeline,
+    g27_layernorm: metal.Pipeline,
+    g27_mla_kv_write: metal.Pipeline,
+    g27_dsa_idx_kv_write: metal.Pipeline,
+    g27_dsa_kpool_build: metal.Pipeline,
+    g27_dsa_scores: metal.Pipeline,
+    g27_dsa_select_topk: metal.Pipeline,
+    g27_mla_sparse_attend: metal.Pipeline,
+
     pub fn init(device: metal.Device, library: metal.Library) metal.Error!HybridPipelines {
         const gdn_decode_d64_f16 = try metal.Pipeline.initSpecialized(device, library, "ami_gdn_decode", &.{
             .{ .index = 0, .value = .{ .u32 = 64 } },
@@ -3142,6 +3173,120 @@ pub const HybridPipelines = struct {
         const g26_capture_tap_ring = try metal.Pipeline.init(device, library, "ami_g26_capture_tap_ring");
         errdefer g26_capture_tap_ring.close();
 
+        var g27_mhc_pre_sinkhorn: [2][2]metal.Pipeline = undefined;
+        var g27_mhc_post_mix: [2][2]metal.Pipeline = undefined;
+        var g27_mhc_built: usize = 0;
+        errdefer {
+            var idx: usize = 0;
+            while (idx < g27_mhc_built) : (idx += 1) {
+                const kind = idx / 4;
+                const pair = idx % 4;
+                const sb = pair / 2;
+                const ab = pair % 2;
+                if (kind == 0) g27_mhc_pre_sinkhorn[sb][ab].close() else g27_mhc_post_mix[sb][ab].close();
+            }
+        }
+        const g27_mhc_names = [2][:0]const u8{ "ami_g27_mhc_pre_sinkhorn", "ami_g27_mhc_post_mix" };
+        for (g27_mhc_names, 0..) |fn_name, kind| {
+            for (0..2) |sb| {
+                for (0..2) |ab| {
+                    const p = try metal.Pipeline.initSpecialized(device, library, fn_name, &.{
+                        .{ .index = 3, .value = .{ .bool = sb == 1 } },
+                        .{ .index = 4, .value = .{ .bool = ab == 1 } },
+                    });
+                    if (kind == 0) g27_mhc_pre_sinkhorn[sb][ab] = p else g27_mhc_post_mix[sb][ab] = p;
+                    g27_mhc_built += 1;
+                }
+            }
+        }
+
+        const kda_conv1d_silu = try metal.Pipeline.init(device, library, "ami_kda_conv1d_silu");
+        errdefer kda_conv1d_silu.close();
+        const kda_compute_gates = try metal.Pipeline.init(device, library, "ami_kda_compute_gates");
+        errdefer kda_compute_gates.close();
+        const kda_decode_d64_f16 = try metal.Pipeline.initSpecialized(device, library, "ami_kda_decode", &.{
+            .{ .index = 0, .value = .{ .u32 = 64 } },
+            .{ .index = 1, .value = .{ .bool = false } },
+        });
+        errdefer kda_decode_d64_f16.close();
+        const kda_decode_d64_bf16 = try metal.Pipeline.initSpecialized(device, library, "ami_kda_decode", &.{
+            .{ .index = 0, .value = .{ .u32 = 64 } },
+            .{ .index = 1, .value = .{ .bool = true } },
+        });
+        errdefer kda_decode_d64_bf16.close();
+        const kda_decode_d128_f16 = try metal.Pipeline.initSpecialized(device, library, "ami_kda_decode", &.{
+            .{ .index = 0, .value = .{ .u32 = 128 } },
+            .{ .index = 1, .value = .{ .bool = false } },
+        });
+        errdefer kda_decode_d128_f16.close();
+        const kda_decode_d128_bf16 = try metal.Pipeline.initSpecialized(device, library, "ami_kda_decode", &.{
+            .{ .index = 0, .value = .{ .u32 = 128 } },
+            .{ .index = 1, .value = .{ .bool = true } },
+        });
+        errdefer kda_decode_d128_bf16.close();
+        const kda_decode_dyn_f16 = try metal.Pipeline.initSpecialized(device, library, "ami_kda_decode", &.{
+            .{ .index = 0, .value = .{ .u32 = 0 } },
+            .{ .index = 1, .value = .{ .bool = false } },
+        });
+        errdefer kda_decode_dyn_f16.close();
+        const kda_decode_dyn_bf16 = try metal.Pipeline.initSpecialized(device, library, "ami_kda_decode", &.{
+            .{ .index = 0, .value = .{ .u32 = 0 } },
+            .{ .index = 1, .value = .{ .bool = true } },
+        });
+        errdefer kda_decode_dyn_bf16.close();
+        const kda_prefill_d64 = try metal.Pipeline.initSpecialized(device, library, "ami_kda_prefill", &.{
+            .{ .index = 0, .value = .{ .u32 = 64 } },
+        });
+        errdefer kda_prefill_d64.close();
+        const kda_prefill_d128 = try metal.Pipeline.initSpecialized(device, library, "ami_kda_prefill", &.{
+            .{ .index = 0, .value = .{ .u32 = 128 } },
+        });
+        errdefer kda_prefill_d128.close();
+        const kda_prefill_dyn = try metal.Pipeline.initSpecialized(device, library, "ami_kda_prefill", &.{
+            .{ .index = 0, .value = .{ .u32 = 0 } },
+        });
+        errdefer kda_prefill_dyn.close();
+        const kda_tree_verify_d64 = try metal.Pipeline.initSpecialized(device, library, "ami_kda_tree_verify", &.{
+            .{ .index = 0, .value = .{ .u32 = 64 } },
+        });
+        errdefer kda_tree_verify_d64.close();
+        const kda_tree_verify_d128 = try metal.Pipeline.initSpecialized(device, library, "ami_kda_tree_verify", &.{
+            .{ .index = 0, .value = .{ .u32 = 128 } },
+        });
+        errdefer kda_tree_verify_d128.close();
+        const kda_tree_verify_dyn = try metal.Pipeline.initSpecialized(device, library, "ami_kda_tree_verify", &.{
+            .{ .index = 0, .value = .{ .u32 = 0 } },
+        });
+        errdefer kda_tree_verify_dyn.close();
+        const kda_out_norm_gate_f16 = try metal.Pipeline.initSpecialized(device, library, "ami_kda_out_norm_gate", &.{
+            .{ .index = 1, .value = .{ .bool = false } },
+        });
+        errdefer kda_out_norm_gate_f16.close();
+        const kda_out_norm_gate_bf16 = try metal.Pipeline.initSpecialized(device, library, "ami_kda_out_norm_gate", &.{
+            .{ .index = 1, .value = .{ .bool = true } },
+        });
+        errdefer kda_out_norm_gate_bf16.close();
+        const kda_commit_tree = try metal.Pipeline.initSpecialized(device, library, "ami_kda_commit_tree", &.{
+            .{ .index = 0, .value = .{ .u32 = 0 } },
+        });
+        errdefer kda_commit_tree.close();
+        const g27_rope_interleave = try metal.Pipeline.init(device, library, "ami_g27_rope_interleave");
+        errdefer g27_rope_interleave.close();
+        const g27_layernorm = try metal.Pipeline.init(device, library, "ami_g27_layernorm");
+        errdefer g27_layernorm.close();
+        const g27_mla_kv_write = try metal.Pipeline.init(device, library, "ami_g27_mla_kv_write");
+        errdefer g27_mla_kv_write.close();
+        const g27_dsa_idx_kv_write = try metal.Pipeline.init(device, library, "ami_g27_dsa_idx_kv_write");
+        errdefer g27_dsa_idx_kv_write.close();
+        const g27_dsa_kpool_build = try metal.Pipeline.init(device, library, "ami_g27_dsa_kpool_build");
+        errdefer g27_dsa_kpool_build.close();
+        const g27_dsa_scores = try metal.Pipeline.init(device, library, "ami_g27_dsa_scores");
+        errdefer g27_dsa_scores.close();
+        const g27_dsa_select_topk = try metal.Pipeline.init(device, library, "ami_g27_dsa_select_topk");
+        errdefer g27_dsa_select_topk.close();
+        const g27_mla_sparse_attend = try metal.Pipeline.init(device, library, "ami_g27_mla_sparse_attend");
+        errdefer g27_mla_sparse_attend.close();
+
         return .{
             .gdn_decode_d64_f16 = gdn_decode_d64_f16,
             .gdn_decode_d64_bf16 = gdn_decode_d64_bf16,
@@ -3212,10 +3357,68 @@ pub const HybridPipelines = struct {
             .g26_moe_route_sigmoid_f32 = g26_moe_route_sigmoid_f32,
             .g26_moe_route_sigmoid_f16 = g26_moe_route_sigmoid_f16,
             .g26_capture_tap_ring = g26_capture_tap_ring,
+            .g27_mhc_pre_sinkhorn = g27_mhc_pre_sinkhorn,
+            .g27_mhc_post_mix = g27_mhc_post_mix,
+            .kda_conv1d_silu = kda_conv1d_silu,
+            .kda_compute_gates = kda_compute_gates,
+            .kda_decode_d64_f16 = kda_decode_d64_f16,
+            .kda_decode_d64_bf16 = kda_decode_d64_bf16,
+            .kda_decode_d128_f16 = kda_decode_d128_f16,
+            .kda_decode_d128_bf16 = kda_decode_d128_bf16,
+            .kda_decode_dyn_f16 = kda_decode_dyn_f16,
+            .kda_decode_dyn_bf16 = kda_decode_dyn_bf16,
+            .kda_prefill_d64 = kda_prefill_d64,
+            .kda_prefill_d128 = kda_prefill_d128,
+            .kda_prefill_dyn = kda_prefill_dyn,
+            .kda_tree_verify_d64 = kda_tree_verify_d64,
+            .kda_tree_verify_d128 = kda_tree_verify_d128,
+            .kda_tree_verify_dyn = kda_tree_verify_dyn,
+            .kda_out_norm_gate_f16 = kda_out_norm_gate_f16,
+            .kda_out_norm_gate_bf16 = kda_out_norm_gate_bf16,
+            .kda_commit_tree = kda_commit_tree,
+            .g27_rope_interleave = g27_rope_interleave,
+            .g27_layernorm = g27_layernorm,
+            .g27_mla_kv_write = g27_mla_kv_write,
+            .g27_dsa_idx_kv_write = g27_dsa_idx_kv_write,
+            .g27_dsa_kpool_build = g27_dsa_kpool_build,
+            .g27_dsa_scores = g27_dsa_scores,
+            .g27_dsa_select_topk = g27_dsa_select_topk,
+            .g27_mla_sparse_attend = g27_mla_sparse_attend,
         };
     }
 
     pub fn close(self: HybridPipelines) void {
+        self.g27_mla_sparse_attend.close();
+        self.g27_dsa_select_topk.close();
+        self.g27_dsa_scores.close();
+        self.g27_dsa_kpool_build.close();
+        self.g27_dsa_idx_kv_write.close();
+        self.g27_mla_kv_write.close();
+        self.g27_layernorm.close();
+        self.g27_rope_interleave.close();
+        self.kda_commit_tree.close();
+        self.kda_out_norm_gate_bf16.close();
+        self.kda_out_norm_gate_f16.close();
+        self.kda_tree_verify_dyn.close();
+        self.kda_tree_verify_d128.close();
+        self.kda_tree_verify_d64.close();
+        self.kda_prefill_dyn.close();
+        self.kda_prefill_d128.close();
+        self.kda_prefill_d64.close();
+        self.kda_decode_dyn_bf16.close();
+        self.kda_decode_dyn_f16.close();
+        self.kda_decode_d128_bf16.close();
+        self.kda_decode_d128_f16.close();
+        self.kda_decode_d64_bf16.close();
+        self.kda_decode_d64_f16.close();
+        self.kda_compute_gates.close();
+        self.kda_conv1d_silu.close();
+        for (0..2) |sb| {
+            for (0..2) |ab| {
+                self.g27_mhc_post_mix[sb][ab].close();
+                self.g27_mhc_pre_sinkhorn[sb][ab].close();
+            }
+        }
         self.g26_capture_tap_ring.close();
         self.g26_moe_route_sigmoid_f16.close();
         self.g26_moe_route_sigmoid_f32.close();
@@ -5497,6 +5700,622 @@ pub const HybridPipelines = struct {
             insert_barrier_before,
         );
     }
+
+    // -----------------------------------------------------------------------
+    // G27 Encoders: `GLM-5.2/5.3` (`glm_moe_dsa`) & `GLM-5.3-Flash` (`glm5_next`)
+    //   - Single-kernel 20-step `hc_mult = 4` mHC Sinkhorn
+    //   - Kimi Delta Attention (`KDA`) decode / prefill / tree_verify / commit
+    //   - `GlmMoeDsaIndexer` + `NoPE MLA` (`index_kpool = 4`) sparse attention
+    // -----------------------------------------------------------------------
+
+    pub fn encodeG27MhcPreSinkhorn(
+        self: HybridPipelines,
+        frame: *metal.Compute.Frame,
+        args: G27MhcPreSinkhornArgs,
+        insert_barrier_before: bool,
+    ) EncodeError!void {
+        if (args.m == 0 or args.hidden_size == 0) return error.ZeroDimension;
+        const params: G27MhcSinkhornParams = .{
+            .m = args.m,
+            .hidden_size = args.hidden_size,
+            .sinkhorn_iters = args.sinkhorn_iters,
+            .flags = if (args.norm_w != null) 1 else 0,
+            .fn_dtype = @backingInt(args.fn_dtype),
+            .norm_dtype = @backingInt(args.norm_dtype),
+            .rms_eps = args.rms_eps,
+            .hc_eps = args.hc_eps,
+        };
+        const sb: usize = if (args.stream_dtype == .bf16) 1 else 0;
+        const ab: usize = if (args.act_dtype == .bf16) 1 else 0;
+        try frame.encodeThreadgroups(
+            self.g27_mhc_pre_sinkhorn[sb][ab],
+            &.{
+                args.streams,
+                args.fn_w,
+                args.base_w,
+                args.scale_w,
+                args.norm_w orelse args.streams,
+                args.branch_out,
+                args.coeffs_out,
+            },
+            std.mem.asBytes(&params),
+            .{ args.m, 1, 1 },
+            .{ 256, 1, 1 },
+            insert_barrier_before,
+        );
+    }
+
+    pub fn encodeG27MhcPostMix(
+        self: HybridPipelines,
+        frame: *metal.Compute.Frame,
+        args: G27MhcPostMixArgs,
+        insert_barrier_before: bool,
+    ) EncodeError!void {
+        if (args.m == 0 or args.hidden_size == 0) return error.ZeroDimension;
+        const params: G27MhcSinkhornParams = .{
+            .m = args.m,
+            .hidden_size = args.hidden_size,
+            .sinkhorn_iters = 0,
+            .flags = 0,
+            .fn_dtype = 0,
+            .norm_dtype = 0,
+            .rms_eps = 1e-5,
+            .hc_eps = 1e-6,
+        };
+        const sb: usize = if (args.stream_dtype == .bf16) 1 else 0;
+        const ab: usize = if (args.act_dtype == .bf16) 1 else 0;
+        try frame.encodeThreadgroups(
+            self.g27_mhc_post_mix[sb][ab],
+            &.{ args.streams, args.sublayer_out, args.coeffs },
+            std.mem.asBytes(&params),
+            .{ args.m, 1, 1 },
+            .{ 256, 1, 1 },
+            insert_barrier_before,
+        );
+    }
+
+    pub fn encodeKdaConv1dSilu(
+        self: HybridPipelines,
+        frame: *metal.Compute.Frame,
+        args: KdaConv1dSiluArgs,
+        insert_barrier_before: bool,
+    ) EncodeError!void {
+        if (args.m == 0 or args.qkv_dim == 0 or args.conv_k == 0) return error.ZeroDimension;
+        if (args.conv_k > 8) return error.InvalidConfig;
+        if (args.is_tree and args.m > MAX_TREE_NODES) return error.InvalidNodeCount;
+        const params: KdaConv1dParams = .{
+            .m = args.m,
+            .qkv_dim = args.qkv_dim,
+            .conv_k = args.conv_k,
+            .write_state = if (args.write_state) 1 else 0,
+            .is_tree = if (args.is_tree) 1 else 0,
+            .w_dtype = @backingInt(args.w_dtype),
+        };
+        const conv_dim: u64 = 3 * @as(u64, args.qkv_dim);
+        const groups_x: u64 = (conv_dim + 255) / 256;
+        try frame.encodeThreadgroups(
+            self.kda_conv1d_silu,
+            &.{
+                args.q_in,
+                args.k_in,
+                args.v_in,
+                args.q_conv_w,
+                args.k_conv_w,
+                args.v_conv_w,
+                args.conv_state_in,
+                args.conv_state_out,
+                args.ancestor_masks orelse args.q_in,
+                args.q_out,
+                args.k_out,
+                args.v_out,
+            },
+            std.mem.asBytes(&params),
+            .{ groups_x, 1, 1 },
+            .{ 256, 1, 1 },
+            insert_barrier_before,
+        );
+    }
+
+    pub fn encodeKdaComputeGates(
+        self: HybridPipelines,
+        frame: *metal.Compute.Frame,
+        args: KdaComputeGatesArgs,
+        insert_barrier_before: bool,
+    ) EncodeError!void {
+        if (args.m == 0 or args.num_heads == 0 or args.head_dim == 0) return error.ZeroDimension;
+        const params: KdaComputeGatesParams = .{
+            .m = args.m,
+            .num_heads = args.num_heads,
+            .head_dim = args.head_dim,
+            .lower_bound = args.lower_bound,
+            .a_log_dtype = @backingInt(args.a_log_dtype),
+            .dt_bias_dtype = @backingInt(args.dt_bias_dtype),
+        };
+        const total: u64 = @as(u64, args.m) * args.num_heads * args.head_dim;
+        const groups_x: u64 = (total + 255) / 256;
+        try frame.encodeThreadgroups(
+            self.kda_compute_gates,
+            &.{ args.f_raw, args.b_raw, args.a_log, args.dt_bias, args.g_out, args.beta_out },
+            std.mem.asBytes(&params),
+            .{ groups_x, 1, 1 },
+            .{ 256, 1, 1 },
+            insert_barrier_before,
+        );
+    }
+
+    pub fn encodeKdaDecode(
+        self: HybridPipelines,
+        frame: *metal.Compute.Frame,
+        args: KdaDecodeArgs,
+        insert_barrier_before: bool,
+    ) EncodeError!void {
+        try validateGdnDims(args.num_heads, args.num_heads, args.head_k_dim, args.head_v_dim);
+        const q_scale = args.q_scale orelse (1.0 / @sqrt(@as(f32, @floatFromInt(args.head_k_dim))));
+        const params: KdaDecodeParams = .{
+            .num_heads = args.num_heads,
+            .head_k_dim = args.head_k_dim,
+            .head_v_dim = args.head_v_dim,
+            .q_scale = q_scale,
+            .l2_eps = args.l2_eps,
+            .rms_eps = args.rms_eps,
+            .apply_l2_norm = if (args.apply_l2_norm) 1 else 0,
+            .apply_out_norm = if (args.norm_w != null) 1 else 0,
+            .apply_out_gate = if (args.z != null) 1 else 0,
+            .per_head_norm = if (args.per_head_norm) 1 else 0,
+            .beta_apply_sigmoid = if (args.beta_apply_sigmoid) 1 else 0,
+        };
+        const pipe = switch (args.head_k_dim) {
+            64 => if (args.norm_dtype == .bf16) self.kda_decode_d64_bf16 else self.kda_decode_d64_f16,
+            128 => if (args.norm_dtype == .bf16) self.kda_decode_d128_bf16 else self.kda_decode_d128_f16,
+            else => if (args.norm_dtype == .bf16) self.kda_decode_dyn_bf16 else self.kda_decode_dyn_f16,
+        };
+        try frame.encodeThreadgroups(
+            pipe,
+            &.{
+                args.q,
+                args.k,
+                args.v,
+                args.g,
+                args.beta,
+                args.z orelse args.v,
+                args.norm_w orelse args.v,
+                args.state_in,
+                args.state_out,
+                args.out,
+            },
+            std.mem.asBytes(&params),
+            .{ args.num_heads, 1, 1 },
+            .{ 256, 1, 1 },
+            insert_barrier_before,
+        );
+    }
+
+    pub fn encodeKdaPrefill(
+        self: HybridPipelines,
+        frame: *metal.Compute.Frame,
+        args: KdaPrefillArgs,
+        insert_barrier_before: bool,
+    ) EncodeError!void {
+        if (args.seq_len == 0) return error.ZeroDimension;
+        try validateGdnDims(args.num_heads, args.num_heads, args.head_k_dim, args.head_v_dim);
+        const q_scale = args.q_scale orelse (1.0 / @sqrt(@as(f32, @floatFromInt(args.head_k_dim))));
+        const params: KdaPrefillParams = .{
+            .seq_len = args.seq_len,
+            .num_heads = args.num_heads,
+            .head_k_dim = args.head_k_dim,
+            .head_v_dim = args.head_v_dim,
+            .q_scale = q_scale,
+            .l2_eps = args.l2_eps,
+            .apply_l2_norm = if (args.apply_l2_norm) 1 else 0,
+            .beta_apply_sigmoid = if (args.beta_apply_sigmoid) 1 else 0,
+            .write_state_only = if (args.write_state_only) 1 else 0,
+            .out_start_token = args.out_start_token,
+        };
+        const pipe = switch (args.head_k_dim) {
+            64 => self.kda_prefill_d64,
+            128 => self.kda_prefill_d128,
+            else => self.kda_prefill_dyn,
+        };
+        const v_groups: u64 = (@as(u64, args.head_v_dim) + 7) / 8;
+        try frame.encodeThreadgroups(
+            pipe,
+            &.{ args.q, args.k, args.v, args.g, args.beta, args.state_in, args.state_out, args.out },
+            std.mem.asBytes(&params),
+            .{ args.num_heads, v_groups, 1 },
+            .{ 256, 1, 1 },
+            insert_barrier_before,
+        );
+        if (!args.write_state_only and (args.norm_w != null or args.z != null)) {
+            const out_tokens = args.seq_len -| args.out_start_token;
+            if (out_tokens > 0) {
+                try self.encodeKdaOutNormGate(frame, .{
+                    .out = args.out,
+                    .z = args.z,
+                    .norm_w = args.norm_w,
+                    .norm_dtype = args.norm_dtype,
+                    .num_tokens = out_tokens,
+                    .num_heads = args.num_heads,
+                    .head_v_dim = args.head_v_dim,
+                    .rms_eps = args.rms_eps,
+                    .per_head_norm = args.per_head_norm,
+                }, true);
+            }
+        }
+    }
+
+    pub fn encodeKdaTreeVerify(
+        self: HybridPipelines,
+        frame: *metal.Compute.Frame,
+        args: KdaTreeVerifyArgs,
+        insert_barrier_before: bool,
+    ) EncodeError!void {
+        if (args.num_nodes == 0) return error.ZeroDimension;
+        if (args.num_nodes > MAX_TREE_NODES) return error.InvalidNodeCount;
+        try validateGdnDims(args.num_heads, args.num_heads, args.head_k_dim, args.head_v_dim);
+        const q_scale = args.q_scale orelse (1.0 / @sqrt(@as(f32, @floatFromInt(args.head_k_dim))));
+        const params: KdaTreeVerifyParams = .{
+            .num_nodes = args.num_nodes,
+            .num_heads = args.num_heads,
+            .head_k_dim = args.head_k_dim,
+            .head_v_dim = args.head_v_dim,
+            .q_scale = q_scale,
+            .l2_eps = args.l2_eps,
+            .apply_l2_norm = if (args.apply_l2_norm) 1 else 0,
+            .beta_apply_sigmoid = if (args.beta_apply_sigmoid) 1 else 0,
+            .scratch_leaf_node = args.scratch_leaf_node orelse std.math.maxInt(u32),
+        };
+        const pipe = switch (args.head_k_dim) {
+            64 => self.kda_tree_verify_d64,
+            128 => self.kda_tree_verify_d128,
+            else => self.kda_tree_verify_dyn,
+        };
+        const v_groups: u64 = (@as(u64, args.head_v_dim) + 7) / 8;
+        try frame.encodeThreadgroups(
+            pipe,
+            &.{
+                args.q,
+                args.k,
+                args.v,
+                args.g,
+                args.beta,
+                args.ancestor_masks,
+                args.state_in,
+                args.state_out orelse args.state_in,
+                args.out,
+            },
+            std.mem.asBytes(&params),
+            .{ args.num_heads, v_groups, 1 },
+            .{ 256, 1, 1 },
+            insert_barrier_before,
+        );
+        if (args.norm_w != null or args.z != null) {
+            try self.encodeKdaOutNormGate(frame, .{
+                .out = args.out,
+                .z = args.z,
+                .norm_w = args.norm_w,
+                .norm_dtype = args.norm_dtype,
+                .num_tokens = args.num_nodes,
+                .num_heads = args.num_heads,
+                .head_v_dim = args.head_v_dim,
+                .rms_eps = args.rms_eps,
+                .per_head_norm = args.per_head_norm,
+            }, true);
+        }
+    }
+
+    pub fn encodeKdaOutNormGate(
+        self: HybridPipelines,
+        frame: *metal.Compute.Frame,
+        args: KdaOutNormGateArgs,
+        insert_barrier_before: bool,
+    ) EncodeError!void {
+        if (args.num_tokens == 0 or args.num_heads == 0 or args.head_v_dim == 0) return error.ZeroDimension;
+        const params: GdnOutNormGateParams = .{
+            .num_tokens = args.num_tokens,
+            .num_v_heads = args.num_heads,
+            .head_v_dim = args.head_v_dim,
+            .rms_eps = args.rms_eps,
+            .apply_out_norm = if (args.norm_w != null) 1 else 0,
+            .apply_out_gate = if (args.z != null) 1 else 0,
+            .per_head_norm = if (args.per_head_norm) 1 else 0,
+        };
+        const pipe = if (args.norm_dtype == .bf16) self.kda_out_norm_gate_bf16 else self.kda_out_norm_gate_f16;
+        try frame.encodeThreadgroups(
+            pipe,
+            &.{ args.out, args.z orelse args.out, args.norm_w orelse args.out },
+            std.mem.asBytes(&params),
+            .{ args.num_heads, args.num_tokens, 1 },
+            .{ 32, 1, 1 },
+            insert_barrier_before,
+        );
+    }
+
+    pub fn encodeKdaCommitTree(
+        self: HybridPipelines,
+        frame: *metal.Compute.Frame,
+        args: KdaCommitTreeArgs,
+        insert_barrier_before: bool,
+    ) EncodeError!void {
+        if (args.accepted_nodes.len == 0) return;
+        if (args.accepted_nodes.len > MAX_TREE_NODES) return error.InvalidNodeCount;
+        try validateGdnDims(args.num_heads, args.num_heads, args.head_k_dim, args.head_v_dim);
+        var params: KdaCommitTreeParams = .{
+            .num_heads = args.num_heads,
+            .head_k_dim = args.head_k_dim,
+            .head_v_dim = args.head_v_dim,
+            .accepted_count = @intCast(args.accepted_nodes.len),
+            .use_node_buffer = 0,
+            .l2_eps = args.l2_eps,
+            .apply_l2_norm = if (args.apply_l2_norm) 1 else 0,
+            .beta_apply_sigmoid = if (args.beta_apply_sigmoid) 1 else 0,
+        };
+        for (args.accepted_nodes, 0..) |nid, i| params.inline_nodes[i] = nid;
+        const v_groups: u64 = (@as(u64, args.head_v_dim) + 7) / 8;
+        try frame.encodeThreadgroups(
+            self.kda_commit_tree,
+            &.{ args.k_tree, args.v_tree, args.g_tree, args.beta_tree, args.k_tree, args.state_in, args.state_out },
+            std.mem.asBytes(&params),
+            .{ args.num_heads, v_groups, 1 },
+            .{ 256, 1, 1 },
+            insert_barrier_before,
+        );
+    }
+
+    pub fn encodeG27RopeInterleave(
+        self: HybridPipelines,
+        frame: *metal.Compute.Frame,
+        args: G27RopeInterleaveArgs,
+        insert_barrier_before: bool,
+    ) EncodeError!void {
+        if (args.num_tokens == 0 or args.num_heads == 0 or args.rot_dim < 2) return error.ZeroDimension;
+        if ((args.rot_dim % 2) != 0 or args.rot_dim > 256) return error.InvalidHeadDim;
+        const params: G27RopeInterleaveParams = .{
+            .num_tokens = args.num_tokens,
+            .num_heads = args.num_heads,
+            .head_stride = args.head_stride,
+            .rot_dim = args.rot_dim,
+            .rot_offset = args.rot_offset,
+            .base_pos = args.base_pos,
+            .use_pos_buf = if (args.positions != null) 1 else 0,
+            .rope_theta = args.rope_theta,
+            .attn_scaling = args.attn_scaling,
+        };
+        try frame.encodeThreadgroups(
+            self.g27_rope_interleave,
+            &.{ args.x, args.positions orelse args.x },
+            std.mem.asBytes(&params),
+            .{ args.num_heads, args.num_tokens, 1 },
+            .{ 32, 1, 1 },
+            insert_barrier_before,
+        );
+    }
+
+    pub fn encodeG27LayerNorm(
+        self: HybridPipelines,
+        frame: *metal.Compute.Frame,
+        args: G27LayerNormArgs,
+        insert_barrier_before: bool,
+    ) EncodeError!void {
+        if (args.num_rows == 0 or args.dim == 0) return error.ZeroDimension;
+        const params: G27LayerNormParams = .{
+            .num_rows = args.num_rows,
+            .dim = args.dim,
+            .w_dtype = @backingInt(args.w_dtype),
+            .b_dtype = @backingInt(args.b_dtype),
+            .eps = args.eps,
+            .has_bias = if (args.bias != null) 1 else 0,
+        };
+        try frame.encodeThreadgroups(
+            self.g27_layernorm,
+            &.{ args.x, args.weight, args.bias orelse args.weight, args.y },
+            std.mem.asBytes(&params),
+            .{ args.num_rows, 1, 1 },
+            .{ 128, 1, 1 },
+            insert_barrier_before,
+        );
+    }
+
+    pub fn encodeG27MlaKvWrite(
+        self: HybridPipelines,
+        frame: *metal.Compute.Frame,
+        args: G27MlaKvWriteArgs,
+        insert_barrier_before: bool,
+    ) EncodeError!void {
+        if (args.num_tokens == 0 or args.kv_lora_rank == 0) return error.ZeroDimension;
+        var params: G27MlaKvWriteParams = .{
+            .num_tokens = args.num_tokens,
+            .kv_lora_rank = args.kv_lora_rank,
+            .qk_rope_head_dim = args.qk_rope_head_dim,
+            .start_pos = args.start_pos,
+            .is_tree_commit = if (args.accepted_nodes != null) 1 else 0,
+        };
+        if (args.accepted_nodes) |nodes| {
+            if (nodes.len != args.num_tokens or nodes.len > MAX_TREE_NODES) return error.InvalidNodeCount;
+            for (nodes, 0..) |nid, i| params.inline_nodes[i] = nid;
+        }
+        try frame.encodeThreadgroups(
+            self.g27_mla_kv_write,
+            &.{ args.latent_in, args.rope_in orelse args.latent_in, args.kv_cache },
+            std.mem.asBytes(&params),
+            .{ args.num_tokens, 1, 1 },
+            .{ 256, 1, 1 },
+            insert_barrier_before,
+        );
+    }
+
+    pub fn encodeG27DsaIdxKvWrite(
+        self: HybridPipelines,
+        frame: *metal.Compute.Frame,
+        args: G27DsaIdxKvWriteArgs,
+        insert_barrier_before: bool,
+    ) EncodeError!void {
+        if (args.num_tokens == 0 or args.index_head_dim == 0) return error.ZeroDimension;
+        var params: G27DsaIdxKvWriteParams = .{
+            .num_tokens = args.num_tokens,
+            .index_head_dim = args.index_head_dim,
+            .start_pos = args.start_pos,
+            .has_gate = if (args.gate_in != null and args.gate_cache != null) 1 else 0,
+            .is_tree_commit = if (args.accepted_nodes != null) 1 else 0,
+        };
+        if (args.accepted_nodes) |nodes| {
+            if (nodes.len != args.num_tokens or nodes.len > MAX_TREE_NODES) return error.InvalidNodeCount;
+            for (nodes, 0..) |nid, i| params.inline_nodes[i] = nid;
+        }
+        try frame.encodeThreadgroups(
+            self.g27_dsa_idx_kv_write,
+            &.{
+                args.k_in,
+                args.gate_in orelse args.k_in,
+                args.k_cache,
+                args.gate_cache orelse args.k_cache,
+            },
+            std.mem.asBytes(&params),
+            .{ args.num_tokens, 1, 1 },
+            .{ 128, 1, 1 },
+            insert_barrier_before,
+        );
+    }
+
+    pub fn encodeG27DsaKpoolBuild(
+        self: HybridPipelines,
+        frame: *metal.Compute.Frame,
+        args: G27DsaKpoolBuildArgs,
+        insert_barrier_before: bool,
+    ) EncodeError!void {
+        if (args.end_pool <= args.start_pool) return;
+        if (args.index_head_dim == 0 or args.kpool == 0) return error.ZeroDimension;
+        const params: G27DsaKpoolBuildParams = .{
+            .start_pool = args.start_pool,
+            .end_pool = args.end_pool,
+            .index_head_dim = args.index_head_dim,
+            .kpool = args.kpool,
+            .ape_dtype = @backingInt(args.ape_dtype),
+        };
+        try frame.encodeThreadgroups(
+            self.g27_dsa_kpool_build,
+            &.{ args.k_cache, args.gate_cache, args.kpool_ape, args.pool_k_cache },
+            std.mem.asBytes(&params),
+            .{ args.end_pool - args.start_pool, 1, 1 },
+            .{ 128, 1, 1 },
+            insert_barrier_before,
+        );
+    }
+
+    pub fn encodeG27DsaScoresAndTopK(
+        self: HybridPipelines,
+        frame: *metal.Compute.Frame,
+        args: G27DsaIndexArgs,
+        insert_barrier_before: bool,
+    ) EncodeError!void {
+        if (args.num_rows == 0 or args.index_n_heads == 0 or args.index_head_dim == 0 or args.max_out_k == 0) {
+            return error.ZeroDimension;
+        }
+        if (args.is_tree and args.num_rows > MAX_TREE_NODES) return error.InvalidNodeCount;
+        const kpool: u32 = @max(args.kpool, 1);
+        const total_vis_upper: u32 = if (args.is_tree) (args.committed_kv_len + args.num_rows) else (args.causal_base_pos + args.num_rows);
+        const num_candidates: u32 = if (kpool <= 1) total_vis_upper else (total_vis_upper / kpool);
+
+        var select_barrier = insert_barrier_before;
+        if (num_candidates > 0) {
+            const score_params: G27DsaScoresParams = .{
+                .num_rows = args.num_rows,
+                .index_n_heads = args.index_n_heads,
+                .index_head_dim = args.index_head_dim,
+                .committed_kv_len = args.committed_kv_len,
+                .num_candidates = num_candidates,
+                .kpool = kpool,
+                .causal_base_pos = args.causal_base_pos,
+                .is_tree = if (args.is_tree) 1 else 0,
+                .weights_f16 = if (args.weights_f16) 1 else 0,
+                .ape_dtype = @backingInt(args.ape_dtype),
+                .softmax_scale = 1.0 / @sqrt(@as(f32, @floatFromInt(args.index_head_dim))),
+                .head_weight_scale = 1.0 / @sqrt(@as(f32, @floatFromInt(args.index_n_heads))),
+            };
+            const groups_x: u64 = (@as(u64, num_candidates) + 63) / 64;
+            try frame.encodeThreadgroups(
+                self.g27_dsa_scores,
+                &.{
+                    args.q_idx,
+                    args.weights,
+                    args.k_cand_cache,
+                    args.k_raw_cache orelse args.k_cand_cache,
+                    args.k_tree orelse args.k_cand_cache,
+                    args.gate_cache orelse args.k_cand_cache,
+                    args.gate_tree orelse args.k_cand_cache,
+                    args.kpool_ape orelse args.k_cand_cache,
+                    args.ancestor_masks orelse args.q_idx,
+                    args.scores_scratch,
+                },
+                std.mem.asBytes(&score_params),
+                .{ groups_x, args.num_rows, 1 },
+                .{ 64, 1, 1 },
+                insert_barrier_before,
+            );
+            select_barrier = true;
+        }
+
+        const sel_params: G27DsaSelectTopKParams = .{
+            .num_rows = args.num_rows,
+            .committed_kv_len = args.committed_kv_len,
+            .num_candidates = num_candidates,
+            .index_topk = args.index_topk,
+            .max_out_k = args.max_out_k,
+            .kpool = kpool,
+            .always_select_tail = if (args.always_select_tail) 1 else 0,
+            .causal_base_pos = args.causal_base_pos,
+            .is_tree = if (args.is_tree) 1 else 0,
+        };
+        try frame.encodeThreadgroups(
+            self.g27_dsa_select_topk,
+            &.{
+                args.scores_scratch,
+                args.ancestor_masks orelse args.q_idx,
+                args.out_indices,
+                args.out_counts,
+            },
+            std.mem.asBytes(&sel_params),
+            .{ args.num_rows, 1, 1 },
+            .{ 256, 1, 1 },
+            select_barrier,
+        );
+    }
+
+    pub fn encodeG27MlaSparseAttn(
+        self: HybridPipelines,
+        frame: *metal.Compute.Frame,
+        args: G27MlaSparseAttnArgs,
+        insert_barrier_before: bool,
+    ) EncodeError!void {
+        if (args.num_rows == 0 or args.num_q_heads == 0 or args.kv_lora_rank == 0 or args.max_out_k == 0) {
+            return error.ZeroDimension;
+        }
+        const params: G27MlaSparseAttnParams = .{
+            .num_rows = args.num_rows,
+            .num_q_heads = args.num_q_heads,
+            .kv_lora_rank = args.kv_lora_rank,
+            .qk_rope_head_dim = args.qk_rope_head_dim,
+            .committed_kv_len = args.committed_kv_len,
+            .max_out_k = args.max_out_k,
+            .scale = args.scale,
+        };
+        try frame.encodeThreadgroups(
+            self.g27_mla_sparse_attend,
+            &.{
+                args.q_nope,
+                args.q_pe orelse args.q_nope,
+                args.kv_cache,
+                args.kv_tree_latent orelse args.kv_cache,
+                args.kv_tree_rope orelse args.kv_cache,
+                args.selected_indices,
+                args.selected_counts,
+                args.out,
+            },
+            std.mem.asBytes(&params),
+            .{ args.num_q_heads, args.num_rows, 1 },
+            .{ 256, 1, 1 },
+            insert_barrier_before,
+        );
+    }
 };
 
 /// Element scalar dtype tag shared by `G26` sink bias and MoE router bias buffers.
@@ -5504,6 +6323,733 @@ pub const ScalarDType = enum(u32) {
     f16 = 0,
     bf16 = 1,
     f32 = 2,
+};
+
+// ===========================================================================
+// M9.2 (`G27`) Parameter Payloads, Wired Arenas, and Argument Structs
+// ===========================================================================
+
+pub const G27MhcSinkhornParams = extern struct {
+    m: u32,
+    hidden_size: u32,
+    sinkhorn_iters: u32,
+    flags: u32,
+    fn_dtype: u32,
+    norm_dtype: u32,
+    rms_eps: f32,
+    hc_eps: f32,
+
+    comptime {
+        if (@sizeOf(G27MhcSinkhornParams) != 32) @compileError("G27MhcSinkhornParams must be 32 bytes");
+    }
+};
+
+pub const G27MhcPreSinkhornArgs = struct {
+    streams: metal.BufferBinding,
+    fn_w: metal.BufferBinding,
+    base_w: metal.BufferBinding,
+    scale_w: metal.BufferBinding,
+    norm_w: ?metal.BufferBinding = null,
+    branch_out: metal.BufferBinding,
+    coeffs_out: metal.BufferBinding,
+    m: u32,
+    hidden_size: u32,
+    sinkhorn_iters: u32 = 20,
+    stream_dtype: quant.FloatDType = .f16,
+    act_dtype: quant.FloatDType = .f16,
+    fn_dtype: ScalarDType = .bf16,
+    norm_dtype: ScalarDType = .bf16,
+    rms_eps: f32 = 1e-5,
+    hc_eps: f32 = 1e-6,
+};
+
+pub const G27MhcPostMixArgs = struct {
+    streams: metal.BufferBinding,
+    sublayer_out: metal.BufferBinding,
+    coeffs: metal.BufferBinding,
+    m: u32,
+    hidden_size: u32,
+    stream_dtype: quant.FloatDType = .f16,
+    act_dtype: quant.FloatDType = .f16,
+};
+
+pub const KdaConv1dParams = extern struct {
+    m: u32,
+    qkv_dim: u32,
+    conv_k: u32,
+    write_state: u32,
+    is_tree: u32,
+    w_dtype: u32,
+    _pad0: u32 = 0,
+    _pad1: u32 = 0,
+
+    comptime {
+        if (@sizeOf(KdaConv1dParams) != 32) @compileError("KdaConv1dParams must be 32 bytes");
+    }
+};
+
+pub const KdaComputeGatesParams = extern struct {
+    m: u32,
+    num_heads: u32,
+    head_dim: u32,
+    lower_bound: f32,
+    a_log_dtype: u32,
+    dt_bias_dtype: u32,
+    _pad0: u32 = 0,
+    _pad1: u32 = 0,
+
+    comptime {
+        if (@sizeOf(KdaComputeGatesParams) != 32) @compileError("KdaComputeGatesParams must be 32 bytes");
+    }
+};
+
+pub const KdaDecodeParams = extern struct {
+    num_heads: u32,
+    head_k_dim: u32,
+    head_v_dim: u32,
+    q_scale: f32,
+    l2_eps: f32,
+    rms_eps: f32,
+    apply_l2_norm: u32,
+    apply_out_norm: u32,
+    apply_out_gate: u32,
+    per_head_norm: u32,
+    beta_apply_sigmoid: u32,
+    _pad0: u32 = 0,
+
+    comptime {
+        if (@sizeOf(KdaDecodeParams) != 48) @compileError("KdaDecodeParams must be 48 bytes");
+    }
+};
+
+pub const KdaPrefillParams = extern struct {
+    seq_len: u32,
+    num_heads: u32,
+    head_k_dim: u32,
+    head_v_dim: u32,
+    q_scale: f32,
+    l2_eps: f32,
+    apply_l2_norm: u32,
+    beta_apply_sigmoid: u32,
+    write_state_only: u32,
+    out_start_token: u32,
+    _pad0: u32 = 0,
+    _pad1: u32 = 0,
+
+    comptime {
+        if (@sizeOf(KdaPrefillParams) != 48) @compileError("KdaPrefillParams must be 48 bytes");
+    }
+};
+
+pub const KdaTreeVerifyParams = extern struct {
+    num_nodes: u32,
+    num_heads: u32,
+    head_k_dim: u32,
+    head_v_dim: u32,
+    q_scale: f32,
+    l2_eps: f32,
+    apply_l2_norm: u32,
+    beta_apply_sigmoid: u32,
+    scratch_leaf_node: u32,
+    _pad0: u32 = 0,
+    _pad1: u32 = 0,
+    _pad2: u32 = 0,
+
+    comptime {
+        if (@sizeOf(KdaTreeVerifyParams) != 48) @compileError("KdaTreeVerifyParams must be 48 bytes");
+    }
+};
+
+pub const KdaCommitTreeParams = extern struct {
+    num_heads: u32,
+    head_k_dim: u32,
+    head_v_dim: u32,
+    accepted_count: u32,
+    use_node_buffer: u32,
+    l2_eps: f32,
+    apply_l2_norm: u32,
+    beta_apply_sigmoid: u32,
+    inline_nodes: [64]u16 = @splat(0),
+
+    comptime {
+        if (@sizeOf(KdaCommitTreeParams) != 160) @compileError("KdaCommitTreeParams must be 160 bytes");
+    }
+};
+
+pub const KdaConv1dSiluArgs = struct {
+    q_in: metal.BufferBinding,
+    k_in: metal.BufferBinding,
+    v_in: metal.BufferBinding,
+    q_conv_w: metal.BufferBinding,
+    k_conv_w: metal.BufferBinding,
+    v_conv_w: metal.BufferBinding,
+    conv_state_in: metal.BufferBinding,
+    conv_state_out: metal.BufferBinding,
+    ancestor_masks: ?metal.BufferBinding = null,
+    q_out: metal.BufferBinding,
+    k_out: metal.BufferBinding,
+    v_out: metal.BufferBinding,
+    m: u32,
+    qkv_dim: u32,
+    conv_k: u32 = 4,
+    write_state: bool = true,
+    is_tree: bool = false,
+    w_dtype: ScalarDType = .f32,
+};
+
+pub const KdaComputeGatesArgs = struct {
+    f_raw: metal.BufferBinding,
+    b_raw: metal.BufferBinding,
+    a_log: metal.BufferBinding,
+    dt_bias: metal.BufferBinding,
+    g_out: metal.BufferBinding,
+    beta_out: metal.BufferBinding,
+    m: u32,
+    num_heads: u32,
+    head_dim: u32,
+    lower_bound: f32 = -5.0,
+    a_log_dtype: ScalarDType = .f32,
+    dt_bias_dtype: ScalarDType = .f32,
+};
+
+pub const KdaDecodeArgs = struct {
+    q: metal.BufferBinding,
+    k: metal.BufferBinding,
+    v: metal.BufferBinding,
+    g: metal.BufferBinding,
+    beta: metal.BufferBinding,
+    z: ?metal.BufferBinding = null,
+    norm_w: ?metal.BufferBinding = null,
+    norm_dtype: quant.FloatDType = .bf16,
+    state_in: metal.BufferBinding,
+    state_out: metal.BufferBinding,
+    out: metal.BufferBinding,
+    num_heads: u32,
+    head_k_dim: u32,
+    head_v_dim: u32,
+    q_scale: ?f32 = null,
+    l2_eps: f32 = 1e-6,
+    rms_eps: f32 = 1e-5,
+    apply_l2_norm: bool = true,
+    per_head_norm: bool = false,
+    beta_apply_sigmoid: bool = false,
+};
+
+pub const KdaPrefillArgs = struct {
+    q: metal.BufferBinding,
+    k: metal.BufferBinding,
+    v: metal.BufferBinding,
+    g: metal.BufferBinding,
+    beta: metal.BufferBinding,
+    z: ?metal.BufferBinding = null,
+    norm_w: ?metal.BufferBinding = null,
+    norm_dtype: quant.FloatDType = .bf16,
+    state_in: metal.BufferBinding,
+    state_out: metal.BufferBinding,
+    out: metal.BufferBinding,
+    seq_len: u32,
+    num_heads: u32,
+    head_k_dim: u32,
+    head_v_dim: u32,
+    q_scale: ?f32 = null,
+    l2_eps: f32 = 1e-6,
+    rms_eps: f32 = 1e-5,
+    apply_l2_norm: bool = true,
+    per_head_norm: bool = false,
+    beta_apply_sigmoid: bool = false,
+    write_state_only: bool = false,
+    out_start_token: u32 = 0,
+};
+
+pub const KdaTreeVerifyArgs = struct {
+    q: metal.BufferBinding,
+    k: metal.BufferBinding,
+    v: metal.BufferBinding,
+    g: metal.BufferBinding,
+    beta: metal.BufferBinding,
+    z: ?metal.BufferBinding = null,
+    norm_w: ?metal.BufferBinding = null,
+    norm_dtype: quant.FloatDType = .bf16,
+    ancestor_masks: metal.BufferBinding,
+    state_in: metal.BufferBinding,
+    state_out: ?metal.BufferBinding = null,
+    out: metal.BufferBinding,
+    num_nodes: u32,
+    num_heads: u32,
+    head_k_dim: u32,
+    head_v_dim: u32,
+    q_scale: ?f32 = null,
+    l2_eps: f32 = 1e-6,
+    rms_eps: f32 = 1e-5,
+    apply_l2_norm: bool = true,
+    per_head_norm: bool = false,
+    beta_apply_sigmoid: bool = false,
+    scratch_leaf_node: ?u32 = null,
+};
+
+pub const KdaOutNormGateArgs = struct {
+    out: metal.BufferBinding,
+    z: ?metal.BufferBinding = null,
+    norm_w: ?metal.BufferBinding = null,
+    norm_dtype: quant.FloatDType = .bf16,
+    num_tokens: u32,
+    num_heads: u32,
+    head_v_dim: u32,
+    rms_eps: f32 = 1e-5,
+    per_head_norm: bool = false,
+};
+
+pub const KdaCommitTreeArgs = struct {
+    k_tree: metal.BufferBinding,
+    v_tree: metal.BufferBinding,
+    g_tree: metal.BufferBinding,
+    beta_tree: metal.BufferBinding,
+    accepted_nodes: []const u16,
+    state_in: metal.BufferBinding,
+    state_out: metal.BufferBinding,
+    num_heads: u32,
+    head_k_dim: u32,
+    head_v_dim: u32,
+    l2_eps: f32 = 1e-6,
+    apply_l2_norm: bool = true,
+    beta_apply_sigmoid: bool = false,
+};
+
+pub const G27RopeInterleaveParams = extern struct {
+    num_tokens: u32,
+    num_heads: u32,
+    head_stride: u32,
+    rot_dim: u32,
+    rot_offset: u32,
+    base_pos: u32,
+    use_pos_buf: u32,
+    rope_theta: f32,
+    attn_scaling: f32,
+    _pad0: u32 = 0,
+    _pad1: u32 = 0,
+    _pad2: u32 = 0,
+
+    comptime {
+        if (@sizeOf(G27RopeInterleaveParams) != 48) @compileError("G27RopeInterleaveParams must be 48 bytes");
+    }
+};
+
+pub const G27RopeInterleaveArgs = struct {
+    x: metal.BufferBinding,
+    positions: ?metal.BufferBinding = null,
+    num_tokens: u32,
+    num_heads: u32,
+    head_stride: u32,
+    rot_dim: u32,
+    rot_offset: u32 = 0,
+    base_pos: u32 = 0,
+    rope_theta: f32 = 8_000_000.0,
+    attn_scaling: f32 = 1.0,
+};
+
+pub const G27LayerNormParams = extern struct {
+    num_rows: u32,
+    dim: u32,
+    w_dtype: u32,
+    b_dtype: u32,
+    eps: f32,
+    has_bias: u32,
+    _pad0: u32 = 0,
+    _pad1: u32 = 0,
+
+    comptime {
+        if (@sizeOf(G27LayerNormParams) != 32) @compileError("G27LayerNormParams must be 32 bytes");
+    }
+};
+
+pub const G27LayerNormArgs = struct {
+    x: metal.BufferBinding,
+    weight: metal.BufferBinding,
+    bias: ?metal.BufferBinding = null,
+    y: metal.BufferBinding,
+    num_rows: u32,
+    dim: u32,
+    w_dtype: ScalarDType = .bf16,
+    b_dtype: ScalarDType = .bf16,
+    eps: f32 = 1e-6,
+};
+
+pub const G27MlaKvWriteParams = extern struct {
+    num_tokens: u32,
+    kv_lora_rank: u32,
+    qk_rope_head_dim: u32,
+    start_pos: u32,
+    is_tree_commit: u32,
+    _pad0: u32 = 0,
+    _pad1: u32 = 0,
+    _pad2: u32 = 0,
+    inline_nodes: [64]u16 = @splat(0),
+
+    comptime {
+        if (@sizeOf(G27MlaKvWriteParams) != 160) @compileError("G27MlaKvWriteParams must be 160 bytes");
+    }
+};
+
+pub const G27MlaKvWriteArgs = struct {
+    latent_in: metal.BufferBinding,
+    rope_in: ?metal.BufferBinding = null,
+    kv_cache: metal.BufferBinding,
+    num_tokens: u32,
+    kv_lora_rank: u32,
+    qk_rope_head_dim: u32,
+    start_pos: u32,
+    accepted_nodes: ?[]const u16 = null,
+};
+
+pub const G27DsaIdxKvWriteParams = extern struct {
+    num_tokens: u32,
+    index_head_dim: u32,
+    start_pos: u32,
+    has_gate: u32,
+    is_tree_commit: u32,
+    _pad0: u32 = 0,
+    _pad1: u32 = 0,
+    _pad2: u32 = 0,
+    inline_nodes: [64]u16 = @splat(0),
+
+    comptime {
+        if (@sizeOf(G27DsaIdxKvWriteParams) != 160) @compileError("G27DsaIdxKvWriteParams must be 160 bytes");
+    }
+};
+
+pub const G27DsaIdxKvWriteArgs = struct {
+    k_in: metal.BufferBinding,
+    gate_in: ?metal.BufferBinding = null,
+    k_cache: metal.BufferBinding,
+    gate_cache: ?metal.BufferBinding = null,
+    num_tokens: u32,
+    index_head_dim: u32,
+    start_pos: u32,
+    accepted_nodes: ?[]const u16 = null,
+};
+
+pub const G27DsaKpoolBuildParams = extern struct {
+    start_pool: u32,
+    end_pool: u32,
+    index_head_dim: u32,
+    kpool: u32,
+    ape_dtype: u32,
+    _pad0: u32 = 0,
+    _pad1: u32 = 0,
+    _pad2: u32 = 0,
+
+    comptime {
+        if (@sizeOf(G27DsaKpoolBuildParams) != 32) @compileError("G27DsaKpoolBuildParams must be 32 bytes");
+    }
+};
+
+pub const G27DsaKpoolBuildArgs = struct {
+    k_cache: metal.BufferBinding,
+    gate_cache: metal.BufferBinding,
+    kpool_ape: metal.BufferBinding,
+    pool_k_cache: metal.BufferBinding,
+    start_pool: u32,
+    end_pool: u32,
+    index_head_dim: u32,
+    kpool: u32 = 4,
+    ape_dtype: ScalarDType = .bf16,
+};
+
+pub const G27DsaScoresParams = extern struct {
+    num_rows: u32,
+    index_n_heads: u32,
+    index_head_dim: u32,
+    committed_kv_len: u32,
+    num_candidates: u32,
+    kpool: u32,
+    causal_base_pos: u32,
+    is_tree: u32,
+    weights_f16: u32,
+    ape_dtype: u32,
+    softmax_scale: f32,
+    head_weight_scale: f32,
+
+    comptime {
+        if (@sizeOf(G27DsaScoresParams) != 48) @compileError("G27DsaScoresParams must be 48 bytes");
+    }
+};
+
+pub const G27DsaSelectTopKParams = extern struct {
+    num_rows: u32,
+    committed_kv_len: u32,
+    num_candidates: u32,
+    index_topk: u32,
+    max_out_k: u32,
+    kpool: u32,
+    always_select_tail: u32,
+    causal_base_pos: u32,
+    is_tree: u32,
+    _pad0: u32 = 0,
+    _pad1: u32 = 0,
+    _pad2: u32 = 0,
+
+    comptime {
+        if (@sizeOf(G27DsaSelectTopKParams) != 48) @compileError("G27DsaSelectTopKParams must be 48 bytes");
+    }
+};
+
+pub const G27DsaIndexArgs = struct {
+    q_idx: metal.BufferBinding,
+    weights: metal.BufferBinding,
+    k_cand_cache: metal.BufferBinding,
+    k_raw_cache: ?metal.BufferBinding = null,
+    k_tree: ?metal.BufferBinding = null,
+    gate_cache: ?metal.BufferBinding = null,
+    gate_tree: ?metal.BufferBinding = null,
+    kpool_ape: ?metal.BufferBinding = null,
+    ancestor_masks: ?metal.BufferBinding = null,
+    scores_scratch: metal.BufferBinding,
+    out_indices: metal.BufferBinding,
+    out_counts: metal.BufferBinding,
+    num_rows: u32,
+    index_n_heads: u32,
+    index_head_dim: u32,
+    committed_kv_len: u32,
+    index_topk: u32,
+    max_out_k: u32,
+    kpool: u32 = 1,
+    always_select_tail: bool = false,
+    causal_base_pos: u32 = 0,
+    is_tree: bool = false,
+    weights_f16: bool = true,
+    ape_dtype: ScalarDType = .bf16,
+};
+
+pub const G27MlaSparseAttnParams = extern struct {
+    num_rows: u32,
+    num_q_heads: u32,
+    kv_lora_rank: u32,
+    qk_rope_head_dim: u32,
+    committed_kv_len: u32,
+    max_out_k: u32,
+    scale: f32,
+    _pad0: u32 = 0,
+
+    comptime {
+        if (@sizeOf(G27MlaSparseAttnParams) != 32) @compileError("G27MlaSparseAttnParams must be 32 bytes");
+    }
+};
+
+pub const G27MlaSparseAttnArgs = struct {
+    q_nope: metal.BufferBinding,
+    q_pe: ?metal.BufferBinding = null,
+    kv_cache: metal.BufferBinding,
+    kv_tree_latent: ?metal.BufferBinding = null,
+    kv_tree_rope: ?metal.BufferBinding = null,
+    selected_indices: metal.BufferBinding,
+    selected_counts: metal.BufferBinding,
+    out: metal.BufferBinding,
+    num_rows: u32,
+    num_q_heads: u32,
+    kv_lora_rank: u32,
+    qk_rope_head_dim: u32 = 0,
+    committed_kv_len: u32,
+    max_out_k: u32,
+    scale: f32,
+};
+
+/// Wired preallocated FP16 compressed latent (+ optional RoPE) KV arena for
+/// `GLM-5.2/5.3` (`glm_moe_dsa`) and `GLM-5.3-Flash` (`glm5_next` NoPE MLA).
+pub const G27MlaKvSpec = struct {
+    num_layers: u32,
+    max_seq_len: u32,
+    kv_lora_rank: u32,
+    qk_rope_head_dim: u32 = 0,
+
+    pub fn validate(self: G27MlaKvSpec) ArenaError!void {
+        if (self.num_layers == 0 or self.max_seq_len == 0 or self.kv_lora_rank == 0) return error.ZeroDimension;
+        if (self.kv_lora_rank > MAX_MLA_LATENT_DIM) return error.InvalidConfig;
+        if (self.qk_rope_head_dim > MAX_MLA_ROPE_DIM) return error.InvalidConfig;
+    }
+
+    pub fn bytesPerToken(self: G27MlaKvSpec) u32 {
+        return (self.kv_lora_rank + self.qk_rope_head_dim) * 2;
+    }
+};
+
+pub const G27MlaKvArena = struct {
+    spec: G27MlaKvSpec,
+    layer_stride_bytes: usize,
+    base_offset: u64,
+    backing: []align(page.APPLE_PAGE_SIZE) u8,
+
+    pub fn requiredBytes(spec: G27MlaKvSpec) ArenaError!usize {
+        try spec.validate();
+        const row_bytes = @as(usize, spec.bytesPerToken());
+        const per_layer_raw = std.math.mul(usize, spec.max_seq_len, row_bytes) catch return error.Overflow;
+        const layer_stride = std.mem.alignForward(usize, per_layer_raw, 64);
+        const total = std.math.mul(usize, spec.num_layers, layer_stride) catch return error.Overflow;
+        return std.mem.alignForward(usize, @max(total, page.APPLE_PAGE_SIZE), page.APPLE_PAGE_SIZE);
+    }
+
+    pub fn init(arena: *arena_mod.WiredArena, spec: G27MlaKvSpec) ArenaError!G27MlaKvArena {
+        const total = try requiredBytes(spec);
+        const row_bytes = @as(usize, spec.bytesPerToken());
+        const per_layer_raw = std.math.mul(usize, spec.max_seq_len, row_bytes) catch return error.Overflow;
+        const layer_stride = std.mem.alignForward(usize, per_layer_raw, 64);
+        const slice = try arena.allocAligned(total, page.APPLE_PAGE_SIZE);
+        @memset(slice, 0);
+        return .{
+            .spec = spec,
+            .layer_stride_bytes = layer_stride,
+            .base_offset = arena.offsetOf(slice.ptr),
+            .backing = @alignCast(slice),
+        };
+    }
+
+    pub fn layerBinding(self: *const G27MlaKvArena, buf: metal.Buffer, mla_slot: u32) ArenaError!metal.BufferBinding {
+        if (mla_slot >= self.spec.num_layers) return error.InvalidLayerIndex;
+        return .{
+            .buffer = buf,
+            .offset = self.base_offset + @as(u64, mla_slot) * @as(u64, self.layer_stride_bytes),
+        };
+    }
+};
+
+/// Wired preallocated FP16 DSA indexer K (+ optional k-pool gate & pooled K) arena
+/// covering ONLY `"full"` indexer layers (`21/78` on GLM-5.2/5.3, `11/45` on GLM-5.3-Flash).
+pub const G27DsaIdxKvSpec = struct {
+    num_full_layers: u32,
+    max_seq_len: u32,
+    index_head_dim: u32,
+    kpool: u32 = 1,
+
+    pub fn validate(self: G27DsaIdxKvSpec) ArenaError!void {
+        if (self.num_full_layers == 0 or self.max_seq_len == 0 or self.index_head_dim == 0) return error.ZeroDimension;
+        if (self.kpool == 0 or self.kpool > 8) return error.InvalidConfig;
+    }
+};
+
+pub const G27DsaIdxKvArena = struct {
+    spec: G27DsaIdxKvSpec,
+    k_layer_stride: usize,
+    gate_offset: usize,
+    pool_offset: usize,
+    pool_layer_stride: usize,
+    base_offset: u64,
+    backing: []align(page.APPLE_PAGE_SIZE) u8,
+
+    pub fn requiredBytes(spec: G27DsaIdxKvSpec) ArenaError!usize {
+        try spec.validate();
+        const k_row = @as(usize, spec.index_head_dim) * 2;
+        const k_layer = std.mem.alignForward(usize, std.math.mul(usize, spec.max_seq_len, k_row) catch return error.Overflow, 64);
+        const k_total = std.math.mul(usize, spec.num_full_layers, k_layer) catch return error.Overflow;
+        var total = k_total;
+        if (spec.kpool > 1) {
+            total = std.math.add(usize, total, k_total) catch return error.Overflow; // gate_cache
+            const max_pools: usize = @max(@as(usize, 1), @as(usize, spec.max_seq_len) / spec.kpool);
+            const p_layer = std.mem.alignForward(usize, std.math.mul(usize, max_pools, k_row) catch return error.Overflow, 64);
+            const p_total = std.math.mul(usize, spec.num_full_layers, p_layer) catch return error.Overflow;
+            total = std.math.add(usize, total, p_total) catch return error.Overflow;
+        }
+        return std.mem.alignForward(usize, @max(total, page.APPLE_PAGE_SIZE), page.APPLE_PAGE_SIZE);
+    }
+
+    pub fn init(arena: *arena_mod.WiredArena, spec: G27DsaIdxKvSpec) ArenaError!G27DsaIdxKvArena {
+        const total = try requiredBytes(spec);
+        const k_row = @as(usize, spec.index_head_dim) * 2;
+        const k_layer = std.mem.alignForward(usize, std.math.mul(usize, spec.max_seq_len, k_row) catch return error.Overflow, 64);
+        const k_total = std.math.mul(usize, spec.num_full_layers, k_layer) catch return error.Overflow;
+        const gate_off = k_total;
+        const pool_off = if (spec.kpool > 1) k_total * 2 else k_total;
+        const max_pools: usize = @max(@as(usize, 1), @as(usize, spec.max_seq_len) / spec.kpool);
+        const p_layer = if (spec.kpool > 1)
+            std.mem.alignForward(usize, std.math.mul(usize, max_pools, k_row) catch return error.Overflow, 64)
+        else
+            0;
+        const slice = try arena.allocAligned(total, page.APPLE_PAGE_SIZE);
+        @memset(slice, 0);
+        return .{
+            .spec = spec,
+            .k_layer_stride = k_layer,
+            .gate_offset = gate_off,
+            .pool_offset = pool_off,
+            .pool_layer_stride = p_layer,
+            .base_offset = arena.offsetOf(slice.ptr),
+            .backing = @alignCast(slice),
+        };
+    }
+
+    pub fn kBinding(self: *const G27DsaIdxKvArena, buf: metal.Buffer, full_slot: u32) ArenaError!metal.BufferBinding {
+        if (full_slot >= self.spec.num_full_layers) return error.InvalidLayerIndex;
+        return .{ .buffer = buf, .offset = self.base_offset + @as(u64, full_slot) * self.k_layer_stride };
+    }
+
+    pub fn gateBinding(self: *const G27DsaIdxKvArena, buf: metal.Buffer, full_slot: u32) ArenaError!metal.BufferBinding {
+        if (full_slot >= self.spec.num_full_layers) return error.InvalidLayerIndex;
+        return .{ .buffer = buf, .offset = self.base_offset + self.gate_offset + @as(u64, full_slot) * self.k_layer_stride };
+    }
+
+    pub fn poolBinding(self: *const G27DsaIdxKvArena, buf: metal.Buffer, full_slot: u32) ArenaError!metal.BufferBinding {
+        if (full_slot >= self.spec.num_full_layers) return error.InvalidLayerIndex;
+        return .{ .buffer = buf, .offset = self.base_offset + self.pool_offset + @as(u64, full_slot) * self.pool_layer_stride };
+    }
+};
+
+/// Wired shared DSA Top-K index cache reused across `"shared"` layers (`index_topk_freq = 4`)
+/// and exposed via `GraphModel.sharedMtpSparseIndices()` for zero-reindex `1L` `MTP` (`D15`).
+pub const G27DsaIndexBufferSpec = struct {
+    max_rows: u32,
+    max_out_k: u32,
+    max_candidates: u32,
+
+    pub fn validate(self: G27DsaIndexBufferSpec) ArenaError!void {
+        if (self.max_rows == 0 or self.max_out_k == 0 or self.max_candidates == 0) return error.ZeroDimension;
+    }
+};
+
+pub const G27DsaIndexBuffer = struct {
+    spec: G27DsaIndexBufferSpec,
+    indices_off: u64,
+    counts_off: u64,
+    scores_off: u64,
+    indices_host: []u32,
+    counts_host: []u32,
+
+    pub fn requiredBytes(spec: G27DsaIndexBufferSpec) ArenaError!usize {
+        try spec.validate();
+        const idx_b = std.mem.alignForward(usize, std.math.mul(usize, std.math.mul(usize, spec.max_rows, spec.max_out_k) catch return error.Overflow, 4) catch return error.Overflow, 64);
+        const cnt_b = std.mem.alignForward(usize, std.math.mul(usize, spec.max_rows, 4) catch return error.Overflow, 64);
+        const sc_b = std.mem.alignForward(usize, std.math.mul(usize, std.math.mul(usize, spec.max_rows, spec.max_candidates) catch return error.Overflow, 4) catch return error.Overflow, 64);
+        return std.math.add(usize, std.math.add(usize, idx_b, cnt_b) catch return error.Overflow, sc_b) catch return error.Overflow;
+    }
+
+    pub fn init(arena: *arena_mod.WiredArena, spec: G27DsaIndexBufferSpec) ArenaError!G27DsaIndexBuffer {
+        try spec.validate();
+        const idx_elems = std.math.mul(usize, spec.max_rows, spec.max_out_k) catch return error.Overflow;
+        const sc_elems = std.math.mul(usize, spec.max_rows, spec.max_candidates) catch return error.Overflow;
+        const idx_raw = try arena.allocAligned(std.math.mul(usize, idx_elems, 4) catch return error.Overflow, 64);
+        const cnt_raw = try arena.allocAligned(std.math.mul(usize, spec.max_rows, 4) catch return error.Overflow, 64);
+        const sc_raw = try arena.allocAligned(std.math.mul(usize, sc_elems, 4) catch return error.Overflow, 64);
+        @memset(idx_raw, 0xFF);
+        @memset(cnt_raw, 0);
+        @memset(sc_raw, 0);
+        return .{
+            .spec = spec,
+            .indices_off = arena.offsetOf(idx_raw.ptr),
+            .counts_off = arena.offsetOf(cnt_raw.ptr),
+            .scores_off = arena.offsetOf(sc_raw.ptr),
+            .indices_host = @alignCast(std.mem.bytesAsSlice(u32, idx_raw[0 .. idx_elems * 4])),
+            .counts_host = @alignCast(std.mem.bytesAsSlice(u32, cnt_raw[0 .. @as(usize, spec.max_rows) * 4])),
+        };
+    }
+
+    pub fn indicesBinding(self: *const G27DsaIndexBuffer, buf: metal.Buffer) metal.BufferBinding {
+        return .{ .buffer = buf, .offset = self.indices_off };
+    }
+
+    pub fn countsBinding(self: *const G27DsaIndexBuffer, buf: metal.Buffer) metal.BufferBinding {
+        return .{ .buffer = buf, .offset = self.counts_off };
+    }
+
+    pub fn scoresBinding(self: *const G27DsaIndexBuffer, buf: metal.Buffer) metal.BufferBinding {
+        return .{ .buffer = buf, .offset = self.scores_off };
+    }
 };
 
 pub const G26QkNormRopeKvParams = extern struct {
@@ -11299,6 +12845,917 @@ test "M9.1 G26: ami_moe_route_topk_sigmoid (E=256 and E=384, top-8, e_score_corr
                 }
                 try std.testing.expect(found);
             }
+        }
+    }
+}
+
+test "G27 single-kernel 20-step hc_mult=4 mHC Sinkhorn GPU == CPU parity and doubly-stochastic check" {
+    const allocator = std.testing.allocator;
+    const device = try metal.Device.open();
+    defer device.close();
+
+    const lib = try metal.Library.openEmbedded(device);
+    defer lib.close();
+    const pipes = try HybridPipelines.init(device, lib);
+    defer pipes.close();
+
+    const m: u32 = 3;
+    const h: u32 = 64;
+    const total_dim: usize = 4 * h;
+    const sinkhorn_iters: u32 = 20;
+    const rms_eps: f32 = 1e-5;
+    const hc_eps: f32 = 1e-6;
+
+    const arena_cap = try page.alignUp(2 * 1024 * 1024);
+    const budget = budget_mod.Budget.compute(.{
+        .memory_bytes = arena_cap + 4 * page.APPLE_PAGE_SIZE,
+        .user_wire_limit = arena_cap,
+        .global_user_wire_limit = arena_cap,
+        .gpu_working_set_bytes = arena_cap,
+        .configured_cap = null,
+        .headroom_bytes = page.APPLE_PAGE_SIZE,
+    });
+    var arena = try arena_mod.WiredArena.init(arena_cap, budget);
+    defer arena.deinit();
+
+    const streams_raw = try arena.allocAligned(@as(usize, m) * total_dim * 2, 64);
+    const fn_raw = try arena.allocAligned(24 * total_dim * 2, 64);
+    const base_raw = try arena.allocAligned(24 * 4, 64);
+    const scale_raw = try arena.allocAligned(3 * 4, 64);
+    const norm_raw = try arena.allocAligned(@as(usize, h) * 2, 64);
+    const branch_raw = try arena.allocAligned(@as(usize, m) * h * 2, 64);
+    const sub_raw = try arena.allocAligned(@as(usize, m) * h * 2, 64);
+    const coeffs_raw = try arena.allocAligned(@as(usize, m) * 20 * 4, 64);
+
+    const streams_f16: []f16 = @alignCast(std.mem.bytesAsSlice(f16, streams_raw[0 .. @as(usize, m) * total_dim * 2]));
+    const fn_f16: []f16 = @alignCast(std.mem.bytesAsSlice(f16, fn_raw[0 .. 24 * total_dim * 2]));
+    const base_f32: []f32 = @alignCast(std.mem.bytesAsSlice(f32, base_raw[0 .. 24 * 4]));
+    const scale_f32: []f32 = @alignCast(std.mem.bytesAsSlice(f32, scale_raw[0 .. 3 * 4]));
+    const norm_f16: []f16 = @alignCast(std.mem.bytesAsSlice(f16, norm_raw[0 .. @as(usize, h) * 2]));
+    const branch_f16: []f16 = @alignCast(std.mem.bytesAsSlice(f16, branch_raw[0 .. @as(usize, m) * h * 2]));
+    const sub_f16: []f16 = @alignCast(std.mem.bytesAsSlice(f16, sub_raw[0 .. @as(usize, m) * h * 2]));
+    const coeffs_f32: []f32 = @alignCast(std.mem.bytesAsSlice(f32, coeffs_raw[0 .. @as(usize, m) * 20 * 4]));
+
+    var prng = std.Random.DefaultPrng.init(0x9201_2026);
+    const rng = prng.random();
+    const streams_orig = try allocator.alloc(f32, @as(usize, m) * total_dim);
+    defer allocator.free(streams_orig);
+    for (0..streams_f16.len) |i| {
+        const v: f16 = @floatCast((rng.float(f32) - 0.5) * 2.0);
+        streams_f16[i] = v;
+        streams_orig[i] = @floatCast(v);
+    }
+    for (0..fn_f16.len) |i| fn_f16[i] = @floatCast((rng.float(f32) - 0.5) * 0.25);
+    for (0..24) |i| base_f32[i] = (rng.float(f32) - 0.5) * 0.6;
+    scale_f32[0] = 0.35;
+    scale_f32[1] = 0.45;
+    scale_f32[2] = 0.55;
+    for (0..h) |i| norm_f16[i] = @floatCast(0.8 + rng.float(f32) * 0.4);
+    for (0..sub_f16.len) |i| sub_f16[i] = @floatCast((rng.float(f32) - 0.5) * 1.5);
+
+    const buf = try metal.Buffer.wrap(device, arena.bytes());
+    defer buf.close();
+    var compute = try metal.Compute.initWithFrames(device, 2);
+    defer compute.close();
+    try compute.makeResident(&.{buf});
+    defer compute.removeResident(&.{buf}) catch |err| {
+        std.debug.panic("removeResident failed: {}", .{err});
+    };
+
+    const streams_b: metal.BufferBinding = .{ .buffer = buf, .offset = arena.offsetOf(streams_raw.ptr) };
+    const fn_b: metal.BufferBinding = .{ .buffer = buf, .offset = arena.offsetOf(fn_raw.ptr) };
+    const base_b: metal.BufferBinding = .{ .buffer = buf, .offset = arena.offsetOf(base_raw.ptr) };
+    const scale_b: metal.BufferBinding = .{ .buffer = buf, .offset = arena.offsetOf(scale_raw.ptr) };
+    const norm_b: metal.BufferBinding = .{ .buffer = buf, .offset = arena.offsetOf(norm_raw.ptr) };
+    const branch_b: metal.BufferBinding = .{ .buffer = buf, .offset = arena.offsetOf(branch_raw.ptr) };
+    const sub_b: metal.BufferBinding = .{ .buffer = buf, .offset = arena.offsetOf(sub_raw.ptr) };
+    const coeffs_b: metal.BufferBinding = .{ .buffer = buf, .offset = arena.offsetOf(coeffs_raw.ptr) };
+
+    var frame = try compute.beginFrame(5000);
+    try pipes.encodeG27MhcPreSinkhorn(&frame, .{
+        .streams = streams_b,
+        .fn_w = fn_b,
+        .base_w = base_b,
+        .scale_w = scale_b,
+        .norm_w = norm_b,
+        .branch_out = branch_b,
+        .coeffs_out = coeffs_b,
+        .m = m,
+        .hidden_size = h,
+        .sinkhorn_iters = sinkhorn_iters,
+        .fn_dtype = .f16,
+        .norm_dtype = .f16,
+        .rms_eps = rms_eps,
+        .hc_eps = hc_eps,
+    }, false);
+    try pipes.encodeG27MhcPostMix(&frame, .{
+        .streams = streams_b,
+        .sublayer_out = sub_b,
+        .coeffs = coeffs_b,
+        .m = m,
+        .hidden_size = h,
+    }, true);
+    const sig = try frame.commit();
+    try compute.wait(sig, 5000);
+
+    // CPU FP32 reference matching `Glm5NextTextHyperConnection` verbatim.
+    var dot_branch: f64 = 0.0;
+    var na_branch: f64 = 0.0;
+    var nb_branch: f64 = 0.0;
+    var dot_streams: f64 = 0.0;
+    var na_streams: f64 = 0.0;
+    var nb_streams: f64 = 0.0;
+    for (0..m) |tok| {
+        const s_tok = streams_orig[tok * total_dim ..][0..total_dim];
+        var sq: f32 = 0.0;
+        for (s_tok) |v| sq += v * v;
+        const inv_rms = 1.0 / @sqrt(sq / @as(f32, @floatFromInt(total_dim)) + rms_eps);
+
+        var raw: [24]f32 = undefined;
+        for (0..24) |r| {
+            var acc: f32 = 0.0;
+            for (0..total_dim) |j| {
+                acc += (s_tok[j] * inv_rms) * @as(f32, @floatCast(fn_f16[r * total_dim + j]));
+            }
+            raw[r] = acc;
+        }
+        var pre: [4]f32 = undefined;
+        var post: [4]f32 = undefined;
+        var comb: [4][4]f32 = undefined;
+        for (0..4) |i| {
+            pre[i] = sigmoidF32(raw[i] * scale_f32[0] + base_f32[i]) + hc_eps;
+            post[i] = 2.0 * sigmoidF32(raw[4 + i] * scale_f32[1] + base_f32[4 + i]);
+        }
+        for (0..4) |r| {
+            var row_z: [4]f32 = undefined;
+            var mx: f32 = -std.math.inf(f32);
+            for (0..4) |c| {
+                row_z[c] = raw[8 + r * 4 + c] * scale_f32[2] + base_f32[8 + r * 4 + c];
+                mx = @max(mx, row_z[c]);
+            }
+            var es: f32 = 0.0;
+            for (0..4) |c| {
+                row_z[c] = @exp(row_z[c] - mx);
+                es += row_z[c];
+            }
+            for (0..4) |c| comb[r][c] = row_z[c] / es + hc_eps;
+        }
+        for (0..4) |c| {
+            var cs: f32 = hc_eps;
+            for (0..4) |r| cs += comb[r][c];
+            for (0..4) |r| comb[r][c] /= cs;
+        }
+        for (1..sinkhorn_iters) |_| {
+            for (0..4) |r| {
+                var rs: f32 = hc_eps;
+                for (0..4) |c| rs += comb[r][c];
+                for (0..4) |c| comb[r][c] /= rs;
+            }
+            for (0..4) |c| {
+                var cs: f32 = hc_eps;
+                for (0..4) |r| cs += comb[r][c];
+                for (0..4) |r| comb[r][c] /= cs;
+            }
+        }
+
+        // Verify doubly-stochastic row/col sums == 1.0 on GPU output `coeffs_f32`.
+        const gpu_c = coeffs_f32[tok * 20 ..][0..20];
+        for (0..4) |r| {
+            var rs: f32 = 0.0;
+            var cs: f32 = 0.0;
+            for (0..4) |c| {
+                rs += gpu_c[4 + r * 4 + c];
+                cs += gpu_c[4 + c * 4 + r];
+                try std.testing.expectApproxEqAbs(comb[r][c], gpu_c[4 + r * 4 + c], 1e-4);
+            }
+            try std.testing.expectApproxEqAbs(@as(f32, 1.0), rs, 1e-4);
+            try std.testing.expectApproxEqAbs(@as(f32, 1.0), cs, 1e-4);
+        }
+
+        // Check pre-mix + norm output.
+        var mix_buf: [64]f32 = undefined;
+        var mix_sq: f32 = 0.0;
+        for (0..h) |d| {
+            var mv: f32 = 0.0;
+            for (0..4) |s| mv += pre[s] * s_tok[s * h + d];
+            mix_buf[d] = mv;
+            mix_sq += mv * mv;
+        }
+        const inv_sub = 1.0 / @sqrt(mix_sq / @as(f32, @floatFromInt(h)) + rms_eps);
+        for (0..h) |d| {
+            const ref = (mix_buf[d] * inv_sub) * @as(f32, @floatCast(norm_f16[d]));
+            const got: f32 = @floatCast(branch_f16[tok * h + d]);
+            dot_branch += @as(f64, ref) * @as(f64, got);
+            na_branch += @as(f64, ref) * @as(f64, ref);
+            nb_branch += @as(f64, got) * @as(f64, got);
+        }
+
+        // Check post-mix: `post[j] * sub_out[d] + sum_i comb[i][j] * streams[i][d]`.
+        for (0..4) |j| {
+            for (0..h) |d| {
+                var acc: f32 = post[j] * @as(f32, @floatCast(sub_f16[tok * h + d]));
+                for (0..4) |i| acc += comb[i][j] * s_tok[i * h + d];
+                const got: f32 = @floatCast(streams_f16[tok * total_dim + j * h + d]);
+                dot_streams += @as(f64, acc) * @as(f64, got);
+                na_streams += @as(f64, acc) * @as(f64, acc);
+                nb_streams += @as(f64, got) * @as(f64, got);
+            }
+        }
+    }
+    const cos_branch = dot_branch / @sqrt(na_branch * nb_branch);
+    const cos_streams = dot_streams / @sqrt(na_streams * nb_streams);
+    try std.testing.expect(cos_branch >= 0.99999);
+    try std.testing.expect(cos_streams >= 0.99999);
+}
+
+test "G27 KDA conv1d + bounded/softplus forget gate + decode == prefill == verifyTree + commitTreeKv" {
+    const allocator = std.testing.allocator;
+    const device = try metal.Device.open();
+    defer device.close();
+
+    const lib = try metal.Library.openEmbedded(device);
+    defer lib.close();
+    const pipes = try HybridPipelines.init(device, lib);
+    defer pipes.close();
+
+    const seq_len: u32 = 6;
+    const num_heads: u32 = 2;
+    const head_dim: u32 = 64;
+    const qkv_dim: u32 = num_heads * head_dim;
+    const conv_k: u32 = 4;
+    const hist: u32 = conv_k - 1;
+    const lower_bound: f32 = -5.0;
+    const rms_eps: f32 = 1e-5;
+    const l2_eps: f32 = 1e-6;
+
+    const arena_cap = try page.alignUp(4 * 1024 * 1024);
+    const budget = budget_mod.Budget.compute(.{
+        .memory_bytes = arena_cap + 4 * page.APPLE_PAGE_SIZE,
+        .user_wire_limit = arena_cap,
+        .global_user_wire_limit = arena_cap,
+        .gpu_working_set_bytes = arena_cap,
+        .configured_cap = null,
+        .headroom_bytes = page.APPLE_PAGE_SIZE,
+    });
+    var arena = try arena_mod.WiredArena.init(arena_cap, budget);
+    defer arena.deinit();
+
+    const q_raw = try arena.allocAligned(@as(usize, seq_len) * qkv_dim * 2, 64);
+    const k_raw = try arena.allocAligned(@as(usize, seq_len) * qkv_dim * 2, 64);
+    const v_raw = try arena.allocAligned(@as(usize, seq_len) * qkv_dim * 2, 64);
+    const q_conv_out = try arena.allocAligned(@as(usize, seq_len) * qkv_dim * 2, 64);
+    const k_conv_out = try arena.allocAligned(@as(usize, seq_len) * qkv_dim * 2, 64);
+    const v_conv_out = try arena.allocAligned(@as(usize, seq_len) * qkv_dim * 2, 64);
+    const f_raw = try arena.allocAligned(@as(usize, seq_len) * qkv_dim * 2, 64);
+    const b_raw = try arena.allocAligned(@as(usize, seq_len) * num_heads * 2, 64);
+    const z_raw = try arena.allocAligned(@as(usize, seq_len) * qkv_dim * 2, 64);
+    const qw_raw = try arena.allocAligned(@as(usize, qkv_dim) * conv_k * 4, 64);
+    const kw_raw = try arena.allocAligned(@as(usize, qkv_dim) * conv_k * 4, 64);
+    const vw_raw = try arena.allocAligned(@as(usize, qkv_dim) * conv_k * 4, 64);
+    const a_log_raw = try arena.allocAligned(@as(usize, num_heads) * 4, 64);
+    const dt_raw = try arena.allocAligned(@as(usize, qkv_dim) * 4, 64);
+    const norm_raw = try arena.allocAligned(@as(usize, head_dim) * 2, 64);
+    const g_raw = try arena.allocAligned(@as(usize, seq_len) * qkv_dim * 4, 64);
+    const beta_raw = try arena.allocAligned(@as(usize, seq_len) * num_heads * 4, 64);
+    const conv_state_a = try arena.allocAligned(@as(usize, hist) * 3 * qkv_dim * 2, 64);
+    const conv_state_b = try arena.allocAligned(@as(usize, hist) * 3 * qkv_dim * 2, 64);
+    const state_a = try arena.allocAligned(@as(usize, num_heads) * head_dim * head_dim * 4, 64);
+    const state_b = try arena.allocAligned(@as(usize, num_heads) * head_dim * head_dim * 4, 64);
+    const state_c = try arena.allocAligned(@as(usize, num_heads) * head_dim * head_dim * 4, 64);
+    const out_prefill = try arena.allocAligned(@as(usize, seq_len) * qkv_dim * 2, 64);
+    const out_decode = try arena.allocAligned(@as(usize, seq_len) * qkv_dim * 2, 64);
+    const out_tree = try arena.allocAligned(@as(usize, seq_len) * qkv_dim * 2, 64);
+    const masks_raw = try arena.allocAligned(@as(usize, seq_len) * 8, 64);
+
+    const q_in_h: []f16 = @alignCast(std.mem.bytesAsSlice(f16, q_raw[0 .. @as(usize, seq_len) * qkv_dim * 2]));
+    const k_in_h: []f16 = @alignCast(std.mem.bytesAsSlice(f16, k_raw[0 .. @as(usize, seq_len) * qkv_dim * 2]));
+    const v_in_h: []f16 = @alignCast(std.mem.bytesAsSlice(f16, v_raw[0 .. @as(usize, seq_len) * qkv_dim * 2]));
+    const f_in_h: []f16 = @alignCast(std.mem.bytesAsSlice(f16, f_raw[0 .. @as(usize, seq_len) * qkv_dim * 2]));
+    const b_in_h: []f16 = @alignCast(std.mem.bytesAsSlice(f16, b_raw[0 .. @as(usize, seq_len) * num_heads * 2]));
+    const z_in_h: []f16 = @alignCast(std.mem.bytesAsSlice(f16, z_raw[0 .. @as(usize, seq_len) * qkv_dim * 2]));
+    const qw_f32: []f32 = @alignCast(std.mem.bytesAsSlice(f32, qw_raw[0 .. @as(usize, qkv_dim) * conv_k * 4]));
+    const kw_f32: []f32 = @alignCast(std.mem.bytesAsSlice(f32, kw_raw[0 .. @as(usize, qkv_dim) * conv_k * 4]));
+    const vw_f32: []f32 = @alignCast(std.mem.bytesAsSlice(f32, vw_raw[0 .. @as(usize, qkv_dim) * conv_k * 4]));
+    const a_log_f32: []f32 = @alignCast(std.mem.bytesAsSlice(f32, a_log_raw[0 .. @as(usize, num_heads) * 4]));
+    const dt_f32: []f32 = @alignCast(std.mem.bytesAsSlice(f32, dt_raw[0 .. @as(usize, qkv_dim) * 4]));
+    const norm_h: []f16 = @alignCast(std.mem.bytesAsSlice(f16, norm_raw[0 .. @as(usize, head_dim) * 2]));
+    const masks_u64: []u64 = @alignCast(std.mem.bytesAsSlice(u64, masks_raw[0 .. @as(usize, seq_len) * 8]));
+
+    var prng = std.Random.DefaultPrng.init(0x9202_2026);
+    const rng = prng.random();
+    for (0..q_in_h.len) |i| {
+        q_in_h[i] = @floatCast((rng.float(f32) - 0.5) * 1.2);
+        k_in_h[i] = @floatCast((rng.float(f32) - 0.5) * 1.2);
+        v_in_h[i] = @floatCast((rng.float(f32) - 0.5) * 1.2);
+        f_in_h[i] = @floatCast((rng.float(f32) - 0.5) * 2.0);
+        z_in_h[i] = @floatCast((rng.float(f32) - 0.5) * 2.0);
+    }
+    for (0..b_in_h.len) |i| b_in_h[i] = @floatCast((rng.float(f32) - 0.5) * 2.0);
+    for (0..qw_f32.len) |i| {
+        qw_f32[i] = (rng.float(f32) - 0.5) * 0.5;
+        kw_f32[i] = (rng.float(f32) - 0.5) * 0.5;
+        vw_f32[i] = (rng.float(f32) - 0.5) * 0.5;
+    }
+    for (0..num_heads) |i| a_log_f32[i] = -0.3 + @as(f32, @floatFromInt(i)) * 0.4;
+    for (0..qkv_dim) |i| dt_f32[i] = (rng.float(f32) - 0.5) * 0.8;
+    for (0..head_dim) |i| norm_h[i] = @floatCast(0.8 + rng.float(f32) * 0.4);
+    for (0..seq_len) |i| masks_u64[i] = (@as(u64, 1) << @intCast(i + 1)) - 1;
+    @memset(conv_state_a, 0);
+    @memset(conv_state_b, 0);
+    @memset(state_a, 0);
+    @memset(state_b, 0);
+    @memset(state_c, 0);
+
+    const buf = try metal.Buffer.wrap(device, arena.bytes());
+    defer buf.close();
+    var compute = try metal.Compute.initWithFrames(device, 2);
+    defer compute.close();
+    try compute.makeResident(&.{buf});
+    defer compute.removeResident(&.{buf}) catch |err| {
+        std.debug.panic("removeResident failed: {}", .{err});
+    };
+
+    const bind = struct {
+        fn of(b: metal.Buffer, a: *const arena_mod.WiredArena, ptr: [*]u8) metal.BufferBinding {
+            return .{ .buffer = b, .offset = a.offsetOf(ptr) };
+        }
+    }.of;
+
+    // 1) Prefill path (all 6 tokens in one pass).
+    {
+        var frame = try compute.beginFrame(5000);
+        try pipes.encodeKdaConv1dSilu(&frame, .{
+            .q_in = bind(buf, &arena, q_raw.ptr),
+            .k_in = bind(buf, &arena, k_raw.ptr),
+            .v_in = bind(buf, &arena, v_raw.ptr),
+            .q_conv_w = bind(buf, &arena, qw_raw.ptr),
+            .k_conv_w = bind(buf, &arena, kw_raw.ptr),
+            .v_conv_w = bind(buf, &arena, vw_raw.ptr),
+            .conv_state_in = bind(buf, &arena, conv_state_a.ptr),
+            .conv_state_out = bind(buf, &arena, conv_state_a.ptr),
+            .q_out = bind(buf, &arena, q_conv_out.ptr),
+            .k_out = bind(buf, &arena, k_conv_out.ptr),
+            .v_out = bind(buf, &arena, v_conv_out.ptr),
+            .m = seq_len,
+            .qkv_dim = qkv_dim,
+            .conv_k = conv_k,
+            .write_state = true,
+            .is_tree = false,
+            .w_dtype = .f32,
+        }, false);
+        try pipes.encodeKdaComputeGates(&frame, .{
+            .f_raw = bind(buf, &arena, f_raw.ptr),
+            .b_raw = bind(buf, &arena, b_raw.ptr),
+            .a_log = bind(buf, &arena, a_log_raw.ptr),
+            .dt_bias = bind(buf, &arena, dt_raw.ptr),
+            .g_out = bind(buf, &arena, g_raw.ptr),
+            .beta_out = bind(buf, &arena, beta_raw.ptr),
+            .m = seq_len,
+            .num_heads = num_heads,
+            .head_dim = head_dim,
+            .lower_bound = lower_bound,
+        }, false);
+        try pipes.encodeKdaPrefill(&frame, .{
+            .q = bind(buf, &arena, q_conv_out.ptr),
+            .k = bind(buf, &arena, k_conv_out.ptr),
+            .v = bind(buf, &arena, v_conv_out.ptr),
+            .g = bind(buf, &arena, g_raw.ptr),
+            .beta = bind(buf, &arena, beta_raw.ptr),
+            .z = bind(buf, &arena, z_raw.ptr),
+            .norm_w = bind(buf, &arena, norm_raw.ptr),
+            .norm_dtype = .f16,
+            .state_in = bind(buf, &arena, state_a.ptr),
+            .state_out = bind(buf, &arena, state_a.ptr),
+            .out = bind(buf, &arena, out_prefill.ptr),
+            .seq_len = seq_len,
+            .num_heads = num_heads,
+            .head_k_dim = head_dim,
+            .head_v_dim = head_dim,
+            .l2_eps = l2_eps,
+            .rms_eps = rms_eps,
+        }, true);
+        const sig = try frame.commit();
+        try compute.wait(sig, 5000);
+    }
+
+    // 2) Sequential decode path (step-by-step `m = 1`).
+    {
+        var frame = try compute.beginFrame(5000);
+        for (0..seq_len) |t| {
+            const qkv_off = @as(u64, t) * qkv_dim * 2;
+            const g_off = @as(u64, t) * qkv_dim * 4;
+            const b_off = @as(u64, t) * num_heads * 4;
+            try pipes.encodeKdaConv1dSilu(&frame, .{
+                .q_in = .{ .buffer = buf, .offset = arena.offsetOf(q_raw.ptr) + qkv_off },
+                .k_in = .{ .buffer = buf, .offset = arena.offsetOf(k_raw.ptr) + qkv_off },
+                .v_in = .{ .buffer = buf, .offset = arena.offsetOf(v_raw.ptr) + qkv_off },
+                .q_conv_w = bind(buf, &arena, qw_raw.ptr),
+                .k_conv_w = bind(buf, &arena, kw_raw.ptr),
+                .v_conv_w = bind(buf, &arena, vw_raw.ptr),
+                .conv_state_in = bind(buf, &arena, conv_state_b.ptr),
+                .conv_state_out = bind(buf, &arena, conv_state_b.ptr),
+                .q_out = .{ .buffer = buf, .offset = arena.offsetOf(q_conv_out.ptr) + qkv_off },
+                .k_out = .{ .buffer = buf, .offset = arena.offsetOf(k_conv_out.ptr) + qkv_off },
+                .v_out = .{ .buffer = buf, .offset = arena.offsetOf(v_conv_out.ptr) + qkv_off },
+                .m = 1,
+                .qkv_dim = qkv_dim,
+                .conv_k = conv_k,
+                .write_state = true,
+                .is_tree = false,
+                .w_dtype = .f32,
+            }, t > 0);
+            try pipes.encodeKdaDecode(&frame, .{
+                .q = .{ .buffer = buf, .offset = arena.offsetOf(q_conv_out.ptr) + qkv_off },
+                .k = .{ .buffer = buf, .offset = arena.offsetOf(k_conv_out.ptr) + qkv_off },
+                .v = .{ .buffer = buf, .offset = arena.offsetOf(v_conv_out.ptr) + qkv_off },
+                .g = .{ .buffer = buf, .offset = arena.offsetOf(g_raw.ptr) + g_off },
+                .beta = .{ .buffer = buf, .offset = arena.offsetOf(beta_raw.ptr) + b_off },
+                .z = .{ .buffer = buf, .offset = arena.offsetOf(z_raw.ptr) + qkv_off },
+                .norm_w = bind(buf, &arena, norm_raw.ptr),
+                .norm_dtype = .f16,
+                .state_in = bind(buf, &arena, state_b.ptr),
+                .state_out = bind(buf, &arena, state_b.ptr),
+                .out = .{ .buffer = buf, .offset = arena.offsetOf(out_decode.ptr) + qkv_off },
+                .num_heads = num_heads,
+                .head_k_dim = head_dim,
+                .head_v_dim = head_dim,
+                .l2_eps = l2_eps,
+                .rms_eps = rms_eps,
+            }, true);
+        }
+        const sig = try frame.commit();
+        try compute.wait(sig, 5000);
+    }
+
+    // 3) Tree-verify + commitTreeKv path over chain `[0,1,2,3,4,5]` from zero state.
+    @memset(conv_state_b, 0);
+    {
+        var frame = try compute.beginFrame(5000);
+        try pipes.encodeKdaConv1dSilu(&frame, .{
+            .q_in = bind(buf, &arena, q_raw.ptr),
+            .k_in = bind(buf, &arena, k_raw.ptr),
+            .v_in = bind(buf, &arena, v_raw.ptr),
+            .q_conv_w = bind(buf, &arena, qw_raw.ptr),
+            .k_conv_w = bind(buf, &arena, kw_raw.ptr),
+            .v_conv_w = bind(buf, &arena, vw_raw.ptr),
+            .conv_state_in = bind(buf, &arena, conv_state_b.ptr),
+            .conv_state_out = bind(buf, &arena, conv_state_b.ptr),
+            .ancestor_masks = bind(buf, &arena, masks_raw.ptr),
+            .q_out = bind(buf, &arena, q_conv_out.ptr),
+            .k_out = bind(buf, &arena, k_conv_out.ptr),
+            .v_out = bind(buf, &arena, v_conv_out.ptr),
+            .m = seq_len,
+            .qkv_dim = qkv_dim,
+            .conv_k = conv_k,
+            .write_state = false,
+            .is_tree = true,
+            .w_dtype = .f32,
+        }, false);
+        try pipes.encodeKdaTreeVerify(&frame, .{
+            .q = bind(buf, &arena, q_conv_out.ptr),
+            .k = bind(buf, &arena, k_conv_out.ptr),
+            .v = bind(buf, &arena, v_conv_out.ptr),
+            .g = bind(buf, &arena, g_raw.ptr),
+            .beta = bind(buf, &arena, beta_raw.ptr),
+            .z = bind(buf, &arena, z_raw.ptr),
+            .norm_w = bind(buf, &arena, norm_raw.ptr),
+            .norm_dtype = .f16,
+            .ancestor_masks = bind(buf, &arena, masks_raw.ptr),
+            .state_in = bind(buf, &arena, state_c.ptr),
+            .out = bind(buf, &arena, out_tree.ptr),
+            .num_nodes = seq_len,
+            .num_heads = num_heads,
+            .head_k_dim = head_dim,
+            .head_v_dim = head_dim,
+            .l2_eps = l2_eps,
+            .rms_eps = rms_eps,
+        }, true);
+        const accepted = [_]u16{ 0, 1, 2, 3, 4, 5 };
+        try pipes.encodeKdaCommitTree(&frame, .{
+            .k_tree = bind(buf, &arena, k_conv_out.ptr),
+            .v_tree = bind(buf, &arena, v_conv_out.ptr),
+            .g_tree = bind(buf, &arena, g_raw.ptr),
+            .beta_tree = bind(buf, &arena, beta_raw.ptr),
+            .accepted_nodes = &accepted,
+            .state_in = bind(buf, &arena, state_c.ptr),
+            .state_out = bind(buf, &arena, state_c.ptr),
+            .num_heads = num_heads,
+            .head_k_dim = head_dim,
+            .head_v_dim = head_dim,
+            .l2_eps = l2_eps,
+        }, true);
+        const sig = try frame.commit();
+        try compute.wait(sig, 5000);
+    }
+
+    // Verify decode == prefill == verifyTree outputs and final states match!
+    const pre_h: []const f16 = @alignCast(std.mem.bytesAsSlice(f16, out_prefill[0 .. @as(usize, seq_len) * qkv_dim * 2]));
+    const dec_h: []const f16 = @alignCast(std.mem.bytesAsSlice(f16, out_decode[0 .. @as(usize, seq_len) * qkv_dim * 2]));
+    const tr_h: []const f16 = @alignCast(std.mem.bytesAsSlice(f16, out_tree[0 .. @as(usize, seq_len) * qkv_dim * 2]));
+    const sa_f32: []const f32 = @alignCast(std.mem.bytesAsSlice(f32, state_a[0 .. @as(usize, num_heads) * head_dim * head_dim * 4]));
+    const sb_f32: []const f32 = @alignCast(std.mem.bytesAsSlice(f32, state_b[0 .. @as(usize, num_heads) * head_dim * head_dim * 4]));
+    const sc_f32: []const f32 = @alignCast(std.mem.bytesAsSlice(f32, state_c[0 .. @as(usize, num_heads) * head_dim * head_dim * 4]));
+
+    for (0..pre_h.len) |i| {
+        try std.testing.expectApproxEqAbs(@as(f32, @floatCast(pre_h[i])), @as(f32, @floatCast(dec_h[i])), 2e-3);
+        try std.testing.expectApproxEqAbs(@as(f32, @floatCast(pre_h[i])), @as(f32, @floatCast(tr_h[i])), 2e-3);
+    }
+    for (0..sa_f32.len) |i| {
+        try std.testing.expectApproxEqAbs(sa_f32[i], sb_f32[i], 1e-4);
+        try std.testing.expectApproxEqAbs(sa_f32[i], sc_f32[i], 1e-4);
+    }
+
+    // Verify against exact CPU FP32 KDA reference (`cos_sim >= 0.9999`).
+    const cpu_state = try allocator.alloc(f32, @as(usize, num_heads) * head_dim * head_dim);
+    defer allocator.free(cpu_state);
+    @memset(cpu_state, 0.0);
+    var dot_c: f64 = 0.0;
+    var na_c: f64 = 0.0;
+    var nb_c: f64 = 0.0;
+    const q_scale = 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim)));
+    for (0..seq_len) |t| {
+        var qc: [qkv_dim]f32 = undefined;
+        var kc: [qkv_dim]f32 = undefined;
+        var vc: [qkv_dim]f32 = undefined;
+        for (0..qkv_dim) |c| {
+            var qa: f32 = 0.0;
+            var ka: f32 = 0.0;
+            var va: f32 = 0.0;
+            for (0..conv_k) |tap| {
+                const rel = @as(i32, @intCast(t)) - @as(i32, @intCast(hist - tap));
+                if (rel >= 0) {
+                    const rt: usize = @intCast(rel);
+                    qa += @as(f32, @floatCast(q_in_h[rt * qkv_dim + c])) * qw_f32[c * conv_k + tap];
+                    ka += @as(f32, @floatCast(k_in_h[rt * qkv_dim + c])) * kw_f32[c * conv_k + tap];
+                    va += @as(f32, @floatCast(v_in_h[rt * qkv_dim + c])) * vw_f32[c * conv_k + tap];
+                }
+            }
+            qc[c] = siluF32(qa);
+            kc[c] = siluF32(ka);
+            vc[c] = siluF32(va);
+        }
+        for (0..num_heads) |hi| {
+            var qsq: f32 = 0.0;
+            var ksq: f32 = 0.0;
+            for (0..head_dim) |d| {
+                const qv = qc[hi * head_dim + d];
+                const kv = kc[hi * head_dim + d];
+                qsq += qv * qv;
+                ksq += kv * kv;
+            }
+            const qf = q_scale / @sqrt(qsq + l2_eps);
+            const kf = 1.0 / @sqrt(ksq + l2_eps);
+            const bv = sigmoidF32(@as(f32, @floatCast(b_in_h[t * num_heads + hi])));
+            const decay_rate = @exp(a_log_f32[hi]);
+            var alpha: [head_dim]f32 = undefined;
+            for (0..head_dim) |d| {
+                const gi = @as(f32, @floatCast(f_in_h[t * qkv_dim + hi * head_dim + d])) + dt_f32[hi * head_dim + d];
+                alpha[d] = @exp(lower_bound * sigmoidF32(decay_rate * gi));
+            }
+            var o_head: [head_dim]f32 = undefined;
+            for (0..head_dim) |dv| {
+                var pred: f32 = 0.0;
+                for (0..head_dim) |dk| {
+                    const si = (hi * head_dim + dk) * head_dim + dv;
+                    cpu_state[si] *= alpha[dk];
+                    pred += cpu_state[si] * (kc[hi * head_dim + dk] * kf);
+                }
+                const delta = bv * (vc[hi * head_dim + dv] - pred);
+                var ov: f32 = 0.0;
+                for (0..head_dim) |dk| {
+                    const si = (hi * head_dim + dk) * head_dim + dv;
+                    cpu_state[si] += (kc[hi * head_dim + dk] * kf) * delta;
+                    ov += cpu_state[si] * (qc[hi * head_dim + dk] * qf);
+                }
+                o_head[dv] = ov;
+            }
+            var osq: f32 = 0.0;
+            for (0..head_dim) |dv| osq += o_head[dv] * o_head[dv];
+            const inv_r = 1.0 / @sqrt(osq / @as(f32, @floatFromInt(head_dim)) + rms_eps);
+            for (0..head_dim) |dv| {
+                const ref = (o_head[dv] * inv_r) * @as(f32, @floatCast(norm_h[dv])) * sigmoidF32(@as(f32, @floatCast(z_in_h[t * qkv_dim + hi * head_dim + dv])));
+                const got: f32 = @floatCast(pre_h[t * qkv_dim + hi * head_dim + dv]);
+                dot_c += @as(f64, ref) * @as(f64, got);
+                na_c += @as(f64, ref) * @as(f64, ref);
+                nb_c += @as(f64, got) * @as(f64, got);
+            }
+        }
+    }
+    const cos_kda = dot_c / @sqrt(na_c * nb_c);
+    try std.testing.expect(cos_kda >= 0.9999);
+}
+
+test "G27 GlmMoeDsaIndexer + radix Top-K + Sparse MLA AND NoPE-MLA index_kpool=4 + tail parity" {
+    const device = try metal.Device.open();
+    defer device.close();
+
+    const lib = try metal.Library.openEmbedded(device);
+    defer lib.close();
+    const pipes = try HybridPipelines.init(device, lib);
+    defer pipes.close();
+
+    const arena_cap = try page.alignUp(4 * 1024 * 1024);
+    const budget = budget_mod.Budget.compute(.{
+        .memory_bytes = arena_cap + 4 * page.APPLE_PAGE_SIZE,
+        .user_wire_limit = arena_cap,
+        .global_user_wire_limit = arena_cap,
+        .gpu_working_set_bytes = arena_cap,
+        .configured_cap = null,
+        .headroom_bytes = page.APPLE_PAGE_SIZE,
+    });
+    var arena = try arena_mod.WiredArena.init(arena_cap, budget);
+    defer arena.deinit();
+
+    // Case 1: GLM-5.2/5.3 (`kpool = 1`, `seq_len = 20`, `index_topk = 8` -> exercises 4-pass radix Top-K!)
+    //         + interleaved RoPE + LayerNorm + Sparse MLA (`qk_rope = 16`, `kv_lora = 64`).
+    // Case 2: GLM-5.3-Flash (`kpool = 4`, `always_select_tail = true`, `seq_len = 23` -> 5 pools + 3 tail,
+    //         `index_topk = 12` -> top 3 pools = 12 tokens + 3 tail = 15 tokens!) + NoPE MLA (`qk_rope = 0`).
+    const seq_len: u32 = 23;
+    const idx_heads: u32 = 4;
+    const idx_dim: u32 = 32;
+    const n_q_heads: u32 = 2;
+    const kv_rank: u32 = 64;
+    const d_rope: u32 = 16;
+
+    const q_idx_raw = try arena.allocAligned(@as(usize, seq_len) * idx_heads * idx_dim * 2, 64);
+    const k_idx_raw = try arena.allocAligned(@as(usize, seq_len) * idx_dim * 2, 64);
+    const k_normed_raw = try arena.allocAligned(@as(usize, seq_len) * idx_dim * 2, 64);
+    const kn_w_raw = try arena.allocAligned(@as(usize, idx_dim) * 4, 64);
+    const kn_b_raw = try arena.allocAligned(@as(usize, idx_dim) * 4, 64);
+    const w_raw = try arena.allocAligned(@as(usize, seq_len) * idx_heads * 2, 64);
+    const gate_raw = try arena.allocAligned(@as(usize, seq_len) * idx_dim * 2, 64);
+    const ape_raw = try arena.allocAligned(4 * @as(usize, idx_dim) * 4, 64);
+    const q_nope_raw = try arena.allocAligned(@as(usize, n_q_heads) * kv_rank * 2, 64);
+    const q_pe_raw = try arena.allocAligned(@as(usize, n_q_heads) * d_rope * 2, 64);
+    const lat_in_raw = try arena.allocAligned(@as(usize, seq_len) * kv_rank * 2, 64);
+    const rope_in_raw = try arena.allocAligned(@as(usize, seq_len) * d_rope * 2, 64);
+    const out_raw = try arena.allocAligned(@as(usize, n_q_heads) * kv_rank * 2, 64);
+
+    const mla_kv = try G27MlaKvArena.init(&arena, .{
+        .num_layers = 2,
+        .max_seq_len = 32,
+        .kv_lora_rank = kv_rank,
+        .qk_rope_head_dim = d_rope,
+    });
+    const idx_kv = try G27DsaIdxKvArena.init(&arena, .{
+        .num_full_layers = 1,
+        .max_seq_len = 32,
+        .index_head_dim = idx_dim,
+        .kpool = 4,
+    });
+    const idx_buf = try G27DsaIndexBuffer.init(&arena, .{
+        .max_rows = 4,
+        .max_out_k = 16,
+        .max_candidates = 32,
+    });
+
+    const q_idx_h: []f16 = @alignCast(std.mem.bytesAsSlice(f16, q_idx_raw[0 .. @as(usize, seq_len) * idx_heads * idx_dim * 2]));
+    const k_idx_h: []f16 = @alignCast(std.mem.bytesAsSlice(f16, k_idx_raw[0 .. @as(usize, seq_len) * idx_dim * 2]));
+    const kn_w: []f32 = @alignCast(std.mem.bytesAsSlice(f32, kn_w_raw[0 .. @as(usize, idx_dim) * 4]));
+    const kn_b: []f32 = @alignCast(std.mem.bytesAsSlice(f32, kn_b_raw[0 .. @as(usize, idx_dim) * 4]));
+    const w_h: []f16 = @alignCast(std.mem.bytesAsSlice(f16, w_raw[0 .. @as(usize, seq_len) * idx_heads * 2]));
+    const gate_h: []f16 = @alignCast(std.mem.bytesAsSlice(f16, gate_raw[0 .. @as(usize, seq_len) * idx_dim * 2]));
+    const ape_f32: []f32 = @alignCast(std.mem.bytesAsSlice(f32, ape_raw[0 .. 4 * @as(usize, idx_dim) * 4]));
+    const q_nope_h: []f16 = @alignCast(std.mem.bytesAsSlice(f16, q_nope_raw[0 .. @as(usize, n_q_heads) * kv_rank * 2]));
+    const q_pe_h: []f16 = @alignCast(std.mem.bytesAsSlice(f16, q_pe_raw[0 .. @as(usize, n_q_heads) * d_rope * 2]));
+    const lat_in_h: []f16 = @alignCast(std.mem.bytesAsSlice(f16, lat_in_raw[0 .. @as(usize, seq_len) * kv_rank * 2]));
+    const rope_in_h: []f16 = @alignCast(std.mem.bytesAsSlice(f16, rope_in_raw[0 .. @as(usize, seq_len) * d_rope * 2]));
+    const out_h: []f16 = @alignCast(std.mem.bytesAsSlice(f16, out_raw[0 .. @as(usize, n_q_heads) * kv_rank * 2]));
+
+    var prng = std.Random.DefaultPrng.init(0x9203_2026);
+    const rng = prng.random();
+    for (q_idx_h) |*v| v.* = @floatCast((rng.float(f32) - 0.5) * 1.5);
+    for (k_idx_h) |*v| v.* = @floatCast((rng.float(f32) - 0.5) * 1.5);
+    for (kn_w) |*v| v.* = 0.8 + rng.float(f32) * 0.4;
+    for (kn_b) |*v| v.* = (rng.float(f32) - 0.5) * 0.2;
+    for (w_h) |*v| v.* = @floatCast(0.2 + rng.float(f32) * 1.0);
+    for (gate_h) |*v| v.* = @floatCast((rng.float(f32) - 0.5) * 2.0);
+    for (ape_f32) |*v| v.* = (rng.float(f32) - 0.5) * 0.5;
+    for (q_nope_h) |*v| v.* = @floatCast((rng.float(f32) - 0.5) * 1.0);
+    for (q_pe_h) |*v| v.* = @floatCast((rng.float(f32) - 0.5) * 1.0);
+    for (lat_in_h) |*v| v.* = @floatCast((rng.float(f32) - 0.5) * 1.0);
+    for (rope_in_h) |*v| v.* = @floatCast((rng.float(f32) - 0.5) * 1.0);
+
+    const buf = try metal.Buffer.wrap(device, arena.bytes());
+    defer buf.close();
+    var compute = try metal.Compute.initWithFrames(device, 2);
+    defer compute.close();
+    try compute.makeResident(&.{buf});
+    defer compute.removeResident(&.{buf}) catch |err| {
+        std.debug.panic("removeResident failed: {}", .{err});
+    };
+
+    const bind = struct {
+        fn of(b: metal.Buffer, a: *const arena_mod.WiredArena, ptr: [*]u8) metal.BufferBinding {
+            return .{ .buffer = b, .offset = a.offsetOf(ptr) };
+        }
+    }.of;
+
+    // Run LayerNorm + Interleaved RoPE + KV write + kpool=4 build + radix Top-K + Sparse MLA.
+    const last_tok: u32 = seq_len - 1;
+    {
+        var frame = try compute.beginFrame(5000);
+        try pipes.encodeG27LayerNorm(&frame, .{
+            .x = bind(buf, &arena, k_idx_raw.ptr),
+            .weight = bind(buf, &arena, kn_w_raw.ptr),
+            .bias = bind(buf, &arena, kn_b_raw.ptr),
+            .y = bind(buf, &arena, k_normed_raw.ptr),
+            .num_rows = seq_len,
+            .dim = idx_dim,
+            .w_dtype = .f32,
+            .b_dtype = .f32,
+            .eps = 1e-6,
+        }, false);
+        try pipes.encodeG27RopeInterleave(&frame, .{
+            .x = bind(buf, &arena, k_normed_raw.ptr),
+            .num_tokens = seq_len,
+            .num_heads = 1,
+            .head_stride = idx_dim,
+            .rot_dim = d_rope,
+            .rot_offset = 0,
+            .base_pos = 0,
+            .rope_theta = 8_000_000.0,
+        }, true);
+        try pipes.encodeG27DsaIdxKvWrite(&frame, .{
+            .k_in = bind(buf, &arena, k_normed_raw.ptr),
+            .gate_in = bind(buf, &arena, gate_raw.ptr),
+            .k_cache = try idx_kv.kBinding(buf, 0),
+            .gate_cache = try idx_kv.gateBinding(buf, 0),
+            .num_tokens = seq_len,
+            .index_head_dim = idx_dim,
+            .start_pos = 0,
+        }, true);
+        try pipes.encodeG27MlaKvWrite(&frame, .{
+            .latent_in = bind(buf, &arena, lat_in_raw.ptr),
+            .rope_in = bind(buf, &arena, rope_in_raw.ptr),
+            .kv_cache = try mla_kv.layerBinding(buf, 0),
+            .num_tokens = seq_len,
+            .kv_lora_rank = kv_rank,
+            .qk_rope_head_dim = d_rope,
+            .start_pos = 0,
+        }, false);
+        // Test Case 1: token-level (`kpool = 1`, `index_topk = 8`) for query at `last_tok = 22`.
+        try pipes.encodeG27DsaScoresAndTopK(&frame, .{
+            .q_idx = .{ .buffer = buf, .offset = arena.offsetOf(q_idx_raw.ptr) + @as(u64, last_tok) * idx_heads * idx_dim * 2 },
+            .weights = .{ .buffer = buf, .offset = arena.offsetOf(w_raw.ptr) + @as(u64, last_tok) * idx_heads * 2 },
+            .k_cand_cache = try idx_kv.kBinding(buf, 0),
+            .scores_scratch = idx_buf.scoresBinding(buf),
+            .out_indices = idx_buf.indicesBinding(buf),
+            .out_counts = idx_buf.countsBinding(buf),
+            .num_rows = 1,
+            .index_n_heads = idx_heads,
+            .index_head_dim = idx_dim,
+            .committed_kv_len = seq_len,
+            .index_topk = 8,
+            .max_out_k = 16,
+            .kpool = 1,
+            .causal_base_pos = last_tok,
+        }, true);
+        try pipes.encodeG27MlaSparseAttn(&frame, .{
+            .q_nope = bind(buf, &arena, q_nope_raw.ptr),
+            .q_pe = bind(buf, &arena, q_pe_raw.ptr),
+            .kv_cache = try mla_kv.layerBinding(buf, 0),
+            .selected_indices = idx_buf.indicesBinding(buf),
+            .selected_counts = idx_buf.countsBinding(buf),
+            .out = bind(buf, &arena, out_raw.ptr),
+            .num_rows = 1,
+            .num_q_heads = n_q_heads,
+            .kv_lora_rank = kv_rank,
+            .qk_rope_head_dim = d_rope,
+            .committed_kv_len = seq_len,
+            .max_out_k = 16,
+            .scale = 1.0 / @sqrt(@as(f32, @floatFromInt(kv_rank + d_rope))),
+        }, true);
+        const sig = try frame.commit();
+        try compute.wait(sig, 5000);
+    }
+
+    try std.testing.expectEqual(@as(u32, 8), idx_buf.counts_host[0]);
+    // Verify sparse MLA output matches exact CPU softmax over those 8 selected tokens!
+    const kv_scale = 1.0 / @sqrt(@as(f32, @floatFromInt(kv_rank + d_rope)));
+    for (0..n_q_heads) |hd| {
+        var scores_cpu: [8]f32 = undefined;
+        var mx: f32 = -std.math.inf(f32);
+        for (0..8) |si| {
+            const tidx = idx_buf.indices_host[si];
+            try std.testing.expect(tidx < seq_len);
+            var dot_v: f32 = 0.0;
+            for (0..kv_rank) |d| dot_v += @as(f32, @floatCast(q_nope_h[hd * kv_rank + d])) * @as(f32, @floatCast(lat_in_h[tidx * kv_rank + d]));
+            for (0..d_rope) |r| dot_v += @as(f32, @floatCast(q_pe_h[hd * d_rope + r])) * @as(f32, @floatCast(rope_in_h[tidx * d_rope + r]));
+            scores_cpu[si] = dot_v * kv_scale;
+            mx = @max(mx, scores_cpu[si]);
+        }
+        var denom: f32 = 0.0;
+        for (0..8) |si| {
+            scores_cpu[si] = @exp(scores_cpu[si] - mx);
+            denom += scores_cpu[si];
+        }
+        for (0..kv_rank) |d| {
+            var acc: f32 = 0.0;
+            for (0..8) |si| {
+                const tidx = idx_buf.indices_host[si];
+                acc += (scores_cpu[si] / denom) * @as(f32, @floatCast(lat_in_h[tidx * kv_rank + d]));
+            }
+            try std.testing.expectApproxEqAbs(acc, @as(f32, @floatCast(out_h[hd * kv_rank + d])), 2e-3);
+        }
+    }
+
+    // Test Case 2: GLM-5.3-Flash `NoPE MLA` (`qk_rope = 0`, `kpool = 4`, `always_select_tail = true`, `index_topk = 12`):
+    // `seq_len = 23` -> `5` complete pools `[0..19]` + `3` tail tokens `[20, 21, 22]`.
+    // Selecting top `12 / 4 = 3` pools -> `12` tokens + `3` tail = `15` selected indices!
+    {
+        var frame = try compute.beginFrame(5000);
+        try pipes.encodeG27DsaKpoolBuild(&frame, .{
+            .k_cache = try idx_kv.kBinding(buf, 0),
+            .gate_cache = try idx_kv.gateBinding(buf, 0),
+            .kpool_ape = bind(buf, &arena, ape_raw.ptr),
+            .pool_k_cache = try idx_kv.poolBinding(buf, 0),
+            .start_pool = 0,
+            .end_pool = seq_len / 4,
+            .index_head_dim = idx_dim,
+            .kpool = 4,
+            .ape_dtype = .f32,
+        }, false);
+        try pipes.encodeG27DsaScoresAndTopK(&frame, .{
+            .q_idx = .{ .buffer = buf, .offset = arena.offsetOf(q_idx_raw.ptr) + @as(u64, last_tok) * idx_heads * idx_dim * 2 },
+            .weights = .{ .buffer = buf, .offset = arena.offsetOf(w_raw.ptr) + @as(u64, last_tok) * idx_heads * 2 },
+            .k_cand_cache = try idx_kv.poolBinding(buf, 0),
+            .k_raw_cache = try idx_kv.kBinding(buf, 0),
+            .gate_cache = try idx_kv.gateBinding(buf, 0),
+            .kpool_ape = bind(buf, &arena, ape_raw.ptr),
+            .scores_scratch = idx_buf.scoresBinding(buf),
+            .out_indices = idx_buf.indicesBinding(buf),
+            .out_counts = idx_buf.countsBinding(buf),
+            .num_rows = 1,
+            .index_n_heads = idx_heads,
+            .index_head_dim = idx_dim,
+            .committed_kv_len = seq_len,
+            .index_topk = 12,
+            .max_out_k = 16,
+            .kpool = 4,
+            .always_select_tail = true,
+            .causal_base_pos = last_tok,
+            .ape_dtype = .f32,
+        }, true);
+        try pipes.encodeG27MlaKvWrite(&frame, .{
+            .latent_in = bind(buf, &arena, lat_in_raw.ptr),
+            .rope_in = null,
+            .kv_cache = try mla_kv.layerBinding(buf, 1),
+            .num_tokens = seq_len,
+            .kv_lora_rank = kv_rank,
+            .qk_rope_head_dim = 0,
+            .start_pos = 0,
+        }, false);
+        try pipes.encodeG27MlaSparseAttn(&frame, .{
+            .q_nope = bind(buf, &arena, q_nope_raw.ptr),
+            .q_pe = null,
+            .kv_cache = try mla_kv.layerBinding(buf, 1),
+            .selected_indices = idx_buf.indicesBinding(buf),
+            .selected_counts = idx_buf.countsBinding(buf),
+            .out = bind(buf, &arena, out_raw.ptr),
+            .num_rows = 1,
+            .num_q_heads = n_q_heads,
+            .kv_lora_rank = kv_rank,
+            .qk_rope_head_dim = 0,
+            .committed_kv_len = seq_len,
+            .max_out_k = 16,
+            .scale = 1.0 / @sqrt(@as(f32, @floatFromInt(kv_rank))),
+        }, true);
+        const sig = try frame.commit();
+        try compute.wait(sig, 5000);
+    }
+
+    try std.testing.expectEqual(@as(u32, 15), idx_buf.counts_host[0]);
+    // Verify tail tokens [20, 21, 22] are ALWAYS present at the end of selected indices!
+    try std.testing.expectEqual(@as(u32, 20), idx_buf.indices_host[12]);
+    try std.testing.expectEqual(@as(u32, 21), idx_buf.indices_host[13]);
+    try std.testing.expectEqual(@as(u32, 22), idx_buf.indices_host[14]);
+    try std.testing.expectEqual(@as(u32, 0xFFFF_FFFF), idx_buf.indices_host[15]);
+    // Verify NoPE MLA sparse attention matches CPU reference over those 15 selected tokens!
+    const nope_scale = 1.0 / @sqrt(@as(f32, @floatFromInt(kv_rank)));
+    for (0..n_q_heads) |hd| {
+        var scores_cpu: [15]f32 = undefined;
+        var mx: f32 = -std.math.inf(f32);
+        for (0..15) |si| {
+            const tidx = idx_buf.indices_host[si];
+            try std.testing.expect(tidx < seq_len);
+            var dot_v: f32 = 0.0;
+            for (0..kv_rank) |d| dot_v += @as(f32, @floatCast(q_nope_h[hd * kv_rank + d])) * @as(f32, @floatCast(lat_in_h[tidx * kv_rank + d]));
+            scores_cpu[si] = dot_v * nope_scale;
+            mx = @max(mx, scores_cpu[si]);
+        }
+        var denom: f32 = 0.0;
+        for (0..15) |si| {
+            scores_cpu[si] = @exp(scores_cpu[si] - mx);
+            denom += scores_cpu[si];
+        }
+        for (0..kv_rank) |d| {
+            var acc: f32 = 0.0;
+            for (0..15) |si| {
+                const tidx = idx_buf.indices_host[si];
+                acc += (scores_cpu[si] / denom) * @as(f32, @floatCast(lat_in_h[tidx * kv_rank + d]));
+            }
+            try std.testing.expectApproxEqAbs(acc, @as(f32, @floatCast(out_h[hd * kv_rank + d])), 2e-3);
         }
     }
 }

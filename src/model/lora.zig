@@ -57,8 +57,13 @@ pub const TargetProjection = enum(u8) {
     kv_a_proj = 13,
     kv_b_proj = 14,
     eh_proj = 15,
+    b_proj = 16,
+    f_a_proj = 17,
+    f_b_proj = 18,
+    g_a_proj = 19,
+    g_b_proj = 20,
 
-    pub const COUNT: usize = 16;
+    pub const COUNT: usize = 21;
 
     pub fn label(self: TargetProjection) []const u8 {
         return switch (self) {
@@ -78,6 +83,11 @@ pub const TargetProjection = enum(u8) {
             .kv_a_proj => "kv_a_proj",
             .kv_b_proj => "kv_b_proj",
             .eh_proj => "eh_proj",
+            .b_proj => "b_proj",
+            .f_a_proj => "f_a_proj",
+            .f_b_proj => "f_b_proj",
+            .g_a_proj => "g_a_proj",
+            .g_b_proj => "g_b_proj",
         };
     }
 
@@ -99,11 +109,16 @@ pub const TargetProjection = enum(u8) {
             .kv_a_proj => "self_attn.kv_a_proj",
             .kv_b_proj => "self_attn.kv_b_proj",
             .eh_proj => "self_attn.eh_proj",
+            .b_proj => "linear_attn.b_proj",
+            .f_a_proj => "linear_attn.f_a_proj",
+            .f_b_proj => "linear_attn.f_b_proj",
+            .g_a_proj => "linear_attn.g_a_proj",
+            .g_b_proj => "linear_attn.g_b_proj",
         };
     }
 
-    pub fn bit(self: TargetProjection) u16 {
-        return @as(u16, 1) << @intCast(@backingInt(self));
+    pub fn bit(self: TargetProjection) u32 {
+        return @as(u32, 1) << @intCast(@backingInt(self));
     }
 
     pub fn parseModuleName(name: []const u8) ?TargetProjection {
@@ -200,6 +215,25 @@ pub const TargetProjection = enum(u8) {
             std.mem.eql(u8, name, "self_attn.eh_proj") or
             std.mem.eql(u8, name, "attn.eh_proj") or
             std.mem.eql(u8, name, "mlp.eh_proj")) return .eh_proj;
+        if (std.mem.eql(u8, name, "b_proj") or
+            std.mem.eql(u8, name, "linear_attn.b_proj") or
+            std.mem.eql(u8, name, "self_attn.b_proj")) return .b_proj;
+        if (std.mem.eql(u8, name, "f_a_proj") or
+            std.mem.eql(u8, name, "linear_attn.f_a_proj") or
+            std.mem.eql(u8, name, "self_attn.f_a_proj") or
+            std.mem.eql(u8, name, "linear_attn.forget_gate.f_a_proj") or
+            std.mem.eql(u8, name, "self_attn.forget_gate.f_a_proj")) return .f_a_proj;
+        if (std.mem.eql(u8, name, "f_b_proj") or
+            std.mem.eql(u8, name, "linear_attn.f_b_proj") or
+            std.mem.eql(u8, name, "self_attn.f_b_proj") or
+            std.mem.eql(u8, name, "linear_attn.forget_gate.f_b_proj") or
+            std.mem.eql(u8, name, "self_attn.forget_gate.f_b_proj")) return .f_b_proj;
+        if (std.mem.eql(u8, name, "g_a_proj") or
+            std.mem.eql(u8, name, "linear_attn.g_a_proj") or
+            std.mem.eql(u8, name, "self_attn.g_a_proj")) return .g_a_proj;
+        if (std.mem.eql(u8, name, "g_b_proj") or
+            std.mem.eql(u8, name, "linear_attn.g_b_proj") or
+            std.mem.eql(u8, name, "self_attn.g_b_proj")) return .g_b_proj;
         return null;
     }
 };
@@ -253,7 +287,7 @@ pub const AdapterConfigMeta = struct {
     rank: u32,
     lora_alpha: f32,
     scale: f32,
-    target_mask: u16,
+    target_mask: u32,
     use_dora: bool = false,
 };
 pub const AdapterMeta = AdapterConfigMeta;
@@ -292,7 +326,7 @@ pub fn parseAdapterConfigJson(allocator: std.mem.Allocator, json_bytes: []const 
         else => return error.InvalidAdapterConfig,
     } else false;
 
-    var target_mask: u16 = 0;
+    var target_mask: u32 = 0;
     if (obj.get("target_modules")) |tm_val| {
         switch (tm_val) {
             .array => |arr| {
@@ -345,7 +379,7 @@ pub const BaseModelShape = struct {
             .gate_attn, .wr_du => .{ .n = self.q_dim, .k = self.hidden_size },
             .qkv_proj => .{ .n = self.q_dim + 2 * self.kv_dim, .k = self.hidden_size },
             .gate_up_proj => .{ .n = 2 * self.intermediate_size, .k = self.hidden_size },
-            .q_a_proj, .q_b_proj, .kv_a_proj, .kv_b_proj, .eh_proj => .{ .n = 0, .k = 0 },
+            .q_a_proj, .q_b_proj, .kv_a_proj, .kv_b_proj, .eh_proj, .b_proj, .f_a_proj, .f_b_proj, .g_a_proj, .g_b_proj => .{ .n = 0, .k = 0 },
         };
     }
 };
@@ -791,7 +825,7 @@ pub const LoraLinearPair = struct {
 pub const LayerAdapters = struct {
     /// Indexed by `@backingInt(TargetProjection)`.
     projections: [TargetProjection.COUNT]?LoraLinearPair = @splat(null),
-    target_mask: u16 = 0,
+    target_mask: u32 = 0,
 
     pub fn hasTarget(self: *const LayerAdapters, target: TargetProjection) bool {
         return (self.target_mask & target.bit()) != 0;
@@ -815,7 +849,7 @@ pub const LoadedAdapter = struct {
     rank: u32 = 0,
     lora_alpha: f32 = 0.0,
     scale: f32 = 0.0,
-    target_mask: u16 = 0,
+    target_mask: u32 = 0,
     use_dora: bool = false,
     wired_bytes: usize = 0,
     num_layers: u32 = 0,
@@ -1150,14 +1184,14 @@ pub const LoraRegistry = struct {
     }
 
     /// Returns `true` if `adapter_slot` targets any projection in `(layer_idx, mask)`.
-    pub fn slotTargetsLayerMask(self: *const LoraRegistry, slot_id: u32, layer_idx: usize, mask: u16) bool {
+    pub fn slotTargetsLayerMask(self: *const LoraRegistry, slot_id: u32, layer_idx: usize, mask: u32) bool {
         const adp = self.adapterAt(slot_id) orelse return false;
         const la = adp.layerAdapters(layer_idx) orelse return false;
         return (la.target_mask & mask) != 0;
     }
 
     /// Returns `true` if ANY slot in `batch_lora_slots` targets `(layer_idx, mask)`.
-    pub fn batchTargetsLayerMask(self: *const LoraRegistry, batch_lora_slots: []const u32, layer_idx: usize, mask: u16) bool {
+    pub fn batchTargetsLayerMask(self: *const LoraRegistry, batch_lora_slots: []const u32, layer_idx: usize, mask: u32) bool {
         for (batch_lora_slots) |sid| {
             if (sid == NO_ADAPTER) continue;
             if (self.slotTargetsLayerMask(sid, layer_idx, mask)) return true;
@@ -1602,7 +1636,7 @@ pub const LoraRegistry = struct {
         var effective_scale: f32 = if (cfg_meta) |m| m.scale else 1.0;
         var effective_alpha: f32 = if (cfg_meta) |m| m.lora_alpha else 0.0;
         var any_dora: bool = if (cfg_meta) |m| m.use_dora else false;
-        var combined_target_mask: u16 = 0;
+        var combined_target_mask: u32 = 0;
         var wired_bytes: usize = 0;
 
         for (parsed.entries) |*a_entry| {
@@ -1814,7 +1848,7 @@ pub fn buildSyntheticAmloraBytes(
 ) ![]u8 {
     var any_dora = false;
     var extra_entries: usize = 0;
-    var tm_mask: u16 = 0;
+    var tm_mask: u32 = 0;
     for (specs) |sp| {
         tm_mask |= sp.target.bit();
         if (sp.dora_mag_f32 != null) {
@@ -1829,8 +1863,10 @@ pub fn buildSyntheticAmloraBytes(
         .gate_proj, .up_proj,   .down_proj,    .gate_attn,
         .wr_du,     .qkv_proj,  .gate_up_proj, .q_a_proj,
         .q_b_proj,  .kv_a_proj, .kv_b_proj,    .eh_proj,
+        .b_proj,    .f_a_proj,  .f_b_proj,     .g_a_proj,
+        .g_b_proj,
     };
-    const emit_mask: u16 = if (tm_mask != 0) tm_mask else (TargetProjection.q_proj.bit() |
+    const emit_mask: u32 = if (tm_mask != 0) tm_mask else (TargetProjection.q_proj.bit() |
         TargetProjection.k_proj.bit() | TargetProjection.v_proj.bit() | TargetProjection.o_proj.bit() |
         TargetProjection.gate_proj.bit() | TargetProjection.up_proj.bit() | TargetProjection.down_proj.bit());
     for (all_targets) |tp| {
@@ -2452,7 +2488,7 @@ test "W30 universal projections, Inkling-2 aliases, 32 MiB R9 pool, and exact Do
     const gpa = std.testing.allocator;
 
     // 1. TargetProjection 16-bit mask and canonical + architecture-native aliases
-    try std.testing.expectEqual(@as(usize, 16), TargetProjection.COUNT);
+    try std.testing.expectEqual(@as(usize, 21), TargetProjection.COUNT);
     try std.testing.expectEqual(@as(?TargetProjection, .q_proj), TargetProjection.parseModuleName("attn.wq_du"));
     try std.testing.expectEqual(@as(?TargetProjection, .q_proj), TargetProjection.parseModuleName("self_attn.q_proj.linear"));
     try std.testing.expectEqual(@as(?TargetProjection, .k_proj), TargetProjection.parseModuleName("attn.wk_dv"));
@@ -2468,7 +2504,7 @@ test "W30 universal projections, Inkling-2 aliases, 32 MiB R9 pool, and exact Do
     try std.testing.expectEqual(@as(?TargetProjection, .gate_up_proj), TargetProjection.parseModuleName("ffn.w13"));
     try std.testing.expectEqual(@as(?TargetProjection, .kv_a_proj), TargetProjection.parseModuleName("self_attn.kv_a_proj_with_mqa"));
     try std.testing.expectEqual(@as(?TargetProjection, .eh_proj), TargetProjection.parseModuleName("eh_proj"));
-    try std.testing.expectEqual(@as(u16, 1 << 15), TargetProjection.eh_proj.bit());
+    try std.testing.expectEqual(@as(u32, 1 << 15), TargetProjection.eh_proj.bit());
     // M9.1 mimo_v2 & qwen3_5 aliases (q_gate_proj + linear_attn GDN projections)
     try std.testing.expectEqual(@as(?TargetProjection, .gate_attn), TargetProjection.parseModuleName("self_attn.q_gate_proj"));
     try std.testing.expectEqual(@as(?TargetProjection, .gate_attn), TargetProjection.parseModuleName("q_gate_proj"));
@@ -2479,8 +2515,15 @@ test "W30 universal projections, Inkling-2 aliases, 32 MiB R9 pool, and exact Do
     try std.testing.expectEqual(@as(?TargetProjection, .o_proj), TargetProjection.parseModuleName("linear_attn.o_proj"));
     try std.testing.expectEqual(@as(?TargetProjection, .o_proj), TargetProjection.parseModuleName("linear_attn.out_proj"));
     try std.testing.expectEqual(@as(?TargetProjection, .qkv_proj), TargetProjection.parseModuleName("linear_attn.in_proj_qkv"));
+    // M9.2 GLM-5.2/5.3/5.3-Flash KDA & MLA projections
+    try std.testing.expectEqual(@as(?TargetProjection, .b_proj), TargetProjection.parseModuleName("linear_attn.b_proj"));
+    try std.testing.expectEqual(@as(?TargetProjection, .f_a_proj), TargetProjection.parseModuleName("linear_attn.f_a_proj"));
+    try std.testing.expectEqual(@as(?TargetProjection, .f_b_proj), TargetProjection.parseModuleName("linear_attn.f_b_proj"));
+    try std.testing.expectEqual(@as(?TargetProjection, .g_a_proj), TargetProjection.parseModuleName("linear_attn.g_a_proj"));
+    try std.testing.expectEqual(@as(?TargetProjection, .g_b_proj), TargetProjection.parseModuleName("linear_attn.g_b_proj"));
+    try std.testing.expectEqual(@as(u32, 1 << 20), TargetProjection.g_b_proj.bit());
 
-    // 2. parseAdapterConfigJson parses use_dora and widened u16 target_mask
+    // 2. parseAdapterConfigJson parses use_dora and widened u32 target_mask
     const cfg_meta = try parseAdapterConfigJson(
         gpa,
         "{\"r\":64,\"lora_alpha\":128,\"use_dora\":true,\"target_modules\":[\"attn.wq_du\",\"attn.gate_attn\",\"attn.wr_du\",\"ffn.w13\",\"eh_proj\"]}",
@@ -2488,7 +2531,7 @@ test "W30 universal projections, Inkling-2 aliases, 32 MiB R9 pool, and exact Do
     try std.testing.expectEqual(@as(u32, 64), cfg_meta.rank);
     try std.testing.expectApproxEqAbs(@as(f32, 2.0), cfg_meta.scale, 1e-6);
     try std.testing.expect(cfg_meta.use_dora);
-    const expected_mask: u16 = TargetProjection.q_proj.bit() |
+    const expected_mask: u32 = TargetProjection.q_proj.bit() |
         TargetProjection.gate_attn.bit() |
         TargetProjection.wr_du.bit() |
         TargetProjection.gate_up_proj.bit() |

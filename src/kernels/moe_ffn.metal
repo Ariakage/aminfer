@@ -94,7 +94,13 @@ struct MoeGateUpParams {
     uint intermediate_size;
     uint num_groups;
     uint row_bytes;
+    float swiglu_limit;
+    uint _pad_sw0;
+    uint _pad_sw1;
+    uint _pad_sw2;
 };
+
+static_assert(sizeof(MoeGateUpParams) == 32, "MoeGateUpParams must be 32 bytes");
 
 struct MoeDownParams {
     uint hidden_size;
@@ -114,7 +120,10 @@ struct MoeReduceParams {
 
 struct ElemParams {
     uint count;
+    float swiglu_limit;
 };
+
+static_assert(sizeof(ElemParams) == 8, "ElemParams must be 8 bytes");
 
 struct ArgmaxParams {
     uint vocab_size;
@@ -123,6 +132,14 @@ struct ArgmaxParams {
 
 static inline float fast_silu(float x) {
     return x / (1.0f + exp(-x));
+}
+
+static inline float apply_swiglu(float g, float u, float limit) {
+    if (limit > 0.0f) {
+        g = min(g, limit);
+        u = clamp(u, -limit, limit);
+    }
+    return fast_silu(g) * u;
 }
 
 // Prescaled bit-field 8-element dot products for single-token fast path (M=1 / count_u=1).
@@ -666,7 +683,7 @@ kernel void ami_moe_gate_up_swiglu(const device half *x [[buffer(0)]],
             const float gt = simd_sum(g_acc[r]);
             const float ut = simd_sum(u_acc[r]);
             if (lane == 0u && (row0 + r) < p.intermediate_size) {
-                inter[out_base + row0 + r] = half(fast_silu(gt) * ut);
+                inter[out_base + row0 + r] = half(apply_swiglu(gt, ut, p.swiglu_limit));
             }
         }
         return;
@@ -733,10 +750,10 @@ kernel void ami_moe_gate_up_swiglu(const device half *x [[buffer(0)]],
                 const float sg2 = simd_sum(g2), su2 = simd_sum(u2);
                 const float sg3 = simd_sum(g3), su3 = simd_sum(u3);
                 if (lane == 0u) {
-                    inter[ulong(s0 + t_base + 0u) * p.intermediate_size + row] = half(fast_silu(sg0) * su0);
-                    if (rem > 1u) inter[ulong(s0 + t_base + 1u) * p.intermediate_size + row] = half(fast_silu(sg1) * su1);
-                    if (rem > 2u) inter[ulong(s0 + t_base + 2u) * p.intermediate_size + row] = half(fast_silu(sg2) * su2);
-                    if (rem > 3u) inter[ulong(s0 + t_base + 3u) * p.intermediate_size + row] = half(fast_silu(sg3) * su3);
+                    inter[ulong(s0 + t_base + 0u) * p.intermediate_size + row] = half(apply_swiglu(sg0, su0, p.swiglu_limit));
+                    if (rem > 1u) inter[ulong(s0 + t_base + 1u) * p.intermediate_size + row] = half(apply_swiglu(sg1, su1, p.swiglu_limit));
+                    if (rem > 2u) inter[ulong(s0 + t_base + 2u) * p.intermediate_size + row] = half(apply_swiglu(sg2, su2, p.swiglu_limit));
+                    if (rem > 3u) inter[ulong(s0 + t_base + 3u) * p.intermediate_size + row] = half(apply_swiglu(sg3, su3, p.swiglu_limit));
                 }
             }
             t_base += rem;
@@ -807,14 +824,14 @@ kernel void ami_moe_gate_up_swiglu(const device half *x [[buffer(0)]],
                 const float sg6 = simd_sum(g6), su6 = simd_sum(u6);
                 const float sg7 = simd_sum(g7), su7 = simd_sum(u7);
                 if (lane == 0u) {
-                    inter[ulong(s0 + t_base + 0u) * p.intermediate_size + row] = half(fast_silu(sg0) * su0);
-                    inter[ulong(s0 + t_base + 1u) * p.intermediate_size + row] = half(fast_silu(sg1) * su1);
-                    inter[ulong(s0 + t_base + 2u) * p.intermediate_size + row] = half(fast_silu(sg2) * su2);
-                    inter[ulong(s0 + t_base + 3u) * p.intermediate_size + row] = half(fast_silu(sg3) * su3);
-                    inter[ulong(s0 + t_base + 4u) * p.intermediate_size + row] = half(fast_silu(sg4) * su4);
-                    if (t_cnt > 5u) inter[ulong(s0 + t_base + 5u) * p.intermediate_size + row] = half(fast_silu(sg5) * su5);
-                    if (t_cnt > 6u) inter[ulong(s0 + t_base + 6u) * p.intermediate_size + row] = half(fast_silu(sg6) * su6);
-                    if (t_cnt > 7u) inter[ulong(s0 + t_base + 7u) * p.intermediate_size + row] = half(fast_silu(sg7) * su7);
+                    inter[ulong(s0 + t_base + 0u) * p.intermediate_size + row] = half(apply_swiglu(sg0, su0, p.swiglu_limit));
+                    inter[ulong(s0 + t_base + 1u) * p.intermediate_size + row] = half(apply_swiglu(sg1, su1, p.swiglu_limit));
+                    inter[ulong(s0 + t_base + 2u) * p.intermediate_size + row] = half(apply_swiglu(sg2, su2, p.swiglu_limit));
+                    inter[ulong(s0 + t_base + 3u) * p.intermediate_size + row] = half(apply_swiglu(sg3, su3, p.swiglu_limit));
+                    inter[ulong(s0 + t_base + 4u) * p.intermediate_size + row] = half(apply_swiglu(sg4, su4, p.swiglu_limit));
+                    if (t_cnt > 5u) inter[ulong(s0 + t_base + 5u) * p.intermediate_size + row] = half(apply_swiglu(sg5, su5, p.swiglu_limit));
+                    if (t_cnt > 6u) inter[ulong(s0 + t_base + 6u) * p.intermediate_size + row] = half(apply_swiglu(sg6, su6, p.swiglu_limit));
+                    if (t_cnt > 7u) inter[ulong(s0 + t_base + 7u) * p.intermediate_size + row] = half(apply_swiglu(sg7, su7, p.swiglu_limit));
                 }
             }
             t_base += t_cnt;
@@ -1089,7 +1106,7 @@ kernel void ami_silu_mul_f16(const device half *gate [[buffer(0)]],
     }
     const float g = float(gate[gid]);
     const float u = float(up[gid]);
-    out[gid] = half(fast_silu(g) * u);
+    out[gid] = half(apply_swiglu(g, u, p.swiglu_limit));
 }
 
 // ---------------------------------------------------------------------------
@@ -1403,7 +1420,7 @@ kernel void ami_moe_gate_up_swiglu_float(const device half *x [[buffer(0)]],
                 const float ut = simd_sum(u_acc[r][t]);
                 if (lane == 0u && t < t_cnt && (row0 + r) < p.intermediate_size) {
                     const ulong slot = ulong(s0 + t_base + t);
-                    inter[slot * p.intermediate_size + row0 + r] = half(fast_silu(gt) * ut);
+                    inter[slot * p.intermediate_size + row0 + r] = half(apply_swiglu(gt, ut, p.swiglu_limit));
                 }
             }
         }
@@ -1605,12 +1622,14 @@ struct MoePerSlotParams {
     uint row_bytes;
     uint m;
     uint top_k;
+    float swiglu_limit;
+    uint _pad_sw;
 };
 
 static_assert(sizeof(ArgmaxRowsParams) == 16, "ArgmaxRowsParams must be 16 bytes");
 static_assert(sizeof(TopKCandidate) == 16, "TopKCandidate must be 16 bytes");
 static_assert(sizeof(TopKLogitsRowsParams) == 16, "TopKLogitsRowsParams must be 16 bytes");
-static_assert(sizeof(MoePerSlotParams) == 24, "MoePerSlotParams must be 24 bytes");
+static_assert(sizeof(MoePerSlotParams) == 32, "MoePerSlotParams must be 32 bytes");
 
 // ---------------------------------------------------------------------------
 // Kernel 13: Batched M-Row Greedy Argmax (`[M, vocab_size]` f16/f32 -> `[M]u32`)
@@ -2066,7 +2085,7 @@ kernel void ami_moe_gate_up_swiglu_perslot(const device half *x [[buffer(0)]],
         const float gt = simd_sum(g_acc[r]);
         const float ut = simd_sum(u_acc[r]);
         if (lane == 0u && (row0 + r) < p.intermediate_size) {
-            inter[out_base + row0 + r] = half(fast_silu(gt) * ut);
+            inter[out_base + row0 + r] = half(apply_swiglu(gt, ut, p.swiglu_limit));
         }
     }
 }
@@ -2632,7 +2651,7 @@ struct MoeSharedGateUpParams {
     uint intermediate_size;
     uint num_groups;
     uint row_bytes;
-    uint _pad0;
+    float swiglu_limit;
     uint _pad1;
     uint _pad2;
 };
@@ -2794,10 +2813,10 @@ kernel void ami_moe_shared_gate_up_swiglu(const device half *x [[buffer(0)]],
         const float gt3 = (cnt > 3u) ? simd_sum(g3) : 0.0f;
         const float ut3 = (cnt > 3u) ? simd_sum(u3) : 0.0f;
         if (lane == 0u) {
-            shared_inter[ulong(tok_base + 0u) * p.intermediate_size + row] = half(fast_silu(gt0) * ut0);
-            if (cnt > 1u) shared_inter[ulong(tok_base + 1u) * p.intermediate_size + row] = half(fast_silu(gt1) * ut1);
-            if (cnt > 2u) shared_inter[ulong(tok_base + 2u) * p.intermediate_size + row] = half(fast_silu(gt2) * ut2);
-            if (cnt > 3u) shared_inter[ulong(tok_base + 3u) * p.intermediate_size + row] = half(fast_silu(gt3) * ut3);
+            shared_inter[ulong(tok_base + 0u) * p.intermediate_size + row] = half(apply_swiglu(gt0, ut0, p.swiglu_limit));
+            if (cnt > 1u) shared_inter[ulong(tok_base + 1u) * p.intermediate_size + row] = half(apply_swiglu(gt1, ut1, p.swiglu_limit));
+            if (cnt > 2u) shared_inter[ulong(tok_base + 2u) * p.intermediate_size + row] = half(apply_swiglu(gt2, ut2, p.swiglu_limit));
+            if (cnt > 3u) shared_inter[ulong(tok_base + 3u) * p.intermediate_size + row] = half(apply_swiglu(gt3, ut3, p.swiglu_limit));
         }
     }
 }
@@ -2843,7 +2862,7 @@ kernel void ami_moe_shared_gate_up_swiglu_float(const device half *x [[buffer(0)
     const float gt = simd_sum(g_acc);
     const float ut = simd_sum(u_acc);
     if (lane == 0u) {
-        shared_inter[ulong(tok) * p.intermediate_size + row] = half(fast_silu(gt) * ut);
+        shared_inter[ulong(tok) * p.intermediate_size + row] = half(apply_swiglu(gt, ut, p.swiglu_limit));
     }
 }
 

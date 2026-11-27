@@ -83,6 +83,24 @@ pub const BackboneKind = enum {
     }
 };
 
+pub const DsaIndexerMode = enum {
+    full,
+    shared,
+
+    pub fn label(self: DsaIndexerMode) []const u8 {
+        return switch (self) {
+            .full => "full",
+            .shared => "shared",
+        };
+    }
+
+    pub fn parse(s: []const u8) error{InvalidOperatorAxis}!DsaIndexerMode {
+        if (std.mem.eql(u8, s, "full")) return .full;
+        if (std.mem.eql(u8, s, "shared")) return .shared;
+        return error.InvalidOperatorAxis;
+    }
+};
+
 pub const AttentionKind = enum {
     gqa_full,
     gated_deltanet,
@@ -92,6 +110,11 @@ pub const AttentionKind = enum {
     swa_ring,
     /// Reserved for M7 Tier 3 (`CSA2`).
     mla_csa2,
+    /// `G27` Kimi Delta Attention (`GLM-5.3-Flash` `34L` linear attention & `Ling-3.1`).
+    kda_linear,
+    /// `G27` DeepSeek Sparse Attention + MLA (`GLM-5.2`/`GLM-5.3` `index_topk_freq=4`,
+    /// `GLM-5.3-Flash` `NoPE MLA` `qk_rope=0`, `index_kpool=4`).
+    mla_dsa,
 
     pub fn label(self: AttentionKind) []const u8 {
         return switch (self) {
@@ -100,6 +123,8 @@ pub const AttentionKind = enum {
             .qsa_sparse => "qsa_sparse",
             .swa_ring => "swa_ring",
             .mla_csa2 => "mla_csa2",
+            .kda_linear => "kda_linear",
+            .mla_dsa => "mla_dsa",
         };
     }
 
@@ -109,6 +134,8 @@ pub const AttentionKind = enum {
         if (std.mem.eql(u8, s, "qsa_sparse") or std.mem.eql(u8, s, "qsa")) return .qsa_sparse;
         if (std.mem.eql(u8, s, "swa_ring") or std.mem.eql(u8, s, "sliding_attention") or std.mem.eql(u8, s, "sliding_window_attention")) return .swa_ring;
         if (std.mem.eql(u8, s, "mla_csa2") or std.mem.eql(u8, s, "csa2")) return .mla_csa2;
+        if (std.mem.eql(u8, s, "kda_linear") or std.mem.eql(u8, s, "kda")) return .kda_linear;
+        if (std.mem.eql(u8, s, "mla_dsa") or std.mem.eql(u8, s, "deepseek_sparse_attention") or std.mem.eql(u8, s, "mla_attention") or std.mem.eql(u8, s, "indexed_attention")) return .mla_dsa;
         return error.InvalidOperatorAxis;
     }
 };
@@ -136,12 +163,19 @@ pub const ResidualKind = enum {
     gated_4branch,
     /// Reserved for M7 Tier 3 (`Single-Pass mHC`).
     mhc_single_pass,
+    /// `G27` single-kernel register-fused 20-step `hc_mult=4` `mHC` Sinkhorn (`GLM-5.3-Flash`).
+    mhc_sinkhorn20,
+
+    pub fn usesMhcStreams(self: ResidualKind) bool {
+        return self == .mhc_single_pass or self == .mhc_sinkhorn20;
+    }
 
     pub fn label(self: ResidualKind) []const u8 {
         return switch (self) {
             .single_stream => "single_stream",
             .gated_4branch => "gated_4branch",
             .mhc_single_pass => "mhc_single_pass",
+            .mhc_sinkhorn20 => "mhc_sinkhorn20",
         };
     }
 
@@ -149,6 +183,7 @@ pub const ResidualKind = enum {
         if (std.mem.eql(u8, s, "single_stream")) return .single_stream;
         if (std.mem.eql(u8, s, "gated_4branch")) return .gated_4branch;
         if (std.mem.eql(u8, s, "mhc_single_pass")) return .mhc_single_pass;
+        if (std.mem.eql(u8, s, "mhc_sinkhorn20") or std.mem.eql(u8, s, "mhc_sinkhorn") or std.mem.eql(u8, s, "mhc")) return .mhc_sinkhorn20;
         return error.InvalidOperatorAxis;
     }
 };
@@ -321,11 +356,24 @@ pub const OperatorAxes = struct {
         return false;
     }
 
+    pub fn hasKda(self: OperatorAxes) bool {
+        for (self.layer_attention_kinds) |k| if (k == .kda_linear) return true;
+        return false;
+    }
+
+    pub fn hasMlaDsa(self: OperatorAxes) bool {
+        for (self.layer_attention_kinds) |k| if (k == .mla_dsa) return true;
+        return false;
+    }
+
     pub fn attentionSummaryLabel(self: OperatorAxes) []const u8 {
         if (self.layer_attention_kinds.len == 0) return "gqa_full";
         const first = self.layer_attention_kinds[0];
         for (self.layer_attention_kinds[1..]) |k| {
-            if (k != first) return "hybrid_gdn_qsa";
+            if (k != first) {
+                if (self.hasKda() and self.hasMlaDsa()) return "hybrid_kda_mla_dsa";
+                return "hybrid_gdn_qsa";
+            }
         }
         return first.label();
     }
@@ -442,6 +490,30 @@ pub const GraphConfig = struct {
     rmsnorm_unit_offset: bool = false,
     attn_output_gate: bool = false,
 
+    // M9.2 (`G27`): `glm_moe_dsa` (`GLM-5.2`/`GLM-5.3`: `index_topk_freq=4` 3/4 shared DSA
+    // + `index_share_for_mtp_iteration=true`) and `glm5_next` (`GLM-5.3-Flash`: 20-step
+    // `hc_mult=4` `mHC` Sinkhorn + `34L` KDA + `11L` NoPE MLA `index_kpool=4` + `swiglu_limit=10.0`).
+    is_glm_moe_dsa: bool = false,
+    is_glm5_next: bool = false,
+    swiglu_limit: f32 = 0.0,
+    mhc_sinkhorn_iters: u32 = 20,
+    mhc_hc_eps: f32 = 1e-6,
+    index_n_heads: u32 = 0,
+    index_head_dim: u32 = 0,
+    index_topk: u32 = 2048,
+    index_topk_freq: u32 = 1,
+    index_skip_topk_offset: u32 = 0,
+    indexer_types: []DsaIndexerMode = &.{},
+    index_share_for_mtp_iteration: bool = false,
+    rope_interleave: bool = false,
+    indexer_rope_interleave: bool = false,
+    index_kpool: u32 = 1,
+    index_kpool_always_select_tail: bool = false,
+    kda_num_heads: u32 = 0,
+    kda_head_dim: u32 = 0,
+    kda_lora_rank: u32 = 0,
+    kda_lower_bound: f32 = -5.0,
+
     pub const ConfigError = error{
         InvalidJson,
         InvalidConfig,
@@ -461,6 +533,10 @@ pub const GraphConfig = struct {
         if (self.csa2_modes.len > 0) {
             allocator.free(self.csa2_modes);
             self.csa2_modes = &.{};
+        }
+        if (self.indexer_types.len > 0) {
+            allocator.free(self.indexer_types);
+            self.indexer_types = &.{};
         }
         for (self.ple_shard_files) |s| allocator.free(s);
         if (self.ple_shard_files.len > 0) {
@@ -636,6 +712,21 @@ pub const GraphConfig = struct {
         return self.linear_num_value_heads * self.linear_value_head_dim;
     }
 
+    pub fn kdaQkvDim(self: GraphConfig) u32 {
+        return self.kda_num_heads * self.kda_head_dim;
+    }
+
+    pub fn effectiveKdaLoraRank(self: GraphConfig) u32 {
+        return if (self.kda_lora_rank > 0) self.kda_lora_rank else self.kda_head_dim;
+    }
+
+    pub fn dsaIndexerMode(self: GraphConfig, layer_idx: usize) DsaIndexerMode {
+        if (layer_idx < self.indexer_types.len) return self.indexer_types[layer_idx];
+        if (self.index_topk_freq <= 1) return .full;
+        const shifted: i64 = @max(@as(i64, @intCast(layer_idx)) - @as(i64, @intCast(self.index_skip_topk_offset)) + 1, 0);
+        return if (@mod(shifted, @as(i64, @intCast(self.index_topk_freq))) == 0) .full else .shared;
+    }
+
     pub fn validate(self: GraphConfig) ConfigError!void {
         if (self.vocab_size == 0 or self.hidden_size == 0 or self.num_hidden_layers == 0) return error.InvalidConfig;
         if (self.m82_family != .none) {
@@ -725,6 +816,33 @@ pub const GraphConfig = struct {
             }
             if (self.linear_conv_kernel_dim > 8) return error.InvalidConfig;
         }
+        if (self.axes.hasKda()) {
+            if (self.kda_num_heads == 0 or self.kda_head_dim == 0) return error.InvalidConfig;
+            if (self.kda_head_dim > hybrid.MAX_GDN_HEAD_DIM) return error.InvalidConfig;
+            if (self.linear_conv_kernel_dim > 8) return error.InvalidConfig;
+        }
+        if (self.axes.hasMlaDsa()) {
+            if (self.num_attention_heads == 0 or self.kv_lora_rank == 0 or self.q_lora_rank == 0 or
+                self.qk_nope_head_dim == 0 or self.v_head_dim == 0)
+            {
+                return error.InvalidConfig;
+            }
+            if (self.kv_lora_rank > hybrid.MAX_MLA_LATENT_DIM) return error.InvalidConfig;
+            if ((self.qk_rope_head_dim % 2) != 0 or self.qk_rope_head_dim > hybrid.MAX_MLA_ROPE_DIM) return error.InvalidConfig;
+            if (self.index_n_heads == 0 or self.index_head_dim == 0) return error.InvalidConfig;
+            if (self.index_kpool == 0 or self.index_kpool > 8) return error.InvalidConfig;
+            if (self.indexer_types.len > 0 and self.indexer_types.len != self.num_hidden_layers) return error.InvalidConfig;
+            var has_prev_full_dsa = false;
+            for (0..self.num_hidden_layers) |l| {
+                if (self.axes.layer_attention_kinds[l] != .mla_dsa) continue;
+                switch (self.dsaIndexerMode(l)) {
+                    .full => has_prev_full_dsa = true,
+                    .shared => {
+                        if (!has_prev_full_dsa) return error.InvalidConfig;
+                    },
+                }
+            }
+        }
         if (self.layer_ffn_kinds.len > 0 and self.layer_ffn_kinds.len != self.num_hidden_layers) {
             return error.InvalidConfig;
         }
@@ -752,6 +870,9 @@ pub const GraphConfig = struct {
                 return error.InvalidConfig;
             }
         }
+        if (self.axes.residual_kind == .mhc_sinkhorn20) {
+            if (self.mhc_num_streams != 4) return error.InvalidConfig;
+        }
         if (self.axes.memory_lookup_kind == .ple_ngram) {
             if (self.ple_embed_dim != 0 and self.ple_embed_dim != self.hidden_size) return error.InvalidConfig;
         } else if (self.axes.memory_lookup_kind == .engram) {
@@ -776,6 +897,15 @@ pub const GraphConfig = struct {
         if (std.mem.indexOf(u8, json_bytes, "\"mimo2\"") != null) return true;
         if (std.mem.indexOf(u8, json_bytes, "\"qwen3_5\"") != null) return true;
         if (std.mem.indexOf(u8, json_bytes, "\"qwen3_5_text\"") != null) return true;
+        if (std.mem.indexOf(u8, json_bytes, "\"glm_moe_dsa\"") != null) return true;
+        if (std.mem.indexOf(u8, json_bytes, "\"glm5_next\"") != null) return true;
+        if (std.mem.indexOf(u8, json_bytes, "\"glm5_next_text\"") != null) return true;
+        if (std.mem.indexOf(u8, json_bytes, "\"deepseek_sparse_attention\"") != null) return true;
+        if (std.mem.indexOf(u8, json_bytes, "\"kda_linear\"") != null) return true;
+        if (std.mem.indexOf(u8, json_bytes, "\"mla_dsa\"") != null) return true;
+        if (std.mem.indexOf(u8, json_bytes, "\"mhc_sinkhorn20\"") != null) return true;
+        if (std.mem.indexOf(u8, json_bytes, "\"index_topk_freq\"") != null) return true;
+        if (std.mem.indexOf(u8, json_bytes, "\"index_kpool\"") != null) return true;
         if (std.mem.indexOf(u8, json_bytes, "\"sliding_attention\"") != null) return true;
         if (std.mem.indexOf(u8, json_bytes, "\"sliding_window_attention\"") != null) return true;
         if (std.mem.indexOf(u8, json_bytes, "\"linear_attention\"") != null) return true;
@@ -834,6 +964,12 @@ pub const GraphConfig = struct {
             std.mem.eql(u8, model_type, "qwen3_5_text") or
             std.mem.eql(u8, root_model_type, "qwen3_5") or
             std.mem.eql(u8, root_model_type, "qwen3_5_text");
+        const is_glm_moe_dsa = std.mem.eql(u8, model_type, "glm_moe_dsa") or
+            std.mem.eql(u8, root_model_type, "glm_moe_dsa");
+        const is_glm5_next = std.mem.eql(u8, model_type, "glm5_next") or
+            std.mem.eql(u8, model_type, "glm5_next_text") or
+            std.mem.eql(u8, root_model_type, "glm5_next") or
+            std.mem.eql(u8, root_model_type, "glm5_next_text");
         const is_looplm = std.mem.eql(u8, model_type, "looplm") or
             std.mem.eql(u8, model_type, "huginn") or
             std.mem.eql(u8, model_type, "ouro");
@@ -854,7 +990,18 @@ pub const GraphConfig = struct {
         var layer_ffn_kinds: []FfnKind = &.{};
         errdefer if (layer_ffn_kinds.len > 0) allocator.free(layer_ffn_kinds);
         if (raw_num_experts > 0) {
-            if (obj.get("moe_layer_freq") orelse root.get("moe_layer_freq")) |mlf_val| {
+            if (obj.get("mlp_layer_types") orelse root.get("mlp_layer_types")) |mlt_val| {
+                if (mlt_val == .array and mlt_val.array.items.len == num_layers) {
+                    layer_ffn_kinds = try allocator.alloc(FfnKind, num_layers);
+                    for (mlt_val.array.items, 0..) |item, l| {
+                        if (item == .string and (std.mem.eql(u8, item.string, "dense") or std.mem.eql(u8, item.string, "dense_swiglu"))) {
+                            layer_ffn_kinds[l] = .dense_swiglu;
+                        } else {
+                            layer_ffn_kinds[l] = .moe_swiglu;
+                        }
+                    }
+                }
+            } else if (obj.get("moe_layer_freq") orelse root.get("moe_layer_freq")) |mlf_val| {
                 if (mlf_val == .array and mlf_val.array.items.len == num_layers) {
                     layer_ffn_kinds = try allocator.alloc(FfnKind, num_layers);
                     for (mlf_val.array.items, 0..) |item, l| {
@@ -872,20 +1019,35 @@ pub const GraphConfig = struct {
                         }
                     }
                 }
-            } else if (is_mimo_v2 and num_layers > 1 and (jsonU32(obj, "intermediate_size") orelse 0) > 0) {
-                // Canonical MiMo-V2.6 layout when `moe_layer_freq` is omitted: dense L0 + MoE L1..N-1.
-                layer_ffn_kinds = try allocator.alloc(FfnKind, num_layers);
-                @memset(layer_ffn_kinds, .moe_swiglu);
-                layer_ffn_kinds[0] = .dense_swiglu;
+            }
+            if (layer_ffn_kinds.len == 0) {
+                if (jsonU32(obj, "first_k_dense_replace") orelse jsonU32(root, "first_k_dense_replace")) |fkd| {
+                    if (fkd > 0) {
+                        layer_ffn_kinds = try allocator.alloc(FfnKind, num_layers);
+                        for (0..num_layers) |l| {
+                            layer_ffn_kinds[l] = if (l < fkd) .dense_swiglu else .moe_swiglu;
+                        }
+                    }
+                } else if (is_mimo_v2 and num_layers > 1 and (jsonU32(obj, "intermediate_size") orelse 0) > 0) {
+                    // Canonical MiMo-V2.6 layout when `moe_layer_freq` is omitted: dense L0 + MoE L1..N-1.
+                    layer_ffn_kinds = try allocator.alloc(FfnKind, num_layers);
+                    @memset(layer_ffn_kinds, .moe_swiglu);
+                    layer_ffn_kinds[0] = .dense_swiglu;
+                }
             }
         }
+        const n_shared_experts: u32 = jsonU32(obj, "n_shared_experts") orelse 0;
         var has_shared_expert: bool = jsonBool(obj, "has_shared_expert") orelse
-            ((jsonU32(obj, "shared_expert_intermediate_size") orelse 0) > 0) or
-            ((jsonU32(obj, "n_shared_experts") orelse 0) > 0);
-        const mhc_num_streams: u32 = jsonU32(obj, "mhc_num_streams") orelse hybrid.DEFAULT_MHC_STREAMS;
+            (((jsonU32(obj, "shared_expert_intermediate_size") orelse 0) > 0) or (n_shared_experts > 0));
+        const has_mhc_s20_flag: bool = (jsonBool(obj, "mhc") orelse false) or
+            ((jsonU32(obj, "hc_mult") orelse 0) > 1) or is_glm5_next;
+        const mhc_num_streams: u32 = jsonU32(obj, "hc_mult") orelse
+            jsonU32(obj, "mhc_num_streams") orelse hybrid.DEFAULT_MHC_STREAMS;
         var residual_branches: u32 = jsonU32(obj, "residual_branches") orelse
-            (if (is_deepseek41) mhc_num_streams else if (is_qwen4) @as(u32, 4) else 1);
-        var residual_kind: ResidualKind = if (is_deepseek41)
+            (if (is_deepseek41 or has_mhc_s20_flag) mhc_num_streams else if (is_qwen4) @as(u32, 4) else 1);
+        var residual_kind: ResidualKind = if (has_mhc_s20_flag)
+            .mhc_sinkhorn20
+        else if (is_deepseek41)
             .mhc_single_pass
         else if (residual_branches == 4)
             .gated_4branch
@@ -910,12 +1072,52 @@ pub const GraphConfig = struct {
         for (0..num_layers) |l| {
             layer_attns[l] = if (is_deepseek41)
                 .mla_csa2
+            else if (is_glm_moe_dsa)
+                .mla_dsa
+            else if (is_glm5_next)
+                (if (((l + 1) % full_interval) == 0) .mla_dsa else .kda_linear)
             else if (is_qwen4)
                 (if (((l + 1) % full_interval) == 0) .qsa_sparse else .gated_deltanet)
             else if (is_qwen3_5)
                 (if (((l + 1) % full_interval) == 0) .gqa_full else .gated_deltanet)
             else
                 .gqa_full;
+        }
+
+        // Override from `linear_attn_config.{kda_layers,full_attn_layers}` if present on `glm5_next`.
+        var kda_num_heads: u32 = jsonU32(obj, "kda_num_heads") orelse 0;
+        var kda_head_dim: u32 = jsonU32(obj, "kda_head_dim") orelse 0;
+        var kda_lora_rank: u32 = jsonU32(obj, "kda_lora_rank") orelse 0;
+        var kda_lower_bound: f32 = jsonF32(obj, "kda_lower_bound") orelse jsonF32(obj, "gate_lower_bound") orelse -5.0;
+        var linear_conv_kernel_dim: u32 = jsonU32(obj, "linear_conv_kernel_dim") orelse
+            jsonU32(obj, "short_conv_kernel_size") orelse 4;
+        if (obj.get("linear_attn_config") orelse root.get("linear_attn_config")) |lac_val| {
+            if (lac_val == .object) {
+                const lac = lac_val.object;
+                if (jsonU32(lac, "num_heads")) |nh| kda_num_heads = nh;
+                if (jsonU32(lac, "head_dim")) |hd| kda_head_dim = hd;
+                if (jsonU32(lac, "lora_rank")) |lr| kda_lora_rank = lr;
+                if (jsonF32(lac, "gate_lower_bound")) |lb| kda_lower_bound = lb;
+                if (jsonU32(lac, "short_conv_kernel_size")) |ck| linear_conv_kernel_dim = ck;
+                if (lac.get("kda_layers")) |kl_val| {
+                    if (kl_val == .array) {
+                        for (kl_val.array.items) |item| {
+                            if (jsonItemU32(item)) |li| {
+                                if (li < num_layers) layer_attns[li] = .kda_linear;
+                            }
+                        }
+                    }
+                }
+                if (lac.get("full_attn_layers")) |fl_val| {
+                    if (fl_val == .array) {
+                        for (fl_val.array.items) |item| {
+                            if (jsonItemU32(item)) |li| {
+                                if (li < num_layers) layer_attns[li] = .mla_dsa;
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         // Override from `hybrid_layer_pattern` (raw HF `MiMo-V2.6`: 0 = full_attention, 1 = sliding_attention).
@@ -936,7 +1138,13 @@ pub const GraphConfig = struct {
                 if (lt_val == .array and lt_val.array.items.len == num_layers) {
                     for (lt_val.array.items, 0..) |item, l| {
                         if (item == .string) {
-                            layer_attns[l] = AttentionKind.parse(item.string) catch return error.UnsupportedOperatorAxis;
+                            if (is_glm5_next and std.mem.eql(u8, item.string, "linear_attention")) {
+                                layer_attns[l] = .kda_linear;
+                            } else if (is_glm5_next and std.mem.eql(u8, item.string, "full_attention")) {
+                                layer_attns[l] = .mla_dsa;
+                            } else {
+                                layer_attns[l] = AttentionKind.parse(item.string) catch return error.UnsupportedOperatorAxis;
+                            }
                         }
                     }
                 }
@@ -974,8 +1182,8 @@ pub const GraphConfig = struct {
                 }
             }
         }
-        const eff_mhc_streams: u32 = if (residual_kind == .mhc_single_pass)
-            (jsonU32(obj, "mhc_num_streams") orelse residual_branches)
+        const eff_mhc_streams: u32 = if (residual_kind.usesMhcStreams())
+            (jsonU32(obj, "hc_mult") orelse jsonU32(obj, "mhc_num_streams") orelse residual_branches)
         else
             mhc_num_streams;
 
@@ -1040,6 +1248,36 @@ pub const GraphConfig = struct {
                     } else {
                         return error.InvalidConfig;
                     }
+                }
+            }
+        }
+
+        var has_mla_dsa = false;
+        for (layer_attns) |ak| {
+            if (ak == .mla_dsa) {
+                has_mla_dsa = true;
+                break;
+            }
+        }
+        const index_topk_freq: u32 = jsonU32(obj, "index_topk_freq") orelse 1;
+        const index_skip_topk_offset: u32 = jsonU32(obj, "index_skip_topk_offset") orelse 0;
+        var indexer_types: []DsaIndexerMode = &.{};
+        errdefer if (indexer_types.len > 0) allocator.free(indexer_types);
+        if (has_mla_dsa or obj.get("indexer_types") != null or root.get("indexer_types") != null) {
+            indexer_types = try allocator.alloc(DsaIndexerMode, num_layers);
+            for (0..num_layers) |l| {
+                if (layer_attns[l] != .mla_dsa or index_topk_freq <= 1) {
+                    indexer_types[l] = .full;
+                } else {
+                    const shifted: i64 = @max(@as(i64, @intCast(l)) - @as(i64, @intCast(index_skip_topk_offset)) + 1, 0);
+                    indexer_types[l] = if (@mod(shifted, @as(i64, @intCast(index_topk_freq))) == 0) .full else .shared;
+                }
+            }
+            if (obj.get("indexer_types") orelse root.get("indexer_types")) |it_val| {
+                if (it_val != .array or it_val.array.items.len != num_layers) return error.InvalidConfig;
+                for (it_val.array.items, 0..) |item, l| {
+                    if (item != .string) return error.InvalidConfig;
+                    indexer_types[l] = DsaIndexerMode.parse(item.string) catch return error.InvalidConfig;
                 }
             }
         }
@@ -1262,6 +1500,15 @@ pub const GraphConfig = struct {
         const attn_output_gate: bool = jsonBool(obj, "attn_output_gate") orelse
             jsonBool(root, "attn_output_gate") orelse is_qwen3_5;
 
+        const moe_inter_size: u32 = jsonU32(obj, "moe_intermediate_size") orelse (if (m82_family.isInkling2()) (jsonU32(obj, "intermediate_size") orelse 0) else 0);
+        const shared_inter_size: u32 = jsonU32(obj, "shared_expert_intermediate_size") orelse
+            (if (n_shared_experts > 0) n_shared_experts * moe_inter_size else 0);
+        const swiglu_limit: f32 = jsonF32(obj, "swiglu_limit") orelse jsonF32(root, "swiglu_limit") orelse 0.0;
+        const mhc_sinkhorn_iters: u32 = jsonU32(obj, "hc_sinkhorn_iters") orelse jsonU32(obj, "sinkhorn_iters") orelse 20;
+        const mhc_hc_eps: f32 = jsonF32(obj, "hc_eps") orelse 1e-6;
+        const rope_interleave: bool = jsonBool(obj, "rope_interleave") orelse is_glm_moe_dsa;
+        const indexer_rope_interleave: bool = jsonBool(obj, "indexer_rope_interleave") orelse (is_glm_moe_dsa or is_glm5_next);
+
         const cfg: GraphConfig = .{
             .axes = .{
                 .backbone_kind = backbone_kind,
@@ -1269,7 +1516,7 @@ pub const GraphConfig = struct {
                 .ffn_kind = ffn_kind,
                 .has_shared_expert = has_shared_expert,
                 .residual_kind = residual_kind,
-                .residual_branches = if (residual_kind == .mhc_single_pass) eff_mhc_streams else residual_branches,
+                .residual_branches = if (residual_kind.usesMhcStreams()) eff_mhc_streams else residual_branches,
                 .memory_lookup_kind = mem_kind,
                 .loop_schedule = ls,
             },
@@ -1280,8 +1527,8 @@ pub const GraphConfig = struct {
             .num_key_value_heads = num_kv_heads,
             .head_dim = head_dim,
             .intermediate_size = jsonU32(obj, "intermediate_size") orelse 0,
-            .moe_intermediate_size = jsonU32(obj, "moe_intermediate_size") orelse (if (m82_family.isInkling2()) (jsonU32(obj, "intermediate_size") orelse 0) else 0),
-            .shared_expert_intermediate_size = jsonU32(obj, "shared_expert_intermediate_size") orelse 0,
+            .moe_intermediate_size = moe_inter_size,
+            .shared_expert_intermediate_size = shared_inter_size,
             .num_experts = raw_num_experts,
             .num_experts_per_tok = raw_top_k,
             .norm_topk_prob = jsonBool(obj, "norm_topk_prob") orelse true,
@@ -1296,8 +1543,8 @@ pub const GraphConfig = struct {
             },
             .max_position_embeddings = jsonU32(obj, "max_position_embeddings") orelse jsonU32(obj, "model_max_length") orelse 32768,
             .tie_word_embeddings = jsonBool(obj, "tie_word_embeddings") orelse false,
-            .bos_token_id = jsonU32(obj, "bos_token_id") orelse jsonU32(root, "bos_token_id") orelse 151643,
-            .eos_token_id = jsonU32(obj, "eos_token_id") orelse jsonU32(root, "eos_token_id") orelse 151645,
+            .bos_token_id = jsonU32OrFirst(obj, "bos_token_id") orelse jsonU32OrFirst(root, "bos_token_id") orelse 151643,
+            .eos_token_id = jsonU32OrFirst(obj, "eos_token_id") orelse jsonU32OrFirst(root, "eos_token_id") orelse 151645,
             .quant_bits = qbits,
             .group_size = gsize,
             .num_encoder_layers = num_encoder_layers,
@@ -1320,7 +1567,7 @@ pub const GraphConfig = struct {
             .linear_num_value_heads = jsonU32(obj, "linear_num_value_heads") orelse 0,
             .linear_key_head_dim = jsonU32(obj, "linear_key_head_dim") orelse 0,
             .linear_value_head_dim = jsonU32(obj, "linear_value_head_dim") orelse 0,
-            .linear_conv_kernel_dim = jsonU32(obj, "linear_conv_kernel_dim") orelse 4,
+            .linear_conv_kernel_dim = linear_conv_kernel_dim,
             .qsa_block_size = jsonU32(obj, "qsa_block_size") orelse hybrid.QSA_DEFAULT_BLOCK_TOKENS,
             .qsa_top_k_blocks = jsonU32(obj, "qsa_top_k_blocks") orelse 8,
             .qsa_window_size = jsonU32(obj, "qsa_window_size") orelse 0,
@@ -1363,11 +1610,37 @@ pub const GraphConfig = struct {
             .moe_topk_group = jsonU32(obj, "topk_group") orelse 1,
             .rmsnorm_unit_offset = rmsnorm_unit_offset,
             .attn_output_gate = attn_output_gate,
+            .is_glm_moe_dsa = is_glm_moe_dsa,
+            .is_glm5_next = is_glm5_next,
+            .swiglu_limit = swiglu_limit,
+            .mhc_sinkhorn_iters = mhc_sinkhorn_iters,
+            .mhc_hc_eps = mhc_hc_eps,
+            .index_n_heads = jsonU32(obj, "index_n_heads") orelse 0,
+            .index_head_dim = jsonU32(obj, "index_head_dim") orelse 0,
+            .index_topk = jsonU32(obj, "index_topk") orelse 2048,
+            .index_topk_freq = index_topk_freq,
+            .index_skip_topk_offset = index_skip_topk_offset,
+            .indexer_types = indexer_types,
+            .index_share_for_mtp_iteration = jsonBool(obj, "index_share_for_mtp_iteration") orelse false,
+            .rope_interleave = rope_interleave,
+            .indexer_rope_interleave = indexer_rope_interleave,
+            .index_kpool = jsonU32(obj, "index_kpool") orelse 1,
+            .index_kpool_always_select_tail = jsonBool(obj, "index_kpool_always_select_tail") orelse false,
+            .kda_num_heads = kda_num_heads,
+            .kda_head_dim = kda_head_dim,
+            .kda_lora_rank = kda_lora_rank,
+            .kda_lower_bound = kda_lower_bound,
         };
         try cfg.validate();
         return cfg;
     }
 };
+
+fn jsonU32OrFirst(obj: std.json.ObjectMap, key: []const u8) ?u32 {
+    const v = obj.get(key) orelse return null;
+    if (v == .array and v.array.items.len > 0) return jsonItemU32(v.array.items[0]);
+    return jsonItemU32(v);
+}
 
 fn jsonStr(obj: std.json.ObjectMap, key: []const u8) ?[]const u8 {
     const v = obj.get(key) orelse return null;
@@ -1679,6 +1952,102 @@ const MhcLayerWeights = struct {
     h_res_bind: metal.BufferBinding,
 };
 
+const MhcSinkhornSublayerWeights = struct {
+    fn_w: metal.BufferBinding,
+    fn_dtype: hybrid.ScalarDType,
+    base_f32: metal.BufferBinding,
+    scale_f32: metal.BufferBinding,
+};
+
+const MhcSinkhornLayerWeights = struct {
+    attn: MhcSinkhornSublayerWeights,
+    ffn: MhcSinkhornSublayerWeights,
+};
+
+const G27DsaScratchBindings = struct {
+    q_idx_bind: metal.BufferBinding = undefined,
+    k_idx_raw_bind: metal.BufferBinding = undefined,
+    k_idx_bind: metal.BufferBinding = undefined,
+    idx_weights_bind: metal.BufferBinding = undefined,
+    idx_gate_bind: metal.BufferBinding = undefined,
+};
+
+const G27KdaScratchBindings = struct {
+    b_raw_bind: metal.BufferBinding = undefined,
+    f_mid_bind: metal.BufferBinding = undefined,
+    f_raw_bind: metal.BufferBinding = undefined,
+    g_mid_bind: metal.BufferBinding = undefined,
+    g_out_bind: metal.BufferBinding = undefined,
+    beta_out_bind: metal.BufferBinding = undefined,
+    fused_qkvbfg_out_bind: metal.BufferBinding = undefined,
+};
+
+const KdaLayerWeights = struct {
+    kda_idx: u32,
+    lora_rank: u32,
+    q_proj: qwen3.LinearBinding,
+    k_proj: qwen3.LinearBinding,
+    v_proj: qwen3.LinearBinding,
+    b_proj: qwen3.LinearBinding,
+    f_a_proj: qwen3.LinearBinding,
+    f_b_proj: qwen3.LinearBinding,
+    g_a_proj: qwen3.LinearBinding,
+    g_b_proj: qwen3.LinearBinding,
+    o_proj: qwen3.LinearBinding,
+    fused_qkvbfg_a_proj: ?qwen3.LinearBinding = null,
+    q_conv_w: ?metal.BufferBinding = null,
+    k_conv_w: ?metal.BufferBinding = null,
+    v_conv_w: ?metal.BufferBinding = null,
+    conv_w_dtype: hybrid.ScalarDType = .f32,
+    conv_k: u32 = 0,
+    a_log: metal.BufferBinding,
+    a_log_dtype: hybrid.ScalarDType = .f32,
+    dt_bias: metal.BufferBinding,
+    dt_bias_dtype: hybrid.ScalarDType = .f32,
+    o_norm: ?qwen3.NormBinding = null,
+    // Per-layer scratch offsets for tree commit (`k_tree`, `v_tree`, `g_tree` [M,qkv_dim] f32, `beta_tree` [M,H] f32, raw QKV).
+    tree_k_off: u64 = 0,
+    tree_v_off: u64 = 0,
+    tree_g_off: u64 = 0,
+    tree_beta_off: u64 = 0,
+    tree_q_raw_off: u64 = 0,
+    tree_k_raw_off: u64 = 0,
+    tree_v_raw_off: u64 = 0,
+    conv_state_off: u64 = 0,
+    conv_state_tmp_off: u64 = 0,
+};
+
+const MlaDsaLayerWeights = struct {
+    mla_idx: u32,
+    indexer_mode: DsaIndexerMode,
+    full_idx_slot: u32,
+    q_a_proj: qwen3.LinearBinding,
+    q_a_norm: qwen3.NormBinding,
+    q_b_proj: qwen3.LinearBinding,
+    kv_a_proj: qwen3.LinearBinding,
+    kv_a_norm: qwen3.NormBinding,
+    kv_b_proj: qwen3.LinearBinding,
+    o_proj: qwen3.LinearBinding,
+    w_uk_t_heads: []qwen3.LinearBinding = &.{},
+    w_uv_heads: []qwen3.LinearBinding = &.{},
+    // Present ONLY when `indexer_mode == .full`; strictly `null` on `"shared"` layers (0 indexer dispatches!).
+    idx_wq_b: ?qwen3.LinearBinding = null,
+    idx_wk: ?qwen3.LinearBinding = null,
+    idx_k_norm_w: ?metal.BufferBinding = null,
+    idx_k_norm_w_dtype: hybrid.ScalarDType = .bf16,
+    idx_k_norm_b: ?metal.BufferBinding = null,
+    idx_k_norm_b_dtype: hybrid.ScalarDType = .bf16,
+    idx_weights_proj: ?qwen3.LinearBinding = null,
+    idx_kpool_gate: ?qwen3.LinearBinding = null,
+    idx_kpool_ape: ?metal.BufferBinding = null,
+    idx_kpool_ape_dtype: hybrid.ScalarDType = .bf16,
+    // Uncommitted tree-verification KV + indexer K/gate staging offsets.
+    tree_latent_off: u64 = 0,
+    tree_rope_off: u64 = 0,
+    tree_idx_k_off: u64 = 0,
+    tree_idx_gate_off: u64 = 0,
+};
+
 const CedBridgeWeights = struct {
     norm: qwen3.NormBinding,
     global_kv_a_proj: qwen3.LinearBinding,
@@ -1845,6 +2214,8 @@ const LayerAttention = union(enum) {
     qsa: QsaLayerWeights,
     swa: SwaLayerWeights,
     mla_csa2: MlaCsa2LayerWeights,
+    kda: KdaLayerWeights,
+    mla_dsa: MlaDsaLayerWeights,
 };
 
 const GraphLayerWeights = struct {
@@ -1853,6 +2224,7 @@ const GraphLayerWeights = struct {
     post_attention_layernorm: qwen3.NormBinding,
     gr: ?GrLayerWeights = null,
     mhc: ?MhcLayerWeights = null,
+    mhc_s20: ?MhcSinkhornLayerWeights = null,
     attn: LayerAttention,
 
     // Dense SwiGLU (when `config.layerFfnKind(l) == .dense_swiglu`)
@@ -2202,6 +2574,86 @@ pub const GraphModel = struct {
     dflare_ctx_hist_len: u32 = 0,
     dflare_ctx_hist_epoch: u64 = 0,
 
+    // M9.2 (`G27`) `GLM-5.2`/`GLM-5.3` (`glm_moe_dsa`) & `GLM-5.3-Flash` (`glm5_next`) runtime state
+    kda_arena: ?hybrid.GdnStateArena = null,
+    g27_mla_kv_arena: ?hybrid.G27MlaKvArena = null,
+    g27_dsa_idx_kv_arena: ?hybrid.G27DsaIdxKvArena = null,
+    g27_dsa_idx_buf: ?hybrid.G27DsaIndexBuffer = null,
+    wp_g27_dsa_idx_buf: ?hybrid.G27DsaIndexBuffer = null,
+    g27_mhc_coeffs_bind: metal.BufferBinding = undefined,
+    wp_g27_mhc_coeffs_bind: metal.BufferBinding = undefined,
+    g27_dsa_scratch: G27DsaScratchBindings = .{},
+    wp_g27_dsa_scratch: G27DsaScratchBindings = .{},
+    g27_kda_scratch: G27KdaScratchBindings = .{},
+    wp_g27_kda_scratch: G27KdaScratchBindings = .{},
+    last_dsa_valid: bool = false,
+    last_dsa_num_rows: u32 = 0,
+    last_dsa_is_wide: bool = false,
+    dsa_full_index_dispatches: u64 = 0,
+    dsa_shared_reuse_hits: u64 = 0,
+
+    /// Zero-reindex sparse Top-K index handle exposed to `1L` `MTP` (`D15`) when
+    /// `index_share_for_mtp_iteration = true` (`GLM-5.2`/`GLM-5.3`/`GLM-5.3-Flash`).
+    pub const SharedMtpSparseIndices = struct {
+        gpu_buf: metal.BufferBinding,
+        host_indices: []const u32,
+        k_selected: u32,
+        max_k: u32,
+        num_rows: u32,
+        valid: bool,
+    };
+
+    pub fn sharedMtpSparseIndices(self: *const GraphModel) SharedMtpSparseIndices {
+        const zero_bind: metal.BufferBinding = .{ .buffer = self.scratch_buf, .offset = 0 };
+        if (!self.last_dsa_valid) {
+            return .{
+                .gpu_buf = zero_bind,
+                .host_indices = &.{},
+                .k_selected = 0,
+                .max_k = 0,
+                .num_rows = 0,
+                .valid = false,
+            };
+        }
+        const idx_buf: *const hybrid.G27DsaIndexBuffer = if (self.last_dsa_is_wide)
+            (if (self.wp_g27_dsa_idx_buf) |*b| b else return .{
+                .gpu_buf = zero_bind,
+                .host_indices = &.{},
+                .k_selected = 0,
+                .max_k = 0,
+                .num_rows = 0,
+                .valid = false,
+            })
+        else
+            (if (self.g27_dsa_idx_buf) |*b| b else return .{
+                .gpu_buf = zero_bind,
+                .host_indices = &.{},
+                .k_selected = 0,
+                .max_k = 0,
+                .num_rows = 0,
+                .valid = false,
+            });
+        const nrows: u32 = @min(self.last_dsa_num_rows, idx_buf.spec.max_rows);
+        const max_k: u32 = idx_buf.spec.max_out_k;
+        const last_row: usize = if (nrows > 0) @as(usize, nrows - 1) else 0;
+        const k_sel: u32 = if (nrows > 0 and last_row < idx_buf.counts_host.len)
+            @min(idx_buf.counts_host[last_row], max_k)
+        else
+            0;
+        const host_slice: []const u32 = if (nrows > 0 and k_sel > 0)
+            idx_buf.indices_host[last_row * max_k ..][0..k_sel]
+        else
+            &.{};
+        return .{
+            .gpu_buf = idx_buf.indicesBinding(self.scratch_buf),
+            .host_indices = host_slice,
+            .k_selected = k_sel,
+            .max_k = max_k,
+            .num_rows = nrows,
+            .valid = (nrows > 0 and k_sel > 0),
+        };
+    }
+
     pub fn baseModelShape(self: *const GraphModel) lora.BaseModelShape {
         return .{
             .num_layers = self.config.num_hidden_layers,
@@ -2309,7 +2761,7 @@ pub const GraphModel = struct {
         return self.lora_registry.?.pairAt(self.active_lora_slot, layer_idx, target) != null;
     }
 
-    pub inline fn hasActiveLoraMask(self: *const GraphModel, layer_idx: usize, mask: u16) bool {
+    pub inline fn hasActiveLoraMask(self: *const GraphModel, layer_idx: usize, mask: u32) bool {
         if (!self.hasActiveLora()) return false;
         return self.lora_registry.?.slotTargetsLayerMask(self.active_lora_slot, layer_idx, mask);
     }
@@ -2397,28 +2849,33 @@ pub const GraphModel = struct {
                 .qsa => |qsa| qsa.q_proj,
                 .swa => |swa| swa.q_proj,
                 .gdn => |g| g.q_proj,
-                .mla_csa2 => null,
+                .kda => |kda| kda.q_proj,
+                .mla_csa2, .mla_dsa => null,
             },
             .k_proj => switch (layer.attn) {
                 .gqa => |gqa| gqa.k_proj,
                 .qsa => |qsa| qsa.k_proj,
                 .swa => |swa| swa.k_proj,
                 .gdn => |g| g.k_proj,
-                .mla_csa2 => null,
+                .kda => |kda| kda.k_proj,
+                .mla_csa2, .mla_dsa => null,
             },
             .v_proj => switch (layer.attn) {
                 .gqa => |gqa| gqa.v_proj,
                 .qsa => |qsa| qsa.v_proj,
                 .swa => |swa| swa.v_proj,
                 .gdn => |g| g.v_proj,
-                .mla_csa2 => null,
+                .kda => |kda| kda.v_proj,
+                .mla_csa2, .mla_dsa => null,
             },
             .o_proj => switch (layer.attn) {
                 .gqa => |gqa| gqa.o_proj,
                 .qsa => |qsa| qsa.o_proj,
                 .swa => |swa| swa.o_proj,
                 .gdn => |g| g.o_proj,
+                .kda => |kda| kda.o_proj,
                 .mla_csa2 => |mla| mla.o_proj,
+                .mla_dsa => |mla| mla.o_proj,
             },
             .gate_attn => switch (layer.attn) {
                 .gdn => |g| g.g_proj,
@@ -2427,14 +2884,41 @@ pub const GraphModel = struct {
             },
             .q_a_proj => switch (layer.attn) {
                 .mla_csa2 => |mla| mla.q_a_proj,
+                .mla_dsa => |mla| mla.q_a_proj,
                 else => null,
             },
             .q_b_proj => switch (layer.attn) {
                 .mla_csa2 => |mla| mla.q_b_proj,
+                .mla_dsa => |mla| mla.q_b_proj,
                 else => null,
             },
             .kv_a_proj => switch (layer.attn) {
                 .mla_csa2 => |mla| mla.kv_a_proj,
+                .mla_dsa => |mla| mla.kv_a_proj,
+                else => null,
+            },
+            .kv_b_proj => switch (layer.attn) {
+                .mla_dsa => |mla| mla.kv_b_proj,
+                else => null,
+            },
+            .b_proj => switch (layer.attn) {
+                .kda => |kda| kda.b_proj,
+                else => null,
+            },
+            .f_a_proj => switch (layer.attn) {
+                .kda => |kda| kda.f_a_proj,
+                else => null,
+            },
+            .f_b_proj => switch (layer.attn) {
+                .kda => |kda| kda.f_b_proj,
+                else => null,
+            },
+            .g_a_proj => switch (layer.attn) {
+                .kda => |kda| kda.g_a_proj,
+                else => null,
+            },
+            .g_b_proj => switch (layer.attn) {
+                .kda => |kda| kda.g_b_proj,
                 else => null,
             },
             .gate_proj => if (self.config.layerFfnKind(layer_idx) == .dense_swiglu) layer.dense_gate else null,
@@ -2672,6 +3156,10 @@ pub const GraphModel = struct {
                     if (mla.w_uk_t_heads.len > 0) allocator.free(mla.w_uk_t_heads);
                     if (mla.w_uv_heads.len > 0) allocator.free(mla.w_uv_heads);
                 },
+                .mla_dsa => |*mla| {
+                    if (mla.w_uk_t_heads.len > 0) allocator.free(mla.w_uk_t_heads);
+                    if (mla.w_uv_heads.len > 0) allocator.free(mla.w_uv_heads);
+                },
                 else => {},
             }
             if (layer.expert_sources.len > 0) allocator.free(layer.expert_sources);
@@ -2742,12 +3230,18 @@ pub const GraphModel = struct {
         if (self.mla_kv_arena) |*ka| @memset(ka.backing, 0);
         if (self.mla_swa_arena) |*sa| @memset(sa.backing, 0);
         if (self.csa2_summary_arena) |*csa| @memset(csa.backing, 0);
+        if (self.g27_mla_kv_arena) |*gka| @memset(gka.backing, 0);
+        if (self.g27_dsa_idx_kv_arena) |*ika| @memset(ika.backing, 0);
+        self.last_dsa_valid = false;
+        self.last_dsa_num_rows = 0;
+        self.last_dsa_is_wide = false;
         if (self.retired_kv_pool) |*pool| pool.reset();
         for (0..self.active_tile_phys_ring.len) |i| {
             self.active_tile_phys_ring[i] = @intCast(i);
         }
         self.syncActiveKvTileTables();
         if (self.gdn_arena) |*ga| ga.resetAll();
+        if (self.kda_arena) |*ka| ka.resetAll();
         for (self.layers) |layer| {
             switch (layer.attn) {
                 .gdn => |g| {
@@ -2757,6 +3251,15 @@ pub const GraphModel = struct {
                         const base = self.scratch_arena.bytes();
                         @memset(base[@intCast(g.conv_state_off)..][0..state_bytes], 0);
                         @memset(base[@intCast(g.conv_state_tmp_off)..][0..state_bytes], 0);
+                    }
+                },
+                .kda => |kda| {
+                    if (kda.conv_k > 1) {
+                        const conv_dim = 3 * self.config.kdaQkvDim();
+                        const state_bytes = @as(usize, kda.conv_k - 1) * conv_dim * @sizeOf(f16);
+                        const base = self.scratch_arena.bytes();
+                        @memset(base[@intCast(kda.conv_state_off)..][0..state_bytes], 0);
+                        @memset(base[@intCast(kda.conv_state_tmp_off)..][0..state_bytes], 0);
                     }
                 },
                 else => {},
@@ -2817,7 +3320,7 @@ pub const GraphModel = struct {
                         );
                     }
                 },
-                .gdn, .swa, .mla_csa2 => {},
+                .gdn, .swa, .mla_csa2, .kda, .mla_dsa => {},
             }
         }
     }
@@ -2861,7 +3364,7 @@ pub const GraphModel = struct {
                     }, false);
                     dispatched = true;
                 },
-                .gdn, .swa, .mla_csa2 => {},
+                .gdn, .swa, .mla_csa2, .kda, .mla_dsa => {},
             }
         }
 
@@ -3252,6 +3755,23 @@ pub const GraphModel = struct {
                     kv_bytes += vis_sparse * tok_b + vis_swa * (@as(u64, self.config.kv_lora_rank) + self.config.qk_rope_head_dim) * @sizeOf(f16);
                     if (mla.mode == .full) kv_bytes += tok_b;
                 },
+                .kda => {
+                    const state_b = @as(u64, self.config.kda_num_heads) *
+                        self.config.kda_head_dim * self.config.kda_head_dim * @sizeOf(f32);
+                    kv_bytes += 2 * state_b;
+                },
+                .mla_dsa => |mla| {
+                    const tok_b: u64 = (@as(u64, self.config.kv_lora_rank) + self.config.qk_rope_head_dim) * @sizeOf(f16);
+                    const vis_sparse: u64 = @min(@as(u64, seq_len), self.config.index_topk);
+                    kv_bytes += vis_sparse * tok_b + tok_b;
+                    if (mla.indexer_mode == .full) {
+                        const cand_len: u64 = if (self.config.index_kpool > 1)
+                            (@as(u64, seq_len) / self.config.index_kpool) + self.config.index_kpool
+                        else
+                            seq_len;
+                        kv_bytes += cand_len * self.config.index_head_dim * @sizeOf(f16);
+                    }
+                },
             }
         }
         const active_layers: u64 = @intCast(self.layers.len - dec_start);
@@ -3556,7 +4076,7 @@ pub const GraphModel = struct {
         const any_qf = dequant.usesQuantFormats(g_amf, gate_proj.group_size) or
             dequant.usesQuantFormats(u_amf, up_proj.group_size);
         const allow_fused_m = (mode != .batched_gemv and m >= self.g18_swiglu_gemm_min_m);
-        if (self.enable_g18_fusion and !self.act_quant_policy.isEnabled() and !any_qf and allow_fused_m and dequant.canFuseGateUp(g_amf, u_amf)) {
+        if (self.config.swiglu_limit == 0.0 and self.enable_g18_fusion and !self.act_quant_policy.isEnabled() and !any_qf and allow_fused_m and dequant.canFuseGateUp(g_amf, u_amf)) {
             var used_fused = true;
             self.dequant_pipes.encodeDenseGateUpSwiglu(frame, .{
                 .x = x_norm,
@@ -3586,6 +4106,7 @@ pub const GraphModel = struct {
             .up = up_out,
             .out = act_out,
             .count = m * self.config.intermediate_size,
+            .swiglu_limit = self.config.swiglu_limit,
         }, true);
     }
 
@@ -3891,7 +4412,8 @@ pub const GraphModel = struct {
         const aux_needs_last = self.enable_feature_taps and
             (self.aux_layer_ids[0] == last_l or self.aux_layer_ids[1] == last_l or self.aux_layer_ids[2] == last_l);
         const allow_tail_prune = (!is_ced) and self.enable_prompt_tail_pruning and !self.compute_all_logits and
-            !preserve_all_top_hidden and !aux_needs_last and !self.hasDFlareCtxHistory();
+            !preserve_all_top_hidden and !aux_needs_last and !self.hasDFlareCtxHistory() and
+            self.wp_mhc_arena == null and !self.config.axes.hasMlaDsa() and !self.config.axes.hasKda();
         const prune_non_final_last = allow_tail_prune and (!is_final_chunk or !compute_logits);
         const prune_final_last_to_m1 = allow_tail_prune and is_final_chunk and compute_logits and (m > 1);
 
@@ -4192,16 +4714,15 @@ pub const GraphModel = struct {
             }
         }
 
-        // Pre-attention residual read + input RMSNorm (`G10` Mega-mHC, 4-branch GR, or single-stream).
+        // Pre-attention residual read + input RMSNorm (`G10` Mega-mHC, `G27` 20-step Sinkhorn mHC, 4-branch GR, or single-stream).
         if (self.wp_mhc_arena) |*mhc| {
-            const mhc_w = layer.mhc.?;
-            try self.encodeMhcPre(frame, mhc.binding(self.scratch_buf), mhc_w, layer.input_layernorm, self.wp_x_norm_bind, m, true);
+            try self.encodeLayerMhcPre(frame, mhc.binding(self.scratch_buf), layer, false, true, layer.input_layernorm, self.wp_x_norm_bind, m, true);
             if (self.ple_rt) |prt| {
                 if (self.config.axes.memory_lookup_kind == .engram) {
                     try self.flushAndReopenWideFrame(frame);
                     try self.prepareEngramLayer(prt, l, tokens, null, base_pos, m, loop_step, self.wp_x_norm_host, true);
                     try self.encodeMhcAddResidual(frame, mhc.binding(self.scratch_buf), self.wpPleLayerBinding(l), m, false);
-                    try self.encodeMhcPre(frame, mhc.binding(self.scratch_buf), mhc_w, layer.input_layernorm, self.wp_x_norm_bind, m, true);
+                    try self.encodeLayerMhcPre(frame, mhc.binding(self.scratch_buf), layer, false, true, layer.input_layernorm, self.wp_x_norm_bind, m, true);
                 }
             }
         } else {
@@ -5577,13 +6098,32 @@ pub const GraphModel = struct {
                     self.beginLoraFrame(frame.slot);
                 }
             },
+            .kda => |kda| {
+                var f_opt: ?metal.Compute.Frame = frame.*;
+                try self.execKdaLayerForward(&f_opt, l, kda, m, loop_step, true, true);
+                if (f_opt) |fo| {
+                    frame.* = fo;
+                } else {
+                    frame.* = try self.compute.beginFrame(self.timeout_ms);
+                    self.beginLoraFrame(frame.slot);
+                }
+            },
+            .mla_dsa => |mla| {
+                var f_opt: ?metal.Compute.Frame = frame.*;
+                try self.execMlaDsaLayerForward(&f_opt, l, mla, base_pos, m, loop_step, true, true);
+                if (f_opt) |fo| {
+                    frame.* = fo;
+                } else {
+                    frame.* = try self.compute.beginFrame(self.timeout_ms);
+                    self.beginLoraFrame(frame.slot);
+                }
+            },
         }
 
-        // Post-attention residual update & post-attention RMSNorm (`G10` Mega-mHC, 4-branch GR, or single-stream).
+        // Post-attention residual update & post-attention RMSNorm (`G10` Mega-mHC, `G27` 20-step Sinkhorn mHC, 4-branch GR, or single-stream).
         if (self.wp_mhc_arena) |*mhc| {
-            const mhc_w = layer.mhc.?;
-            try self.encodeMhcPost(frame, mhc.binding(self.scratch_buf), self.wp_proj_out_bind, mhc_w, eff_m, true);
-            try self.encodeMhcPre(frame, mhc.binding(self.scratch_buf), mhc_w, layer.post_attention_layernorm, self.wp_x_norm_bind, eff_m, true);
+            try self.encodeLayerMhcPost(frame, mhc.binding(self.scratch_buf), self.wp_proj_out_bind, layer, false, true, eff_m, true);
+            try self.encodeLayerMhcPre(frame, mhc.binding(self.scratch_buf), layer, true, true, layer.post_attention_layernorm, self.wp_x_norm_bind, eff_m, true);
         } else {
             if (self.wp_gr_arena) |*gr| {
                 const stream_eff: metal.BufferBinding = if (tail_m1_last)
@@ -5655,6 +6195,7 @@ pub const GraphModel = struct {
                         .up = self.wp_dense_up_bind,
                         .out = self.wp_dense_act_bind,
                         .count = eff_m * self.config.intermediate_size,
+                        .swiglu_limit = self.config.swiglu_limit,
                     }, true);
                 } else {
                     try self.encodeDenseGateUpAct(
@@ -5675,7 +6216,7 @@ pub const GraphModel = struct {
                     if (self.hasActiveLora()) {
                         _ = try self.encodeLoraSingle(frame, l, .down_proj, self.wp_dense_act_bind, self.wp_proj_out_bind, eff_m, layer.dense_down.k, layer.dense_down.n, true);
                     }
-                    try self.encodeMhcPost(frame, mhc.binding(self.scratch_buf), self.wp_proj_out_bind, layer.mhc.?, eff_m, true);
+                    try self.encodeLayerMhcPost(frame, mhc.binding(self.scratch_buf), self.wp_proj_out_bind, layer, true, true, eff_m, true);
                 } else if (self.wp_gr_arena) |*gr| {
                     try self.encodeLinearGemmWithTile(frame, layer.dense_down, self.wp_dense_act_bind, self.wp_proj_out_bind, eff_m, true, true);
                     if (self.hasActiveLora()) {
@@ -5769,7 +6310,7 @@ pub const GraphModel = struct {
                     try self.encodeMoELayerDispatch(frame, layer, moe_args, true);
                 }
                 if (self.wp_mhc_arena) |*mhc| {
-                    try self.encodeMhcPost(frame, mhc.binding(self.scratch_buf), self.wp_proj_out_bind, layer.mhc.?, eff_m, true);
+                    try self.encodeLayerMhcPost(frame, mhc.binding(self.scratch_buf), self.wp_proj_out_bind, layer, true, true, eff_m, true);
                 } else if (self.wp_gr_arena) |*gr| {
                     const stream_eff: metal.BufferBinding = if (tail_m1_last)
                         .{ .buffer = self.scratch_buf, .offset = gr.base_offset + @as(u64, m - 1) * h * @sizeOf(f16) }
@@ -6077,6 +6618,85 @@ pub const GraphModel = struct {
                         self.m7_stats.csa2_kv_writes += 1;
                         self.m7_stats.csa2_summary_updates += 1;
                         had_dispatch = true;
+                    }
+                },
+                .kda => |kda| {
+                    const ka = &(self.kda_arena.?);
+                    try self.hybrid_pipes.encodeKdaCommitTree(&frame, .{
+                        .k_tree = .{ .buffer = self.scratch_buf, .offset = kda.tree_k_off },
+                        .v_tree = .{ .buffer = self.scratch_buf, .offset = kda.tree_v_off },
+                        .g_tree = .{ .buffer = self.scratch_buf, .offset = kda.tree_g_off },
+                        .beta_tree = .{ .buffer = self.scratch_buf, .offset = kda.tree_beta_off },
+                        .accepted_nodes = accepted_nodes,
+                        .state_in = try ka.committedBinding(self.scratch_buf, kda.kda_idx),
+                        .state_out = try ka.committedBinding(self.scratch_buf, kda.kda_idx),
+                        .num_heads = self.config.kda_num_heads,
+                        .head_k_dim = self.config.kda_head_dim,
+                        .head_v_dim = self.config.kda_head_dim,
+                        .l2_eps = 1e-6,
+                        .apply_l2_norm = true,
+                        .beta_apply_sigmoid = false,
+                    }, had_dispatch);
+                    had_dispatch = true;
+                    if (kda.q_conv_w != null and kda.conv_k > 1) {
+                        const qkv_d = self.config.kdaQkvDim();
+                        try self.hybrid_pipes.encodeGdnConv1dCommit(&frame, .{
+                            .q_raw = .{ .buffer = self.scratch_buf, .offset = kda.tree_q_raw_off },
+                            .k_raw = .{ .buffer = self.scratch_buf, .offset = kda.tree_k_raw_off },
+                            .v_raw = .{ .buffer = self.scratch_buf, .offset = kda.tree_v_raw_off },
+                            .conv_state_in = .{ .buffer = self.scratch_buf, .offset = kda.conv_state_off },
+                            .conv_state_out = .{ .buffer = self.scratch_buf, .offset = kda.conv_state_off },
+                            .accepted_nodes = accepted_nodes,
+                            .gdn_qk = qkv_d,
+                            .gdn_v = qkv_d,
+                            .conv_k = kda.conv_k,
+                        }, true);
+                    }
+                },
+                .mla_dsa => |mla| {
+                    const kv_arena = &(self.g27_mla_kv_arena.?);
+                    const d_rope = self.config.qk_rope_head_dim;
+                    try self.hybrid_pipes.encodeG27MlaKvWrite(&frame, .{
+                        .latent_in = .{ .buffer = self.scratch_buf, .offset = mla.tree_latent_off },
+                        .rope_in = if (d_rope > 0) .{ .buffer = self.scratch_buf, .offset = mla.tree_rope_off } else null,
+                        .kv_cache = try kv_arena.layerBinding(self.scratch_buf, mla.mla_idx),
+                        .num_tokens = mla_k,
+                        .kv_lora_rank = self.config.kv_lora_rank,
+                        .qk_rope_head_dim = d_rope,
+                        .start_pos = base_pos,
+                        .accepted_nodes = accepted_nodes,
+                    }, had_dispatch);
+                    had_dispatch = true;
+                    if (mla.indexer_mode == .full) {
+                        const idx_kv = &(self.g27_dsa_idx_kv_arena.?);
+                        const kpool = self.config.index_kpool;
+                        try self.hybrid_pipes.encodeG27DsaIdxKvWrite(&frame, .{
+                            .k_in = .{ .buffer = self.scratch_buf, .offset = mla.tree_idx_k_off },
+                            .gate_in = if (kpool > 1) .{ .buffer = self.scratch_buf, .offset = mla.tree_idx_gate_off } else null,
+                            .k_cache = try idx_kv.kBinding(self.scratch_buf, mla.full_idx_slot),
+                            .gate_cache = if (kpool > 1) try idx_kv.gateBinding(self.scratch_buf, mla.full_idx_slot) else null,
+                            .num_tokens = mla_k,
+                            .index_head_dim = self.config.index_head_dim,
+                            .start_pos = base_pos,
+                            .accepted_nodes = accepted_nodes,
+                        }, true);
+                        if (kpool > 1) {
+                            const start_pool = base_pos / kpool;
+                            const end_pool = mla_new_kv_len / kpool;
+                            if (end_pool > start_pool) {
+                                try self.hybrid_pipes.encodeG27DsaKpoolBuild(&frame, .{
+                                    .k_cache = try idx_kv.kBinding(self.scratch_buf, mla.full_idx_slot),
+                                    .gate_cache = try idx_kv.gateBinding(self.scratch_buf, mla.full_idx_slot),
+                                    .kpool_ape = mla.idx_kpool_ape.?,
+                                    .pool_k_cache = try idx_kv.poolBinding(self.scratch_buf, mla.full_idx_slot),
+                                    .start_pool = start_pool,
+                                    .end_pool = end_pool,
+                                    .index_head_dim = self.config.index_head_dim,
+                                    .kpool = kpool,
+                                    .ape_dtype = mla.idx_kpool_ape_dtype,
+                                }, true);
+                            }
+                        }
                     }
                 },
             }
@@ -7421,12 +8041,11 @@ pub const GraphModel = struct {
             }
         }
 
-        // --- Pre-Attention Residual Mix + Input RMSNorm (`G10` Mega-mHC, 4-branch GR, or single-stream) ---
+        // --- Pre-Attention Residual Mix + Input RMSNorm (`G10` Mega-mHC, `G27` 20-step Sinkhorn mHC, 4-branch GR, or single-stream) ---
         if (self.mhc_arena) |*mhc| {
-            const mhc_w = layer.mhc.?;
             {
                 const f = try self.ensureFrame(frame_opt);
-                try self.encodeMhcPre(f, mhc.binding(self.scratch_buf), mhc_w, layer.input_layernorm, self.x_norm_bind, m, true);
+                try self.encodeLayerMhcPre(f, mhc.binding(self.scratch_buf), layer, false, false, layer.input_layernorm, self.x_norm_bind, m, true);
             }
             if (self.ple_rt) |prt| {
                 if (self.config.axes.memory_lookup_kind == .engram) {
@@ -7434,7 +8053,7 @@ pub const GraphModel = struct {
                     try self.prepareEngramLayer(prt, l, token_ids, ancestor_masks, base_pos, m, loop_step, self.x_norm_host, false);
                     const f = try self.ensureFrame(frame_opt);
                     try self.encodeMhcAddResidual(f, mhc.binding(self.scratch_buf), self.pleLayerBinding(l), m, false);
-                    try self.encodeMhcPre(f, mhc.binding(self.scratch_buf), mhc_w, layer.input_layernorm, self.x_norm_bind, m, true);
+                    try self.encodeLayerMhcPre(f, mhc.binding(self.scratch_buf), layer, false, false, layer.input_layernorm, self.x_norm_bind, m, true);
                 }
             }
         } else {
@@ -7530,14 +8149,19 @@ pub const GraphModel = struct {
             .mla_csa2 => |*mla| {
                 try self.execMlaCsa2LayerForward(frame_opt, l, mla, base_pos, m, loop_step, commit_kv_and_gdn, false, kv_len_override);
             },
+            .kda => |kda| {
+                try self.execKdaLayerForward(frame_opt, l, kda, m, loop_step, commit_kv_and_gdn, false);
+            },
+            .mla_dsa => |mla| {
+                try self.execMlaDsaLayerForward(frame_opt, l, mla, base_pos, m, loop_step, commit_kv_and_gdn, false);
+            },
         }
 
-        // Residual update after attention + Post-attention RMSNorm (`G10` Mega-mHC, 4-branch GR, or single-stream).
+        // Residual update after attention + Post-attention RMSNorm (`G10` Mega-mHC, `G27` 20-step Sinkhorn mHC, 4-branch GR, or single-stream).
         if (self.mhc_arena) |*mhc| {
-            const mhc_w = layer.mhc.?;
             const f = try self.ensureFrame(frame_opt);
-            try self.encodeMhcPost(f, mhc.binding(self.scratch_buf), self.proj_out_bind, mhc_w, m, true);
-            try self.encodeMhcPre(f, mhc.binding(self.scratch_buf), mhc_w, layer.post_attention_layernorm, self.x_norm_bind, m, true);
+            try self.encodeLayerMhcPost(f, mhc.binding(self.scratch_buf), self.proj_out_bind, layer, false, false, m, true);
+            try self.encodeLayerMhcPre(f, mhc.binding(self.scratch_buf), layer, true, false, layer.post_attention_layernorm, self.x_norm_bind, m, true);
         } else {
             if (self.gr_arena) |*gr| {
                 const f = try self.ensureFrame(frame_opt);
@@ -7610,6 +8234,7 @@ pub const GraphModel = struct {
                             .up = self.dense_up_bind,
                             .out = self.dense_act_bind,
                             .count = m * self.config.intermediate_size,
+                            .swiglu_limit = self.config.swiglu_limit,
                         }, true);
                     }
                 }
@@ -7709,7 +8334,7 @@ pub const GraphModel = struct {
     fn applyFfnResidual(self: *GraphModel, frame_opt: *?metal.Compute.Frame, l: usize, m: u32, h: u32) GraphStepError!void {
         const f = try self.ensureFrame(frame_opt);
         if (self.mhc_arena) |*mhc| {
-            try self.encodeMhcPost(f, mhc.binding(self.scratch_buf), self.proj_out_bind, self.layers[l].mhc.?, m, true);
+            try self.encodeLayerMhcPost(f, mhc.binding(self.scratch_buf), self.proj_out_bind, &self.layers[l], true, false, m, true);
         } else if (self.gr_arena) |*gr| {
             try self.hybrid_pipes.encodeGrWriteGate(f, .{
                 .stream = gr.binding(self.scratch_buf),
@@ -8800,6 +9425,9 @@ pub const GraphModel = struct {
         barrier_before: bool,
     ) moe.EncodeError!void {
         var resolved_args = args;
+        if (resolved_args.swiglu_limit == 0.0) {
+            resolved_args.swiglu_limit = self.config.swiglu_limit;
+        }
         const router_uses_qf = dequant.usesQuantFormats(layer.router_amf_dtype, layer.router_group_size);
         if (router_uses_qf and resolved_args.router != .logits) {
             const qfp = if (self.qf_pipes) |*p| p else return error.PipelineNotInitialized;
@@ -9100,6 +9728,7 @@ pub const GraphModel = struct {
                 .scheme_bucket = scheme_bucket,
                 .max_active_override = cap,
                 .use_indirect = use_indirect,
+                .swiglu_limit = base.swiglu_limit,
             };
             switch (desc.gate_up_dtype) {
                 .f16 => try self.moe_pipes.encodeGateUpSwigluFloat(frame, .f16, gu_args, gu_barrier),
@@ -9486,6 +10115,697 @@ pub const GraphModel = struct {
             .h_res = mhc_w.h_res_bind,
             .m = m,
         }, barrier_before);
+    }
+
+    fn encodeLayerMhcPre(
+        self: *const GraphModel,
+        frame: *metal.Compute.Frame,
+        streams: metal.BufferBinding,
+        layer: *const GraphLayerWeights,
+        is_ffn: bool,
+        is_wide: bool,
+        norm: qwen3.NormBinding,
+        branch_out: metal.BufferBinding,
+        m: u32,
+        barrier_before: bool,
+    ) GraphStepError!void {
+        if (layer.mhc_s20) |s20| {
+            const sub = if (is_ffn) s20.ffn else s20.attn;
+            const coeffs_bind = if (is_wide) self.wp_g27_mhc_coeffs_bind else self.g27_mhc_coeffs_bind;
+            try self.hybrid_pipes.encodeG27MhcPreSinkhorn(frame, .{
+                .streams = streams,
+                .fn_w = sub.fn_w,
+                .base_w = sub.base_f32,
+                .scale_w = sub.scale_f32,
+                .norm_w = norm.binding,
+                .branch_out = branch_out,
+                .coeffs_out = coeffs_bind,
+                .m = m,
+                .hidden_size = self.config.hidden_size,
+                .sinkhorn_iters = self.config.mhc_sinkhorn_iters,
+                .stream_dtype = .f16,
+                .act_dtype = .f16,
+                .fn_dtype = sub.fn_dtype,
+                .norm_dtype = floatToScalarDType(norm.dtype),
+                .rms_eps = self.config.rms_norm_eps,
+                .hc_eps = self.config.mhc_hc_eps,
+            }, barrier_before);
+            return;
+        }
+        try self.encodeMhcPre(frame, streams, layer.mhc.?, norm, branch_out, m, barrier_before);
+    }
+
+    fn encodeLayerMhcPost(
+        self: *const GraphModel,
+        frame: *metal.Compute.Frame,
+        streams: metal.BufferBinding,
+        sublayer_out: metal.BufferBinding,
+        layer: *const GraphLayerWeights,
+        is_ffn: bool,
+        is_wide: bool,
+        m: u32,
+        barrier_before: bool,
+    ) GraphStepError!void {
+        _ = is_ffn;
+        if (layer.mhc_s20 != null) {
+            const coeffs_bind = if (is_wide) self.wp_g27_mhc_coeffs_bind else self.g27_mhc_coeffs_bind;
+            try self.hybrid_pipes.encodeG27MhcPostMix(frame, .{
+                .streams = streams,
+                .sublayer_out = sublayer_out,
+                .coeffs = coeffs_bind,
+                .m = m,
+                .hidden_size = self.config.hidden_size,
+                .stream_dtype = .f16,
+                .act_dtype = .f16,
+            }, barrier_before);
+            return;
+        }
+        try self.encodeMhcPost(frame, streams, sublayer_out, layer.mhc.?, m, barrier_before);
+    }
+
+    fn execKdaLayerForward(
+        self: *GraphModel,
+        frame_opt: *?metal.Compute.Frame,
+        l: usize,
+        kda: KdaLayerWeights,
+        m: u32,
+        loop_step: u32,
+        commit_state: bool,
+        is_wide: bool,
+    ) GraphStepError!void {
+        const cfg = self.config;
+        const ka = &(self.kda_arena.?);
+        const qkv_dim: u32 = cfg.kdaQkvDim();
+        const n_heads: u32 = cfg.kda_num_heads;
+        const head_dim: u32 = cfg.kda_head_dim;
+        const lora_rank: u32 = kda.lora_rank;
+        const has_conv = (kda.q_conv_w != null and kda.conv_k > 1);
+
+        const x_norm_bind = if (is_wide) self.wp_x_norm_bind else self.x_norm_bind;
+        const attn_out_bind = if (is_wide) self.wp_attn_out_bind else self.attn_out_bind;
+        const proj_out_bind = if (is_wide) self.wp_proj_out_bind else self.proj_out_bind;
+        const z_bind = if (is_wide) self.wp_gdn_z_bind else self.gdn_z_bind;
+        const ksc = if (is_wide) self.wp_g27_kda_scratch else self.g27_kda_scratch;
+
+        const q_raw_bind: metal.BufferBinding = if (is_wide)
+            self.wp_q_bind
+        else
+            .{ .buffer = self.scratch_buf, .offset = kda.tree_q_raw_off };
+        const k_raw_bind: metal.BufferBinding = if (is_wide)
+            self.wp_k_bind
+        else if (has_conv)
+            .{ .buffer = self.scratch_buf, .offset = kda.tree_k_raw_off }
+        else
+            .{ .buffer = self.scratch_buf, .offset = kda.tree_k_off };
+        const v_raw_bind: metal.BufferBinding = if (is_wide)
+            self.wp_v_bind
+        else if (has_conv)
+            .{ .buffer = self.scratch_buf, .offset = kda.tree_v_raw_off }
+        else
+            .{ .buffer = self.scratch_buf, .offset = kda.tree_v_off };
+
+        const q_eff_bind: metal.BufferBinding = if (has_conv)
+            (if (is_wide) self.wp_q_conv_bind else self.q_conv_bind)
+        else
+            q_raw_bind;
+        const k_eff_bind: metal.BufferBinding = if (has_conv)
+            (if (is_wide) self.wp_k_conv_bind else .{ .buffer = self.scratch_buf, .offset = kda.tree_k_off })
+        else
+            k_raw_bind;
+        const v_eff_bind: metal.BufferBinding = if (has_conv)
+            (if (is_wide) self.wp_v_conv_bind else .{ .buffer = self.scratch_buf, .offset = kda.tree_v_off })
+        else
+            v_raw_bind;
+
+        const g_out_bind: metal.BufferBinding = if (is_wide)
+            ksc.g_out_bind
+        else
+            .{ .buffer = self.scratch_buf, .offset = kda.tree_g_off };
+        const beta_out_bind: metal.BufferBinding = if (is_wide)
+            ksc.beta_out_bind
+        else
+            .{ .buffer = self.scratch_buf, .offset = kda.tree_beta_off };
+
+        const encodeMatmul = struct {
+            fn call(
+                gm: *GraphModel,
+                f: *metal.Compute.Frame,
+                lin: qwen3.LinearBinding,
+                x: metal.BufferBinding,
+                y: metal.BufferBinding,
+                rows: u32,
+                wide: bool,
+                barrier: bool,
+            ) GraphStepError!void {
+                if (wide) {
+                    try gm.encodeLinearGemmWithTile(f, lin, x, y, rows, true, barrier);
+                } else {
+                    try gm.encodeLinearBatched(f, lin, x, y, rows, barrier);
+                }
+            }
+        }.call;
+
+        const f = try self.ensureFrame(frame_opt);
+
+        // 1. Q, K, V, b_proj, f_a_proj, g_a_proj (fused or separate)
+        if (kda.fused_qkvbfg_a_proj) |fused| {
+            const total_cols: u32 = 3 * qkv_dim + n_heads + 2 * lora_rank;
+            try encodeMatmul(self, f, fused, x_norm_bind, ksc.fused_qkvbfg_out_bind, m, is_wide, true);
+            try self.moe_pipes.encodeCopyStrided(f, .{ .src = ksc.fused_qkvbfg_out_bind, .dst = q_raw_bind, .num_rows = m, .copy_cols = qkv_dim, .src_stride = total_cols, .src_col_off = 0, .dst_stride = qkv_dim }, true);
+            try self.moe_pipes.encodeCopyStrided(f, .{ .src = ksc.fused_qkvbfg_out_bind, .dst = k_raw_bind, .num_rows = m, .copy_cols = qkv_dim, .src_stride = total_cols, .src_col_off = qkv_dim, .dst_stride = qkv_dim }, false);
+            try self.moe_pipes.encodeCopyStrided(f, .{ .src = ksc.fused_qkvbfg_out_bind, .dst = v_raw_bind, .num_rows = m, .copy_cols = qkv_dim, .src_stride = total_cols, .src_col_off = 2 * qkv_dim, .dst_stride = qkv_dim }, false);
+            try self.moe_pipes.encodeCopyStrided(f, .{ .src = ksc.fused_qkvbfg_out_bind, .dst = ksc.b_raw_bind, .num_rows = m, .copy_cols = n_heads, .src_stride = total_cols, .src_col_off = 3 * qkv_dim, .dst_stride = n_heads }, false);
+            try self.moe_pipes.encodeCopyStrided(f, .{ .src = ksc.fused_qkvbfg_out_bind, .dst = ksc.f_mid_bind, .num_rows = m, .copy_cols = lora_rank, .src_stride = total_cols, .src_col_off = 3 * qkv_dim + n_heads, .dst_stride = lora_rank }, false);
+            try self.moe_pipes.encodeCopyStrided(f, .{ .src = ksc.fused_qkvbfg_out_bind, .dst = ksc.g_mid_bind, .num_rows = m, .copy_cols = lora_rank, .src_stride = total_cols, .src_col_off = 3 * qkv_dim + n_heads + lora_rank, .dst_stride = lora_rank }, false);
+        } else {
+            try encodeMatmul(self, f, kda.q_proj, x_norm_bind, q_raw_bind, m, is_wide, true);
+            try encodeMatmul(self, f, kda.k_proj, x_norm_bind, k_raw_bind, m, is_wide, false);
+            try encodeMatmul(self, f, kda.v_proj, x_norm_bind, v_raw_bind, m, is_wide, false);
+            try encodeMatmul(self, f, kda.b_proj, x_norm_bind, ksc.b_raw_bind, m, is_wide, false);
+            try encodeMatmul(self, f, kda.f_a_proj, x_norm_bind, ksc.f_mid_bind, m, is_wide, false);
+            try encodeMatmul(self, f, kda.g_a_proj, x_norm_bind, ksc.g_mid_bind, m, is_wide, false);
+        }
+        if (self.hasActiveLora()) {
+            _ = try self.encodeLoraSingle(f, l, .q_proj, x_norm_bind, q_raw_bind, m, kda.q_proj.k, kda.q_proj.n, true);
+            _ = try self.encodeLoraSingle(f, l, .k_proj, x_norm_bind, k_raw_bind, m, kda.k_proj.k, kda.k_proj.n, true);
+            _ = try self.encodeLoraSingle(f, l, .v_proj, x_norm_bind, v_raw_bind, m, kda.v_proj.k, kda.v_proj.n, true);
+            _ = try self.encodeLoraSingle(f, l, .b_proj, x_norm_bind, ksc.b_raw_bind, m, kda.b_proj.k, kda.b_proj.n, true);
+            _ = try self.encodeLoraSingle(f, l, .f_a_proj, x_norm_bind, ksc.f_mid_bind, m, kda.f_a_proj.k, kda.f_a_proj.n, true);
+            _ = try self.encodeLoraSingle(f, l, .g_a_proj, x_norm_bind, ksc.g_mid_bind, m, kda.g_a_proj.k, kda.g_a_proj.n, true);
+        }
+
+        // 2. Low-rank forget & output gates: `f_b(f_a(x))` and `g_b(g_a(x))`
+        try encodeMatmul(self, f, kda.f_b_proj, ksc.f_mid_bind, ksc.f_raw_bind, m, is_wide, true);
+        try encodeMatmul(self, f, kda.g_b_proj, ksc.g_mid_bind, z_bind, m, is_wide, false);
+        if (self.hasActiveLora()) {
+            _ = try self.encodeLoraSingle(f, l, .f_b_proj, ksc.f_mid_bind, ksc.f_raw_bind, m, kda.f_b_proj.k, kda.f_b_proj.n, true);
+            _ = try self.encodeLoraSingle(f, l, .g_b_proj, ksc.g_mid_bind, z_bind, m, kda.g_b_proj.k, kda.g_b_proj.n, true);
+        }
+
+        // 3. Per-key-element decay `g` and scalar-per-head `beta`
+        try self.hybrid_pipes.encodeKdaComputeGates(f, .{
+            .f_raw = ksc.f_raw_bind,
+            .b_raw = ksc.b_raw_bind,
+            .a_log = kda.a_log,
+            .dt_bias = kda.dt_bias,
+            .g_out = g_out_bind,
+            .beta_out = beta_out_bind,
+            .m = m,
+            .num_heads = n_heads,
+            .head_dim = head_dim,
+            .lower_bound = cfg.kda_lower_bound,
+            .a_log_dtype = kda.a_log_dtype,
+            .dt_bias_dtype = kda.dt_bias_dtype,
+        }, true);
+
+        // 4. Separate `{q,k,v}` causal depthwise Conv1d + SiLU
+        const is_tree = (!is_wide and !commit_state);
+        if (has_conv) {
+            try self.hybrid_pipes.encodeKdaConv1dSilu(f, .{
+                .q_in = q_raw_bind,
+                .k_in = k_raw_bind,
+                .v_in = v_raw_bind,
+                .q_conv_w = kda.q_conv_w.?,
+                .k_conv_w = kda.k_conv_w.?,
+                .v_conv_w = kda.v_conv_w.?,
+                .conv_state_in = .{ .buffer = self.scratch_buf, .offset = kda.conv_state_off },
+                .conv_state_out = .{ .buffer = self.scratch_buf, .offset = kda.conv_state_off },
+                .ancestor_masks = if (is_tree) self.ancestor_masks_bind else null,
+                .q_out = q_eff_bind,
+                .k_out = k_eff_bind,
+                .v_out = v_eff_bind,
+                .m = m,
+                .qkv_dim = qkv_dim,
+                .conv_k = kda.conv_k,
+                .write_state = (commit_state and loop_step == 0),
+                .is_tree = is_tree,
+                .w_dtype = kda.conv_w_dtype,
+            }, false);
+        }
+
+        // 5. KDA recurrent state update + output RMSNorm * sigmoid(z)
+        const state_bind = try ka.committedBinding(self.scratch_buf, kda.kda_idx);
+        const norm_w_bind: ?metal.BufferBinding = if (kda.o_norm) |on| on.binding else null;
+        const norm_w_dt: quant.FloatDType = if (kda.o_norm) |on| on.dtype else .bf16;
+        if (commit_state and loop_step == 0 and m == 1) {
+            try self.hybrid_pipes.encodeKdaDecode(f, .{
+                .q = q_eff_bind,
+                .k = k_eff_bind,
+                .v = v_eff_bind,
+                .g = g_out_bind,
+                .beta = beta_out_bind,
+                .z = z_bind,
+                .norm_w = norm_w_bind,
+                .norm_dtype = norm_w_dt,
+                .state_in = state_bind,
+                .state_out = state_bind,
+                .out = attn_out_bind,
+                .num_heads = n_heads,
+                .head_k_dim = head_dim,
+                .head_v_dim = head_dim,
+                .l2_eps = 1e-6,
+                .rms_eps = cfg.rms_norm_eps,
+                .apply_l2_norm = true,
+                .per_head_norm = false,
+                .beta_apply_sigmoid = false,
+            }, true);
+        } else if (commit_state and loop_step == 0) {
+            try self.hybrid_pipes.encodeKdaPrefill(f, .{
+                .q = q_eff_bind,
+                .k = k_eff_bind,
+                .v = v_eff_bind,
+                .g = g_out_bind,
+                .beta = beta_out_bind,
+                .z = z_bind,
+                .norm_w = norm_w_bind,
+                .norm_dtype = norm_w_dt,
+                .state_in = state_bind,
+                .state_out = state_bind,
+                .out = attn_out_bind,
+                .seq_len = m,
+                .num_heads = n_heads,
+                .head_k_dim = head_dim,
+                .head_v_dim = head_dim,
+                .l2_eps = 1e-6,
+                .rms_eps = cfg.rms_norm_eps,
+                .apply_l2_norm = true,
+                .per_head_norm = false,
+                .beta_apply_sigmoid = false,
+            }, true);
+        } else {
+            try self.hybrid_pipes.encodeKdaTreeVerify(f, .{
+                .q = q_eff_bind,
+                .k = k_eff_bind,
+                .v = v_eff_bind,
+                .g = g_out_bind,
+                .beta = beta_out_bind,
+                .z = z_bind,
+                .norm_w = norm_w_bind,
+                .norm_dtype = norm_w_dt,
+                .ancestor_masks = self.ancestor_masks_bind,
+                .state_in = state_bind,
+                .state_out = null,
+                .out = attn_out_bind,
+                .num_nodes = m,
+                .num_heads = n_heads,
+                .head_k_dim = head_dim,
+                .head_v_dim = head_dim,
+                .l2_eps = 1e-6,
+                .rms_eps = cfg.rms_norm_eps,
+                .apply_l2_norm = true,
+                .per_head_norm = false,
+                .beta_apply_sigmoid = false,
+            }, true);
+        }
+
+        // 6. Output projection
+        try encodeMatmul(self, f, kda.o_proj, attn_out_bind, proj_out_bind, m, is_wide, true);
+        if (self.hasActiveLora()) {
+            _ = try self.encodeLoraSingle(f, l, .o_proj, attn_out_bind, proj_out_bind, m, kda.o_proj.k, kda.o_proj.n, true);
+        }
+    }
+
+    fn execMlaDsaLayerForward(
+        self: *GraphModel,
+        frame_opt: *?metal.Compute.Frame,
+        l: usize,
+        mla: MlaDsaLayerWeights,
+        base_pos: u32,
+        m: u32,
+        loop_step: u32,
+        commit_state: bool,
+        is_wide: bool,
+    ) GraphStepError!void {
+        const cfg = self.config;
+        const n_heads: u32 = cfg.num_attention_heads;
+        const q_rank: u32 = cfg.q_lora_rank;
+        const kv_rank: u32 = cfg.kv_lora_rank;
+        const d_nope: u32 = cfg.qk_nope_head_dim;
+        const d_rope: u32 = cfg.qk_rope_head_dim;
+        const d_v: u32 = cfg.v_head_dim;
+        const q_head_stride: u32 = d_nope + d_rope;
+        const q_full_dim: u32 = n_heads * q_head_stride;
+        const kv_a_dim: u32 = kv_rank + d_rope;
+        const kpool: u32 = @max(cfg.index_kpool, 1);
+
+        const sc = if (is_wide) &self.wp_mla_scratch else &self.mla_scratch;
+        const dsc = if (is_wide) &self.wp_g27_dsa_scratch else &self.g27_dsa_scratch;
+        const idx_buf = if (is_wide) &(self.wp_g27_dsa_idx_buf.?) else &(self.g27_dsa_idx_buf.?);
+        const x_norm_bind = if (is_wide) self.wp_x_norm_bind else self.x_norm_bind;
+        const attn_out_bind = if (is_wide) self.wp_attn_out_bind else self.attn_out_bind;
+        const proj_out_bind = if (is_wide) self.wp_proj_out_bind else self.proj_out_bind;
+        const pos_bind: ?metal.BufferBinding = if (is_wide) null else self.positions_bind;
+
+        const encodeMatmul = struct {
+            fn call(
+                gm: *GraphModel,
+                f: *metal.Compute.Frame,
+                lin: qwen3.LinearBinding,
+                x: metal.BufferBinding,
+                y: metal.BufferBinding,
+                rows: u32,
+                wide: bool,
+                barrier: bool,
+            ) GraphStepError!void {
+                if (wide) {
+                    try gm.encodeLinearGemmWithTile(f, lin, x, y, rows, true, barrier);
+                } else {
+                    try gm.encodeLinearBatched(f, lin, x, y, rows, barrier);
+                }
+            }
+        }.call;
+
+        const kv_arena = &(self.g27_mla_kv_arena.?);
+        const kv_cache_bind = try kv_arena.layerBinding(self.scratch_buf, mla.mla_idx);
+        const is_tree = (!is_wide and !commit_state);
+        const lat_dst: metal.BufferBinding = if (is_tree)
+            .{ .buffer = self.scratch_buf, .offset = mla.tree_latent_off }
+        else
+            sc.latent_norm_bind;
+        const rope_dst: metal.BufferBinding = if (is_tree)
+            .{ .buffer = self.scratch_buf, .offset = mla.tree_rope_off }
+        else
+            sc.rope_rot_bind;
+
+        const f = try self.ensureFrame(frame_opt);
+
+        // 1. Q path: `q_a_proj -> q_a_layernorm -> q_b_proj -> W_UK^T absorb` (+ optional `q_pe` split)
+        try encodeMatmul(self, f, mla.q_a_proj, x_norm_bind, sc.q_a_bind, m, is_wide, true);
+        if (self.hasActiveLora()) {
+            _ = try self.encodeLoraSingle(f, l, .q_a_proj, x_norm_bind, sc.q_a_bind, m, mla.q_a_proj.k, mla.q_a_proj.n, true);
+        }
+        try self.attn_pipes.encodeRmsNorm(f, .{
+            .x = sc.q_a_bind,
+            .w = mla.q_a_norm.binding,
+            .y = sc.q_a_norm_bind,
+            .num_rows = m,
+            .hidden_dim = q_rank,
+            .eps = cfg.rms_norm_eps,
+            .w_dtype = mla.q_a_norm.dtype,
+        }, true);
+        try encodeMatmul(self, f, mla.q_b_proj, sc.q_a_norm_bind, sc.q_full_bind, m, is_wide, true);
+        if (self.hasActiveLora()) {
+            _ = try self.encodeLoraSingle(f, l, .q_b_proj, sc.q_a_norm_bind, sc.q_full_bind, m, mla.q_b_proj.k, mla.q_b_proj.n, true);
+        }
+
+        for (0..n_heads) |hd| {
+            const hd_u32: u32 = @intCast(hd);
+            try self.moe_pipes.encodeCopyStrided(f, .{
+                .src = sc.q_full_bind,
+                .dst = sc.head_in_bind,
+                .num_rows = m,
+                .copy_cols = d_nope,
+                .src_stride = q_full_dim,
+                .src_col_off = hd_u32 * q_head_stride,
+                .dst_stride = d_nope,
+            }, true);
+            try encodeMatmul(self, f, mla.w_uk_t_heads[hd], sc.head_in_bind, sc.head_out_bind, m, is_wide, true);
+            try self.moe_pipes.encodeCopyStrided(f, .{
+                .src = sc.head_out_bind,
+                .dst = sc.q_nope_bind,
+                .num_rows = m,
+                .copy_cols = kv_rank,
+                .src_stride = kv_rank,
+                .dst_stride = n_heads * kv_rank,
+                .dst_col_off = hd_u32 * kv_rank,
+            }, true);
+            if (d_rope > 0) {
+                try self.moe_pipes.encodeCopyStrided(f, .{
+                    .src = sc.q_full_bind,
+                    .dst = sc.q_pe_bind,
+                    .num_rows = m,
+                    .copy_cols = d_rope,
+                    .src_stride = q_full_dim,
+                    .src_col_off = hd_u32 * q_head_stride + d_nope,
+                    .dst_stride = n_heads * d_rope,
+                    .dst_col_off = hd_u32 * d_rope,
+                }, false);
+            }
+        }
+
+        // 2. Per-layer KV latent (+ optional RoPE) projection: EVERY `mla_dsa` layer owns its KV cache!
+        try encodeMatmul(self, f, mla.kv_a_proj, x_norm_bind, sc.kv_a_bind, m, is_wide, true);
+        if (self.hasActiveLora()) {
+            _ = try self.encodeLoraSingle(f, l, .kv_a_proj, x_norm_bind, sc.kv_a_bind, m, mla.kv_a_proj.k, mla.kv_a_proj.n, true);
+        }
+        if (d_rope == 0) {
+            try self.attn_pipes.encodeRmsNorm(f, .{
+                .x = sc.kv_a_bind,
+                .w = mla.kv_a_norm.binding,
+                .y = lat_dst,
+                .num_rows = m,
+                .hidden_dim = kv_rank,
+                .eps = cfg.rms_norm_eps,
+                .w_dtype = mla.kv_a_norm.dtype,
+            }, true);
+        } else {
+            try self.moe_pipes.encodeCopyStrided(f, .{
+                .src = sc.kv_a_bind,
+                .dst = sc.latent_raw_bind,
+                .num_rows = m,
+                .copy_cols = kv_rank,
+                .src_stride = kv_a_dim,
+                .src_col_off = 0,
+                .dst_stride = kv_rank,
+            }, true);
+            try self.moe_pipes.encodeCopyStrided(f, .{
+                .src = sc.kv_a_bind,
+                .dst = rope_dst,
+                .num_rows = m,
+                .copy_cols = d_rope,
+                .src_stride = kv_a_dim,
+                .src_col_off = kv_rank,
+                .dst_stride = d_rope,
+            }, false);
+            try self.attn_pipes.encodeRmsNorm(f, .{
+                .x = sc.latent_raw_bind,
+                .w = mla.kv_a_norm.binding,
+                .y = lat_dst,
+                .num_rows = m,
+                .hidden_dim = kv_rank,
+                .eps = cfg.rms_norm_eps,
+                .w_dtype = mla.kv_a_norm.dtype,
+            }, true);
+
+            // 3. Interleaved RoPE on `q_pe` and `k_pe` (skipped completely when `d_rope == 0`, NoPE MLA!)
+            try self.hybrid_pipes.encodeG27RopeInterleave(f, .{
+                .x = sc.q_pe_bind,
+                .positions = pos_bind,
+                .num_tokens = m,
+                .num_heads = n_heads,
+                .head_stride = d_rope,
+                .rot_dim = d_rope,
+                .rot_offset = 0,
+                .base_pos = base_pos,
+                .rope_theta = cfg.rope_theta,
+            }, true);
+            try self.hybrid_pipes.encodeG27RopeInterleave(f, .{
+                .x = rope_dst,
+                .positions = pos_bind,
+                .num_tokens = m,
+                .num_heads = 1,
+                .head_stride = d_rope,
+                .rot_dim = d_rope,
+                .rot_offset = 0,
+                .base_pos = base_pos,
+                .rope_theta = cfg.rope_theta,
+            }, false);
+        }
+
+        // 4. Commit compressed KV on non-tree passes (`loop_step == 0`)
+        if (commit_state and loop_step == 0) {
+            try self.hybrid_pipes.encodeG27MlaKvWrite(f, .{
+                .latent_in = lat_dst,
+                .rope_in = if (d_rope > 0) rope_dst else null,
+                .kv_cache = kv_cache_bind,
+                .num_tokens = m,
+                .kv_lora_rank = kv_rank,
+                .qk_rope_head_dim = d_rope,
+                .start_pos = base_pos,
+            }, true);
+        }
+
+        // 5. DSA Indexer (`"full"` runs indexer + updates shared Top-K cache; `"shared"` = 0 indexer dispatches!)
+        const committed_len_for_attn: u32 = if (commit_state) (base_pos + m) else base_pos;
+        if (mla.indexer_mode == .full) {
+            const idx_n_heads = cfg.index_n_heads;
+            const idx_head_dim = cfg.index_head_dim;
+            const k_idx_dst: metal.BufferBinding = if (is_tree)
+                .{ .buffer = self.scratch_buf, .offset = mla.tree_idx_k_off }
+            else
+                dsc.k_idx_bind;
+            const gate_dst: metal.BufferBinding = if (is_tree)
+                .{ .buffer = self.scratch_buf, .offset = mla.tree_idx_gate_off }
+            else
+                dsc.idx_gate_bind;
+
+            try encodeMatmul(self, f, mla.idx_wq_b.?, sc.q_a_norm_bind, dsc.q_idx_bind, m, is_wide, true);
+            try encodeMatmul(self, f, mla.idx_wk.?, x_norm_bind, dsc.k_idx_raw_bind, m, is_wide, false);
+            try encodeMatmul(self, f, mla.idx_weights_proj.?, x_norm_bind, dsc.idx_weights_bind, m, is_wide, false);
+            if (kpool > 1) {
+                try encodeMatmul(self, f, mla.idx_kpool_gate.?, x_norm_bind, gate_dst, m, is_wide, false);
+            }
+            try self.hybrid_pipes.encodeG27LayerNorm(f, .{
+                .x = dsc.k_idx_raw_bind,
+                .weight = mla.idx_k_norm_w.?,
+                .bias = mla.idx_k_norm_b,
+                .y = k_idx_dst,
+                .num_rows = m,
+                .dim = idx_head_dim,
+                .w_dtype = mla.idx_k_norm_w_dtype,
+                .b_dtype = mla.idx_k_norm_b_dtype,
+                .eps = 1e-6,
+            }, true);
+
+            if (d_rope > 0) {
+                try self.hybrid_pipes.encodeG27RopeInterleave(f, .{
+                    .x = dsc.q_idx_bind,
+                    .positions = pos_bind,
+                    .num_tokens = m,
+                    .num_heads = idx_n_heads,
+                    .head_stride = idx_head_dim,
+                    .rot_dim = d_rope,
+                    .rot_offset = 0,
+                    .base_pos = base_pos,
+                    .rope_theta = cfg.rope_theta,
+                }, true);
+                try self.hybrid_pipes.encodeG27RopeInterleave(f, .{
+                    .x = k_idx_dst,
+                    .positions = pos_bind,
+                    .num_tokens = m,
+                    .num_heads = 1,
+                    .head_stride = idx_head_dim,
+                    .rot_dim = d_rope,
+                    .rot_offset = 0,
+                    .base_pos = base_pos,
+                    .rope_theta = cfg.rope_theta,
+                }, false);
+            }
+
+            const idx_kv = &(self.g27_dsa_idx_kv_arena.?);
+            const k_cache_bind = try idx_kv.kBinding(self.scratch_buf, mla.full_idx_slot);
+            const gate_cache_opt: ?metal.BufferBinding = if (kpool > 1)
+                try idx_kv.gateBinding(self.scratch_buf, mla.full_idx_slot)
+            else
+                null;
+            const pool_cache_opt: ?metal.BufferBinding = if (kpool > 1)
+                try idx_kv.poolBinding(self.scratch_buf, mla.full_idx_slot)
+            else
+                null;
+
+            if (commit_state and loop_step == 0) {
+                try self.hybrid_pipes.encodeG27DsaIdxKvWrite(f, .{
+                    .k_in = k_idx_dst,
+                    .gate_in = if (kpool > 1) gate_dst else null,
+                    .k_cache = k_cache_bind,
+                    .gate_cache = gate_cache_opt,
+                    .num_tokens = m,
+                    .index_head_dim = idx_head_dim,
+                    .start_pos = base_pos,
+                }, true);
+                if (kpool > 1) {
+                    const start_pool = base_pos / kpool;
+                    const end_pool = (base_pos + m) / kpool;
+                    if (end_pool > start_pool) {
+                        try self.hybrid_pipes.encodeG27DsaKpoolBuild(f, .{
+                            .k_cache = k_cache_bind,
+                            .gate_cache = gate_cache_opt.?,
+                            .kpool_ape = mla.idx_kpool_ape.?,
+                            .pool_k_cache = pool_cache_opt.?,
+                            .start_pool = start_pool,
+                            .end_pool = end_pool,
+                            .index_head_dim = idx_head_dim,
+                            .kpool = kpool,
+                            .ape_dtype = mla.idx_kpool_ape_dtype,
+                        }, true);
+                    }
+                }
+            }
+
+            try self.hybrid_pipes.encodeG27DsaScoresAndTopK(f, .{
+                .q_idx = dsc.q_idx_bind,
+                .weights = dsc.idx_weights_bind,
+                .k_cand_cache = if (kpool > 1) pool_cache_opt.? else k_cache_bind,
+                .k_raw_cache = if (kpool > 1) k_cache_bind else null,
+                .k_tree = if (is_tree) k_idx_dst else null,
+                .gate_cache = gate_cache_opt,
+                .gate_tree = if (is_tree and kpool > 1) gate_dst else null,
+                .kpool_ape = mla.idx_kpool_ape,
+                .ancestor_masks = if (is_tree) self.ancestor_masks_bind else null,
+                .scores_scratch = idx_buf.scoresBinding(self.scratch_buf),
+                .out_indices = idx_buf.indicesBinding(self.scratch_buf),
+                .out_counts = idx_buf.countsBinding(self.scratch_buf),
+                .num_rows = m,
+                .index_n_heads = idx_n_heads,
+                .index_head_dim = idx_head_dim,
+                .committed_kv_len = committed_len_for_attn,
+                .index_topk = cfg.index_topk,
+                .max_out_k = idx_buf.spec.max_out_k,
+                .kpool = kpool,
+                .always_select_tail = cfg.index_kpool_always_select_tail,
+                .causal_base_pos = base_pos,
+                .is_tree = is_tree,
+                .weights_f16 = true,
+                .ape_dtype = mla.idx_kpool_ape_dtype,
+            }, true);
+
+            self.dsa_full_index_dispatches += 1;
+            self.last_dsa_valid = true;
+            self.last_dsa_num_rows = m;
+            self.last_dsa_is_wide = is_wide;
+        } else {
+            // `"shared"` DSA layer (`3/4` of MoE layers on GLM-5.2/5.3): strictly 0 indexer dispatches!
+            self.dsa_shared_reuse_hits += 1;
+        }
+
+        // 6. Sparse absorbed MLA attention over selected Top-K indices
+        const attn_scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(d_nope + d_rope)));
+        try self.hybrid_pipes.encodeG27MlaSparseAttn(f, .{
+            .q_nope = sc.q_nope_bind,
+            .q_pe = if (d_rope > 0) sc.q_pe_bind else null,
+            .kv_cache = kv_cache_bind,
+            .kv_tree_latent = if (is_tree) lat_dst else null,
+            .kv_tree_rope = if (is_tree and d_rope > 0) rope_dst else null,
+            .selected_indices = idx_buf.indicesBinding(self.scratch_buf),
+            .selected_counts = idx_buf.countsBinding(self.scratch_buf),
+            .out = sc.attn_latent_bind,
+            .num_rows = m,
+            .num_q_heads = n_heads,
+            .kv_lora_rank = kv_rank,
+            .qk_rope_head_dim = d_rope,
+            .committed_kv_len = committed_len_for_attn,
+            .max_out_k = idx_buf.spec.max_out_k,
+            .scale = attn_scale,
+        }, true);
+
+        // 7. Unabsorb per-head `W_UV` (`[m, n_heads, kv_rank]` -> `[m, n_heads, d_v]`) + `o_proj`
+        for (0..n_heads) |hd| {
+            const hd_u32: u32 = @intCast(hd);
+            try self.moe_pipes.encodeCopyStrided(f, .{
+                .src = sc.attn_latent_bind,
+                .dst = sc.head_out_bind,
+                .num_rows = m,
+                .copy_cols = kv_rank,
+                .src_stride = n_heads * kv_rank,
+                .src_col_off = hd_u32 * kv_rank,
+                .dst_stride = kv_rank,
+            }, true);
+            try encodeMatmul(self, f, mla.w_uv_heads[hd], sc.head_out_bind, sc.head_in_bind, m, is_wide, true);
+            try self.moe_pipes.encodeCopyStrided(f, .{
+                .src = sc.head_in_bind,
+                .dst = attn_out_bind,
+                .num_rows = m,
+                .copy_cols = d_v,
+                .src_stride = d_v,
+                .dst_stride = n_heads * d_v,
+                .dst_col_off = hd_u32 * d_v,
+            }, true);
+        }
+
+        try encodeMatmul(self, f, mla.o_proj, attn_out_bind, proj_out_bind, m, is_wide, true);
+        if (self.hasActiveLora()) {
+            _ = try self.encodeLoraSingle(f, l, .o_proj, attn_out_bind, proj_out_bind, m, mla.o_proj.k, mla.o_proj.n, true);
+        }
     }
 
     fn encodeMhcAddResidual(
@@ -10369,6 +11689,7 @@ pub const GraphModel = struct {
                         }, true);
                     }
                 },
+                .kda, .mla_dsa => {},
             }
         }
     }
@@ -11024,6 +12345,9 @@ pub const GraphModel = struct {
         var num_mla_layers: u32 = 0;
         var num_mla_full_layers: u32 = 0;
         var num_mla_index_layers: u32 = 0;
+        var num_kda_layers: u32 = 0;
+        var num_mla_dsa_layers: u32 = 0;
+        var num_dsa_full_layers: u32 = 0;
         if (config.m82_family == .none) {
             for (config.axes.layer_attention_kinds, 0..) |ak, l_idx| {
                 switch (ak) {
@@ -11042,9 +12366,51 @@ pub const GraphModel = struct {
                             .reuse => {},
                         }
                     },
+                    .kda_linear => num_kda_layers += 1,
+                    .mla_dsa => {
+                        num_mla_dsa_layers += 1;
+                        if (config.dsaIndexerMode(l_idx) == .full) {
+                            num_dsa_full_layers += 1;
+                        }
+                    },
                 }
             }
         }
+        const any_mla = (num_mla_layers > 0 or num_mla_dsa_layers > 0);
+        const eff_kda_lora_rank: u32 = if (num_kda_layers > 0) blk_klr: {
+            var rank: u32 = config.effectiveKdaLoraRank();
+            var kn_buf: [96]u8 = undefined;
+            for (0..config.num_hidden_layers) |li| {
+                if (config.axes.layer_attention_kinds[li] != .kda_linear) continue;
+                const s1 = std.fmt.bufPrint(&kn_buf, "layers.{d}.linear_attn.f_a_proj", .{li}) catch break;
+                if (source.findWithWeight(s1)) |e| {
+                    rank = @max(rank, e.shape[0]);
+                    break;
+                }
+                const s2 = std.fmt.bufPrint(&kn_buf, "layers.{d}.self_attn.f_a_proj", .{li}) catch break;
+                if (source.findWithWeight(s2)) |e| {
+                    rank = @max(rank, e.shape[0]);
+                    break;
+                }
+                break;
+            }
+            break :blk_klr @max(rank, 1);
+        } else 0;
+        const dsa_max_cand: u32 = if (num_mla_dsa_layers > 0)
+            (if (config.index_kpool > 1)
+                @max(@as(u32, 1), (options.max_seq_len / config.index_kpool) + config.index_kpool)
+            else
+                @max(@as(u32, 1), options.max_seq_len))
+        else
+            1;
+        const dsa_max_out_k: u32 = if (num_mla_dsa_layers > 0) blk_dok: {
+            const tail_extra: u32 = if (config.index_kpool > 1 and config.index_kpool_always_select_tail)
+                (config.index_kpool - 1)
+            else
+                0;
+            const target_k: u32 = if (config.index_topk > 0) (config.index_topk + tail_extra) else options.max_seq_len;
+            break :blk_dok @max(@as(u32, 1), @min(options.max_seq_len, target_k));
+        } else 1;
         const has_dense_ffn = config.hasDenseFfn();
         const has_moe_ffn = config.hasMoeFfn();
         const swa_window = config.effectiveSlidingWindow();
@@ -11106,10 +12472,14 @@ pub const GraphModel = struct {
         const supports_wide_prefill = (config.m82_family == .none) and
             ((num_gqa_layers == 0) or (config.head_dim <= hybrid.MAX_QSA_HEAD_DIM and config.globalVHeadDim() <= hybrid.MAX_QSA_HEAD_DIM));
         const req_wide_cap: u32 = @min(attention.MAX_WIDE_PREFILL_TOKENS, @max(@as(u32, 1), options.wide_prefill_chunk_tokens));
-        const ple_limited_wide: u32 = if (options.ple_paths.len > 0)
-            @min(req_wide_cap, @as(u32, ple_mod.MAX_BATCH_TOKENS))
+        const dsa_limited_wide: u32 = if (num_mla_dsa_layers > 0 and dsa_max_cand > 0)
+            @max(@as(u32, 1), @min(req_wide_cap, @as(u32, 8 * 1024 * 1024) / dsa_max_cand))
         else
             req_wide_cap;
+        const ple_limited_wide: u32 = if (options.ple_paths.len > 0)
+            @min(dsa_limited_wide, @as(u32, ple_mod.MAX_BATCH_TOKENS))
+        else
+            dsa_limited_wide;
         const wide_prefill_max_tokens: u32 = if (options.gpu_prefill_mode == .wide and supports_wide_prefill)
             @min(ple_limited_wide, options.max_seq_len)
         else
@@ -11132,9 +12502,17 @@ pub const GraphModel = struct {
                     dflare_target_layers[ti] = @intCast(custom[ti]);
                 }
                 dflare_tap_count = n_taps;
-            } else if (config.is_mimo_v2 or options.enable_dflare_taps) {
+            } else if (config.is_mimo_v2 or config.is_glm5_next or options.enable_dflare_taps) {
                 const nl = config.num_hidden_layers;
-                if (nl == 48) {
+                if (nl == 45 and config.is_glm5_next) {
+                    // Canonical `lablup/GLM-5.3-Flash-DFlash2-Agentic` 5-tap indices (`[5, 14, 24, 33, 42]`).
+                    dflare_target_layers[0] = 5;
+                    dflare_target_layers[1] = 14;
+                    dflare_target_layers[2] = 24;
+                    dflare_target_layers[3] = 33;
+                    dflare_target_layers[4] = 42;
+                    dflare_tap_count = 5;
+                } else if (nl == 48) {
                     dflare_target_layers[0] = 0;
                     dflare_target_layers[1] = 11;
                     dflare_target_layers[2] = 23;
@@ -11177,14 +12555,15 @@ pub const GraphModel = struct {
         const swa_k_d = if (num_swa_layers > 0) config.swaKDim() else 0;
         const swa_v_d = if (num_swa_layers > 0) config.swaVDim() else 0;
         const swa_o_d = if (num_swa_layers > 0) config.swaAttnOutDim() else 0;
-        const max_q_dim: u32 = @max(@max(config.qDim(), swa_q_d), @max(config.gdnQkDim(), @max(config.mlaQDim(), h)));
+        const kda_qkv_d = if (num_kda_layers > 0) config.kdaQkvDim() else 0;
+        const max_q_dim: u32 = @max(@max(config.qDim(), swa_q_d), @max(@max(config.gdnQkDim(), kda_qkv_d), @max(config.mlaQDim(), h)));
         const max_kv_dim: u32 = @max(
             @max(@max(config.kvDim(), config.globalVDim()), @max(swa_k_d, swa_v_d)),
-            @max(config.gdnQkDim(), @max(config.gdnVDim(), @max(config.mlaKvADim(), h))),
+            @max(@max(config.gdnQkDim(), kda_qkv_d), @max(config.gdnVDim(), @max(config.mlaKvADim(), h))),
         );
         const max_attn_out: u32 = @max(
             @max(@max(config.qDim(), config.globalAttnOutDim()), swa_o_d),
-            @max(config.gdnVDim(), @max(config.mlaVDim(), h)),
+            @max(@max(config.gdnVDim(), kda_qkv_d), @max(config.mlaVDim(), h)),
         );
         const max_inter: u32 = @max(@max(config.intermediate_size, config.moe_intermediate_size), @max(config.shared_expert_intermediate_size, h));
         const max_top_k: u32 = if (has_moe_ffn) config.maxLayerTopK() else 1;
@@ -11219,12 +12598,15 @@ pub const GraphModel = struct {
             addAligned(&tree_scratch_bytes, @as(usize, max_m) * 4 * 4); // gr_g_write
             addAligned(&tree_scratch_bytes, @as(usize, max_m) * 4 * 4); // gr_decay
         } else {
-            if (config.axes.residual_kind == .mhc_single_pass) {
+            if (config.axes.residual_kind.usesMhcStreams()) {
                 tree_scratch_bytes += try hybrid.MhcStreamArena.requiredBytes(.{
                     .max_tokens = max_m,
                     .num_streams = config.mhc_num_streams,
                     .hidden_size = h,
                 });
+                if (config.axes.residual_kind == .mhc_sinkhorn20) {
+                    addAligned(&tree_scratch_bytes, @as(usize, max_m) * 20 * 4); // g27_mhc_coeffs
+                }
             }
             addAligned(&tree_scratch_bytes, @as(usize, max_m) * 4 * 4);
             addAligned(&tree_scratch_bytes, @as(usize, max_m) * 4 * 4);
@@ -11300,7 +12682,7 @@ pub const GraphModel = struct {
                 addAligned(&tree_scratch_bytes, @as(usize, max_m) * swa_v_d * 2);
             }
         }
-        if (num_mla_layers > 0) {
+        if (any_mla) {
             addAligned(&tree_scratch_bytes, @as(usize, max_m) * config.q_lora_rank * 2); // q_a
             addAligned(&tree_scratch_bytes, @as(usize, max_m) * config.q_lora_rank * 2); // q_a_norm
             addAligned(&tree_scratch_bytes, @as(usize, max_m) * config.mlaQDim() * 2); // q_full
@@ -11314,6 +12696,8 @@ pub const GraphModel = struct {
             addAligned(&tree_scratch_bytes, @as(usize, max_m) * mla_head_in_dim * 2); // head_in
             addAligned(&tree_scratch_bytes, @as(usize, max_m) * mla_head_out_dim * 2); // head_out
             addAligned(&tree_scratch_bytes, @as(usize, max_m) * config.num_attention_heads * config.kv_lora_rank * 2); // attn_latent
+        }
+        if (num_mla_layers > 0) {
             for (0..num_mla_index_layers) |_| {
                 tree_scratch_bytes += (try hybrid.Csa2IndexBuffer.requiredBytes(.{
                     .max_nodes = max_m,
@@ -11323,6 +12707,47 @@ pub const GraphModel = struct {
             for (0..num_mla_full_layers) |_| {
                 addAligned(&tree_scratch_bytes, @as(usize, max_m) * config.kv_lora_rank * 2); // tree_latent
                 addAligned(&tree_scratch_bytes, @as(usize, max_m) * @max(config.qk_rope_head_dim, 2) * 2); // tree_rope
+            }
+        }
+        if (num_kda_layers > 0) {
+            const fused_cols: usize = 3 * @as(usize, kda_qkv_d) + config.kda_num_heads + 2 * eff_kda_lora_rank;
+            addAligned(&tree_scratch_bytes, @as(usize, max_m) * config.kda_num_heads * 2); // b_raw
+            addAligned(&tree_scratch_bytes, @as(usize, max_m) * eff_kda_lora_rank * 2); // f_mid
+            addAligned(&tree_scratch_bytes, @as(usize, max_m) * kda_qkv_d * 2); // f_raw
+            addAligned(&tree_scratch_bytes, @as(usize, max_m) * eff_kda_lora_rank * 2); // g_mid
+            addAligned(&tree_scratch_bytes, @as(usize, max_m) * kda_qkv_d * 4); // g_out
+            addAligned(&tree_scratch_bytes, @as(usize, max_m) * config.kda_num_heads * 4); // beta_out
+            addAligned(&tree_scratch_bytes, @as(usize, max_m) * fused_cols * 2); // fused_qkvbfg_out
+            for (0..num_kda_layers) |_| {
+                addAligned(&tree_scratch_bytes, @as(usize, max_m) * kda_qkv_d * 2); // tree_k
+                addAligned(&tree_scratch_bytes, @as(usize, max_m) * kda_qkv_d * 2); // tree_v
+                addAligned(&tree_scratch_bytes, @as(usize, max_m) * kda_qkv_d * 4); // tree_g
+                addAligned(&tree_scratch_bytes, @as(usize, max_m) * config.kda_num_heads * 4); // tree_beta
+                addAligned(&tree_scratch_bytes, @as(usize, max_m) * kda_qkv_d * 2); // tree_q_raw
+                addAligned(&tree_scratch_bytes, @as(usize, max_m) * kda_qkv_d * 2); // tree_k_raw
+                addAligned(&tree_scratch_bytes, @as(usize, max_m) * kda_qkv_d * 2); // tree_v_raw
+            }
+        }
+        if (num_mla_dsa_layers > 0) {
+            addAligned(&tree_scratch_bytes, @as(usize, max_m) * config.index_n_heads * config.index_head_dim * 2); // q_idx
+            addAligned(&tree_scratch_bytes, @as(usize, max_m) * config.index_head_dim * 2); // k_idx_raw
+            addAligned(&tree_scratch_bytes, @as(usize, max_m) * config.index_head_dim * 2); // k_idx
+            addAligned(&tree_scratch_bytes, @as(usize, max_m) * config.index_n_heads * 2); // idx_weights
+            addAligned(&tree_scratch_bytes, @as(usize, max_m) * config.index_head_dim * 2); // idx_gate
+            tree_scratch_bytes += (try hybrid.G27DsaIndexBuffer.requiredBytes(.{
+                .max_rows = max_m,
+                .max_out_k = dsa_max_out_k,
+                .max_candidates = dsa_max_cand,
+            })) + 256;
+            for (0..num_mla_dsa_layers) |_| {
+                addAligned(&tree_scratch_bytes, @as(usize, max_m) * config.kv_lora_rank * 2); // tree_latent
+                addAligned(&tree_scratch_bytes, @as(usize, max_m) * @max(config.qk_rope_head_dim, 2) * 2); // tree_rope
+            }
+            for (0..num_dsa_full_layers) |_| {
+                addAligned(&tree_scratch_bytes, @as(usize, max_m) * config.index_head_dim * 2); // tree_idx_k
+                if (config.index_kpool > 1) {
+                    addAligned(&tree_scratch_bytes, @as(usize, max_m) * config.index_head_dim * 2); // tree_idx_gate
+                }
             }
         }
         tree_scratch_bytes += 4 * page.APPLE_PAGE_SIZE;
@@ -11338,12 +12763,15 @@ pub const GraphModel = struct {
                 addAligned(&wide_scratch_bytes, w_cap * 4 * 4);
                 addAligned(&wide_scratch_bytes, w_cap * 4 * 4);
                 addAligned(&wide_scratch_bytes, w_cap * 4 * 4);
-            } else if (config.axes.residual_kind == .mhc_single_pass) {
+            } else if (config.axes.residual_kind.usesMhcStreams()) {
                 wide_scratch_bytes += try hybrid.MhcStreamArena.requiredBytes(.{
                     .max_tokens = wide_prefill_max_tokens,
                     .num_streams = config.mhc_num_streams,
                     .hidden_size = h,
                 });
+                if (config.axes.residual_kind == .mhc_sinkhorn20) {
+                    addAligned(&wide_scratch_bytes, w_cap * 20 * 4); // wp_g27_mhc_coeffs
+                }
             }
             addAligned(&wide_scratch_bytes, w_cap * 4); // wp_token_ids
             addAligned(&wide_scratch_bytes, w_cap * @sizeOf(hybrid.Pos3D)); // wp_pos3d
@@ -11374,8 +12802,23 @@ pub const GraphModel = struct {
                         addAligned(&wide_scratch_bytes, w_cap * qk_d * 2); // wp_q_raw
                     }
                 }
+            } else if (num_kda_layers > 0) {
+                addAligned(&wide_scratch_bytes, w_cap * max_q_dim * 2); // wp_q_conv
+                addAligned(&wide_scratch_bytes, w_cap * max_kv_dim * 2); // wp_k_conv
+                addAligned(&wide_scratch_bytes, w_cap * max_kv_dim * 2); // wp_v_conv
+                addAligned(&wide_scratch_bytes, w_cap * max_attn_out * 2); // wp_gdn_z
             } else if (config.attn_output_gate) {
                 addAligned(&wide_scratch_bytes, w_cap * max_attn_out * 2); // wp_gdn_z (q_gate_proj)
+            }
+            if (num_kda_layers > 0) {
+                const fused_cols: usize = 3 * @as(usize, kda_qkv_d) + config.kda_num_heads + 2 * eff_kda_lora_rank;
+                addAligned(&wide_scratch_bytes, w_cap * config.kda_num_heads * 2); // b_raw
+                addAligned(&wide_scratch_bytes, w_cap * eff_kda_lora_rank * 2); // f_mid
+                addAligned(&wide_scratch_bytes, w_cap * kda_qkv_d * 2); // f_raw
+                addAligned(&wide_scratch_bytes, w_cap * eff_kda_lora_rank * 2); // g_mid
+                addAligned(&wide_scratch_bytes, w_cap * kda_qkv_d * 4); // g_out
+                addAligned(&wide_scratch_bytes, w_cap * config.kda_num_heads * 4); // beta_out
+                addAligned(&wide_scratch_bytes, w_cap * fused_cols * 2); // fused_qkvbfg_out
             }
             addAligned(&wide_scratch_bytes, w_cap * max_attn_out * 2); // wp_attn_out
             addAligned(&wide_scratch_bytes, w_cap * h * 2); // wp_proj_out
@@ -11406,7 +12849,7 @@ pub const GraphModel = struct {
                     }
                 }
             }
-            if (num_mla_layers > 0) {
+            if (any_mla) {
                 addAligned(&wide_scratch_bytes, w_cap * config.q_lora_rank * 2);
                 addAligned(&wide_scratch_bytes, w_cap * config.q_lora_rank * 2);
                 addAligned(&wide_scratch_bytes, w_cap * config.mlaQDim() * 2);
@@ -11420,12 +12863,26 @@ pub const GraphModel = struct {
                 addAligned(&wide_scratch_bytes, w_cap * mla_head_in_dim * 2);
                 addAligned(&wide_scratch_bytes, w_cap * mla_head_out_dim * 2);
                 addAligned(&wide_scratch_bytes, w_cap * config.num_attention_heads * config.kv_lora_rank * 2);
+            }
+            if (num_mla_layers > 0) {
                 for (0..num_mla_index_layers) |_| {
                     wide_scratch_bytes += (try hybrid.Csa2IndexBuffer.requiredBytes(.{
                         .max_nodes = wide_prefill_max_tokens,
                         .top_k_blocks = config.csa2_top_k_blocks,
                     })) + page.APPLE_PAGE_SIZE;
                 }
+            }
+            if (num_mla_dsa_layers > 0) {
+                addAligned(&wide_scratch_bytes, w_cap * config.index_n_heads * config.index_head_dim * 2);
+                addAligned(&wide_scratch_bytes, w_cap * config.index_head_dim * 2);
+                addAligned(&wide_scratch_bytes, w_cap * config.index_head_dim * 2);
+                addAligned(&wide_scratch_bytes, w_cap * config.index_n_heads * 2);
+                addAligned(&wide_scratch_bytes, w_cap * config.index_head_dim * 2);
+                wide_scratch_bytes += (try hybrid.G27DsaIndexBuffer.requiredBytes(.{
+                    .max_rows = wide_prefill_max_tokens,
+                    .max_out_k = dsa_max_out_k,
+                    .max_candidates = dsa_max_cand,
+                })) + 256;
             }
             wide_scratch_bytes += 4 * page.APPLE_PAGE_SIZE;
         }
@@ -11472,13 +12929,60 @@ pub const GraphModel = struct {
                 }
             }
         }
-        if (config.axes.residual_kind == .mhc_single_pass) {
+        const g27_mla_kv_spec: hybrid.G27MlaKvSpec = .{
+            .num_layers = @max(@as(u32, 1), num_mla_dsa_layers),
+            .max_seq_len = options.max_seq_len,
+            .kv_lora_rank = if (num_mla_dsa_layers > 0) config.kv_lora_rank else 32,
+            .qk_rope_head_dim = if (num_mla_dsa_layers > 0) config.qk_rope_head_dim else 0,
+        };
+        const g27_dsa_idx_kv_spec: hybrid.G27DsaIdxKvSpec = .{
+            .num_full_layers = @max(@as(u32, 1), num_dsa_full_layers),
+            .max_seq_len = options.max_seq_len,
+            .index_head_dim = if (num_mla_dsa_layers > 0) config.index_head_dim else 32,
+            .kpool = @max(@as(u32, 1), config.index_kpool),
+        };
+        if (num_mla_dsa_layers > 0) {
+            persist_bytes += try hybrid.G27MlaKvArena.requiredBytes(g27_mla_kv_spec);
+            persist_bytes += try hybrid.G27DsaIdxKvArena.requiredBytes(g27_dsa_idx_kv_spec);
+            const per_head_uk = @as(usize, config.kv_lora_rank) * config.qk_nope_head_dim * 2;
+            const per_head_uv = @as(usize, config.v_head_dim) * config.kv_lora_rank * 2;
+            for (0..num_mla_dsa_layers) |_| {
+                for (0..config.num_attention_heads) |_| {
+                    addAligned(&persist_bytes, per_head_uk);
+                    addAligned(&persist_bytes, per_head_uv);
+                }
+            }
+        }
+        if (config.axes.residual_kind.usesMhcStreams()) {
             const s_cnt: usize = config.mhc_num_streams;
             addAligned(&persist_bytes, s_cnt * 4); // mhc_uniform_pre
-            for (0..config.num_hidden_layers) |_| {
-                addAligned(&persist_bytes, s_cnt * 4); // h_pre
-                addAligned(&persist_bytes, s_cnt * 4); // h_post
-                addAligned(&persist_bytes, s_cnt * s_cnt * 4); // h_res
+            if (config.axes.residual_kind == .mhc_single_pass) {
+                for (0..config.num_hidden_layers) |_| {
+                    addAligned(&persist_bytes, s_cnt * 4); // h_pre
+                    addAligned(&persist_bytes, s_cnt * 4); // h_post
+                    addAligned(&persist_bytes, s_cnt * s_cnt * 4); // h_res
+                }
+            } else {
+                for (0..config.num_hidden_layers) |_| {
+                    addAligned(&persist_bytes, 24 * 4); // hc_attn_base f32
+                    addAligned(&persist_bytes, 3 * 4); // hc_attn_scale f32
+                    addAligned(&persist_bytes, 24 * 4); // hc_ffn_base f32
+                    addAligned(&persist_bytes, 3 * 4); // hc_ffn_scale f32
+                }
+            }
+        }
+        if (num_kda_layers > 0) {
+            persist_bytes += try hybrid.GdnStateArena.requiredBytes(.{
+                .num_gdn_layers = num_kda_layers,
+                .num_v_heads = config.kda_num_heads,
+                .head_k_dim = config.kda_head_dim,
+                .head_v_dim = config.kda_head_dim,
+            });
+            const conv_d = 3 * kda_qkv_d;
+            const conv_hist = if (config.linear_conv_kernel_dim > 1) config.linear_conv_kernel_dim - 1 else 1;
+            for (0..num_kda_layers) |_| {
+                addAligned(&persist_bytes, @as(usize, conv_hist) * conv_d * 2); // conv_state
+                addAligned(&persist_bytes, @as(usize, conv_hist) * conv_d * 2); // conv_state_tmp
             }
         }
         if (num_gdn_layers > 0) {
@@ -11764,6 +13268,10 @@ pub const GraphModel = struct {
         var wp_x_host: []f16 = &.{};
         var wp_x_norm_host: []f16 = &.{};
         var wp_proj_out_host: []f16 = &.{};
+        var wp_g27_mhc_coeffs_bind: metal.BufferBinding = .{ .buffer = scratch_buf, .offset = 0 };
+        var wp_g27_kda_scratch: G27KdaScratchBindings = .{};
+        var wp_g27_dsa_scratch: G27DsaScratchBindings = .{};
+        var wp_g27_dsa_idx_buf: ?hybrid.G27DsaIndexBuffer = null;
         if (wide_enabled) {
             if (config.axes.residual_kind == .gated_4branch) {
                 wp_gr_arena = try hybrid.GrStreamArena.init(wp_arena, .{
@@ -11776,12 +13284,16 @@ pub const GraphModel = struct {
                 wp_gr_g_read_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(gr_r.ptr) };
                 wp_gr_g_write_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(gr_w.ptr) };
                 wp_gr_decay_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(gr_d.ptr) };
-            } else if (config.axes.residual_kind == .mhc_single_pass) {
+            } else if (config.axes.residual_kind.usesMhcStreams()) {
                 wp_mhc_arena = try hybrid.MhcStreamArena.init(wp_arena, .{
                     .max_tokens = wide_prefill_max_tokens,
                     .num_streams = config.mhc_num_streams,
                     .hidden_size = h,
                 });
+                if (config.axes.residual_kind == .mhc_sinkhorn20) {
+                    const wc_raw = try wp_arena.allocAligned(w_cap * 20 * 4, 64);
+                    wp_g27_mhc_coeffs_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(wc_raw.ptr) };
+                }
             }
             const wt_raw = try wp_arena.allocAligned(w_cap * 4, 64);
             const wp3_raw = try wp_arena.allocAligned(w_cap * @sizeOf(hybrid.Pos3D), 64);
@@ -11825,9 +13337,37 @@ pub const GraphModel = struct {
                 wp_gdn_z_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(wgz.ptr) };
                 wp_gdn_g_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(wgg.ptr) };
                 wp_gdn_beta_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(wgb.ptr) };
+            } else if (num_kda_layers > 0) {
+                const wqc = try wp_arena.allocAligned(w_cap * max_q_dim * 2, 64);
+                const wkc = try wp_arena.allocAligned(w_cap * max_kv_dim * 2, 64);
+                const wvc = try wp_arena.allocAligned(w_cap * max_kv_dim * 2, 64);
+                const wgz = try wp_arena.allocAligned(w_cap * max_attn_out * 2, 64);
+                wp_q_conv_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(wqc.ptr) };
+                wp_k_conv_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(wkc.ptr) };
+                wp_v_conv_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(wvc.ptr) };
+                wp_gdn_z_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(wgz.ptr) };
             } else if (config.attn_output_gate) {
                 const wgz = try wp_arena.allocAligned(w_cap * max_attn_out * 2, 64);
                 wp_gdn_z_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(wgz.ptr) };
+            }
+            if (num_kda_layers > 0) {
+                const fused_cols: usize = 3 * @as(usize, kda_qkv_d) + config.kda_num_heads + 2 * eff_kda_lora_rank;
+                const wkb = try wp_arena.allocAligned(w_cap * config.kda_num_heads * 2, 64);
+                const wkfm = try wp_arena.allocAligned(w_cap * eff_kda_lora_rank * 2, 64);
+                const wkfr = try wp_arena.allocAligned(w_cap * kda_qkv_d * 2, 64);
+                const wkgm = try wp_arena.allocAligned(w_cap * eff_kda_lora_rank * 2, 64);
+                const wkgo = try wp_arena.allocAligned(w_cap * kda_qkv_d * 4, 64);
+                const wkbo = try wp_arena.allocAligned(w_cap * config.kda_num_heads * 4, 64);
+                const wkfz = try wp_arena.allocAligned(w_cap * fused_cols * 2, 64);
+                wp_g27_kda_scratch = .{
+                    .b_raw_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(wkb.ptr) },
+                    .f_mid_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(wkfm.ptr) },
+                    .f_raw_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(wkfr.ptr) },
+                    .g_mid_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(wkgm.ptr) },
+                    .g_out_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(wkgo.ptr) },
+                    .beta_out_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(wkbo.ptr) },
+                    .fused_qkvbfg_out_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(wkfz.ptr) },
+                };
             }
             const wao_raw = try wp_arena.allocAligned(w_cap * max_attn_out * 2, 64);
             const wpo_raw = try wp_arena.allocAligned(w_cap * h * 2, 64);
@@ -11845,7 +13385,7 @@ pub const GraphModel = struct {
             if (has_moe_ffn) {
                 wp_moe_ws = try moe.MoeWorkspace.init(wp_arena, wp_moe_ws_spec);
             }
-            if (num_mla_layers > 0) {
+            if (any_mla) {
                 const d_rope_alloc: usize = @max(config.qk_rope_head_dim, 2);
                 const w_qa = try wp_arena.allocAligned(w_cap * config.q_lora_rank * 2, 64);
                 const w_qan = try wp_arena.allocAligned(w_cap * config.q_lora_rank * 2, 64);
@@ -11878,6 +13418,25 @@ pub const GraphModel = struct {
                     .attn_latent_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(w_al.ptr) },
                 };
             }
+            if (num_mla_dsa_layers > 0) {
+                const w_qi = try wp_arena.allocAligned(w_cap * config.index_n_heads * config.index_head_dim * 2, 64);
+                const w_kir = try wp_arena.allocAligned(w_cap * config.index_head_dim * 2, 64);
+                const w_ki = try wp_arena.allocAligned(w_cap * config.index_head_dim * 2, 64);
+                const w_iw = try wp_arena.allocAligned(w_cap * config.index_n_heads * 2, 64);
+                const w_ig = try wp_arena.allocAligned(w_cap * config.index_head_dim * 2, 64);
+                wp_g27_dsa_scratch = .{
+                    .q_idx_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(w_qi.ptr) },
+                    .k_idx_raw_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(w_kir.ptr) },
+                    .k_idx_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(w_ki.ptr) },
+                    .idx_weights_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(w_iw.ptr) },
+                    .idx_gate_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(w_ig.ptr) },
+                };
+                wp_g27_dsa_idx_buf = try hybrid.G27DsaIndexBuffer.init(wp_arena, .{
+                    .max_rows = wide_prefill_max_tokens,
+                    .max_out_k = dsa_max_out_k,
+                    .max_candidates = dsa_max_cand,
+                });
+            }
         }
 
         // --- Carve Region B: decode & `verifyTree` scratch (`tr_arena`) ---
@@ -11888,7 +13447,7 @@ pub const GraphModel = struct {
             })
         else
             null;
-        const mhc_arena: ?hybrid.MhcStreamArena = if (config.axes.residual_kind == .mhc_single_pass)
+        const mhc_arena: ?hybrid.MhcStreamArena = if (config.axes.residual_kind.usesMhcStreams())
             try hybrid.MhcStreamArena.init(tr_arena, .{
                 .max_tokens = max_m,
                 .num_streams = config.mhc_num_streams,
@@ -11896,6 +13455,11 @@ pub const GraphModel = struct {
             })
         else
             null;
+        var g27_mhc_coeffs_bind: metal.BufferBinding = .{ .buffer = scratch_buf, .offset = 0 };
+        if (config.axes.residual_kind == .mhc_sinkhorn20) {
+            const tc_raw = try tr_arena.allocAligned(@as(usize, max_m) * 20 * 4, 64);
+            g27_mhc_coeffs_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(tc_raw.ptr) };
+        }
 
         const gr_g_read_raw = try tr_arena.allocAligned(@as(usize, max_m) * 4 * 4, 64);
         const gr_g_write_raw = try tr_arena.allocAligned(@as(usize, max_m) * 4 * 4, 64);
@@ -11937,7 +13501,7 @@ pub const GraphModel = struct {
             null;
 
         var mla_scratch: MlaScratchBindings = .{};
-        if (num_mla_layers > 0) {
+        if (any_mla) {
             const d_rope_alloc: usize = @max(config.qk_rope_head_dim, 2);
             const t_qa = try tr_arena.allocAligned(@as(usize, max_m) * config.q_lora_rank * 2, 64);
             const t_qan = try tr_arena.allocAligned(@as(usize, max_m) * config.q_lora_rank * 2, 64);
@@ -11970,6 +13534,47 @@ pub const GraphModel = struct {
                 .attn_latent_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(t_al.ptr) },
             };
         }
+        var g27_kda_scratch: G27KdaScratchBindings = .{};
+        if (num_kda_layers > 0) {
+            const fused_cols: usize = 3 * @as(usize, kda_qkv_d) + config.kda_num_heads + 2 * eff_kda_lora_rank;
+            const tkb = try tr_arena.allocAligned(@as(usize, max_m) * config.kda_num_heads * 2, 64);
+            const tkfm = try tr_arena.allocAligned(@as(usize, max_m) * eff_kda_lora_rank * 2, 64);
+            const tkfr = try tr_arena.allocAligned(@as(usize, max_m) * kda_qkv_d * 2, 64);
+            const tkgm = try tr_arena.allocAligned(@as(usize, max_m) * eff_kda_lora_rank * 2, 64);
+            const tkgo = try tr_arena.allocAligned(@as(usize, max_m) * kda_qkv_d * 4, 64);
+            const tkbo = try tr_arena.allocAligned(@as(usize, max_m) * config.kda_num_heads * 4, 64);
+            const tkfz = try tr_arena.allocAligned(@as(usize, max_m) * fused_cols * 2, 64);
+            g27_kda_scratch = .{
+                .b_raw_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(tkb.ptr) },
+                .f_mid_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(tkfm.ptr) },
+                .f_raw_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(tkfr.ptr) },
+                .g_mid_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(tkgm.ptr) },
+                .g_out_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(tkgo.ptr) },
+                .beta_out_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(tkbo.ptr) },
+                .fused_qkvbfg_out_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(tkfz.ptr) },
+            };
+        }
+        var g27_dsa_scratch: G27DsaScratchBindings = .{};
+        var g27_dsa_idx_buf: ?hybrid.G27DsaIndexBuffer = null;
+        if (num_mla_dsa_layers > 0) {
+            const t_qi = try tr_arena.allocAligned(@as(usize, max_m) * config.index_n_heads * config.index_head_dim * 2, 64);
+            const t_kir = try tr_arena.allocAligned(@as(usize, max_m) * config.index_head_dim * 2, 64);
+            const t_ki = try tr_arena.allocAligned(@as(usize, max_m) * config.index_head_dim * 2, 64);
+            const t_iw = try tr_arena.allocAligned(@as(usize, max_m) * config.index_n_heads * 2, 64);
+            const t_ig = try tr_arena.allocAligned(@as(usize, max_m) * config.index_head_dim * 2, 64);
+            g27_dsa_scratch = .{
+                .q_idx_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(t_qi.ptr) },
+                .k_idx_raw_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(t_kir.ptr) },
+                .k_idx_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(t_ki.ptr) },
+                .idx_weights_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(t_iw.ptr) },
+                .idx_gate_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(t_ig.ptr) },
+            };
+            g27_dsa_idx_buf = try hybrid.G27DsaIndexBuffer.init(tr_arena, .{
+                .max_rows = max_m,
+                .max_out_k = dsa_max_out_k,
+                .max_candidates = dsa_max_cand,
+            });
+        }
 
         // --- Carve persistent non-aliased sub-arenas inside `scratch_arena` ---
         const mla_kv_arena: ?hybrid.MlaFp4KvArena = if (num_mla_layers > 0)
@@ -11982,6 +13587,14 @@ pub const GraphModel = struct {
             null;
         const mla_swa_arena: ?hybrid.MlaSwaRingArena = if (num_mla_layers > 0 and config.swa_window > 0)
             try hybrid.MlaSwaRingArena.init(&scratch_arena, mla_swa_spec)
+        else
+            null;
+        const g27_mla_kv_arena: ?hybrid.G27MlaKvArena = if (num_mla_dsa_layers > 0)
+            try hybrid.G27MlaKvArena.init(&scratch_arena, g27_mla_kv_spec)
+        else
+            null;
+        const g27_dsa_idx_kv_arena: ?hybrid.G27DsaIdxKvArena = if (num_mla_dsa_layers > 0)
+            try hybrid.G27DsaIdxKvArena.init(&scratch_arena, g27_dsa_idx_kv_spec)
         else
             null;
         var mla_commit_latent_bind: metal.BufferBinding = .{ .buffer = scratch_buf, .offset = 0 };
@@ -11997,7 +13610,7 @@ pub const GraphModel = struct {
             mla_commit_rope_host = @alignCast(std.mem.bytesAsSlice(f16, cr_raw[0 .. @as(usize, max_m) * @max(config.qk_rope_head_dim, 2) * 2]));
         }
         var mhc_uniform_pre_bind: metal.BufferBinding = .{ .buffer = scratch_buf, .offset = 0 };
-        if (config.axes.residual_kind == .mhc_single_pass) {
+        if (config.axes.residual_kind.usesMhcStreams()) {
             const s_cnt: usize = config.mhc_num_streams;
             const u_raw = try scratch_arena.allocAligned(s_cnt * 4, 64);
             const u_f32: []f32 = @alignCast(std.mem.bytesAsSlice(f32, u_raw[0 .. s_cnt * 4]));
@@ -12020,6 +13633,15 @@ pub const GraphModel = struct {
                 .num_v_heads = config.linear_num_value_heads,
                 .head_k_dim = config.linear_key_head_dim,
                 .head_v_dim = config.linear_value_head_dim,
+            })
+        else
+            null;
+        const kda_arena: ?hybrid.GdnStateArena = if (num_kda_layers > 0)
+            try hybrid.GdnStateArena.init(&scratch_arena, .{
+                .num_gdn_layers = num_kda_layers,
+                .num_v_heads = config.kda_num_heads,
+                .head_k_dim = config.kda_head_dim,
+                .head_v_dim = config.kda_head_dim,
             })
         else
             null;
@@ -12138,6 +13760,10 @@ pub const GraphModel = struct {
                         if (mla.w_uk_t_heads.len > 0) allocator.free(mla.w_uk_t_heads);
                         if (mla.w_uv_heads.len > 0) allocator.free(mla.w_uv_heads);
                     },
+                    .mla_dsa => |*mla| {
+                        if (mla.w_uk_t_heads.len > 0) allocator.free(mla.w_uk_t_heads);
+                        if (mla.w_uv_heads.len > 0) allocator.free(mla.w_uv_heads);
+                    },
                     else => {},
                 }
                 if (layers[li].expert_sources.len > 0) allocator.free(layers[li].expert_sources);
@@ -12151,6 +13777,9 @@ pub const GraphModel = struct {
         var swa_cursor: u32 = 0;
         var mla_cursor: u32 = 0;
         var mla_full_cursor: u32 = 0;
+        var kda_cursor: u32 = 0;
+        var mla_dsa_cursor: u32 = 0;
+        var dsa_full_cursor: u32 = 0;
         var cur_kv_owner_slot: u32 = 0;
         var cur_kv_owner_layer: usize = 0;
         var cur_idx_owner_layer: usize = 0;
@@ -12259,6 +13888,67 @@ pub const GraphModel = struct {
                     .h_res_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(hr_raw.ptr) },
                 };
                 total_layers_non_expert_bytes += (2 * s_cnt * @as(u64, h) + s_cnt * s_cnt) * 2;
+            }
+
+            var mhc_s20_w: ?MhcSinkhornLayerWeights = null;
+            if (config.axes.residual_kind == .mhc_sinkhorn20) {
+                const bindMhcSub = struct {
+                    fn call(
+                        src: AmfSource,
+                        wshards: []const WeightShard,
+                        eshard: []const u16,
+                        eoffs: []const u64,
+                        eslices: []const []const u8,
+                        ebase: usize,
+                        s_arena: *arena_mod.WiredArena,
+                        s_buf: metal.Buffer,
+                        layer_idx: usize,
+                        sub_name: []const u8,
+                    ) GraphLoadError!MhcSinkhornSublayerWeights {
+                        var nb: [128]u8 = undefined;
+                        const fn_nm = std.fmt.bufPrint(&nb, "layers.{d}.hc_{s}_fn", .{ layer_idx, sub_name }) catch unreachable;
+                        const fn_e = src.findWithWeight(fn_nm) orelse return error.MissingTensor;
+                        const fn_idx = entryIndexOf(ebase, fn_e);
+                        const fn_dt = amfToScalarDType(try fn_e.dataType()) orelse return error.UnsupportedDType;
+
+                        const base_nm = std.fmt.bufPrint(&nb, "layers.{d}.hc_{s}_base", .{ layer_idx, sub_name }) catch unreachable;
+                        const base_e = src.find(base_nm) orelse return error.MissingTensor;
+                        const base_idx = entryIndexOf(ebase, base_e);
+                        const base_dt = try base_e.dataType();
+                        const base_bind: metal.BufferBinding = if (base_dt == .f32)
+                            .{ .buffer = wshards[eshard[base_idx]].buffer, .offset = eoffs[base_idx] }
+                        else blk_b: {
+                            const b_raw = try s_arena.allocAligned(24 * 4, 64);
+                            const b_f32: []f32 = @alignCast(std.mem.bytesAsSlice(f32, b_raw[0 .. 24 * 4]));
+                            for (0..24) |i| b_f32[i] = readFloatElem(eslices[base_idx], base_dt, i);
+                            break :blk_b .{ .buffer = s_buf, .offset = s_arena.offsetOf(b_raw.ptr) };
+                        };
+
+                        const scale_nm = std.fmt.bufPrint(&nb, "layers.{d}.hc_{s}_scale", .{ layer_idx, sub_name }) catch unreachable;
+                        const scale_e = src.find(scale_nm) orelse return error.MissingTensor;
+                        const scale_idx = entryIndexOf(ebase, scale_e);
+                        const scale_dt = try scale_e.dataType();
+                        const scale_bind: metal.BufferBinding = if (scale_dt == .f32)
+                            .{ .buffer = wshards[eshard[scale_idx]].buffer, .offset = eoffs[scale_idx] }
+                        else blk_s: {
+                            const sc_raw = try s_arena.allocAligned(3 * 4, 64);
+                            const sc_f32: []f32 = @alignCast(std.mem.bytesAsSlice(f32, sc_raw[0 .. 3 * 4]));
+                            for (0..3) |i| sc_f32[i] = readFloatElem(eslices[scale_idx], scale_dt, i);
+                            break :blk_s .{ .buffer = s_buf, .offset = s_arena.offsetOf(sc_raw.ptr) };
+                        };
+
+                        return .{
+                            .fn_w = .{ .buffer = wshards[eshard[fn_idx]].buffer, .offset = eoffs[fn_idx] },
+                            .fn_dtype = fn_dt,
+                            .base_f32 = base_bind,
+                            .scale_f32 = scale_bind,
+                        };
+                    }
+                }.call;
+                const attn_sub = try bindMhcSub(source, weight_shards, entry_shard, entry_offsets, entry_slices, entry_base_ptr, &scratch_arena, scratch_buf, l, "attn");
+                const ffn_sub = try bindMhcSub(source, weight_shards, entry_shard, entry_offsets, entry_slices, entry_base_ptr, &scratch_arena, scratch_buf, l, "ffn");
+                mhc_s20_w = .{ .attn = attn_sub, .ffn = ffn_sub };
+                total_layers_non_expert_bytes += 2 * (24 * 4 * @as(u64, h) * 2 + 27 * 4);
             }
 
             var attn_union: LayerAttention = undefined;
@@ -12839,6 +14529,365 @@ pub const GraphModel = struct {
                     layer_attn_bytes = qa_p.alg_bytes + qb_p.alg_bytes + kva_p.alg_bytes + kvb_p.alg_bytes + o_p.alg_bytes +
                         (if (csa_idx_p) |ip| ip.alg_bytes else 0);
                 },
+                .kda_linear => {
+                    const qkv_d: u32 = config.kdaQkvDim();
+                    const n_kda_h: u32 = config.kda_num_heads;
+                    const kda_hd: u32 = config.kda_head_dim;
+                    const findKdaPfx = struct {
+                        fn call(src: AmfSource, layer_idx: usize) []const u8 {
+                            var nb: [96]u8 = undefined;
+                            const probe1 = std.fmt.bufPrint(&nb, "layers.{d}.linear_attn.o_proj", .{layer_idx}) catch unreachable;
+                            if (src.findWithWeight(probe1) != null) return "linear_attn";
+                            return "self_attn";
+                        }
+                    }.call;
+                    const kda_pfx = findKdaPfx(source, l);
+
+                    const fb_nm = std.fmt.bufPrint(&name_buf, "layers.{d}.{s}.f_b_proj", .{ l, kda_pfx }) catch unreachable;
+                    const fb_e = source.findWithWeight(fb_nm) orelse return error.MissingTensor;
+                    const lora_rank: u32 = if (fb_e.shape[1] > 0) fb_e.shape[1] else eff_kda_lora_rank;
+                    const fb_p = try bindLinear(source, weight_shards, entry_shard, entry_offsets, entry_slices, entry_base_ptr, fb_nm, qkv_d, lora_rank);
+                    const gb_nm = std.fmt.bufPrint(&name_buf, "layers.{d}.{s}.g_b_proj", .{ l, kda_pfx }) catch unreachable;
+                    const gb_p = try bindLinear(source, weight_shards, entry_shard, entry_offsets, entry_slices, entry_base_ptr, gb_nm, qkv_d, lora_rank);
+                    const o_nm = std.fmt.bufPrint(&name_buf, "layers.{d}.{s}.o_proj", .{ l, kda_pfx }) catch unreachable;
+                    const o_p = try bindLinear(source, weight_shards, entry_shard, entry_offsets, entry_slices, entry_base_ptr, o_nm, h, qkv_d);
+
+                    const fused_cols: u32 = 3 * qkv_d + n_kda_h + 2 * lora_rank;
+                    const fused_nm = std.fmt.bufPrint(&name_buf, "layers.{d}.{s}.fused_qkvbfg_a_proj", .{ l, kda_pfx }) catch unreachable;
+                    const fused_p: ?qwen3.LinearBinding = if (source.findWithWeight(fused_nm) != null)
+                        try bindLinear(source, weight_shards, entry_shard, entry_offsets, entry_slices, entry_base_ptr, fused_nm, fused_cols, h)
+                    else
+                        null;
+
+                    const zero_lin: qwen3.LinearBinding = .{
+                        .weight = .{ .buffer = scratch_buf, .offset = 0 },
+                        .scale_bias = null,
+                        .n = 0,
+                        .k = 0,
+                        .dtype = .f16,
+                        .alg_bytes = 0,
+                    };
+                    const q_nm = std.fmt.bufPrint(&name_buf, "layers.{d}.{s}.q_proj", .{ l, kda_pfx }) catch unreachable;
+                    const q_p = if (fused_p != null and source.findWithWeight(q_nm) == null)
+                        zero_lin
+                    else
+                        try bindLinear(source, weight_shards, entry_shard, entry_offsets, entry_slices, entry_base_ptr, q_nm, qkv_d, h);
+                    const k_nm = std.fmt.bufPrint(&name_buf, "layers.{d}.{s}.k_proj", .{ l, kda_pfx }) catch unreachable;
+                    const k_p = if (fused_p != null and source.findWithWeight(k_nm) == null)
+                        zero_lin
+                    else
+                        try bindLinear(source, weight_shards, entry_shard, entry_offsets, entry_slices, entry_base_ptr, k_nm, qkv_d, h);
+                    const v_nm = std.fmt.bufPrint(&name_buf, "layers.{d}.{s}.v_proj", .{ l, kda_pfx }) catch unreachable;
+                    const v_p = if (fused_p != null and source.findWithWeight(v_nm) == null)
+                        zero_lin
+                    else
+                        try bindLinear(source, weight_shards, entry_shard, entry_offsets, entry_slices, entry_base_ptr, v_nm, qkv_d, h);
+                    const b_nm = std.fmt.bufPrint(&name_buf, "layers.{d}.{s}.b_proj", .{ l, kda_pfx }) catch unreachable;
+                    const b_p = if (fused_p != null and source.findWithWeight(b_nm) == null)
+                        zero_lin
+                    else
+                        try bindLinear(source, weight_shards, entry_shard, entry_offsets, entry_slices, entry_base_ptr, b_nm, n_kda_h, h);
+                    const fa_nm = std.fmt.bufPrint(&name_buf, "layers.{d}.{s}.f_a_proj", .{ l, kda_pfx }) catch unreachable;
+                    const fa_p = if (fused_p != null and source.findWithWeight(fa_nm) == null)
+                        zero_lin
+                    else
+                        try bindLinear(source, weight_shards, entry_shard, entry_offsets, entry_slices, entry_base_ptr, fa_nm, lora_rank, h);
+                    const ga_nm = std.fmt.bufPrint(&name_buf, "layers.{d}.{s}.g_a_proj", .{ l, kda_pfx }) catch unreachable;
+                    const ga_p = if (fused_p != null and source.findWithWeight(ga_nm) == null)
+                        zero_lin
+                    else
+                        try bindLinear(source, weight_shards, entry_shard, entry_offsets, entry_slices, entry_base_ptr, ga_nm, lora_rank, h);
+
+                    const al_nm = std.fmt.bufPrint(&name_buf, "layers.{d}.{s}.A_log", .{ l, kda_pfx }) catch unreachable;
+                    const ale = source.find(al_nm) orelse return error.MissingTensor;
+                    const al_idx = entryIndexOf(entry_base_ptr, ale);
+                    const al_dt = amfToScalarDType(try ale.dataType()) orelse return error.UnsupportedDType;
+
+                    const dt_nm = std.fmt.bufPrint(&name_buf, "layers.{d}.{s}.dt_bias", .{ l, kda_pfx }) catch unreachable;
+                    const dte = source.find(dt_nm) orelse return error.MissingTensor;
+                    const dt_idx = entryIndexOf(entry_base_ptr, dte);
+                    const dt_dt = amfToScalarDType(try dte.dataType()) orelse return error.UnsupportedDType;
+
+                    var q_cw: ?metal.BufferBinding = null;
+                    var k_cw: ?metal.BufferBinding = null;
+                    var v_cw: ?metal.BufferBinding = null;
+                    var conv_w_dt: hybrid.ScalarDType = .f32;
+                    var conv_k: u32 = 0;
+                    const qcw_nm = std.fmt.bufPrint(&name_buf, "layers.{d}.{s}.q_conv1d.weight", .{ l, kda_pfx }) catch unreachable;
+                    if (source.find(qcw_nm)) |qcwe| {
+                        const kcw_nm = std.fmt.bufPrint(&name_buf, "layers.{d}.{s}.k_conv1d.weight", .{ l, kda_pfx }) catch unreachable;
+                        const kcwe = source.find(kcw_nm) orelse return error.MissingTensor;
+                        const vcw_nm = std.fmt.bufPrint(&name_buf, "layers.{d}.{s}.v_conv1d.weight", .{ l, kda_pfx }) catch unreachable;
+                        const vcwe = source.find(vcw_nm) orelse return error.MissingTensor;
+                        const qcw_idx = entryIndexOf(entry_base_ptr, qcwe);
+                        const kcw_idx = entryIndexOf(entry_base_ptr, kcwe);
+                        const vcw_idx = entryIndexOf(entry_base_ptr, vcwe);
+                        q_cw = .{ .buffer = weight_shards[entry_shard[qcw_idx]].buffer, .offset = entry_offsets[qcw_idx] };
+                        k_cw = .{ .buffer = weight_shards[entry_shard[kcw_idx]].buffer, .offset = entry_offsets[kcw_idx] };
+                        v_cw = .{ .buffer = weight_shards[entry_shard[vcw_idx]].buffer, .offset = entry_offsets[vcw_idx] };
+                        conv_w_dt = amfToScalarDType(try qcwe.dataType()) orelse return error.UnsupportedDType;
+                        conv_k = if (qcwe.rank >= 3) @intCast(qcwe.shape[2]) else @intCast(qcwe.shape[1]);
+                    } else {
+                        const ucw_nm = std.fmt.bufPrint(&name_buf, "layers.{d}.{s}.conv1d.weight", .{ l, kda_pfx }) catch unreachable;
+                        if (source.find(ucw_nm)) |ucwe| {
+                            const ucw_idx = entryIndexOf(entry_base_ptr, ucwe);
+                            const base_buf = weight_shards[entry_shard[ucw_idx]].buffer;
+                            const base_off = entry_offsets[ucw_idx];
+                            conv_w_dt = amfToScalarDType(try ucwe.dataType()) orelse return error.UnsupportedDType;
+                            conv_k = if (ucwe.rank >= 3) @intCast(ucwe.shape[2]) else @intCast(ucwe.shape[1]);
+                            const elem_b: u64 = if (conv_w_dt == .f32) 4 else 2;
+                            const part_bytes: u64 = @as(u64, qkv_d) * conv_k * elem_b;
+                            q_cw = .{ .buffer = base_buf, .offset = base_off };
+                            k_cw = .{ .buffer = base_buf, .offset = base_off + part_bytes };
+                            v_cw = .{ .buffer = base_buf, .offset = base_off + 2 * part_bytes };
+                        }
+                    }
+
+                    const on_nm = std.fmt.bufPrint(&name_buf, "layers.{d}.{s}.o_norm.weight", .{ l, kda_pfx }) catch unreachable;
+                    const out_norm: ?qwen3.NormBinding = if (source.find(on_nm) != null)
+                        try bindNorm(source, weight_shards, entry_shard, entry_offsets, entry_slices, entry_base_ptr, on_nm, kda_hd)
+                    else blk_on: {
+                        const nn_nm = std.fmt.bufPrint(&name_buf, "layers.{d}.{s}.norm.weight", .{ l, kda_pfx }) catch unreachable;
+                        break :blk_on if (source.find(nn_nm) != null)
+                            try bindNorm(source, weight_shards, entry_shard, entry_offsets, entry_slices, entry_base_ptr, nn_nm, kda_hd)
+                        else
+                            null;
+                    };
+
+                    const tk_r = try tr_arena.allocAligned(@as(usize, max_m) * qkv_d * 2, 64);
+                    const tv_r = try tr_arena.allocAligned(@as(usize, max_m) * qkv_d * 2, 64);
+                    const tg_r = try tr_arena.allocAligned(@as(usize, max_m) * qkv_d * 4, 64);
+                    const tb_r = try tr_arena.allocAligned(@as(usize, max_m) * n_kda_h * 4, 64);
+                    const tqr_r = try tr_arena.allocAligned(@as(usize, max_m) * qkv_d * 2, 64);
+                    const tkr_r = try tr_arena.allocAligned(@as(usize, max_m) * qkv_d * 2, 64);
+                    const tvr_r = try tr_arena.allocAligned(@as(usize, max_m) * qkv_d * 2, 64);
+
+                    const conv_hist = if (conv_k > 1) conv_k - 1 else 1;
+                    const conv_d = 3 * qkv_d;
+                    const cs_r = try scratch_arena.allocAligned(@as(usize, conv_hist) * conv_d * 2, 64);
+                    const cst_r = try scratch_arena.allocAligned(@as(usize, conv_hist) * conv_d * 2, 64);
+                    @memset(cs_r, 0);
+                    @memset(cst_r, 0);
+
+                    attn_union = .{ .kda = .{
+                        .kda_idx = kda_cursor,
+                        .lora_rank = lora_rank,
+                        .q_proj = q_p,
+                        .k_proj = k_p,
+                        .v_proj = v_p,
+                        .b_proj = b_p,
+                        .f_a_proj = fa_p,
+                        .f_b_proj = fb_p,
+                        .g_a_proj = ga_p,
+                        .g_b_proj = gb_p,
+                        .o_proj = o_p,
+                        .fused_qkvbfg_a_proj = fused_p,
+                        .q_conv_w = q_cw,
+                        .k_conv_w = k_cw,
+                        .v_conv_w = v_cw,
+                        .conv_w_dtype = conv_w_dt,
+                        .conv_k = conv_k,
+                        .a_log = .{ .buffer = weight_shards[entry_shard[al_idx]].buffer, .offset = entry_offsets[al_idx] },
+                        .a_log_dtype = al_dt,
+                        .dt_bias = .{ .buffer = weight_shards[entry_shard[dt_idx]].buffer, .offset = entry_offsets[dt_idx] },
+                        .dt_bias_dtype = dt_dt,
+                        .o_norm = out_norm,
+                        .tree_k_off = scratch_arena.offsetOf(tk_r.ptr),
+                        .tree_v_off = scratch_arena.offsetOf(tv_r.ptr),
+                        .tree_g_off = scratch_arena.offsetOf(tg_r.ptr),
+                        .tree_beta_off = scratch_arena.offsetOf(tb_r.ptr),
+                        .tree_q_raw_off = scratch_arena.offsetOf(tqr_r.ptr),
+                        .tree_k_raw_off = scratch_arena.offsetOf(tkr_r.ptr),
+                        .tree_v_raw_off = scratch_arena.offsetOf(tvr_r.ptr),
+                        .conv_state_off = scratch_arena.offsetOf(cs_r.ptr),
+                        .conv_state_tmp_off = scratch_arena.offsetOf(cst_r.ptr),
+                    } };
+                    kda_cursor += 1;
+                    layer_attn_bytes = (if (fused_p) |fp| fp.alg_bytes else (q_p.alg_bytes + k_p.alg_bytes + v_p.alg_bytes + b_p.alg_bytes + fa_p.alg_bytes + ga_p.alg_bytes)) +
+                        fb_p.alg_bytes + gb_p.alg_bytes + o_p.alg_bytes;
+                },
+                .mla_dsa => {
+                    const idx_mode = config.dsaIndexerMode(l);
+                    const n_heads: u32 = config.num_attention_heads;
+                    const kv_rank: u32 = config.kv_lora_rank;
+                    const q_rank: u32 = config.q_lora_rank;
+                    const d_nope: u32 = config.qk_nope_head_dim;
+                    const d_rope: u32 = config.qk_rope_head_dim;
+                    const d_v: u32 = config.v_head_dim;
+
+                    const qa_nm = std.fmt.bufPrint(&name_buf, "layers.{d}.self_attn.q_a_proj", .{l}) catch unreachable;
+                    const qa_p = try bindLinear(source, weight_shards, entry_shard, entry_offsets, entry_slices, entry_base_ptr, qa_nm, q_rank, h);
+                    const qan_nm = std.fmt.bufPrint(&name_buf, "layers.{d}.self_attn.q_a_layernorm.weight", .{l}) catch unreachable;
+                    const qan = try bindNorm(source, weight_shards, entry_shard, entry_offsets, entry_slices, entry_base_ptr, qan_nm, q_rank);
+                    const qb_nm = std.fmt.bufPrint(&name_buf, "layers.{d}.self_attn.q_b_proj", .{l}) catch unreachable;
+                    const qb_p = try bindLinear(source, weight_shards, entry_shard, entry_offsets, entry_slices, entry_base_ptr, qb_nm, config.mlaQDim(), q_rank);
+                    const kva_nm = std.fmt.bufPrint(&name_buf, "layers.{d}.self_attn.kv_a_proj_with_mqa", .{l}) catch unreachable;
+                    const kva_p = try bindLinear(source, weight_shards, entry_shard, entry_offsets, entry_slices, entry_base_ptr, kva_nm, config.mlaKvADim(), h);
+                    const kvan_nm = std.fmt.bufPrint(&name_buf, "layers.{d}.self_attn.kv_a_layernorm.weight", .{l}) catch unreachable;
+                    const kvan = try bindNorm(source, weight_shards, entry_shard, entry_offsets, entry_slices, entry_base_ptr, kvan_nm, kv_rank);
+                    const kvb_nm = std.fmt.bufPrint(&name_buf, "layers.{d}.self_attn.kv_b_proj", .{l}) catch unreachable;
+                    const kvb_p = try bindLinear(source, weight_shards, entry_shard, entry_offsets, entry_slices, entry_base_ptr, kvb_nm, config.mlaKvBDim(), kv_rank);
+                    const o_nm = std.fmt.bufPrint(&name_buf, "layers.{d}.self_attn.o_proj", .{l}) catch unreachable;
+                    const o_p = try bindLinear(source, weight_shards, entry_shard, entry_offsets, entry_slices, entry_base_ptr, o_nm, h, config.mlaVDim());
+
+                    // Startup-only dequantization of `kv_b_proj` into per-head `W_UK^T` & `W_UV` (0 hot-path allocs).
+                    const kvb_lookup = std.fmt.bufPrint(&name_buf, "layers.{d}.self_attn.kv_b_proj", .{l}) catch unreachable;
+                    const kvb_entry = source.findWithWeight(kvb_lookup) orelse return error.MissingTensor;
+                    const kvb_idx = entryIndexOf(entry_base_ptr, kvb_entry);
+                    const kvb_raw = entry_slices[kvb_idx];
+                    const kvb_dt = try kvb_entry.dataType();
+
+                    const w_uk_t_heads = try allocator.alloc(qwen3.LinearBinding, n_heads);
+                    errdefer allocator.free(w_uk_t_heads);
+                    const w_uv_heads = try allocator.alloc(qwen3.LinearBinding, n_heads);
+                    errdefer allocator.free(w_uv_heads);
+
+                    const row_buf = try allocator.alloc(f32, kv_rank);
+                    defer allocator.free(row_buf);
+                    const per_head_rows: usize = d_nope + d_v;
+                    for (0..n_heads) |hd| {
+                        const uk_raw = try scratch_arena.allocAligned(@as(usize, kv_rank) * d_nope * 2, 64);
+                        const uk_f16: []f16 = @alignCast(std.mem.bytesAsSlice(f16, uk_raw[0 .. @as(usize, kv_rank) * d_nope * 2]));
+                        for (0..d_nope) |c| {
+                            try decodeMatrixRowF32(kvb_entry, kvb_dt, kvb_raw, hd * per_head_rows + c, kv_rank, row_buf);
+                            for (0..kv_rank) |r| {
+                                uk_f16[r * d_nope + c] = @floatCast(row_buf[r]);
+                            }
+                        }
+                        w_uk_t_heads[hd] = .{
+                            .weight = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(uk_raw.ptr) },
+                            .scale_bias = null,
+                            .n = kv_rank,
+                            .k = d_nope,
+                            .dtype = .f16,
+                            .alg_bytes = @as(u64, kv_rank) * d_nope * 2,
+                        };
+
+                        const uv_raw = try scratch_arena.allocAligned(@as(usize, d_v) * kv_rank * 2, 64);
+                        const uv_f16: []f16 = @alignCast(std.mem.bytesAsSlice(f16, uv_raw[0 .. @as(usize, d_v) * kv_rank * 2]));
+                        for (0..d_v) |j| {
+                            try decodeMatrixRowF32(kvb_entry, kvb_dt, kvb_raw, hd * per_head_rows + d_nope + j, kv_rank, row_buf);
+                            for (0..kv_rank) |r| {
+                                uv_f16[j * kv_rank + r] = @floatCast(row_buf[r]);
+                            }
+                        }
+                        w_uv_heads[hd] = .{
+                            .weight = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(uv_raw.ptr) },
+                            .scale_bias = null,
+                            .n = d_v,
+                            .k = kv_rank,
+                            .dtype = .f16,
+                            .alg_bytes = @as(u64, d_v) * kv_rank * 2,
+                        };
+                    }
+
+                    const tl_raw = try tr_arena.allocAligned(@as(usize, max_m) * kv_rank * 2, 64);
+                    const tr_raw = try tr_arena.allocAligned(@as(usize, max_m) * @max(d_rope, 2) * 2, 64);
+                    const tree_lat_off = scratch_arena.offsetOf(tl_raw.ptr);
+                    const tree_rope_off = scratch_arena.offsetOf(tr_raw.ptr);
+
+                    var idx_wq_b: ?qwen3.LinearBinding = null;
+                    var idx_wk: ?qwen3.LinearBinding = null;
+                    var idx_k_norm_w: ?metal.BufferBinding = null;
+                    var idx_k_norm_w_dt: hybrid.ScalarDType = .bf16;
+                    var idx_k_norm_b: ?metal.BufferBinding = null;
+                    var idx_k_norm_b_dt: hybrid.ScalarDType = .bf16;
+                    var idx_weights_proj: ?qwen3.LinearBinding = null;
+                    var idx_kpool_gate: ?qwen3.LinearBinding = null;
+                    var idx_kpool_ape: ?metal.BufferBinding = null;
+                    var idx_kpool_ape_dt: hybrid.ScalarDType = .bf16;
+                    var tree_idx_k_off: u64 = 0;
+                    var tree_idx_gate_off: u64 = 0;
+                    var full_slot: u32 = 0;
+
+                    if (idx_mode == .full) {
+                        const idx_pfx: []const u8 = blk_ip: {
+                            const probe = std.fmt.bufPrint(&name_buf, "layers.{d}.attn.idx.wk", .{l}) catch unreachable;
+                            if (source.findWithWeight(probe) != null) break :blk_ip "attn.idx";
+                            break :blk_ip "self_attn.indexer";
+                        };
+                        const wqb_nm = std.fmt.bufPrint(&name_buf, "layers.{d}.{s}.wq_b", .{ l, idx_pfx }) catch unreachable;
+                        idx_wq_b = try bindLinear(source, weight_shards, entry_shard, entry_offsets, entry_slices, entry_base_ptr, wqb_nm, config.index_n_heads * config.index_head_dim, q_rank);
+                        const wk_nm = std.fmt.bufPrint(&name_buf, "layers.{d}.{s}.wk", .{ l, idx_pfx }) catch unreachable;
+                        idx_wk = try bindLinear(source, weight_shards, entry_shard, entry_offsets, entry_slices, entry_base_ptr, wk_nm, config.index_head_dim, h);
+                        const wp_nm = std.fmt.bufPrint(&name_buf, "layers.{d}.{s}.weights_proj", .{ l, idx_pfx }) catch unreachable;
+                        idx_weights_proj = try bindLinear(source, weight_shards, entry_shard, entry_offsets, entry_slices, entry_base_ptr, wp_nm, config.index_n_heads, h);
+
+                        const knw_nm = std.fmt.bufPrint(&name_buf, "layers.{d}.{s}.k_norm.weight", .{ l, idx_pfx }) catch unreachable;
+                        const knw_e = source.find(knw_nm) orelse return error.MissingTensor;
+                        const knw_idx = entryIndexOf(entry_base_ptr, knw_e);
+                        idx_k_norm_w = .{ .buffer = weight_shards[entry_shard[knw_idx]].buffer, .offset = entry_offsets[knw_idx] };
+                        idx_k_norm_w_dt = amfToScalarDType(try knw_e.dataType()) orelse return error.UnsupportedDType;
+
+                        const knb_nm = std.fmt.bufPrint(&name_buf, "layers.{d}.{s}.k_norm.bias", .{ l, idx_pfx }) catch unreachable;
+                        if (source.find(knb_nm)) |knb_e| {
+                            const knb_idx = entryIndexOf(entry_base_ptr, knb_e);
+                            idx_k_norm_b = .{ .buffer = weight_shards[entry_shard[knb_idx]].buffer, .offset = entry_offsets[knb_idx] };
+                            idx_k_norm_b_dt = amfToScalarDType(try knb_e.dataType()) orelse return error.UnsupportedDType;
+                        }
+
+                        if (config.index_kpool > 1) {
+                            const kg_nm1 = std.fmt.bufPrint(&name_buf, "layers.{d}.{s}.kpool_gate", .{ l, idx_pfx }) catch unreachable;
+                            const kg_nm: []const u8 = if (source.findWithWeight(kg_nm1) != null)
+                                kg_nm1
+                            else
+                                std.fmt.bufPrint(&name_buf, "layers.{d}.{s}.index_kpool_compress_gate", .{ l, idx_pfx }) catch unreachable;
+                            idx_kpool_gate = try bindLinear(source, weight_shards, entry_shard, entry_offsets, entry_slices, entry_base_ptr, kg_nm, config.index_head_dim, h);
+
+                            const ka_nm1 = std.fmt.bufPrint(&name_buf, "layers.{d}.{s}.kpool_ape", .{ l, idx_pfx }) catch unreachable;
+                            const ka_e = source.find(ka_nm1) orelse blk_ka: {
+                                const ka_nm2 = std.fmt.bufPrint(&name_buf, "layers.{d}.{s}.index_kpool_compress_ape", .{ l, idx_pfx }) catch unreachable;
+                                break :blk_ka source.find(ka_nm2) orelse return error.MissingTensor;
+                            };
+                            const ka_idx = entryIndexOf(entry_base_ptr, ka_e);
+                            idx_kpool_ape = .{ .buffer = weight_shards[entry_shard[ka_idx]].buffer, .offset = entry_offsets[ka_idx] };
+                            idx_kpool_ape_dt = amfToScalarDType(try ka_e.dataType()) orelse return error.UnsupportedDType;
+
+                            const tig_raw = try tr_arena.allocAligned(@as(usize, max_m) * config.index_head_dim * 2, 64);
+                            tree_idx_gate_off = scratch_arena.offsetOf(tig_raw.ptr);
+                        }
+
+                        const tik_raw = try tr_arena.allocAligned(@as(usize, max_m) * config.index_head_dim * 2, 64);
+                        tree_idx_k_off = scratch_arena.offsetOf(tik_raw.ptr);
+                        full_slot = dsa_full_cursor;
+                        dsa_full_cursor += 1;
+                    }
+
+                    attn_union = .{ .mla_dsa = .{
+                        .mla_idx = mla_dsa_cursor,
+                        .indexer_mode = idx_mode,
+                        .full_idx_slot = full_slot,
+                        .q_a_proj = qa_p,
+                        .q_a_norm = qan,
+                        .q_b_proj = qb_p,
+                        .kv_a_proj = kva_p,
+                        .kv_a_norm = kvan,
+                        .kv_b_proj = kvb_p,
+                        .o_proj = o_p,
+                        .w_uk_t_heads = w_uk_t_heads,
+                        .w_uv_heads = w_uv_heads,
+                        .idx_wq_b = idx_wq_b,
+                        .idx_wk = idx_wk,
+                        .idx_k_norm_w = idx_k_norm_w,
+                        .idx_k_norm_w_dtype = idx_k_norm_w_dt,
+                        .idx_k_norm_b = idx_k_norm_b,
+                        .idx_k_norm_b_dtype = idx_k_norm_b_dt,
+                        .idx_weights_proj = idx_weights_proj,
+                        .idx_kpool_gate = idx_kpool_gate,
+                        .idx_kpool_ape = idx_kpool_ape,
+                        .idx_kpool_ape_dtype = idx_kpool_ape_dt,
+                        .tree_latent_off = tree_lat_off,
+                        .tree_rope_off = tree_rope_off,
+                        .tree_idx_k_off = tree_idx_k_off,
+                        .tree_idx_gate_off = tree_idx_gate_off,
+                    } };
+                    mla_dsa_cursor += 1;
+                    layer_attn_bytes = qa_p.alg_bytes + qb_p.alg_bytes + kva_p.alg_bytes + kvb_p.alg_bytes + o_p.alg_bytes +
+                        (if (idx_wq_b) |w| w.alg_bytes else 0) +
+                        (if (idx_wk) |w| w.alg_bytes else 0) +
+                        (if (idx_weights_proj) |w| w.alg_bytes else 0) +
+                        (if (idx_kpool_gate) |w| w.alg_bytes else 0);
+                },
             }
 
             var lw: GraphLayerWeights = .{
@@ -12847,6 +14896,7 @@ pub const GraphModel = struct {
                 .post_attention_layernorm = post_ln,
                 .gr = gr_w,
                 .mhc = mhc_w,
+                .mhc_s20 = mhc_s20_w,
                 .attn = attn_union,
             };
 
@@ -13347,6 +15397,22 @@ pub const GraphModel = struct {
             .dflare_ctx_hist_cap = dflare_ctx_hist_cap,
             .dflare_ctx_hist_len = 0,
             .dflare_ctx_hist_epoch = 0,
+            .kda_arena = kda_arena,
+            .g27_mla_kv_arena = g27_mla_kv_arena,
+            .g27_dsa_idx_kv_arena = g27_dsa_idx_kv_arena,
+            .g27_dsa_idx_buf = g27_dsa_idx_buf,
+            .wp_g27_dsa_idx_buf = wp_g27_dsa_idx_buf,
+            .g27_mhc_coeffs_bind = g27_mhc_coeffs_bind,
+            .wp_g27_mhc_coeffs_bind = wp_g27_mhc_coeffs_bind,
+            .g27_dsa_scratch = g27_dsa_scratch,
+            .wp_g27_dsa_scratch = wp_g27_dsa_scratch,
+            .g27_kda_scratch = g27_kda_scratch,
+            .wp_g27_kda_scratch = wp_g27_kda_scratch,
+            .last_dsa_valid = false,
+            .last_dsa_num_rows = 0,
+            .last_dsa_is_wide = false,
+            .dsa_full_index_dispatches = 0,
+            .dsa_shared_reuse_hits = 0,
             .single_expert_bytes = single_expert_bytes,
             .total_layers_non_expert_bytes = total_layers_non_expert_bytes,
             .total_layers_static_bytes = total_layers_static_bytes,
@@ -13860,7 +15926,7 @@ pub const GraphBatchRuntime = struct {
                     layer_to_kv_idx[l] = num_kv_layers;
                     num_kv_layers += 1;
                 },
-                .mla_csa2 => {},
+                .mla_csa2, .kda, .mla_dsa => {},
             }
         }
         const kv_idx_to_layer = try allocator.alloc(u32, num_kv_layers);
@@ -15872,7 +17938,7 @@ pub const GraphBatchRuntime = struct {
                         _ = try model.encodeLoraSingle(&frame, l, .o_proj, model.wp_attn_out_bind, model.wp_proj_out_bind, eff_m, swa.o_proj.k, swa.o_proj.n, true);
                     }
                 },
-                .mla_csa2 => {},
+                .mla_csa2, .kda, .mla_dsa => {},
             }
 
             if (model.wp_gr_arena) |*gr| {
@@ -15936,6 +18002,7 @@ pub const GraphBatchRuntime = struct {
                             .up = model.wp_dense_up_bind,
                             .out = model.wp_dense_act_bind,
                             .count = eff_m * model.config.intermediate_size,
+                            .swiglu_limit = model.config.swiglu_limit,
                         }, true);
                     } else {
                         try model.encodeDenseGateUpAct(
@@ -16630,7 +18697,7 @@ pub const GraphBatchRuntime = struct {
                         _ = try model.encodeLoraSingle(&frame, l, .o_proj, model.attn_out_bind, model.proj_out_bind, m, swa.o_proj.k, swa.o_proj.n, true);
                     }
                 },
-                .mla_csa2 => {},
+                .mla_csa2, .kda, .mla_dsa => {},
             }
 
             // Residual add (4-branch GR or standard)
@@ -16759,6 +18826,7 @@ pub const GraphBatchRuntime = struct {
                     .up = model.dense_up_bind,
                     .out = model.dense_act_bind,
                     .count = m * model.config.intermediate_size,
+                    .swiglu_limit = model.config.swiglu_limit,
                 }, true);
                 try model.encodeLinearBatched(frame, layer.dense_down, model.dense_act_bind, model.proj_out_bind, m, true);
                 if (batch_lora_slots) |slots| {
@@ -17526,7 +19594,7 @@ pub const GraphBatchRuntime = struct {
                         _ = model.encodeLoraBatch(&frame, row_lora_slots, l, .o_proj, model.attn_out_bind, model.proj_out_bind, b_u32, swa.o_proj.k, swa.o_proj.n, true) catch return error.DecodeFailed;
                     }
                 },
-                .mla_csa2 => {},
+                .mla_csa2, .kda, .mla_dsa => {},
             }
 
             if (model.gr_arena) |*gr| {
@@ -17887,6 +19955,22 @@ fn amfToFloatDType(dt: amf.DType) ?quant.FloatDType {
     };
 }
 
+fn floatToScalarDType(dt: quant.FloatDType) hybrid.ScalarDType {
+    return switch (dt) {
+        .f16 => .f16,
+        .bf16 => .bf16,
+    };
+}
+
+fn amfToScalarDType(dt: amf.DType) ?hybrid.ScalarDType {
+    return switch (dt) {
+        .f16 => .f16,
+        .bf16 => .bf16,
+        .f32 => .f32,
+        else => null,
+    };
+}
+
 fn integerExactSqrt(val: u64) ?u32 {
     if (val == 0) return 0;
     const root: u64 = std.math.sqrt(val);
@@ -18025,6 +20109,8 @@ fn inferVisionConfigFromEntries(
         "visual.merger.linear_fc1",
         "visual.merger.fc1",
         "visual.merger.w1",
+        "visual.merger.proj",
+        "visual.downsample",
         "visual.proj_in",
         "vision.merger.linear_fc1",
         "vision.merger.fc1",
@@ -18360,6 +20446,8 @@ fn bindVisionWeights(
         "visual.merger.linear_fc1",
         "visual.merger.fc1",
         "visual.merger.w1",
+        "visual.merger.proj",
+        "visual.downsample",
         "visual.proj_in",
         "vision.merger.linear_fc1",
         "vision.merger.fc1",
@@ -18376,6 +20464,7 @@ fn bindVisionWeights(
         "visual.merger.linear_fc2",
         "visual.merger.fc2",
         "visual.merger.w2",
+        "visual.merger.down_proj",
         "visual.proj_out",
         "vision.merger.linear_fc2",
         "vision.merger.fc2",
@@ -22743,4 +24832,492 @@ test "M9.1 G26: synthetic qwen3_5 (rmsnorm_unit_offset, GDN + 256-dim partial-Ro
         max_diff = @max(max_diff, @abs(@as(f32, @floatCast(serial_m.readLogitsF16()[vi])) - @as(f32, @floatCast(tree_m.readLogitsF16()[vi]))));
     }
     try std.testing.expect(max_diff < 5e-2);
+}
+
+test "M9.2 G27: synthetic glm_moe_dsa (index_topk_freq=4 3/4 shared DSA, zero-reindex MTP indices, interleaved RoPE, sigmoid+bias MoE) parity" {
+    const allocator = std.testing.allocator;
+    const glm_dsa_json =
+        \\{
+        \\  "model_type": "glm_moe_dsa",
+        \\  "vocab_size": 128,
+        \\  "hidden_size": 128,
+        \\  "intermediate_size": 128,
+        \\  "moe_intermediate_size": 64,
+        \\  "n_shared_experts": 1,
+        \\  "num_hidden_layers": 5,
+        \\  "first_k_dense_replace": 1,
+        \\  "num_attention_heads": 4,
+        \\  "num_key_value_heads": 4,
+        \\  "head_dim": 32,
+        \\  "q_lora_rank": 64,
+        \\  "kv_lora_rank": 64,
+        \\  "qk_nope_head_dim": 32,
+        \\  "qk_rope_head_dim": 16,
+        \\  "v_head_dim": 32,
+        \\  "index_n_heads": 4,
+        \\  "index_head_dim": 32,
+        \\  "index_topk": 6,
+        \\  "index_topk_freq": 4,
+        \\  "index_skip_topk_offset": 1,
+        \\  "index_share_for_mtp_iteration": true,
+        \\  "rope_interleave": true,
+        \\  "indexer_rope_interleave": true,
+        \\  "rope_parameters": { "rope_theta": 8000000.0, "rope_type": "default" },
+        \\  "rms_norm_eps": 1e-5,
+        \\  "n_routed_experts": 8,
+        \\  "num_experts_per_tok": 2,
+        \\  "scoring_func": "sigmoid",
+        \\  "norm_topk_prob": true,
+        \\  "routed_scaling_factor": 2.5,
+        \\  "eos_token_id": [154820, 154827]
+        \\}
+    ;
+
+    try std.testing.expect(GraphConfig.isGraphConfigJson(glm_dsa_json));
+    var cfg = try GraphConfig.fromJson(allocator, glm_dsa_json);
+    defer cfg.deinit(allocator);
+    try std.testing.expect(cfg.is_glm_moe_dsa);
+    try std.testing.expectEqual(@as(u32, 64), cfg.shared_expert_intermediate_size);
+    try std.testing.expectEqual(FfnKind.dense_swiglu, cfg.layerFfnKind(0));
+    try std.testing.expectEqual(FfnKind.moe_swiglu, cfg.layerFfnKind(1));
+    try std.testing.expectEqual(DsaIndexerMode.full, cfg.dsaIndexerMode(0));
+    try std.testing.expectEqual(DsaIndexerMode.shared, cfg.dsaIndexerMode(1));
+    try std.testing.expectEqual(DsaIndexerMode.shared, cfg.dsaIndexerMode(2));
+    try std.testing.expectEqual(DsaIndexerMode.shared, cfg.dsaIndexerMode(3));
+    try std.testing.expectEqual(DsaIndexerMode.full, cfg.dsaIndexerMode(4));
+    try std.testing.expect(cfg.index_share_for_mtp_iteration);
+
+    // Verify W30 LoRA/DoRA target parsing covers GLM-5.2/5.3 MLA & GLM-5.3-Flash KDA modules.
+    try std.testing.expectEqual(lora.TargetProjection.q_a_proj, lora.TargetProjection.parseModuleName("self_attn.q_a_proj").?);
+    try std.testing.expectEqual(lora.TargetProjection.q_b_proj, lora.TargetProjection.parseModuleName("self_attn.q_b_proj").?);
+    try std.testing.expectEqual(lora.TargetProjection.kv_a_proj, lora.TargetProjection.parseModuleName("self_attn.kv_a_proj_with_mqa").?);
+    try std.testing.expectEqual(lora.TargetProjection.kv_b_proj, lora.TargetProjection.parseModuleName("self_attn.kv_b_proj").?);
+    try std.testing.expectEqual(lora.TargetProjection.b_proj, lora.TargetProjection.parseModuleName("linear_attn.b_proj").?);
+    try std.testing.expectEqual(lora.TargetProjection.f_a_proj, lora.TargetProjection.parseModuleName("linear_attn.f_a_proj").?);
+    try std.testing.expectEqual(lora.TargetProjection.f_b_proj, lora.TargetProjection.parseModuleName("linear_attn.f_b_proj").?);
+    try std.testing.expectEqual(lora.TargetProjection.g_a_proj, lora.TargetProjection.parseModuleName("linear_attn.g_a_proj").?);
+    try std.testing.expectEqual(lora.TargetProjection.g_b_proj, lora.TargetProjection.parseModuleName("linear_attn.g_b_proj").?);
+
+    const h: u32 = cfg.hidden_size;
+    const vocab: u32 = cfg.vocab_size;
+    var blobs: std.ArrayListUnmanaged(TestTensorBlob) = .empty;
+    var owned_names: std.ArrayListUnmanaged([]u8) = .empty;
+    defer {
+        for (blobs.items) |b| allocator.free(b.bytes);
+        blobs.deinit(allocator);
+        for (owned_names.items) |n| allocator.free(n);
+        owned_names.deinit(allocator);
+    }
+
+    const addBlob = struct {
+        fn call(
+            alloc: std.mem.Allocator,
+            list: *std.ArrayListUnmanaged(TestTensorBlob),
+            names: *std.ArrayListUnmanaged([]u8),
+            nm: []const u8,
+            kind: amf.TensorKind,
+            dt: amf.DType,
+            layer: u16,
+            expert_id: u16,
+            shape: [4]u32,
+            ndim: u8,
+            data: []u8,
+        ) !void {
+            const dup = try alloc.dupe(u8, nm);
+            try names.append(alloc, dup);
+            try list.append(alloc, .{
+                .name = dup,
+                .kind = kind,
+                .dtype = dt,
+                .layer = layer,
+                .expert = expert_id,
+                .shape = shape,
+                .ndim = ndim,
+                .bytes = data,
+            });
+        }
+    }.call;
+
+    try addBlob(allocator, &blobs, &owned_names, "embed_tokens", .embedding, .f16, amf.NO_LAYER, amf.NO_EXPERT, .{ vocab, h, 0, 0 }, 2, try fillDeterministicF16(allocator, 9101, vocab * h, 0.25));
+    var nbuf: [160]u8 = undefined;
+    for (0..cfg.num_hidden_layers) |l| {
+        const sbase: u64 = 12000 + l * 400;
+        try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.input_layernorm.weight", .{l}), .norm, .bf16, @intCast(l), amf.NO_EXPERT, .{ h, 0, 0, 0 }, 1, try fillConstantBf16(allocator, h, 1.0));
+        try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.post_attention_layernorm.weight", .{l}), .norm, .bf16, @intCast(l), amf.NO_EXPERT, .{ h, 0, 0, 0 }, 1, try fillConstantBf16(allocator, h, 1.0));
+
+        // MLA weights (present on every layer)
+        try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.self_attn.q_a_proj", .{l}), .dense, .f16, @intCast(l), amf.NO_EXPERT, .{ cfg.q_lora_rank, h, 0, 0 }, 2, try fillDeterministicF16(allocator, sbase + 1, cfg.q_lora_rank * h, 0.08));
+        try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.self_attn.q_a_layernorm.weight", .{l}), .norm, .bf16, @intCast(l), amf.NO_EXPERT, .{ cfg.q_lora_rank, 0, 0, 0 }, 1, try fillConstantBf16(allocator, cfg.q_lora_rank, 1.0));
+        try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.self_attn.q_b_proj", .{l}), .dense, .f16, @intCast(l), amf.NO_EXPERT, .{ cfg.mlaQDim(), cfg.q_lora_rank, 0, 0 }, 2, try fillDeterministicF16(allocator, sbase + 2, cfg.mlaQDim() * cfg.q_lora_rank, 0.08));
+        try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.self_attn.kv_a_proj_with_mqa", .{l}), .dense, .f16, @intCast(l), amf.NO_EXPERT, .{ cfg.mlaKvADim(), h, 0, 0 }, 2, try fillDeterministicF16(allocator, sbase + 3, cfg.mlaKvADim() * h, 0.08));
+        try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.self_attn.kv_a_layernorm.weight", .{l}), .norm, .bf16, @intCast(l), amf.NO_EXPERT, .{ cfg.kv_lora_rank, 0, 0, 0 }, 1, try fillConstantBf16(allocator, cfg.kv_lora_rank, 1.0));
+        try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.self_attn.kv_b_proj", .{l}), .dense, .f16, @intCast(l), amf.NO_EXPERT, .{ cfg.mlaKvBDim(), cfg.kv_lora_rank, 0, 0 }, 2, try fillDeterministicF16(allocator, sbase + 4, cfg.mlaKvBDim() * cfg.kv_lora_rank, 0.08));
+        try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.self_attn.o_proj", .{l}), .dense, .f16, @intCast(l), amf.NO_EXPERT, .{ h, cfg.mlaVDim(), 0, 0 }, 2, try fillDeterministicF16(allocator, sbase + 5, h * cfg.mlaVDim(), 0.08));
+
+        // DSA Indexer weights ONLY on `"full"` layers (`L0` and `L4`; `L1..L3` have NO indexer weights at all!)
+        if (cfg.dsaIndexerMode(l) == .full) {
+            const idx_q_dim = cfg.index_n_heads * cfg.index_head_dim;
+            try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.attn.idx.wq_b", .{l}), .dense, .f16, @intCast(l), amf.NO_EXPERT, .{ idx_q_dim, cfg.q_lora_rank, 0, 0 }, 2, try fillDeterministicF16(allocator, sbase + 10, idx_q_dim * cfg.q_lora_rank, 0.12));
+            try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.attn.idx.wk", .{l}), .dense, .f16, @intCast(l), amf.NO_EXPERT, .{ cfg.index_head_dim, h, 0, 0 }, 2, try fillDeterministicF16(allocator, sbase + 11, cfg.index_head_dim * h, 0.12));
+            try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.attn.idx.k_norm.weight", .{l}), .norm, .bf16, @intCast(l), amf.NO_EXPERT, .{ cfg.index_head_dim, 0, 0, 0 }, 1, try fillConstantBf16(allocator, cfg.index_head_dim, 1.0));
+            try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.attn.idx.k_norm.bias", .{l}), .norm, .bf16, @intCast(l), amf.NO_EXPERT, .{ cfg.index_head_dim, 0, 0, 0 }, 1, try fillDeterministicBf16(allocator, sbase + 12, cfg.index_head_dim, 0.05));
+            try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.attn.idx.weights_proj", .{l}), .dense, .f16, @intCast(l), amf.NO_EXPERT, .{ cfg.index_n_heads, h, 0, 0 }, 2, try fillDeterministicF16(allocator, sbase + 13, cfg.index_n_heads * h, 0.15));
+        }
+
+        if (cfg.layerFfnKind(l) == .dense_swiglu) {
+            try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.mlp.gate_proj", .{l}), .dense, .f16, @intCast(l), amf.NO_EXPERT, .{ cfg.intermediate_size, h, 0, 0 }, 2, try fillDeterministicF16(allocator, sbase + 20, cfg.intermediate_size * h, 0.07));
+            try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.mlp.up_proj", .{l}), .dense, .f16, @intCast(l), amf.NO_EXPERT, .{ cfg.intermediate_size, h, 0, 0 }, 2, try fillDeterministicF16(allocator, sbase + 21, cfg.intermediate_size * h, 0.07));
+            try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.mlp.down_proj", .{l}), .dense, .f16, @intCast(l), amf.NO_EXPERT, .{ h, cfg.intermediate_size, 0, 0 }, 2, try fillDeterministicF16(allocator, sbase + 22, h * cfg.intermediate_size, 0.07));
+        } else {
+            try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.mlp.gate.weight", .{l}), .router, .f32, @intCast(l), amf.NO_EXPERT, .{ cfg.num_experts, h, 0, 0 }, 2, try fillDeterministicF32(allocator, sbase + 30, cfg.num_experts * h, -0.25, 0.25));
+            try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.mlp.gate.bias", .{l}), .router, .f32, @intCast(l), amf.NO_EXPERT, .{ cfg.num_experts, 0, 0, 0 }, 1, try fillDeterministicF32(allocator, sbase + 31, cfg.num_experts, -0.1, 0.1));
+            try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.mlp.shared_experts.gate_proj", .{l}), .dense, .f16, @intCast(l), amf.NO_EXPERT, .{ cfg.shared_expert_intermediate_size, h, 0, 0 }, 2, try fillDeterministicF16(allocator, sbase + 32, cfg.shared_expert_intermediate_size * h, 0.07));
+            try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.mlp.shared_experts.up_proj", .{l}), .dense, .f16, @intCast(l), amf.NO_EXPERT, .{ cfg.shared_expert_intermediate_size, h, 0, 0 }, 2, try fillDeterministicF16(allocator, sbase + 33, cfg.shared_expert_intermediate_size * h, 0.07));
+            try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.mlp.shared_experts.down_proj", .{l}), .dense, .f16, @intCast(l), amf.NO_EXPERT, .{ h, cfg.shared_expert_intermediate_size, 0, 0 }, 2, try fillDeterministicF16(allocator, sbase + 34, h * cfg.shared_expert_intermediate_size, 0.07));
+            for (0..cfg.num_experts) |e| {
+                const es: u64 = sbase + 50 + e * 5;
+                try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.mlp.experts.{d}.gate_proj", .{ l, e }), .hot_expert, .f16, @intCast(l), @intCast(e), .{ cfg.moe_intermediate_size, h, 0, 0 }, 2, try fillDeterministicF16(allocator, es + 1, cfg.moe_intermediate_size * h, 0.06));
+                try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.mlp.experts.{d}.up_proj", .{ l, e }), .hot_expert, .f16, @intCast(l), @intCast(e), .{ cfg.moe_intermediate_size, h, 0, 0 }, 2, try fillDeterministicF16(allocator, es + 2, cfg.moe_intermediate_size * h, 0.06));
+                try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.mlp.experts.{d}.down_proj", .{ l, e }), .hot_expert, .f16, @intCast(l), @intCast(e), .{ h, cfg.moe_intermediate_size, 0, 0 }, 2, try fillDeterministicF16(allocator, es + 3, h * cfg.moe_intermediate_size, 0.06));
+            }
+        }
+    }
+    try addBlob(allocator, &blobs, &owned_names, "norm.weight", .norm, .bf16, amf.NO_LAYER, amf.NO_EXPERT, .{ h, 0, 0, 0 }, 1, try fillConstantBf16(allocator, h, 1.0));
+    try addBlob(allocator, &blobs, &owned_names, "lm_head", .lm_head, .f16, amf.NO_LAYER, amf.NO_EXPERT, .{ vocab, h, 0, 0 }, 2, try fillDeterministicF16(allocator, 9901, vocab * h, 0.14));
+
+    const amf_bytes = try buildTestAmf(allocator, "synth-glm-moe-dsa", blobs.items);
+    defer allocator.free(amf_bytes);
+
+    var wide_m = try GraphModel.loadFromBytes(allocator, amf_bytes, cfg, .{
+        .max_seq_len = 64,
+        .max_tree_nodes = 16,
+    });
+    defer wide_m.deinit(allocator);
+
+    var serial_m = try GraphModel.loadFromBytes(allocator, amf_bytes, cfg, .{
+        .max_seq_len = 64,
+        .max_tree_nodes = 16,
+    });
+    defer serial_m.deinit(allocator);
+
+    var tree_m = try GraphModel.loadFromBytes(allocator, amf_bytes, cfg, .{
+        .max_seq_len = 64,
+        .max_tree_nodes = 16,
+    });
+    defer tree_m.deinit(allocator);
+
+    const prompt = [_]u32{ 5, 17, 42, 83, 11, 64, 9, 97, 23, 51 };
+    const w_p0 = try wide_m.prefillChunk(&prompt, 0, true);
+    var s_p0: u32 = 0;
+    for (prompt, 0..) |tok, pi| {
+        s_p0 = try serial_m.stepDecode(tok, @intCast(pi));
+    }
+    try std.testing.expectEqual(s_p0, w_p0);
+    // Verify exact shared-DSA zero-dispatch counts: 2 full layers + 3 shared layers per pass!
+    try std.testing.expectEqual(@as(u64, 2), wide_m.dsa_full_index_dispatches);
+    try std.testing.expectEqual(@as(u64, 3), wide_m.dsa_shared_reuse_hits);
+    try std.testing.expectEqual(@as(u64, 2 * prompt.len), serial_m.dsa_full_index_dispatches);
+    try std.testing.expectEqual(@as(u64, 3 * prompt.len), serial_m.dsa_shared_reuse_hits);
+
+    // Verify `sharedMtpSparseIndices()` hook for `1L` `MTP` (`index_share_for_mtp_iteration = true`)!
+    const mtp_idx_w = wide_m.sharedMtpSparseIndices();
+    try std.testing.expect(mtp_idx_w.valid);
+    try std.testing.expectEqual(@as(u32, cfg.index_topk), mtp_idx_w.k_selected);
+    try std.testing.expectEqual(@as(usize, cfg.index_topk), mtp_idx_w.host_indices.len);
+    for (mtp_idx_w.host_indices) |ti| {
+        try std.testing.expect(ti < prompt.len);
+    }
+
+    var prefill_diff: f32 = 0.0;
+    for (0..vocab) |vi| {
+        prefill_diff = @max(prefill_diff, @abs(@as(f32, @floatCast(wide_m.readLogitsF16()[vi])) - @as(f32, @floatCast(serial_m.readLogitsF16()[vi]))));
+    }
+    try std.testing.expect(prefill_diff < 5e-2);
+
+    // Verify branching `verifyTree` + `commitTreeKv` vs sequential `stepDecode`.
+    _ = try tree_m.prefillChunk(&prompt, 0, true);
+    const step_toks = [_]u32{ s_p0, (s_p0 + 3) % vocab, (s_p0 + 7) % vocab };
+    var serial_preds: [3]u32 = undefined;
+    for (0..3) |st| {
+        serial_preds[st] = try serial_m.stepDecode(step_toks[st], @as(u32, @intCast(prompt.len + st)));
+    }
+    const tree_toks = [_]u32{ step_toks[0], 29, step_toks[1], 41, step_toks[2] };
+    const tree_pos = [_]u32{ 10, 11, 11, 12, 12 };
+    const tree_masks = [_]u64{ 0b00001, 0b00011, 0b00101, 0b01011, 0b10101 };
+    const vr = try tree_m.verifyTree(&tree_toks, &tree_pos, &tree_masks, 10);
+    const acc = [_]u16{ 0, 2, 4 };
+    for (acc, 0..) |nid, st| {
+        try std.testing.expectEqual(serial_preds[st], vr.argmax_tokens[nid]);
+    }
+    try tree_m.commitTreeKv(10, &acc);
+
+    const s_post = try serial_m.stepDecode(serial_preds[2], 13);
+    const t_post = try tree_m.stepDecode(serial_preds[2], 13);
+    try std.testing.expectEqual(s_post, t_post);
+    const mtp_idx_post = tree_m.sharedMtpSparseIndices();
+    try std.testing.expect(mtp_idx_post.valid);
+    try std.testing.expectEqual(@as(u32, cfg.index_topk), mtp_idx_post.k_selected);
+    var post_diff: f32 = 0.0;
+    for (0..vocab) |vi| {
+        post_diff = @max(post_diff, @abs(@as(f32, @floatCast(serial_m.readLogitsF16()[vi])) - @as(f32, @floatCast(tree_m.readLogitsF16()[vi]))));
+    }
+    try std.testing.expect(post_diff < 5e-2);
+}
+
+test "M9.2 G27: synthetic glm5_next (20-step hc_mult=4 mHC Sinkhorn + 3L KDA + 1L NoPE MLA index_kpool=4 + swiglu_limit=10.0 + DFlash2 taps) parity" {
+    const allocator = std.testing.allocator;
+    const glm5_next_json =
+        \\{
+        \\  "model_type": "glm5_next",
+        \\  "text_config": {
+        \\    "model_type": "glm5_next_text",
+        \\    "vocab_size": 128,
+        \\    "hidden_size": 128,
+        \\    "intermediate_size": 128,
+        \\    "moe_intermediate_size": 64,
+        \\    "n_shared_experts": 1,
+        \\    "num_hidden_layers": 4,
+        \\    "first_k_dense_replace": 1,
+        \\    "num_attention_heads": 4,
+        \\    "num_key_value_heads": 4,
+        \\    "head_dim": 0,
+        \\    "q_lora_rank": 64,
+        \\    "kv_lora_rank": 64,
+        \\    "qk_nope_head_dim": 32,
+        \\    "qk_rope_head_dim": 0,
+        \\    "v_head_dim": 32,
+        \\    "mla_use_nope": true,
+        \\    "mhc": true,
+        \\    "hc_mult": 4,
+        \\    "hc_sinkhorn_iters": 20,
+        \\    "hc_eps": 1e-6,
+        \\    "layer_types": ["linear_attention", "linear_attention", "linear_attention", "deepseek_sparse_attention"],
+        \\    "linear_attn_config": {
+        \\      "num_heads": 4,
+        \\      "head_dim": 32,
+        \\      "gate_lower_bound": -5.0,
+        \\      "short_conv_kernel_size": 4
+        \\    },
+        \\    "index_n_heads": 4,
+        \\    "index_head_dim": 32,
+        \\    "index_topk": 8,
+        \\    "index_kpool": 4,
+        \\    "index_kpool_always_select_tail": true,
+        \\    "index_share_for_mtp_iteration": true,
+        \\    "rms_norm_eps": 1e-5,
+        \\    "n_routed_experts": 8,
+        \\    "num_experts_per_tok": 2,
+        \\    "scoring_func": "sigmoid",
+        \\    "norm_topk_prob": true,
+        \\    "routed_scaling_factor": 2.5,
+        \\    "swiglu_limit": 10.0,
+        \\    "eos_token_id": [154820, 154827, 154829]
+        \\  }
+        \\}
+    ;
+
+    try std.testing.expect(GraphConfig.isGraphConfigJson(glm5_next_json));
+    var cfg = try GraphConfig.fromJson(allocator, glm5_next_json);
+    defer cfg.deinit(allocator);
+    try std.testing.expect(cfg.is_glm5_next);
+    try std.testing.expectEqual(ResidualKind.mhc_sinkhorn20, cfg.axes.residual_kind);
+    try std.testing.expectEqual(@as(u32, 4), cfg.mhc_num_streams);
+    try std.testing.expectEqual(@as(u32, 20), cfg.mhc_sinkhorn_iters);
+    try std.testing.expectEqual(AttentionKind.kda_linear, cfg.axes.layer_attention_kinds[0]);
+    try std.testing.expectEqual(AttentionKind.mla_dsa, cfg.axes.layer_attention_kinds[3]);
+    try std.testing.expectEqual(@as(u32, 0), cfg.qk_rope_head_dim);
+    try std.testing.expectEqual(@as(u32, 4), cfg.index_kpool);
+    try std.testing.expect(cfg.index_kpool_always_select_tail);
+    try std.testing.expectApproxEqAbs(@as(f32, 10.0), cfg.swiglu_limit, 1e-5);
+    try std.testing.expectApproxEqAbs(@as(f32, -5.0), cfg.kda_lower_bound, 1e-5);
+
+    const h: u32 = cfg.hidden_size;
+    const vocab: u32 = cfg.vocab_size;
+    var blobs: std.ArrayListUnmanaged(TestTensorBlob) = .empty;
+    var owned_names: std.ArrayListUnmanaged([]u8) = .empty;
+    defer {
+        for (blobs.items) |b| allocator.free(b.bytes);
+        blobs.deinit(allocator);
+        for (owned_names.items) |n| allocator.free(n);
+        owned_names.deinit(allocator);
+    }
+
+    const addBlob = struct {
+        fn call(
+            alloc: std.mem.Allocator,
+            list: *std.ArrayListUnmanaged(TestTensorBlob),
+            names: *std.ArrayListUnmanaged([]u8),
+            nm: []const u8,
+            kind: amf.TensorKind,
+            dt: amf.DType,
+            layer: u16,
+            expert_id: u16,
+            shape: [4]u32,
+            ndim: u8,
+            data: []u8,
+        ) !void {
+            const dup = try alloc.dupe(u8, nm);
+            try names.append(alloc, dup);
+            try list.append(alloc, .{
+                .name = dup,
+                .kind = kind,
+                .dtype = dt,
+                .layer = layer,
+                .expert = expert_id,
+                .shape = shape,
+                .ndim = ndim,
+                .bytes = data,
+            });
+        }
+    }.call;
+
+    try addBlob(allocator, &blobs, &owned_names, "embed_tokens", .embedding, .f16, amf.NO_LAYER, amf.NO_EXPERT, .{ vocab, h, 0, 0 }, 2, try fillDeterministicF16(allocator, 15101, vocab * h, 0.25));
+    var nbuf: [160]u8 = undefined;
+    for (0..cfg.num_hidden_layers) |l| {
+        const sbase: u64 = 20000 + l * 500;
+        try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.input_layernorm.weight", .{l}), .norm, .bf16, @intCast(l), amf.NO_EXPERT, .{ h, 0, 0, 0 }, 1, try fillConstantBf16(allocator, h, 1.0));
+        try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.post_attention_layernorm.weight", .{l}), .norm, .bf16, @intCast(l), amf.NO_EXPERT, .{ h, 0, 0, 0 }, 1, try fillConstantBf16(allocator, h, 1.0));
+
+        // 20-step hc_mult=4 mHC weights for both `hc_attn` and `hc_ffn`
+        for ([_][]const u8{ "attn", "ffn" }, 0..) |sub, si| {
+            try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.hc_{s}_fn", .{ l, sub }), .dense, .bf16, @intCast(l), amf.NO_EXPERT, .{ 24, 4 * h, 0, 0 }, 2, try fillDeterministicBf16(allocator, sbase + 1 + si * 3, 24 * 4 * h, 0.08));
+            try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.hc_{s}_base", .{ l, sub }), .dense, .f32, @intCast(l), amf.NO_EXPERT, .{ 24, 0, 0, 0 }, 1, try fillDeterministicF32(allocator, sbase + 2 + si * 3, 24, -0.3, 0.3));
+            try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.hc_{s}_scale", .{ l, sub }), .dense, .f32, @intCast(l), amf.NO_EXPERT, .{ 3, 0, 0, 0 }, 1, try fillDeterministicF32(allocator, sbase + 3 + si * 3, 3, 0.05, 0.25));
+        }
+
+        if (cfg.axes.layer_attention_kinds[l] == .kda_linear) {
+            const qkv_d = cfg.kdaQkvDim();
+            const lr = cfg.effectiveKdaLoraRank();
+            // Exercise BOTH separate projections (`L0, L1`) and fused `fused_qkvbfg_a_proj` (`L2`).
+            if (l == 2) {
+                const fused_n = 3 * qkv_d + cfg.kda_num_heads + 2 * lr;
+                try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.linear_attn.fused_qkvbfg_a_proj", .{l}), .dense, .f16, @intCast(l), amf.NO_EXPERT, .{ fused_n, h, 0, 0 }, 2, try fillDeterministicF16(allocator, sbase + 10, fused_n * h, 0.07));
+            } else {
+                try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.linear_attn.q_proj", .{l}), .dense, .f16, @intCast(l), amf.NO_EXPERT, .{ qkv_d, h, 0, 0 }, 2, try fillDeterministicF16(allocator, sbase + 10, qkv_d * h, 0.07));
+                try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.linear_attn.k_proj", .{l}), .dense, .f16, @intCast(l), amf.NO_EXPERT, .{ qkv_d, h, 0, 0 }, 2, try fillDeterministicF16(allocator, sbase + 11, qkv_d * h, 0.07));
+                try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.linear_attn.v_proj", .{l}), .dense, .f16, @intCast(l), amf.NO_EXPERT, .{ qkv_d, h, 0, 0 }, 2, try fillDeterministicF16(allocator, sbase + 12, qkv_d * h, 0.07));
+                try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.linear_attn.b_proj", .{l}), .dense, .f16, @intCast(l), amf.NO_EXPERT, .{ cfg.kda_num_heads, h, 0, 0 }, 2, try fillDeterministicF16(allocator, sbase + 13, cfg.kda_num_heads * h, 0.09));
+                try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.linear_attn.f_a_proj", .{l}), .dense, .f16, @intCast(l), amf.NO_EXPERT, .{ lr, h, 0, 0 }, 2, try fillDeterministicF16(allocator, sbase + 14, lr * h, 0.08));
+                try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.linear_attn.g_a_proj", .{l}), .dense, .f16, @intCast(l), amf.NO_EXPERT, .{ lr, h, 0, 0 }, 2, try fillDeterministicF16(allocator, sbase + 15, lr * h, 0.08));
+            }
+            try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.linear_attn.f_b_proj", .{l}), .dense, .f16, @intCast(l), amf.NO_EXPERT, .{ qkv_d, lr, 0, 0 }, 2, try fillDeterministicF16(allocator, sbase + 16, qkv_d * lr, 0.08));
+            try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.linear_attn.g_b_proj", .{l}), .dense, .f16, @intCast(l), amf.NO_EXPERT, .{ qkv_d, lr, 0, 0 }, 2, try fillDeterministicF16(allocator, sbase + 17, qkv_d * lr, 0.08));
+            try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.linear_attn.o_proj", .{l}), .dense, .f16, @intCast(l), amf.NO_EXPERT, .{ h, qkv_d, 0, 0 }, 2, try fillDeterministicF16(allocator, sbase + 18, h * qkv_d, 0.07));
+            try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.linear_attn.q_conv1d.weight", .{l}), .dense, .f32, @intCast(l), amf.NO_EXPERT, .{ qkv_d, 4, 0, 0 }, 2, try fillDeterministicF32(allocator, sbase + 19, qkv_d * 4, -0.25, 0.25));
+            try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.linear_attn.k_conv1d.weight", .{l}), .dense, .f32, @intCast(l), amf.NO_EXPERT, .{ qkv_d, 4, 0, 0 }, 2, try fillDeterministicF32(allocator, sbase + 20, qkv_d * 4, -0.25, 0.25));
+            try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.linear_attn.v_conv1d.weight", .{l}), .dense, .f32, @intCast(l), amf.NO_EXPERT, .{ qkv_d, 4, 0, 0 }, 2, try fillDeterministicF32(allocator, sbase + 21, qkv_d * 4, -0.25, 0.25));
+            try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.linear_attn.A_log", .{l}), .dense, .f32, @intCast(l), amf.NO_EXPERT, .{ cfg.kda_num_heads, 0, 0, 0 }, 1, try fillDeterministicF32(allocator, sbase + 22, cfg.kda_num_heads, -1.0, 0.5));
+            try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.linear_attn.dt_bias", .{l}), .dense, .f32, @intCast(l), amf.NO_EXPERT, .{ qkv_d, 0, 0, 0 }, 1, try fillDeterministicF32(allocator, sbase + 23, qkv_d, -0.2, 0.2));
+            try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.linear_attn.o_norm.weight", .{l}), .norm, .bf16, @intCast(l), amf.NO_EXPERT, .{ cfg.kda_head_dim, 0, 0, 0 }, 1, try fillConstantBf16(allocator, cfg.kda_head_dim, 1.0));
+        } else {
+            // NoPE MLA (`qk_rope_head_dim = 0`) + `index_kpool = 4`
+            try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.self_attn.q_a_proj", .{l}), .dense, .f16, @intCast(l), amf.NO_EXPERT, .{ cfg.q_lora_rank, h, 0, 0 }, 2, try fillDeterministicF16(allocator, sbase + 30, cfg.q_lora_rank * h, 0.08));
+            try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.self_attn.q_a_layernorm.weight", .{l}), .norm, .bf16, @intCast(l), amf.NO_EXPERT, .{ cfg.q_lora_rank, 0, 0, 0 }, 1, try fillConstantBf16(allocator, cfg.q_lora_rank, 1.0));
+            try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.self_attn.q_b_proj", .{l}), .dense, .f16, @intCast(l), amf.NO_EXPERT, .{ cfg.mlaQDim(), cfg.q_lora_rank, 0, 0 }, 2, try fillDeterministicF16(allocator, sbase + 31, cfg.mlaQDim() * cfg.q_lora_rank, 0.08));
+            try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.self_attn.kv_a_proj_with_mqa", .{l}), .dense, .f16, @intCast(l), amf.NO_EXPERT, .{ cfg.mlaKvADim(), h, 0, 0 }, 2, try fillDeterministicF16(allocator, sbase + 32, cfg.mlaKvADim() * h, 0.08));
+            try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.self_attn.kv_a_layernorm.weight", .{l}), .norm, .bf16, @intCast(l), amf.NO_EXPERT, .{ cfg.kv_lora_rank, 0, 0, 0 }, 1, try fillConstantBf16(allocator, cfg.kv_lora_rank, 1.0));
+            try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.self_attn.kv_b_proj", .{l}), .dense, .f16, @intCast(l), amf.NO_EXPERT, .{ cfg.mlaKvBDim(), cfg.kv_lora_rank, 0, 0 }, 2, try fillDeterministicF16(allocator, sbase + 33, cfg.mlaKvBDim() * cfg.kv_lora_rank, 0.08));
+            try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.self_attn.o_proj", .{l}), .dense, .f16, @intCast(l), amf.NO_EXPERT, .{ h, cfg.mlaVDim(), 0, 0 }, 2, try fillDeterministicF16(allocator, sbase + 34, h * cfg.mlaVDim(), 0.08));
+
+            const idx_q_dim = cfg.index_n_heads * cfg.index_head_dim;
+            try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.attn.idx.wq_b", .{l}), .dense, .f16, @intCast(l), amf.NO_EXPERT, .{ idx_q_dim, cfg.q_lora_rank, 0, 0 }, 2, try fillDeterministicF16(allocator, sbase + 40, idx_q_dim * cfg.q_lora_rank, 0.12));
+            try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.attn.idx.wk", .{l}), .dense, .f16, @intCast(l), amf.NO_EXPERT, .{ cfg.index_head_dim, h, 0, 0 }, 2, try fillDeterministicF16(allocator, sbase + 41, cfg.index_head_dim * h, 0.12));
+            try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.attn.idx.k_norm.weight", .{l}), .norm, .bf16, @intCast(l), amf.NO_EXPERT, .{ cfg.index_head_dim, 0, 0, 0 }, 1, try fillConstantBf16(allocator, cfg.index_head_dim, 1.0));
+            try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.attn.idx.k_norm.bias", .{l}), .norm, .bf16, @intCast(l), amf.NO_EXPERT, .{ cfg.index_head_dim, 0, 0, 0 }, 1, try fillDeterministicBf16(allocator, sbase + 42, cfg.index_head_dim, 0.05));
+            try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.attn.idx.weights_proj", .{l}), .dense, .f16, @intCast(l), amf.NO_EXPERT, .{ cfg.index_n_heads, h, 0, 0 }, 2, try fillDeterministicF16(allocator, sbase + 43, cfg.index_n_heads * h, 0.15));
+            try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.attn.idx.kpool_gate", .{l}), .dense, .f16, @intCast(l), amf.NO_EXPERT, .{ cfg.index_head_dim, h, 0, 0 }, 2, try fillDeterministicF16(allocator, sbase + 44, cfg.index_head_dim * h, 0.10));
+            try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.attn.idx.kpool_ape", .{l}), .dense, .bf16, @intCast(l), amf.NO_EXPERT, .{ cfg.index_kpool, cfg.index_head_dim, 0, 0 }, 2, try fillDeterministicBf16(allocator, sbase + 45, cfg.index_kpool * cfg.index_head_dim, 0.10));
+        }
+
+        if (cfg.layerFfnKind(l) == .dense_swiglu) {
+            try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.mlp.gate_proj", .{l}), .dense, .f16, @intCast(l), amf.NO_EXPERT, .{ cfg.intermediate_size, h, 0, 0 }, 2, try fillDeterministicF16(allocator, sbase + 60, cfg.intermediate_size * h, 0.07));
+            try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.mlp.up_proj", .{l}), .dense, .f16, @intCast(l), amf.NO_EXPERT, .{ cfg.intermediate_size, h, 0, 0 }, 2, try fillDeterministicF16(allocator, sbase + 61, cfg.intermediate_size * h, 0.07));
+            try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.mlp.down_proj", .{l}), .dense, .f16, @intCast(l), amf.NO_EXPERT, .{ h, cfg.intermediate_size, 0, 0 }, 2, try fillDeterministicF16(allocator, sbase + 62, h * cfg.intermediate_size, 0.07));
+        } else {
+            try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.mlp.gate.weight", .{l}), .router, .f32, @intCast(l), amf.NO_EXPERT, .{ cfg.num_experts, h, 0, 0 }, 2, try fillDeterministicF32(allocator, sbase + 70, cfg.num_experts * h, -0.25, 0.25));
+            try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.mlp.gate.bias", .{l}), .router, .f32, @intCast(l), amf.NO_EXPERT, .{ cfg.num_experts, 0, 0, 0 }, 1, try fillDeterministicF32(allocator, sbase + 71, cfg.num_experts, -0.1, 0.1));
+            try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.mlp.shared_experts.gate_proj", .{l}), .dense, .f16, @intCast(l), amf.NO_EXPERT, .{ cfg.shared_expert_intermediate_size, h, 0, 0 }, 2, try fillDeterministicF16(allocator, sbase + 72, cfg.shared_expert_intermediate_size * h, 0.07));
+            try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.mlp.shared_experts.up_proj", .{l}), .dense, .f16, @intCast(l), amf.NO_EXPERT, .{ cfg.shared_expert_intermediate_size, h, 0, 0 }, 2, try fillDeterministicF16(allocator, sbase + 73, cfg.shared_expert_intermediate_size * h, 0.07));
+            try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.mlp.shared_experts.down_proj", .{l}), .dense, .f16, @intCast(l), amf.NO_EXPERT, .{ h, cfg.shared_expert_intermediate_size, 0, 0 }, 2, try fillDeterministicF16(allocator, sbase + 74, h * cfg.shared_expert_intermediate_size, 0.07));
+            for (0..cfg.num_experts) |e| {
+                const es: u64 = sbase + 90 + e * 5;
+                try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.mlp.experts.{d}.gate_proj", .{ l, e }), .hot_expert, .f16, @intCast(l), @intCast(e), .{ cfg.moe_intermediate_size, h, 0, 0 }, 2, try fillDeterministicF16(allocator, es + 1, cfg.moe_intermediate_size * h, 0.06));
+                try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.mlp.experts.{d}.up_proj", .{ l, e }), .hot_expert, .f16, @intCast(l), @intCast(e), .{ cfg.moe_intermediate_size, h, 0, 0 }, 2, try fillDeterministicF16(allocator, es + 2, cfg.moe_intermediate_size * h, 0.06));
+                try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.mlp.experts.{d}.down_proj", .{ l, e }), .hot_expert, .f16, @intCast(l), @intCast(e), .{ h, cfg.moe_intermediate_size, 0, 0 }, 2, try fillDeterministicF16(allocator, es + 3, h * cfg.moe_intermediate_size, 0.06));
+            }
+        }
+    }
+    try addBlob(allocator, &blobs, &owned_names, "norm.weight", .norm, .bf16, amf.NO_LAYER, amf.NO_EXPERT, .{ h, 0, 0, 0 }, 1, try fillConstantBf16(allocator, h, 1.0));
+    try addBlob(allocator, &blobs, &owned_names, "lm_head", .lm_head, .f16, amf.NO_LAYER, amf.NO_EXPERT, .{ vocab, h, 0, 0 }, 2, try fillDeterministicF16(allocator, 29901, vocab * h, 0.14));
+
+    const amf_bytes = try buildTestAmf(allocator, "synth-glm5-next", blobs.items);
+    defer allocator.free(amf_bytes);
+
+    var wide_m = try GraphModel.loadFromBytes(allocator, amf_bytes, cfg, .{
+        .max_seq_len = 64,
+        .max_tree_nodes = 16,
+        .dflare_ctx_hist_cap = 64,
+    });
+    defer wide_m.deinit(allocator);
+
+    var serial_m = try GraphModel.loadFromBytes(allocator, amf_bytes, cfg, .{
+        .max_seq_len = 64,
+        .max_tree_nodes = 16,
+        .dflare_ctx_hist_cap = 64,
+    });
+    defer serial_m.deinit(allocator);
+
+    var tree_m = try GraphModel.loadFromBytes(allocator, amf_bytes, cfg, .{
+        .max_seq_len = 64,
+        .max_tree_nodes = 16,
+        .dflare_ctx_hist_cap = 64,
+    });
+    defer tree_m.deinit(allocator);
+
+    // 11 tokens = 2 complete kpool=4 pools (8 tokens) + 3 unpooled tail tokens!
+    const prompt = [_]u32{ 3, 14, 27, 58, 91, 6, 44, 72, 19, 85, 31 };
+    const w_p0 = try wide_m.prefillChunk(&prompt, 0, true);
+    var s_p0: u32 = 0;
+    for (prompt, 0..) |tok, pi| {
+        s_p0 = try serial_m.stepDecode(tok, @intCast(pi));
+    }
+    try std.testing.expectEqual(s_p0, w_p0);
+    try std.testing.expect(wide_m.hasDFlareCtxHistory());
+    try std.testing.expectEqual(@as(u32, prompt.len), wide_m.dflare_ctx_hist_len);
+
+    // Verify `sharedMtpSparseIndices()` selects top pools + all 3 unpooled tail tokens (`8 + 3 = 11`).
+    const mtp_idx = wide_m.sharedMtpSparseIndices();
+    try std.testing.expect(mtp_idx.valid);
+    try std.testing.expectEqual(@as(u32, 11), mtp_idx.k_selected);
+    var prefill_diff: f32 = 0.0;
+    for (0..vocab) |vi| {
+        prefill_diff = @max(prefill_diff, @abs(@as(f32, @floatCast(wide_m.readLogitsF16()[vi])) - @as(f32, @floatCast(serial_m.readLogitsF16()[vi]))));
+    }
+    try std.testing.expect(prefill_diff < 5e-2);
+
+    // Verify branching `verifyTree` + `commitTreeKv` across 20-step mHC + 3L KDA (separate + fused) + NoPE MLA kpool=4!
+    _ = try tree_m.prefillChunk(&prompt, 0, true);
+    const step_toks = [_]u32{ s_p0, (s_p0 + 4) % vocab, (s_p0 + 9) % vocab };
+    var serial_preds: [3]u32 = undefined;
+    for (0..3) |st| {
+        serial_preds[st] = try serial_m.stepDecode(step_toks[st], @as(u32, @intCast(prompt.len + st)));
+    }
+    const tree_toks = [_]u32{ step_toks[0], 22, step_toks[1], 67, step_toks[2] };
+    const tree_pos = [_]u32{ 11, 12, 12, 13, 13 };
+    const tree_masks = [_]u64{ 0b00001, 0b00011, 0b00101, 0b01011, 0b10101 };
+    const vr = try tree_m.verifyTree(&tree_toks, &tree_pos, &tree_masks, 11);
+    const acc = [_]u16{ 0, 2, 4 };
+    for (acc, 0..) |nid, st| {
+        try std.testing.expectEqual(serial_preds[st], vr.argmax_tokens[nid]);
+    }
+    try tree_m.commitTreeKv(11, &acc);
+
+    const s_post = try serial_m.stepDecode(serial_preds[2], 14);
+    const t_post = try tree_m.stepDecode(serial_preds[2], 14);
+    try std.testing.expectEqual(s_post, t_post);
+    var post_diff: f32 = 0.0;
+    for (0..vocab) |vi| {
+        post_diff = @max(post_diff, @abs(@as(f32, @floatCast(serial_m.readLogitsF16()[vi])) - @as(f32, @floatCast(tree_m.readLogitsF16()[vi]))));
+    }
+    try std.testing.expect(post_diff < 5e-2);
 }

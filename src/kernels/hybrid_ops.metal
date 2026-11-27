@@ -6228,3 +6228,2040 @@ kernel void ami_g26_capture_tap_ring(const device half *src [[buffer(0)]],
         }
     }
 }
+
+// ===========================================================================
+// Section G: M9.2 (`G27`) — GLM-5.2 / GLM-5.3 (`glm_moe_dsa`) &
+// GLM-5.3-Flash (`glm5_next`) Metal 4 Operators
+//   1. Single-kernel register-fused 20-step `hc_mult = 4` mHC Sinkhorn
+//      (`ami_g27_mhc_pre_sinkhorn`, `ami_g27_mhc_post_mix`)
+//   2. Kimi Delta Attention (`KDA`): separate `{q,k,v}_conv1d + SiLU`,
+//      per-channel bounded/softplus forget gate, decode / prefill / tree_verify /
+//      commit_tree / sigmoid-gated RMSNorm (`ami_kda_*`)
+//   3. `GlmMoeDsaIndexer` + `NoPE MLA` (`qk_rope = 0`, `index_kpool = 4`):
+//      interleaved RoPE, LayerNorm with bias, FP16 MLA & indexer KV write,
+//      k-pool key compression, DSA parallel scoring + exact radix Top-K +
+//      tail selection, and sparse absorbed MLA attention (`ami_g27_*`)
+// ===========================================================================
+
+static inline float g27_load_scalar_f32(const device uchar *buf, ulong idx, uint dtype) {
+    if (dtype == 2u) {
+        return ((const device float *)buf)[idx];
+    }
+    if (dtype == 1u) {
+        return float(((const device bfloat *)buf)[idx]);
+    }
+    return float(((const device half *)buf)[idx]);
+}
+
+static inline float4 g27_softmax4_plus_eps(float4 z, float eps) {
+    const float m = max(max(z.x, z.y), max(z.z, z.w));
+    const float4 e = exp(z - m);
+    const float inv_s = 1.0f / (e.x + e.y + e.z + e.w);
+    return e * inv_s + eps;
+}
+
+static inline float g27_row_norm4(float4 v, float eps) {
+    return 1.0f / (v.x + v.y + v.z + v.w + eps);
+}
+
+// ---------------------------------------------------------------------------
+// G.1: Single-Kernel Register-Fused 20-Step `hc_mult = 4` mHC Sinkhorn
+// Matches `Glm5NextTextHyperConnection` verbatim:
+//   flat = UnweightedRMSNorm(streams.view(M, 4*H), rms_eps)
+//   raw[24] = flat @ fn^T
+//   pre  = sigmoid(raw[0..4] * scale[0] + base[0..4]) + hc_eps
+//   post = 2 * sigmoid(raw[4..8] * scale[1] + base[4..8])
+//   comb = softmax(raw[8..24].view(4,4) * scale[2] + base[8..24].view(4,4), dim=-1) + hc_eps
+//   comb /= (col_sum(comb) + hc_eps)
+//   (sinkhorn_iters - 1) times:
+//     comb /= (row_sum(comb) + hc_eps)
+//     comb /= (col_sum(comb) + hc_eps)
+//   collapsed = sum_{s=0..3} pre[s] * streams[s]
+//   optional sublayer RMSNorm(collapsed, norm_w, rms_eps) -> branch_out
+// ---------------------------------------------------------------------------
+
+struct G27MhcSinkhornParams {
+    uint m;
+    uint hidden_size;
+    uint sinkhorn_iters;
+    uint flags;      // bit0=has_norm_w
+    uint fn_dtype;   // 0=f16, 1=bf16, 2=f32
+    uint norm_dtype; // 0=f16, 1=bf16, 2=f32
+    float rms_eps;
+    float hc_eps;
+};
+
+static_assert(sizeof(G27MhcSinkhornParams) == 32, "G27MhcSinkhornParams must be 32 bytes");
+
+// Grid: (M, 1, 1) threadgroups, 256 threads (8 simdgroups).
+kernel void ami_g27_mhc_pre_sinkhorn(const device uchar *streams [[buffer(0)]],
+                                     const device uchar *fn_w [[buffer(1)]],
+                                     const device float *base_w [[buffer(2)]],
+                                     const device float *scale_w [[buffer(3)]],
+                                     const device uchar *norm_w [[buffer(4)]],
+                                     device uchar *branch_out [[buffer(5)]],
+                                     device float *coeffs_out [[buffer(6)]],
+                                     constant G27MhcSinkhornParams &p [[buffer(7)]],
+                                     uint tg_x [[threadgroup_position_in_grid]],
+                                     uint tid [[thread_index_in_threadgroup]],
+                                     uint sg_id [[simdgroup_index_in_threadgroup]],
+                                     uint lane [[thread_index_in_simdgroup]]) {
+    const uint tok = tg_x;
+    if (tok >= p.m || p.hidden_size == 0u) {
+        return;
+    }
+
+    const uint total_dim = 4u * p.hidden_size;
+    const ulong tok_stream_base = ulong(tok) * total_dim;
+
+    threadgroup float tg_raw[24];
+    threadgroup float tg_pre[4];
+    threadgroup float tg_reduce[8];
+    threadgroup float tg_inv_rms[1];
+
+    // 8 simdgroups x 3 rows/simdgroup = 24 rows of `fn [24, 4*H]`.
+    // Exploits linearity: `fn @ (streams * inv_rms) == (fn @ streams) * inv_rms`
+    // so `streams` and `fn_w` are streamed in a single coalesced pass!
+    const uint r0 = sg_id * 3u + 0u;
+    const uint r1 = sg_id * 3u + 1u;
+    const uint r2 = sg_id * 3u + 2u;
+    const ulong fn_off0 = ulong(r0) * total_dim;
+    const ulong fn_off1 = ulong(r1) * total_dim;
+    const ulong fn_off2 = ulong(r2) * total_dim;
+
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+    float acc2 = 0.0f;
+    float sq_sum = 0.0f;
+
+    for (uint j = lane; j < total_dim; j += 32u) {
+        const float sv = hybrid_load_f16_or_bf16(streams, tok_stream_base + j, GR_STREAM_BF16);
+        if (sg_id == 0u) {
+            sq_sum = fma(sv, sv, sq_sum);
+        }
+        const float w0 = g27_load_scalar_f32(fn_w, fn_off0 + j, p.fn_dtype);
+        const float w1 = g27_load_scalar_f32(fn_w, fn_off1 + j, p.fn_dtype);
+        const float w2 = g27_load_scalar_f32(fn_w, fn_off2 + j, p.fn_dtype);
+        acc0 = fma(sv, w0, acc0);
+        acc1 = fma(sv, w1, acc1);
+        acc2 = fma(sv, w2, acc2);
+    }
+
+    const float sum0 = simd_sum(acc0);
+    const float sum1 = simd_sum(acc1);
+    const float sum2 = simd_sum(acc2);
+    const float total_sq = (sg_id == 0u) ? simd_sum(sq_sum) : 0.0f;
+    if (lane == 0u) {
+        tg_raw[r0] = sum0;
+        tg_raw[r1] = sum1;
+        tg_raw[r2] = sum2;
+        if (sg_id == 0u) {
+            tg_inv_rms[0] = rsqrt(total_sq / float(total_dim) + p.rms_eps);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Single-thread register-fused 20-step Sinkhorn-Knopp in `float4 c0..c3` (0 spills).
+    if (tid == 0u) {
+        const float inv_rms = tg_inv_rms[0];
+        const float eps = p.hc_eps;
+        const float s_pre = scale_w[0] * inv_rms;
+        const float s_post = scale_w[1] * inv_rms;
+        const float s_comb = scale_w[2] * inv_rms;
+
+        tg_pre[0] = hybrid_sigmoid(fma(tg_raw[0], s_pre, base_w[0])) + eps;
+        tg_pre[1] = hybrid_sigmoid(fma(tg_raw[1], s_pre, base_w[1])) + eps;
+        tg_pre[2] = hybrid_sigmoid(fma(tg_raw[2], s_pre, base_w[2])) + eps;
+        tg_pre[3] = hybrid_sigmoid(fma(tg_raw[3], s_pre, base_w[3])) + eps;
+
+        const float p0 = 2.0f * hybrid_sigmoid(fma(tg_raw[4], s_post, base_w[4]));
+        const float p1 = 2.0f * hybrid_sigmoid(fma(tg_raw[5], s_post, base_w[5]));
+        const float p2 = 2.0f * hybrid_sigmoid(fma(tg_raw[6], s_post, base_w[6]));
+        const float p3 = 2.0f * hybrid_sigmoid(fma(tg_raw[7], s_post, base_w[7]));
+
+        float4 c0 = g27_softmax4_plus_eps(float4(
+            fma(tg_raw[8],  s_comb, base_w[8]),
+            fma(tg_raw[9],  s_comb, base_w[9]),
+            fma(tg_raw[10], s_comb, base_w[10]),
+            fma(tg_raw[11], s_comb, base_w[11])), eps);
+        float4 c1 = g27_softmax4_plus_eps(float4(
+            fma(tg_raw[12], s_comb, base_w[12]),
+            fma(tg_raw[13], s_comb, base_w[13]),
+            fma(tg_raw[14], s_comb, base_w[14]),
+            fma(tg_raw[15], s_comb, base_w[15])), eps);
+        float4 c2 = g27_softmax4_plus_eps(float4(
+            fma(tg_raw[16], s_comb, base_w[16]),
+            fma(tg_raw[17], s_comb, base_w[17]),
+            fma(tg_raw[18], s_comb, base_w[18]),
+            fma(tg_raw[19], s_comb, base_w[19])), eps);
+        float4 c3 = g27_softmax4_plus_eps(float4(
+            fma(tg_raw[20], s_comb, base_w[20]),
+            fma(tg_raw[21], s_comb, base_w[21]),
+            fma(tg_raw[22], s_comb, base_w[22]),
+            fma(tg_raw[23], s_comb, base_w[23])), eps);
+
+        if (p.sinkhorn_iters > 0u) {
+            const float4 inv_c0 = 1.0f / (c0 + c1 + c2 + c3 + eps);
+            c0 *= inv_c0;
+            c1 *= inv_c0;
+            c2 *= inv_c0;
+            c3 *= inv_c0;
+            for (uint it = 1u; it < p.sinkhorn_iters; ++it) {
+                c0 *= g27_row_norm4(c0, eps);
+                c1 *= g27_row_norm4(c1, eps);
+                c2 *= g27_row_norm4(c2, eps);
+                c3 *= g27_row_norm4(c3, eps);
+                const float4 inv_c = 1.0f / (c0 + c1 + c2 + c3 + eps);
+                c0 *= inv_c;
+                c1 *= inv_c;
+                c2 *= inv_c;
+                c3 *= inv_c;
+            }
+        }
+
+        device float *dst_c = coeffs_out + ulong(tok) * 20u;
+        dst_c[0] = p0; dst_c[1] = p1; dst_c[2] = p2; dst_c[3] = p3;
+        dst_c[4] = c0.x; dst_c[5] = c0.y; dst_c[6] = c0.z; dst_c[7] = c0.w;
+        dst_c[8] = c1.x; dst_c[9] = c1.y; dst_c[10] = c1.z; dst_c[11] = c1.w;
+        dst_c[12] = c2.x; dst_c[13] = c2.y; dst_c[14] = c2.z; dst_c[15] = c2.w;
+        dst_c[16] = c3.x; dst_c[17] = c3.y; dst_c[18] = c3.z; dst_c[19] = c3.w;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const float pre0 = tg_pre[0];
+    const float pre1 = tg_pre[1];
+    const float pre2 = tg_pre[2];
+    const float pre3 = tg_pre[3];
+    const bool has_norm_w = ((p.flags & 1u) != 0u);
+    const ulong h = ulong(p.hidden_size);
+    const ulong tok_out_base = ulong(tok) * h;
+
+    float inv_rms_sub = 1.0f;
+    if (has_norm_w) {
+        float sq_partial = 0.0f;
+        for (uint d = tid; d < p.hidden_size; d += 256u) {
+            const float s0 = hybrid_load_f16_or_bf16(streams, tok_stream_base + 0ul * h + d, GR_STREAM_BF16);
+            const float s1 = hybrid_load_f16_or_bf16(streams, tok_stream_base + 1ul * h + d, GR_STREAM_BF16);
+            const float s2 = hybrid_load_f16_or_bf16(streams, tok_stream_base + 2ul * h + d, GR_STREAM_BF16);
+            const float s3 = hybrid_load_f16_or_bf16(streams, tok_stream_base + 3ul * h + d, GR_STREAM_BF16);
+            const float mix = fma(pre0, s0, fma(pre1, s1, fma(pre2, s2, pre3 * s3)));
+            sq_partial = fma(mix, mix, sq_partial);
+        }
+        const float sg_sq = simd_sum(sq_partial);
+        if (lane == 0u) {
+            tg_reduce[sg_id] = sg_sq;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        const float sub_sq = ((tg_reduce[0] + tg_reduce[1]) + (tg_reduce[2] + tg_reduce[3])) +
+                             ((tg_reduce[4] + tg_reduce[5]) + (tg_reduce[6] + tg_reduce[7]));
+        inv_rms_sub = rsqrt(sub_sq / float(p.hidden_size) + p.rms_eps);
+    }
+
+    for (uint d = tid; d < p.hidden_size; d += 256u) {
+        const float s0 = hybrid_load_f16_or_bf16(streams, tok_stream_base + 0ul * h + d, GR_STREAM_BF16);
+        const float s1 = hybrid_load_f16_or_bf16(streams, tok_stream_base + 1ul * h + d, GR_STREAM_BF16);
+        const float s2 = hybrid_load_f16_or_bf16(streams, tok_stream_base + 2ul * h + d, GR_STREAM_BF16);
+        const float s3 = hybrid_load_f16_or_bf16(streams, tok_stream_base + 3ul * h + d, GR_STREAM_BF16);
+        float mix = fma(pre0, s0, fma(pre1, s1, fma(pre2, s2, pre3 * s3)));
+        if (has_norm_w) {
+            const float nw = g27_load_scalar_f32(norm_w, d, p.norm_dtype);
+            mix = (mix * inv_rms_sub) * nw;
+        }
+        hybrid_store_f16_or_bf16(branch_out, tok_out_base + d, mix, GR_ACT_BF16);
+    }
+}
+
+// Single-kernel mHC post-mix for `hc_mult = 4`:
+//   streams[tok, j, d] = post[j] * sub_out[tok, d] + sum_{i=0..3} comb[i, j] * streams[tok, i, d]
+// Grid: (M, 1, 1) threadgroups, 256 threads.
+kernel void ami_g27_mhc_post_mix(device uchar *streams [[buffer(0)]],
+                                 const device uchar *sublayer_out [[buffer(1)]],
+                                 const device float *coeffs [[buffer(2)]],
+                                 constant G27MhcSinkhornParams &p [[buffer(3)]],
+                                 uint tg_x [[threadgroup_position_in_grid]],
+                                 uint tid [[thread_index_in_threadgroup]]) {
+    const uint tok = tg_x;
+    if (tok >= p.m || p.hidden_size == 0u) {
+        return;
+    }
+
+    threadgroup float tg_c[20];
+    if (tid < 20u) {
+        tg_c[tid] = coeffs[ulong(tok) * 20u + tid];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const float4 post = float4(tg_c[0], tg_c[1], tg_c[2], tg_c[3]);
+    const float4 c0 = float4(tg_c[4], tg_c[5], tg_c[6], tg_c[7]);
+    const float4 c1 = float4(tg_c[8], tg_c[9], tg_c[10], tg_c[11]);
+    const float4 c2 = float4(tg_c[12], tg_c[13], tg_c[14], tg_c[15]);
+    const float4 c3 = float4(tg_c[16], tg_c[17], tg_c[18], tg_c[19]);
+
+    const ulong h = ulong(p.hidden_size);
+    const ulong tok_stream_base = ulong(tok) * 4ul * h;
+    const ulong tok_in_base = ulong(tok) * h;
+
+    for (uint d = tid; d < p.hidden_size; d += 256u) {
+        const float y = hybrid_load_f16_or_bf16(sublayer_out, tok_in_base + d, GR_ACT_BF16);
+        const float s0 = hybrid_load_f16_or_bf16(streams, tok_stream_base + 0ul * h + d, GR_STREAM_BF16);
+        const float s1 = hybrid_load_f16_or_bf16(streams, tok_stream_base + 1ul * h + d, GR_STREAM_BF16);
+        const float s2 = hybrid_load_f16_or_bf16(streams, tok_stream_base + 2ul * h + d, GR_STREAM_BF16);
+        const float s3 = hybrid_load_f16_or_bf16(streams, tok_stream_base + 3ul * h + d, GR_STREAM_BF16);
+
+        const float4 out_s = fma(post, y, fma(c0, s0, fma(c1, s1, fma(c2, s2, c3 * s3))));
+        hybrid_store_f16_or_bf16(streams, tok_stream_base + 0ul * h + d, out_s.x, GR_STREAM_BF16);
+        hybrid_store_f16_or_bf16(streams, tok_stream_base + 1ul * h + d, out_s.y, GR_STREAM_BF16);
+        hybrid_store_f16_or_bf16(streams, tok_stream_base + 2ul * h + d, out_s.z, GR_STREAM_BF16);
+        hybrid_store_f16_or_bf16(streams, tok_stream_base + 3ul * h + d, out_s.w, GR_STREAM_BF16);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// G.2: Kimi Delta Attention (`KDA`, `GLM-5.3-Flash` 34L `linear_attention`)
+// Reusable for M9.3 `Ling-3.1` via configurable `lower_bound` (`< 0`: safe
+// bounded sigmoid gate; `== 0`: softplus gate).
+// ---------------------------------------------------------------------------
+
+struct KdaConv1dParams {
+    uint m;
+    uint qkv_dim;
+    uint conv_k;
+    uint write_state;
+    uint is_tree;
+    uint w_dtype; // 0=f16, 1=bf16, 2=f32
+    uint _pad0;
+    uint _pad1;
+};
+
+struct KdaComputeGatesParams {
+    uint m;
+    uint num_heads;
+    uint head_dim;
+    float lower_bound; // < 0: lower_bound * sigmoid(exp(A_log) * (f + dt_bias)); == 0: -exp(A_log) * softplus(...)
+    uint a_log_dtype;  // 0=f16, 1=bf16, 2=f32
+    uint dt_bias_dtype;
+    uint _pad0;
+    uint _pad1;
+};
+
+struct KdaDecodeParams {
+    uint num_heads;
+    uint head_k_dim;
+    uint head_v_dim;
+    float q_scale;
+    float l2_eps;
+    float rms_eps;
+    uint apply_l2_norm;
+    uint apply_out_norm;
+    uint apply_out_gate;
+    uint per_head_norm;
+    uint beta_apply_sigmoid;
+    uint _pad0;
+};
+
+struct KdaPrefillParams {
+    uint seq_len;
+    uint num_heads;
+    uint head_k_dim;
+    uint head_v_dim;
+    float q_scale;
+    float l2_eps;
+    uint apply_l2_norm;
+    uint beta_apply_sigmoid;
+    uint write_state_only;
+    uint out_start_token;
+    uint _pad0;
+    uint _pad1;
+};
+
+struct KdaTreeVerifyParams {
+    uint num_nodes;
+    uint num_heads;
+    uint head_k_dim;
+    uint head_v_dim;
+    float q_scale;
+    float l2_eps;
+    uint apply_l2_norm;
+    uint beta_apply_sigmoid;
+    uint scratch_leaf_node;
+    uint _pad0;
+    uint _pad1;
+    uint _pad2;
+};
+
+struct KdaCommitTreeParams {
+    uint num_heads;
+    uint head_k_dim;
+    uint head_v_dim;
+    uint accepted_count;
+    uint use_node_buffer;
+    float l2_eps;
+    uint apply_l2_norm;
+    uint beta_apply_sigmoid;
+    ushort inline_nodes[64];
+};
+
+static_assert(sizeof(KdaConv1dParams) == 32, "KdaConv1dParams must be 32 bytes");
+static_assert(sizeof(KdaComputeGatesParams) == 32, "KdaComputeGatesParams must be 32 bytes");
+static_assert(sizeof(KdaDecodeParams) == 48, "KdaDecodeParams must be 48 bytes");
+static_assert(sizeof(KdaPrefillParams) == 48, "KdaPrefillParams must be 48 bytes");
+static_assert(sizeof(KdaTreeVerifyParams) == 48, "KdaTreeVerifyParams must be 48 bytes");
+static_assert(sizeof(KdaCommitTreeParams) == 160, "KdaCommitTreeParams must be 160 bytes");
+
+// Separate `{q,k,v}` causal depthwise Conv1D + SiLU (`conv_k in [1..8]`, `3 * qkv_dim` total channels).
+// State layout matches `ami_gdn_conv1d_commit`: `[conv_k - 1, 3 * qkv_dim]` f16.
+kernel void ami_kda_conv1d_silu(const device half *q_in [[buffer(0)]],
+                                const device half *k_in [[buffer(1)]],
+                                const device half *v_in [[buffer(2)]],
+                                const device uchar *q_conv_w [[buffer(3)]],
+                                const device uchar *k_conv_w [[buffer(4)]],
+                                const device uchar *v_conv_w [[buffer(5)]],
+                                const device half *conv_state_in [[buffer(6)]],
+                                device half *conv_state_out [[buffer(7)]],
+                                const device ulong *ancestor_masks [[buffer(8)]],
+                                device half *q_out [[buffer(9)]],
+                                device half *k_out [[buffer(10)]],
+                                device half *v_out [[buffer(11)]],
+                                constant KdaConv1dParams &p [[buffer(12)]],
+                                uint gid [[thread_position_in_grid]]) {
+    const uint conv_dim = 3u * p.qkv_dim;
+    if (gid >= conv_dim) {
+        return;
+    }
+
+    const uint hist = (p.conv_k > 0u) ? (p.conv_k - 1u) : 0u;
+    const uint part = (gid < p.qkv_dim) ? 0u : ((gid < 2u * p.qkv_dim) ? 1u : 2u);
+    const uint local_c = gid - part * p.qkv_dim;
+    const device uchar *w_buf = (part == 0u) ? q_conv_w : ((part == 1u) ? k_conv_w : v_conv_w);
+    const device half *in_buf = (part == 0u) ? q_in : ((part == 1u) ? k_in : v_in);
+    device half *out_buf = (part == 0u) ? q_out : ((part == 1u) ? k_out : v_out);
+    const ulong w_base = ulong(local_c) * p.conv_k;
+
+    if (p.is_tree == 0u) {
+        for (uint tok = 0u; tok < p.m; ++tok) {
+            float acc = 0.0f;
+            for (uint tap = 0u; tap < p.conv_k; ++tap) {
+                const int rel = int(tok) - int(hist - tap);
+                float xv;
+                if (rel < 0) {
+                    const uint s_idx = uint(int(hist) + rel);
+                    xv = float(conv_state_in[ulong(s_idx) * conv_dim + gid]);
+                } else {
+                    xv = float(in_buf[ulong(uint(rel)) * p.qkv_dim + local_c]);
+                }
+                acc = fma(xv, g27_load_scalar_f32(w_buf, w_base + tap, p.w_dtype), acc);
+            }
+            out_buf[ulong(tok) * p.qkv_dim + local_c] = half(hybrid_fast_silu(acc));
+        }
+
+        if (p.write_state != 0u && hist > 0u) {
+            for (uint s = 0u; s < hist; ++s) {
+                const int rel = int(p.m) - int(hist - s);
+                float xv;
+                if (rel < 0) {
+                    const uint old_s = uint(int(hist) + rel);
+                    xv = float(conv_state_in[ulong(old_s) * conv_dim + gid]);
+                } else {
+                    xv = float(in_buf[ulong(uint(rel)) * p.qkv_dim + local_c]);
+                }
+                conv_state_out[ulong(s) * conv_dim + gid] = half(xv);
+            }
+        }
+    } else {
+        for (uint node = 0u; node < p.m; ++node) {
+            const ulong mask = ancestor_masks[node];
+            float acc = 0.0f;
+            for (uint tap = 0u; tap < p.conv_k; ++tap) {
+                float xv;
+                if (tap == hist) {
+                    xv = float(in_buf[ulong(node) * p.qkv_dim + local_c]);
+                } else {
+                    const uint back = hist - tap; // 1 = parent, 2 = grandparent, ...
+                    uint found_cnt = 0u;
+                    int anc_node = -1;
+                    if (node > 0u) {
+                        for (int cand = int(node) - 1; cand >= 0; --cand) {
+                            if (((mask >> uint(cand)) & 1ul) != 0ul) {
+                                found_cnt++;
+                                if (found_cnt == back) {
+                                    anc_node = cand;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    if (anc_node >= 0) {
+                        xv = float(in_buf[ulong(uint(anc_node)) * p.qkv_dim + local_c]);
+                    } else {
+                        const uint past_back = back - found_cnt;
+                        const uint s_idx = hist - past_back;
+                        xv = float(conv_state_in[ulong(s_idx) * conv_dim + gid]);
+                    }
+                }
+                acc = fma(xv, g27_load_scalar_f32(w_buf, w_base + tap, p.w_dtype), acc);
+            }
+            out_buf[ulong(node) * p.qkv_dim + local_c] = half(hybrid_fast_silu(acc));
+        }
+    }
+}
+
+// Per-key-element KDA forget gate `g [M, num_heads, head_dim]` + `beta = sigmoid(b_raw) [M, num_heads]`.
+kernel void ami_kda_compute_gates(const device half *f_raw [[buffer(0)]],
+                                  const device half *b_raw [[buffer(1)]],
+                                  const device uchar *a_log [[buffer(2)]],
+                                  const device uchar *dt_bias [[buffer(3)]],
+                                  device float *g_out [[buffer(4)]],
+                                  device float *beta_out [[buffer(5)]],
+                                  constant KdaComputeGatesParams &p [[buffer(6)]],
+                                  uint gid [[thread_position_in_grid]]) {
+    const uint qkv_dim = p.num_heads * p.head_dim;
+    const uint total = p.m * qkv_dim;
+    if (gid >= total) {
+        return;
+    }
+
+    const uint tok = gid / qkv_dim;
+    const uint rem = gid - tok * qkv_dim;
+    const uint h = rem / p.head_dim;
+    const uint d = rem - h * p.head_dim;
+
+    const float decay_rate = exp(g27_load_scalar_f32(a_log, h, p.a_log_dtype));
+    const float g_in = float(f_raw[gid]) + g27_load_scalar_f32(dt_bias, rem, p.dt_bias_dtype);
+
+    float g_val;
+    if (p.lower_bound < 0.0f) {
+        g_val = p.lower_bound * hybrid_sigmoid(decay_rate * g_in);
+    } else {
+        const float sp = (g_in > 20.0f) ? g_in : log(1.0f + exp(g_in));
+        g_val = -decay_rate * sp;
+    }
+    g_out[gid] = g_val;
+
+    if (d == 0u) {
+        const uint bh_idx = tok * p.num_heads + h;
+        beta_out[bh_idx] = hybrid_sigmoid(float(b_raw[bh_idx]));
+    }
+}
+
+// Single-step KDA decode (`M = 1`) with per-dk decay `exp(g[h, dk])`, FP32 L2Norm,
+// and fused optional RMSNorm + sigmoid output gate (`Glm5NextTextRMSNormGated`).
+// Grid: (num_heads, 1, 1) threadgroups, 256 threads (8 simdgroups).
+kernel void ami_kda_decode(const device half *q [[buffer(0)]],
+                           const device half *k [[buffer(1)]],
+                           const device half *v [[buffer(2)]],
+                           const device float *g [[buffer(3)]],
+                           const device float *beta [[buffer(4)]],
+                           const device half *z [[buffer(5)]],
+                           const device uchar *norm_w [[buffer(6)]],
+                           const device float *state_in [[buffer(7)]],
+                           device float *state_out [[buffer(8)]],
+                           device half *out [[buffer(9)]],
+                           constant KdaDecodeParams &p [[buffer(10)]],
+                           uint tg_x [[threadgroup_position_in_grid]],
+                           uint tid [[thread_index_in_threadgroup]],
+                           uint sg_id [[simdgroup_index_in_threadgroup]],
+                           uint lane [[thread_index_in_simdgroup]]) {
+    const uint h = tg_x;
+    if (h >= p.num_heads) {
+        return;
+    }
+
+    const uint d_k = (GDN_HEAD_K_DIM > 0u) ? GDN_HEAD_K_DIM : p.head_k_dim;
+    const uint d_v = p.head_v_dim;
+
+    threadgroup float tg_q[256];
+    threadgroup float tg_k[256];
+    threadgroup float tg_alpha[256];
+    threadgroup float tg_o[256];
+    threadgroup float tg_rms_val[1];
+
+    if (sg_id == 0u) {
+        const device half *q_src = q + ulong(h) * d_k;
+        const device half *k_src = k + ulong(h) * d_k;
+        const device float *g_src = g + ulong(h) * d_k;
+        float q_sq = 0.0f;
+        float k_sq = 0.0f;
+        for (uint dk = lane; dk < d_k; dk += 32u) {
+            const float qv = float(q_src[dk]);
+            const float kv = float(k_src[dk]);
+            tg_q[dk] = qv;
+            tg_k[dk] = kv;
+            tg_alpha[dk] = exp(g_src[dk]);
+            q_sq = fma(qv, qv, q_sq);
+            k_sq = fma(kv, kv, k_sq);
+        }
+        const float q_sum = simd_sum(q_sq);
+        const float k_sum = simd_sum(k_sq);
+        const float q_fac = (p.apply_l2_norm != 0u) ? (p.q_scale / sqrt(q_sum + p.l2_eps)) : p.q_scale;
+        const float k_fac = (p.apply_l2_norm != 0u) ? (1.0f / sqrt(k_sum + p.l2_eps)) : 1.0f;
+        for (uint dk = lane; dk < d_k; dk += 32u) {
+            tg_q[dk] *= q_fac;
+            tg_k[dk] *= k_fac;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const float beta_val = (p.beta_apply_sigmoid != 0u) ? hybrid_sigmoid(beta[h]) : beta[h];
+    const ulong head_state_base = ulong(h) * d_k * d_v;
+    const ulong v_head_base = ulong(h) * d_v;
+
+    for (uint dv = sg_id; dv < d_v; dv += 8u) {
+        float pred_acc = 0.0f;
+        float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f;
+        float s4 = 0.0f, s5 = 0.0f, s6 = 0.0f, s7 = 0.0f;
+
+        if (GDN_HEAD_K_DIM == 64u) {
+            const uint dk0 = lane;
+            const uint dk1 = lane + 32u;
+            s0 = state_in[head_state_base + ulong(dk0) * d_v + dv] * tg_alpha[dk0];
+            s1 = state_in[head_state_base + ulong(dk1) * d_v + dv] * tg_alpha[dk1];
+            pred_acc = fma(s0, tg_k[dk0], s1 * tg_k[dk1]);
+        } else if (GDN_HEAD_K_DIM == 128u) {
+            const uint dk0 = lane;
+            const uint dk1 = lane + 32u;
+            const uint dk2 = lane + 64u;
+            const uint dk3 = lane + 96u;
+            s0 = state_in[head_state_base + ulong(dk0) * d_v + dv] * tg_alpha[dk0];
+            s1 = state_in[head_state_base + ulong(dk1) * d_v + dv] * tg_alpha[dk1];
+            s2 = state_in[head_state_base + ulong(dk2) * d_v + dv] * tg_alpha[dk2];
+            s3 = state_in[head_state_base + ulong(dk3) * d_v + dv] * tg_alpha[dk3];
+            pred_acc = fma(s0, tg_k[dk0], fma(s1, tg_k[dk1], fma(s2, tg_k[dk2], s3 * tg_k[dk3])));
+        } else {
+            if (lane < d_k)        { s0 = state_in[head_state_base + ulong(lane) * d_v + dv] * tg_alpha[lane]; pred_acc = fma(s0, tg_k[lane], pred_acc); }
+            if (lane + 32u < d_k)  { s1 = state_in[head_state_base + ulong(lane + 32u) * d_v + dv] * tg_alpha[lane + 32u]; pred_acc = fma(s1, tg_k[lane + 32u], pred_acc); }
+            if (lane + 64u < d_k)  { s2 = state_in[head_state_base + ulong(lane + 64u) * d_v + dv] * tg_alpha[lane + 64u]; pred_acc = fma(s2, tg_k[lane + 64u], pred_acc); }
+            if (lane + 96u < d_k)  { s3 = state_in[head_state_base + ulong(lane + 96u) * d_v + dv] * tg_alpha[lane + 96u]; pred_acc = fma(s3, tg_k[lane + 96u], pred_acc); }
+            if (lane + 128u < d_k) { s4 = state_in[head_state_base + ulong(lane + 128u) * d_v + dv] * tg_alpha[lane + 128u]; pred_acc = fma(s4, tg_k[lane + 128u], pred_acc); }
+            if (lane + 160u < d_k) { s5 = state_in[head_state_base + ulong(lane + 160u) * d_v + dv] * tg_alpha[lane + 160u]; pred_acc = fma(s5, tg_k[lane + 160u], pred_acc); }
+            if (lane + 192u < d_k) { s6 = state_in[head_state_base + ulong(lane + 192u) * d_v + dv] * tg_alpha[lane + 192u]; pred_acc = fma(s6, tg_k[lane + 192u], pred_acc); }
+            if (lane + 224u < d_k) { s7 = state_in[head_state_base + ulong(lane + 224u) * d_v + dv] * tg_alpha[lane + 224u]; pred_acc = fma(s7, tg_k[lane + 224u], pred_acc); }
+        }
+
+        const float pred_v = simd_sum(pred_acc);
+        const float delta = beta_val * (float(v[v_head_base + dv]) - pred_v);
+
+        float o_acc = 0.0f;
+        if (GDN_HEAD_K_DIM == 64u) {
+            const uint dk0 = lane;
+            const uint dk1 = lane + 32u;
+            s0 = fma(tg_k[dk0], delta, s0); state_out[head_state_base + ulong(dk0) * d_v + dv] = s0;
+            s1 = fma(tg_k[dk1], delta, s1); state_out[head_state_base + ulong(dk1) * d_v + dv] = s1;
+            o_acc = fma(s0, tg_q[dk0], s1 * tg_q[dk1]);
+        } else if (GDN_HEAD_K_DIM == 128u) {
+            const uint dk0 = lane;
+            const uint dk1 = lane + 32u;
+            const uint dk2 = lane + 64u;
+            const uint dk3 = lane + 96u;
+            s0 = fma(tg_k[dk0], delta, s0); state_out[head_state_base + ulong(dk0) * d_v + dv] = s0;
+            s1 = fma(tg_k[dk1], delta, s1); state_out[head_state_base + ulong(dk1) * d_v + dv] = s1;
+            s2 = fma(tg_k[dk2], delta, s2); state_out[head_state_base + ulong(dk2) * d_v + dv] = s2;
+            s3 = fma(tg_k[dk3], delta, s3); state_out[head_state_base + ulong(dk3) * d_v + dv] = s3;
+            o_acc = fma(s0, tg_q[dk0], fma(s1, tg_q[dk1], fma(s2, tg_q[dk2], s3 * tg_q[dk3])));
+        } else {
+            if (lane < d_k)        { s0 = fma(tg_k[lane], delta, s0); state_out[head_state_base + ulong(lane) * d_v + dv] = s0; o_acc = fma(s0, tg_q[lane], o_acc); }
+            if (lane + 32u < d_k)  { s1 = fma(tg_k[lane + 32u], delta, s1); state_out[head_state_base + ulong(lane + 32u) * d_v + dv] = s1; o_acc = fma(s1, tg_q[lane + 32u], o_acc); }
+            if (lane + 64u < d_k)  { s2 = fma(tg_k[lane + 64u], delta, s2); state_out[head_state_base + ulong(lane + 64u) * d_v + dv] = s2; o_acc = fma(s2, tg_q[lane + 64u], o_acc); }
+            if (lane + 96u < d_k)  { s3 = fma(tg_k[lane + 96u], delta, s3); state_out[head_state_base + ulong(lane + 96u) * d_v + dv] = s3; o_acc = fma(s3, tg_q[lane + 96u], o_acc); }
+            if (lane + 128u < d_k) { s4 = fma(tg_k[lane + 128u], delta, s4); state_out[head_state_base + ulong(lane + 128u) * d_v + dv] = s4; o_acc = fma(s4, tg_q[lane + 128u], o_acc); }
+            if (lane + 160u < d_k) { s5 = fma(tg_k[lane + 160u], delta, s5); state_out[head_state_base + ulong(lane + 160u) * d_v + dv] = s5; o_acc = fma(s5, tg_q[lane + 160u], o_acc); }
+            if (lane + 192u < d_k) { s6 = fma(tg_k[lane + 192u], delta, s6); state_out[head_state_base + ulong(lane + 192u) * d_v + dv] = s6; o_acc = fma(s6, tg_q[lane + 192u], o_acc); }
+            if (lane + 224u < d_k) { s7 = fma(tg_k[lane + 224u], delta, s7); state_out[head_state_base + ulong(lane + 224u) * d_v + dv] = s7; o_acc = fma(s7, tg_q[lane + 224u], o_acc); }
+        }
+
+        const float o_val = simd_sum(o_acc);
+        if (lane == 0u) {
+            tg_o[dv] = (p.apply_out_norm != 0u) ? float(half(o_val)) : o_val;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float inv_rms = 1.0f;
+    if (p.apply_out_norm != 0u) {
+        if (sg_id == 0u) {
+            float sum_sq = 0.0f;
+            for (uint dv = lane; dv < d_v; dv += 32u) {
+                const float ov = tg_o[dv];
+                sum_sq = fma(ov, ov, sum_sq);
+            }
+            const float total_sq = simd_sum(sum_sq);
+            if (lane == 0u) {
+                tg_rms_val[0] = rsqrt(total_sq / float(d_v) + p.rms_eps);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        inv_rms = tg_rms_val[0];
+    }
+
+    const uint nw_base = (p.per_head_norm != 0u) ? (h * d_v) : 0u;
+    for (uint dv = tid; dv < d_v; dv += 256u) {
+        float val = tg_o[dv];
+        if (p.apply_out_norm != 0u) {
+            val = (val * inv_rms) * hybrid_load_norm_w(norm_w, nw_base + dv, HYBRID_NORM_W_BF16);
+        }
+        if (p.apply_out_gate != 0u) {
+            val *= hybrid_sigmoid(float(z[v_head_base + dv]));
+        }
+        out[v_head_base + dv] = half(val);
+    }
+}
+
+// Chunked-prefill KDA (`seq_len >= 1`), register-resident state columns with 4-token SRAM chunks.
+// Grid: (num_heads, ceil(head_v_dim / 8), 1) threadgroups, 256 threads.
+kernel void ami_kda_prefill(const device half *q [[buffer(0)]],
+                            const device half *k [[buffer(1)]],
+                            const device half *v [[buffer(2)]],
+                            const device float *g [[buffer(3)]],
+                            const device float *beta [[buffer(4)]],
+                            const device float *state_in [[buffer(5)]],
+                            device float *state_out [[buffer(6)]],
+                            device half *out [[buffer(7)]],
+                            constant KdaPrefillParams &p [[buffer(8)]],
+                            uint2 tg_pos [[threadgroup_position_in_grid]],
+                            uint sg_id [[simdgroup_index_in_threadgroup]],
+                            uint lane [[thread_index_in_simdgroup]]) {
+    const uint h = tg_pos.x;
+    const uint dv = tg_pos.y * 8u + sg_id;
+    if (h >= p.num_heads) {
+        return;
+    }
+
+    const uint d_k = (GDN_HEAD_K_DIM > 0u) ? GDN_HEAD_K_DIM : p.head_k_dim;
+    const uint d_v = p.head_v_dim;
+    const bool active_dv = (dv < d_v);
+    const ulong head_state_base = ulong(h) * d_k * d_v;
+
+    threadgroup float tg_q[4][256];
+    threadgroup float tg_k[4][256];
+    threadgroup float tg_alpha[4][256];
+    threadgroup float tg_beta[4];
+
+    float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f;
+    float s4 = 0.0f, s5 = 0.0f, s6 = 0.0f, s7 = 0.0f;
+    if (active_dv) {
+        if (GDN_HEAD_K_DIM == 64u) {
+            s0 = state_in[head_state_base + ulong(lane) * d_v + dv];
+            s1 = state_in[head_state_base + ulong(lane + 32u) * d_v + dv];
+        } else if (GDN_HEAD_K_DIM == 128u) {
+            s0 = state_in[head_state_base + ulong(lane) * d_v + dv];
+            s1 = state_in[head_state_base + ulong(lane + 32u) * d_v + dv];
+            s2 = state_in[head_state_base + ulong(lane + 64u) * d_v + dv];
+            s3 = state_in[head_state_base + ulong(lane + 96u) * d_v + dv];
+        } else {
+            if (lane < d_k)        s0 = state_in[head_state_base + ulong(lane) * d_v + dv];
+            if (lane + 32u < d_k)  s1 = state_in[head_state_base + ulong(lane + 32u) * d_v + dv];
+            if (lane + 64u < d_k)  s2 = state_in[head_state_base + ulong(lane + 64u) * d_v + dv];
+            if (lane + 96u < d_k)  s3 = state_in[head_state_base + ulong(lane + 96u) * d_v + dv];
+            if (lane + 128u < d_k) s4 = state_in[head_state_base + ulong(lane + 128u) * d_v + dv];
+            if (lane + 160u < d_k) s5 = state_in[head_state_base + ulong(lane + 160u) * d_v + dv];
+            if (lane + 192u < d_k) s6 = state_in[head_state_base + ulong(lane + 192u) * d_v + dv];
+            if (lane + 224u < d_k) s7 = state_in[head_state_base + ulong(lane + 224u) * d_v + dv];
+        }
+    }
+
+    for (uint t_base = 0u; t_base < p.seq_len; t_base += 4u) {
+        const uint chunk_n = min(4u, p.seq_len - t_base);
+        // Simdgroups 0..3 cooperatively stage Q, K, exp(g), beta for up to 4 tokens.
+        if (sg_id < chunk_n) {
+            const uint tok = t_base + sg_id;
+            const ulong qk_off = (ulong(tok) * p.num_heads + h) * d_k;
+            float q_sq = 0.0f;
+            float k_sq = 0.0f;
+            for (uint dk = lane; dk < d_k; dk += 32u) {
+                const float qv = float(q[qk_off + dk]);
+                const float kv = float(k[qk_off + dk]);
+                tg_q[sg_id][dk] = qv;
+                tg_k[sg_id][dk] = kv;
+                tg_alpha[sg_id][dk] = exp(g[qk_off + dk]);
+                q_sq = fma(qv, qv, q_sq);
+                k_sq = fma(kv, kv, k_sq);
+            }
+            const float q_sum = simd_sum(q_sq);
+            const float k_sum = simd_sum(k_sq);
+            const float q_fac = (p.apply_l2_norm != 0u) ? (p.q_scale / sqrt(q_sum + p.l2_eps)) : p.q_scale;
+            const float k_fac = (p.apply_l2_norm != 0u) ? (1.0f / sqrt(k_sum + p.l2_eps)) : 1.0f;
+            for (uint dk = lane; dk < d_k; dk += 32u) {
+                tg_q[sg_id][dk] *= q_fac;
+                tg_k[sg_id][dk] *= k_fac;
+            }
+            if (lane == 0u) {
+                const float bv = beta[ulong(tok) * p.num_heads + h];
+                tg_beta[sg_id] = (p.beta_apply_sigmoid != 0u) ? hybrid_sigmoid(bv) : bv;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (active_dv) {
+            for (uint c = 0u; c < chunk_n; ++c) {
+                const uint tok = t_base + c;
+                const float beta_val = tg_beta[c];
+                const ulong v_idx = (ulong(tok) * p.num_heads + h) * d_v + dv;
+                const float v_val = float(v[v_idx]);
+
+                float pred_acc = 0.0f;
+                if (GDN_HEAD_K_DIM == 64u) {
+                    s0 *= tg_alpha[c][lane];
+                    s1 *= tg_alpha[c][lane + 32u];
+                    pred_acc = fma(s0, tg_k[c][lane], s1 * tg_k[c][lane + 32u]);
+                } else if (GDN_HEAD_K_DIM == 128u) {
+                    s0 *= tg_alpha[c][lane];
+                    s1 *= tg_alpha[c][lane + 32u];
+                    s2 *= tg_alpha[c][lane + 64u];
+                    s3 *= tg_alpha[c][lane + 96u];
+                    pred_acc = fma(s0, tg_k[c][lane], fma(s1, tg_k[c][lane + 32u], fma(s2, tg_k[c][lane + 64u], s3 * tg_k[c][lane + 96u])));
+                } else {
+                    if (lane < d_k)        { s0 *= tg_alpha[c][lane]; pred_acc = fma(s0, tg_k[c][lane], pred_acc); }
+                    if (lane + 32u < d_k)  { s1 *= tg_alpha[c][lane + 32u]; pred_acc = fma(s1, tg_k[c][lane + 32u], pred_acc); }
+                    if (lane + 64u < d_k)  { s2 *= tg_alpha[c][lane + 64u]; pred_acc = fma(s2, tg_k[c][lane + 64u], pred_acc); }
+                    if (lane + 96u < d_k)  { s3 *= tg_alpha[c][lane + 96u]; pred_acc = fma(s3, tg_k[c][lane + 96u], pred_acc); }
+                    if (lane + 128u < d_k) { s4 *= tg_alpha[c][lane + 128u]; pred_acc = fma(s4, tg_k[c][lane + 128u], pred_acc); }
+                    if (lane + 160u < d_k) { s5 *= tg_alpha[c][lane + 160u]; pred_acc = fma(s5, tg_k[c][lane + 160u], pred_acc); }
+                    if (lane + 192u < d_k) { s6 *= tg_alpha[c][lane + 192u]; pred_acc = fma(s6, tg_k[c][lane + 192u], pred_acc); }
+                    if (lane + 224u < d_k) { s7 *= tg_alpha[c][lane + 224u]; pred_acc = fma(s7, tg_k[c][lane + 224u], pred_acc); }
+                }
+
+                const float pred_v = simd_sum(pred_acc);
+                const float delta = beta_val * (v_val - pred_v);
+
+                float o_acc = 0.0f;
+                if (GDN_HEAD_K_DIM == 64u) {
+                    s0 = fma(tg_k[c][lane], delta, s0);
+                    s1 = fma(tg_k[c][lane + 32u], delta, s1);
+                    o_acc = fma(s0, tg_q[c][lane], s1 * tg_q[c][lane + 32u]);
+                } else if (GDN_HEAD_K_DIM == 128u) {
+                    s0 = fma(tg_k[c][lane], delta, s0);
+                    s1 = fma(tg_k[c][lane + 32u], delta, s1);
+                    s2 = fma(tg_k[c][lane + 64u], delta, s2);
+                    s3 = fma(tg_k[c][lane + 96u], delta, s3);
+                    o_acc = fma(s0, tg_q[c][lane], fma(s1, tg_q[c][lane + 32u], fma(s2, tg_q[c][lane + 64u], s3 * tg_q[c][lane + 96u])));
+                } else {
+                    if (lane < d_k)        { s0 = fma(tg_k[c][lane], delta, s0); o_acc = fma(s0, tg_q[c][lane], o_acc); }
+                    if (lane + 32u < d_k)  { s1 = fma(tg_k[c][lane + 32u], delta, s1); o_acc = fma(s1, tg_q[c][lane + 32u], o_acc); }
+                    if (lane + 64u < d_k)  { s2 = fma(tg_k[c][lane + 64u], delta, s2); o_acc = fma(s2, tg_q[c][lane + 64u], o_acc); }
+                    if (lane + 96u < d_k)  { s3 = fma(tg_k[c][lane + 96u], delta, s3); o_acc = fma(s3, tg_q[c][lane + 96u], o_acc); }
+                    if (lane + 128u < d_k) { s4 = fma(tg_k[c][lane + 128u], delta, s4); o_acc = fma(s4, tg_q[c][lane + 128u], o_acc); }
+                    if (lane + 160u < d_k) { s5 = fma(tg_k[c][lane + 160u], delta, s5); o_acc = fma(s5, tg_q[c][lane + 160u], o_acc); }
+                    if (lane + 192u < d_k) { s6 = fma(tg_k[c][lane + 192u], delta, s6); o_acc = fma(s6, tg_q[c][lane + 192u], o_acc); }
+                    if (lane + 224u < d_k) { s7 = fma(tg_k[c][lane + 224u], delta, s7); o_acc = fma(s7, tg_q[c][lane + 224u], o_acc); }
+                }
+
+                if (p.write_state_only == 0u && tok >= p.out_start_token) {
+                    const float o_val = simd_sum(o_acc);
+                    if (lane == 0u) {
+                        const ulong out_idx = (ulong(tok - p.out_start_token) * p.num_heads + h) * d_v + dv;
+                        out[out_idx] = half(o_val);
+                    }
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (active_dv) {
+        if (GDN_HEAD_K_DIM == 64u) {
+            state_out[head_state_base + ulong(lane) * d_v + dv] = s0;
+            state_out[head_state_base + ulong(lane + 32u) * d_v + dv] = s1;
+        } else if (GDN_HEAD_K_DIM == 128u) {
+            state_out[head_state_base + ulong(lane) * d_v + dv] = s0;
+            state_out[head_state_base + ulong(lane + 32u) * d_v + dv] = s1;
+            state_out[head_state_base + ulong(lane + 64u) * d_v + dv] = s2;
+            state_out[head_state_base + ulong(lane + 96u) * d_v + dv] = s3;
+        } else {
+            if (lane < d_k)        state_out[head_state_base + ulong(lane) * d_v + dv] = s0;
+            if (lane + 32u < d_k)  state_out[head_state_base + ulong(lane + 32u) * d_v + dv] = s1;
+            if (lane + 64u < d_k)  state_out[head_state_base + ulong(lane + 64u) * d_v + dv] = s2;
+            if (lane + 96u < d_k)  state_out[head_state_base + ulong(lane + 96u) * d_v + dv] = s3;
+            if (lane + 128u < d_k) state_out[head_state_base + ulong(lane + 128u) * d_v + dv] = s4;
+            if (lane + 160u < d_k) state_out[head_state_base + ulong(lane + 160u) * d_v + dv] = s5;
+            if (lane + 192u < d_k) state_out[head_state_base + ulong(lane + 192u) * d_v + dv] = s6;
+            if (lane + 224u < d_k) state_out[head_state_base + ulong(lane + 224u) * d_v + dv] = s7;
+        }
+    }
+}
+
+// Tree-verification KDA (`num_nodes <= 64`, 64-bit `ancestor_masks`), non-mutating committed state.
+// Grid: (num_heads, ceil(head_v_dim / 8), 1) threadgroups, 256 threads.
+kernel void ami_kda_tree_verify(const device half *q [[buffer(0)]],
+                                const device half *k [[buffer(1)]],
+                                const device half *v [[buffer(2)]],
+                                const device float *g [[buffer(3)]],
+                                const device float *beta [[buffer(4)]],
+                                const device ulong *ancestor_masks [[buffer(5)]],
+                                const device float *state_in [[buffer(6)]],
+                                device float *state_out [[buffer(7)]],
+                                device half *out [[buffer(8)]],
+                                constant KdaTreeVerifyParams &p [[buffer(9)]],
+                                uint2 tg_pos [[threadgroup_position_in_grid]],
+                                uint tid [[thread_index_in_threadgroup]],
+                                uint sg_id [[simdgroup_index_in_threadgroup]],
+                                uint lane [[thread_index_in_simdgroup]]) {
+    const uint h = tg_pos.x;
+    const uint dv = tg_pos.y * 8u + sg_id;
+    if (h >= p.num_heads) {
+        return;
+    }
+
+    const uint d_k = (GDN_HEAD_K_DIM > 0u) ? GDN_HEAD_K_DIM : p.head_k_dim;
+    const uint d_v = p.head_v_dim;
+    const bool active_dv = (dv < d_v);
+    const ulong head_state_base = ulong(h) * d_k * d_v;
+
+    threadgroup ulong tg_masks[64];
+    threadgroup uchar tg_depth[64];
+    threadgroup uchar tg_path[64];
+    threadgroup uint tg_path_len;
+    threadgroup float tg_beta[64];
+    threadgroup float tg_q_fac[64];
+    threadgroup float tg_k_fac[64];
+
+    if (tid < p.num_nodes) {
+        const ulong mask = ancestor_masks[tid];
+        tg_masks[tid] = mask;
+        tg_depth[tid] = uchar(popcount(mask));
+        const float bv = beta[ulong(tid) * p.num_heads + h];
+        tg_beta[tid] = (p.beta_apply_sigmoid != 0u) ? hybrid_sigmoid(bv) : bv;
+    }
+    for (uint node = sg_id; node < p.num_nodes; node += 8u) {
+        const ulong qk_off = (ulong(node) * p.num_heads + h) * d_k;
+        float q_sq = 0.0f;
+        float k_sq = 0.0f;
+        for (uint dk = lane; dk < d_k; dk += 32u) {
+            const float qv = float(q[qk_off + dk]);
+            const float kv = float(k[qk_off + dk]);
+            q_sq = fma(qv, qv, q_sq);
+            k_sq = fma(kv, kv, k_sq);
+        }
+        const float q_sum = simd_sum(q_sq);
+        const float k_sum = simd_sum(k_sq);
+        if (lane == 0u) {
+            tg_q_fac[node] = (p.apply_l2_norm != 0u) ? (p.q_scale / sqrt(q_sum + p.l2_eps)) : p.q_scale;
+            tg_k_fac[node] = (p.apply_l2_norm != 0u) ? (1.0f / sqrt(k_sum + p.l2_eps)) : 1.0f;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float si0 = 0.0f, si1 = 0.0f, si2 = 0.0f, si3 = 0.0f;
+    float si4 = 0.0f, si5 = 0.0f, si6 = 0.0f, si7 = 0.0f;
+    if (active_dv) {
+        if (lane < d_k)        si0 = state_in[head_state_base + ulong(lane) * d_v + dv];
+        if (lane + 32u < d_k)  si1 = state_in[head_state_base + ulong(lane + 32u) * d_v + dv];
+        if (lane + 64u < d_k)  si2 = state_in[head_state_base + ulong(lane + 64u) * d_v + dv];
+        if (lane + 96u < d_k)  si3 = state_in[head_state_base + ulong(lane + 96u) * d_v + dv];
+        if (lane + 128u < d_k) si4 = state_in[head_state_base + ulong(lane + 128u) * d_v + dv];
+        if (lane + 160u < d_k) si5 = state_in[head_state_base + ulong(lane + 160u) * d_v + dv];
+        if (lane + 192u < d_k) si6 = state_in[head_state_base + ulong(lane + 192u) * d_v + dv];
+        if (lane + 224u < d_k) si7 = state_in[head_state_base + ulong(lane + 224u) * d_v + dv];
+    }
+
+    for (uint node = 0u; node < p.num_nodes; ++node) {
+        if (tid == 0u) {
+            ulong rem = tg_masks[node];
+            const uint depth_n = uint(tg_depth[node]);
+            tg_path_len = depth_n;
+            while (rem != 0ul) {
+                const uint j = uint(ctz(rem));
+                rem &= (rem - 1ul);
+                if (j < p.num_nodes) {
+                    const uint pos = uint(tg_depth[j]) - 1u;
+                    if (pos < depth_n && pos < 64u) {
+                        tg_path[pos] = uchar(j);
+                    }
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (active_dv) {
+            float s0 = si0, s1 = si1, s2 = si2, s3 = si3;
+            float s4 = si4, s5 = si5, s6 = si6, s7 = si7;
+            const uint plen = tg_path_len;
+            for (uint step = 0u; step < plen; ++step) {
+                const uint j = uint(tg_path[step]);
+                const float beta_val = tg_beta[j];
+                const float k_fac = tg_k_fac[j];
+                const ulong qk_off = (ulong(j) * p.num_heads + h) * d_k;
+                const ulong v_idx = (ulong(j) * p.num_heads + h) * d_v + dv;
+                const float v_val = float(v[v_idx]);
+
+                float pred_acc = 0.0f;
+                float k0 = 0.0f, k1 = 0.0f, k2 = 0.0f, k3 = 0.0f;
+                float k4 = 0.0f, k5 = 0.0f, k6 = 0.0f, k7 = 0.0f;
+                if (GDN_HEAD_K_DIM == 64u) {
+                    k0 = float(k[qk_off + lane]) * k_fac;       s0 *= exp(g[qk_off + lane]);       pred_acc = fma(s0, k0, pred_acc);
+                    k1 = float(k[qk_off + lane + 32u]) * k_fac; s1 *= exp(g[qk_off + lane + 32u]); pred_acc = fma(s1, k1, pred_acc);
+                } else if (GDN_HEAD_K_DIM == 128u) {
+                    k0 = float(k[qk_off + lane]) * k_fac;       s0 *= exp(g[qk_off + lane]);       pred_acc = fma(s0, k0, pred_acc);
+                    k1 = float(k[qk_off + lane + 32u]) * k_fac; s1 *= exp(g[qk_off + lane + 32u]); pred_acc = fma(s1, k1, pred_acc);
+                    k2 = float(k[qk_off + lane + 64u]) * k_fac; s2 *= exp(g[qk_off + lane + 64u]); pred_acc = fma(s2, k2, pred_acc);
+                    k3 = float(k[qk_off + lane + 96u]) * k_fac; s3 *= exp(g[qk_off + lane + 96u]); pred_acc = fma(s3, k3, pred_acc);
+                } else {
+                    if (lane < d_k)        { k0 = float(k[qk_off + lane]) * k_fac;        s0 *= exp(g[qk_off + lane]);        pred_acc = fma(s0, k0, pred_acc); }
+                    if (lane + 32u < d_k)  { k1 = float(k[qk_off + lane + 32u]) * k_fac;  s1 *= exp(g[qk_off + lane + 32u]);  pred_acc = fma(s1, k1, pred_acc); }
+                    if (lane + 64u < d_k)  { k2 = float(k[qk_off + lane + 64u]) * k_fac;  s2 *= exp(g[qk_off + lane + 64u]);  pred_acc = fma(s2, k2, pred_acc); }
+                    if (lane + 96u < d_k)  { k3 = float(k[qk_off + lane + 96u]) * k_fac;  s3 *= exp(g[qk_off + lane + 96u]);  pred_acc = fma(s3, k3, pred_acc); }
+                    if (lane + 128u < d_k) { k4 = float(k[qk_off + lane + 128u]) * k_fac; s4 *= exp(g[qk_off + lane + 128u]); pred_acc = fma(s4, k4, pred_acc); }
+                    if (lane + 160u < d_k) { k5 = float(k[qk_off + lane + 160u]) * k_fac; s5 *= exp(g[qk_off + lane + 160u]); pred_acc = fma(s5, k5, pred_acc); }
+                    if (lane + 192u < d_k) { k6 = float(k[qk_off + lane + 192u]) * k_fac; s6 *= exp(g[qk_off + lane + 192u]); pred_acc = fma(s6, k6, pred_acc); }
+                    if (lane + 224u < d_k) { k7 = float(k[qk_off + lane + 224u]) * k_fac; s7 *= exp(g[qk_off + lane + 224u]); pred_acc = fma(s7, k7, pred_acc); }
+                }
+
+                const float pred_v = simd_sum(pred_acc);
+                const float delta = beta_val * (v_val - pred_v);
+
+                if (GDN_HEAD_K_DIM == 64u) {
+                    s0 = fma(k0, delta, s0); s1 = fma(k1, delta, s1);
+                } else if (GDN_HEAD_K_DIM == 128u) {
+                    s0 = fma(k0, delta, s0); s1 = fma(k1, delta, s1);
+                    s2 = fma(k2, delta, s2); s3 = fma(k3, delta, s3);
+                } else {
+                    if (lane < d_k)        s0 = fma(k0, delta, s0);
+                    if (lane + 32u < d_k)  s1 = fma(k1, delta, s1);
+                    if (lane + 64u < d_k)  s2 = fma(k2, delta, s2);
+                    if (lane + 96u < d_k)  s3 = fma(k3, delta, s3);
+                    if (lane + 128u < d_k) s4 = fma(k4, delta, s4);
+                    if (lane + 160u < d_k) s5 = fma(k5, delta, s5);
+                    if (lane + 192u < d_k) s6 = fma(k6, delta, s6);
+                    if (lane + 224u < d_k) s7 = fma(k7, delta, s7);
+                }
+            }
+
+            const ulong q_off = (ulong(node) * p.num_heads + h) * d_k;
+            const float q_fac = tg_q_fac[node];
+            float o_acc = 0.0f;
+            if (GDN_HEAD_K_DIM == 64u) {
+                o_acc = fma(s0, float(q[q_off + lane]) * q_fac, s1 * (float(q[q_off + lane + 32u]) * q_fac));
+            } else if (GDN_HEAD_K_DIM == 128u) {
+                o_acc = fma(s0, float(q[q_off + lane]) * q_fac,
+                        fma(s1, float(q[q_off + lane + 32u]) * q_fac,
+                        fma(s2, float(q[q_off + lane + 64u]) * q_fac,
+                            s3 * (float(q[q_off + lane + 96u]) * q_fac))));
+            } else {
+                if (lane < d_k)        o_acc = fma(s0, float(q[q_off + lane]) * q_fac, o_acc);
+                if (lane + 32u < d_k)  o_acc = fma(s1, float(q[q_off + lane + 32u]) * q_fac, o_acc);
+                if (lane + 64u < d_k)  o_acc = fma(s2, float(q[q_off + lane + 64u]) * q_fac, o_acc);
+                if (lane + 96u < d_k)  o_acc = fma(s3, float(q[q_off + lane + 96u]) * q_fac, o_acc);
+                if (lane + 128u < d_k) o_acc = fma(s4, float(q[q_off + lane + 128u]) * q_fac, o_acc);
+                if (lane + 160u < d_k) o_acc = fma(s5, float(q[q_off + lane + 160u]) * q_fac, o_acc);
+                if (lane + 192u < d_k) o_acc = fma(s6, float(q[q_off + lane + 192u]) * q_fac, o_acc);
+                if (lane + 224u < d_k) o_acc = fma(s7, float(q[q_off + lane + 224u]) * q_fac, o_acc);
+            }
+
+            const float o_val = simd_sum(o_acc);
+            if (lane == 0u) {
+                out[(ulong(node) * p.num_heads + h) * d_v + dv] = half(o_val);
+            }
+
+            if (node == p.scratch_leaf_node) {
+                if (lane < d_k)        state_out[head_state_base + ulong(lane) * d_v + dv] = s0;
+                if (lane + 32u < d_k)  state_out[head_state_base + ulong(lane + 32u) * d_v + dv] = s1;
+                if (lane + 64u < d_k)  state_out[head_state_base + ulong(lane + 64u) * d_v + dv] = s2;
+                if (lane + 96u < d_k)  state_out[head_state_base + ulong(lane + 96u) * d_v + dv] = s3;
+                if (lane + 128u < d_k) state_out[head_state_base + ulong(lane + 128u) * d_v + dv] = s4;
+                if (lane + 160u < d_k) state_out[head_state_base + ulong(lane + 160u) * d_v + dv] = s5;
+                if (lane + 192u < d_k) state_out[head_state_base + ulong(lane + 192u) * d_v + dv] = s6;
+                if (lane + 224u < d_k) state_out[head_state_base + ulong(lane + 224u) * d_v + dv] = s7;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
+// In-place per-head FP32 RMSNorm + sigmoid output gate (`Glm5NextTextRMSNormGated`).
+// Grid: (num_heads, num_tokens, 1) threadgroups, 32 threads.
+kernel void ami_kda_out_norm_gate(device half *out [[buffer(0)]],
+                                  const device half *z [[buffer(1)]],
+                                  const device uchar *norm_w [[buffer(2)]],
+                                  constant GdnOutNormGateParams &p [[buffer(3)]],
+                                  uint2 tg_pos [[threadgroup_position_in_grid]],
+                                  uint lane [[thread_index_in_simdgroup]]) {
+    const uint h = tg_pos.x;
+    const uint tok = tg_pos.y;
+    if (h >= p.num_v_heads || tok >= p.num_tokens) {
+        return;
+    }
+
+    const uint d_v = p.head_v_dim;
+    const ulong base = (ulong(tok) * p.num_v_heads + h) * d_v;
+
+    float inv_rms = 1.0f;
+    if (p.apply_out_norm != 0u) {
+        float sum_sq = 0.0f;
+        for (uint dv = lane; dv < d_v; dv += 32u) {
+            const float ov = float(out[base + dv]);
+            sum_sq = fma(ov, ov, sum_sq);
+        }
+        const float total_sq = simd_sum(sum_sq);
+        inv_rms = rsqrt(total_sq / float(d_v) + p.rms_eps);
+    }
+
+    const uint nw_base = (p.per_head_norm != 0u) ? (h * d_v) : 0u;
+    for (uint dv = lane; dv < d_v; dv += 32u) {
+        float val = float(out[base + dv]);
+        if (p.apply_out_norm != 0u) {
+            val = (val * inv_rms) * hybrid_load_norm_w(norm_w, nw_base + dv, HYBRID_NORM_W_BF16);
+        }
+        if (p.apply_out_gate != 0u) {
+            val *= hybrid_sigmoid(float(z[base + dv]));
+        }
+        out[base + dv] = half(val);
+    }
+}
+
+// Advances committed KDA recurrent state along `accepted_nodes[0..accepted_count]`.
+// Grid: (num_heads, ceil(head_v_dim / 8), 1) threadgroups, 256 threads.
+kernel void ami_kda_commit_tree(const device half *k_tree [[buffer(0)]],
+                                const device half *v_tree [[buffer(1)]],
+                                const device float *g_tree [[buffer(2)]],
+                                const device float *beta_tree [[buffer(3)]],
+                                const device ushort *accepted_nodes [[buffer(4)]],
+                                const device float *state_in [[buffer(5)]],
+                                device float *state_out [[buffer(6)]],
+                                constant KdaCommitTreeParams &p [[buffer(7)]],
+                                uint2 tg_pos [[threadgroup_position_in_grid]],
+                                uint sg_id [[simdgroup_index_in_threadgroup]],
+                                uint lane [[thread_index_in_simdgroup]]) {
+    const uint h = tg_pos.x;
+    const uint dv = tg_pos.y * 8u + sg_id;
+    if (h >= p.num_heads || dv >= p.head_v_dim) {
+        return;
+    }
+
+    const uint d_k = (GDN_HEAD_K_DIM > 0u) ? GDN_HEAD_K_DIM : p.head_k_dim;
+    const uint d_v = p.head_v_dim;
+    const ulong head_state_base = ulong(h) * d_k * d_v;
+
+    float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f;
+    float s4 = 0.0f, s5 = 0.0f, s6 = 0.0f, s7 = 0.0f;
+    if (lane < d_k)        s0 = state_in[head_state_base + ulong(lane) * d_v + dv];
+    if (lane + 32u < d_k)  s1 = state_in[head_state_base + ulong(lane + 32u) * d_v + dv];
+    if (lane + 64u < d_k)  s2 = state_in[head_state_base + ulong(lane + 64u) * d_v + dv];
+    if (lane + 96u < d_k)  s3 = state_in[head_state_base + ulong(lane + 96u) * d_v + dv];
+    if (lane + 128u < d_k) s4 = state_in[head_state_base + ulong(lane + 128u) * d_v + dv];
+    if (lane + 160u < d_k) s5 = state_in[head_state_base + ulong(lane + 160u) * d_v + dv];
+    if (lane + 192u < d_k) s6 = state_in[head_state_base + ulong(lane + 192u) * d_v + dv];
+    if (lane + 224u < d_k) s7 = state_in[head_state_base + ulong(lane + 224u) * d_v + dv];
+
+    for (uint step = 0u; step < p.accepted_count; ++step) {
+        const uint node = (p.use_node_buffer != 0u) ? uint(accepted_nodes[step]) : uint(p.inline_nodes[step]);
+        const ulong qk_off = (ulong(node) * p.num_heads + h) * d_k;
+        const ulong v_idx = (ulong(node) * p.num_heads + h) * d_v + dv;
+
+        float k0 = 0.0f, k1 = 0.0f, k2 = 0.0f, k3 = 0.0f;
+        float k4 = 0.0f, k5 = 0.0f, k6 = 0.0f, k7 = 0.0f;
+        float k_sq = 0.0f;
+        if (lane < d_k)        { k0 = float(k_tree[qk_off + lane]);        k_sq = fma(k0, k0, k_sq); }
+        if (lane + 32u < d_k)  { k1 = float(k_tree[qk_off + lane + 32u]);  k_sq = fma(k1, k1, k_sq); }
+        if (lane + 64u < d_k)  { k2 = float(k_tree[qk_off + lane + 64u]);  k_sq = fma(k2, k2, k_sq); }
+        if (lane + 96u < d_k)  { k3 = float(k_tree[qk_off + lane + 96u]);  k_sq = fma(k3, k3, k_sq); }
+        if (lane + 128u < d_k) { k4 = float(k_tree[qk_off + lane + 128u]); k_sq = fma(k4, k4, k_sq); }
+        if (lane + 160u < d_k) { k5 = float(k_tree[qk_off + lane + 160u]); k_sq = fma(k5, k5, k_sq); }
+        if (lane + 192u < d_k) { k6 = float(k_tree[qk_off + lane + 192u]); k_sq = fma(k6, k6, k_sq); }
+        if (lane + 224u < d_k) { k7 = float(k_tree[qk_off + lane + 224u]); k_sq = fma(k7, k7, k_sq); }
+        const float k_fac = (p.apply_l2_norm != 0u) ? (1.0f / sqrt(simd_sum(k_sq) + p.l2_eps)) : 1.0f;
+        k0 *= k_fac; k1 *= k_fac; k2 *= k_fac; k3 *= k_fac;
+        k4 *= k_fac; k5 *= k_fac; k6 *= k_fac; k7 *= k_fac;
+
+        float pred_acc = 0.0f;
+        if (lane < d_k)        { s0 *= exp(g_tree[qk_off + lane]);        pred_acc = fma(s0, k0, pred_acc); }
+        if (lane + 32u < d_k)  { s1 *= exp(g_tree[qk_off + lane + 32u]);  pred_acc = fma(s1, k1, pred_acc); }
+        if (lane + 64u < d_k)  { s2 *= exp(g_tree[qk_off + lane + 64u]);  pred_acc = fma(s2, k2, pred_acc); }
+        if (lane + 96u < d_k)  { s3 *= exp(g_tree[qk_off + lane + 96u]);  pred_acc = fma(s3, k3, pred_acc); }
+        if (lane + 128u < d_k) { s4 *= exp(g_tree[qk_off + lane + 128u]); pred_acc = fma(s4, k4, pred_acc); }
+        if (lane + 160u < d_k) { s5 *= exp(g_tree[qk_off + lane + 160u]); pred_acc = fma(s5, k5, pred_acc); }
+        if (lane + 192u < d_k) { s6 *= exp(g_tree[qk_off + lane + 192u]); pred_acc = fma(s6, k6, pred_acc); }
+        if (lane + 224u < d_k) { s7 *= exp(g_tree[qk_off + lane + 224u]); pred_acc = fma(s7, k7, pred_acc); }
+
+        const float pred_v = simd_sum(pred_acc);
+        const float bv = beta_tree[ulong(node) * p.num_heads + h];
+        const float beta_val = (p.beta_apply_sigmoid != 0u) ? hybrid_sigmoid(bv) : bv;
+        const float delta = beta_val * (float(v_tree[v_idx]) - pred_v);
+
+        if (lane < d_k)        s0 = fma(k0, delta, s0);
+        if (lane + 32u < d_k)  s1 = fma(k1, delta, s1);
+        if (lane + 64u < d_k)  s2 = fma(k2, delta, s2);
+        if (lane + 96u < d_k)  s3 = fma(k3, delta, s3);
+        if (lane + 128u < d_k) s4 = fma(k4, delta, s4);
+        if (lane + 160u < d_k) s5 = fma(k5, delta, s5);
+        if (lane + 192u < d_k) s6 = fma(k6, delta, s6);
+        if (lane + 224u < d_k) s7 = fma(k7, delta, s7);
+    }
+
+    if (lane < d_k)        state_out[head_state_base + ulong(lane) * d_v + dv] = s0;
+    if (lane + 32u < d_k)  state_out[head_state_base + ulong(lane + 32u) * d_v + dv] = s1;
+    if (lane + 64u < d_k)  state_out[head_state_base + ulong(lane + 64u) * d_v + dv] = s2;
+    if (lane + 96u < d_k)  state_out[head_state_base + ulong(lane + 96u) * d_v + dv] = s3;
+    if (lane + 128u < d_k) state_out[head_state_base + ulong(lane + 128u) * d_v + dv] = s4;
+    if (lane + 160u < d_k) state_out[head_state_base + ulong(lane + 160u) * d_v + dv] = s5;
+    if (lane + 192u < d_k) state_out[head_state_base + ulong(lane + 192u) * d_v + dv] = s6;
+    if (lane + 224u < d_k) state_out[head_state_base + ulong(lane + 224u) * d_v + dv] = s7;
+}
+
+// ---------------------------------------------------------------------------
+// G.3: `GlmMoeDsaIndexer` (`GLM-5.2/5.3`), `NoPE MLA` + `index_kpool = 4`
+// (`GLM-5.3-Flash`), and Sparse Absorbed MLA Attention
+// ---------------------------------------------------------------------------
+
+struct G27RopeInterleaveParams {
+    uint num_tokens;
+    uint num_heads;
+    uint head_stride;
+    uint rot_dim;
+    uint rot_offset;
+    uint base_pos;
+    uint use_pos_buf;
+    float rope_theta;
+    float attn_scaling;
+    uint _pad0;
+    uint _pad1;
+    uint _pad2;
+};
+
+struct G27LayerNormParams {
+    uint num_rows;
+    uint dim;
+    uint w_dtype; // 0=f16, 1=bf16, 2=f32
+    uint b_dtype; // 0=f16, 1=bf16, 2=f32
+    float eps;
+    uint has_bias;
+    uint _pad0;
+    uint _pad1;
+};
+
+struct G27MlaKvWriteParams {
+    uint num_tokens;
+    uint kv_lora_rank;
+    uint qk_rope_head_dim;
+    uint start_pos;
+    uint is_tree_commit;
+    uint _pad0;
+    uint _pad1;
+    uint _pad2;
+    ushort inline_nodes[64];
+};
+
+struct G27DsaIdxKvWriteParams {
+    uint num_tokens;
+    uint index_head_dim;
+    uint start_pos;
+    uint has_gate;
+    uint is_tree_commit;
+    uint _pad0;
+    uint _pad1;
+    uint _pad2;
+    ushort inline_nodes[64];
+};
+
+struct G27DsaKpoolBuildParams {
+    uint start_pool;
+    uint end_pool;
+    uint index_head_dim;
+    uint kpool;
+    uint ape_dtype; // 0=f16, 1=bf16, 2=f32
+    uint _pad0;
+    uint _pad1;
+    uint _pad2;
+};
+
+struct G27DsaScoresParams {
+    uint num_rows;
+    uint index_n_heads;
+    uint index_head_dim;
+    uint committed_kv_len; // committed tokens in k_cache (or all tokens in linear prefill)
+    uint num_candidates;   // total score slots per row
+    uint kpool;            // 1 = token-level (`glm_moe_dsa`), 4 = pooled (`glm5_next`)
+    uint causal_base_pos;  // for linear causal mode (is_tree == 0)
+    uint is_tree;          // 1 = use ancestor_masks + k_tree for uncommitted tokens
+    uint weights_f16;      // 1 = weights buffer is f16, 0 = f32
+    uint ape_dtype;        // 0=f16, 1=bf16, 2=f32
+    float softmax_scale;   // index_head_dim^-0.5
+    float head_weight_scale; // index_n_heads^-0.5
+};
+
+struct G27DsaSelectTopKParams {
+    uint num_rows;
+    uint committed_kv_len;
+    uint num_candidates;
+    uint index_topk;
+    uint max_out_k;
+    uint kpool;
+    uint always_select_tail;
+    uint causal_base_pos;
+    uint is_tree;
+    uint _pad0;
+    uint _pad1;
+    uint _pad2;
+};
+
+struct G27MlaSparseAttnParams {
+    uint num_rows;
+    uint num_q_heads;
+    uint kv_lora_rank;
+    uint qk_rope_head_dim; // 0 for NoPE MLA (`glm5_next`)
+    uint committed_kv_len;
+    uint max_out_k;
+    float scale;
+    uint _pad0;
+};
+
+static_assert(sizeof(G27RopeInterleaveParams) == 48, "G27RopeInterleaveParams must be 48 bytes");
+static_assert(sizeof(G27LayerNormParams) == 32, "G27LayerNormParams must be 32 bytes");
+static_assert(sizeof(G27MlaKvWriteParams) == 160, "G27MlaKvWriteParams must be 160 bytes");
+static_assert(sizeof(G27DsaIdxKvWriteParams) == 160, "G27DsaIdxKvWriteParams must be 160 bytes");
+static_assert(sizeof(G27DsaKpoolBuildParams) == 32, "G27DsaKpoolBuildParams must be 32 bytes");
+static_assert(sizeof(G27DsaScoresParams) == 48, "G27DsaScoresParams must be 48 bytes");
+static_assert(sizeof(G27DsaSelectTopKParams) == 48, "G27DsaSelectTopKParams must be 48 bytes");
+static_assert(sizeof(G27MlaSparseAttnParams) == 32, "G27MlaSparseAttnParams must be 32 bytes");
+
+// Interleaved RoPE matching `apply_rotary_pos_emb_interleave`:
+//   out[j]         = in[2*j] * cos - in[2*j + 1] * sin
+//   out[j + D/2]   = in[2*j + 1] * cos + in[2*j] * sin
+// Grid: (num_heads, num_tokens, 1), 32 threads (1 simdgroup).
+kernel void ami_g27_rope_interleave(device half *x [[buffer(0)]],
+                                    const device uint *positions [[buffer(1)]],
+                                    constant G27RopeInterleaveParams &p [[buffer(2)]],
+                                    uint2 tg_pos [[threadgroup_position_in_grid]],
+                                    uint lane [[thread_index_in_simdgroup]]) {
+    const uint head = tg_pos.x;
+    const uint tok = tg_pos.y;
+    if (head >= p.num_heads || tok >= p.num_tokens || p.rot_dim < 2u || p.rot_dim > 256u) {
+        return;
+    }
+
+    const uint half_d = p.rot_dim >> 1;
+    const uint pos = (p.use_pos_buf != 0u) ? positions[tok] : (p.base_pos + tok);
+    const ulong base = (ulong(tok) * p.num_heads + head) * p.head_stride + p.rot_offset;
+
+    threadgroup float tg_out[256];
+    const float inv_rot_dim = 1.0f / float(p.rot_dim);
+    const float log_theta = log(p.rope_theta);
+
+    for (uint j = lane; j < half_d; j += 32u) {
+        const float x0 = float(x[base + 2u * j]);
+        const float x1 = float(x[base + 2u * j + 1u]);
+        const float inv_freq = exp(-log_theta * (float(2u * j) * inv_rot_dim));
+        const float angle = float(pos) * inv_freq;
+        const float c = cos(angle) * p.attn_scaling;
+        const float s = sin(angle) * p.attn_scaling;
+        tg_out[j] = x0 * c - x1 * s;
+        tg_out[j + half_d] = x1 * c + x0 * s;
+    }
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint d = lane; d < p.rot_dim; d += 32u) {
+        x[base + d] = half(tg_out[d]);
+    }
+}
+
+// Standard FP32 LayerNorm with weight + optional bias (`k_norm` in `GlmMoeDsaIndexer` & `Glm5NextTextIndexer`).
+// Grid: (num_rows, 1, 1), 128 threads (4 simdgroups).
+kernel void ami_g27_layernorm(const device half *x [[buffer(0)]],
+                              const device uchar *weight [[buffer(1)]],
+                              const device uchar *bias [[buffer(2)]],
+                              device half *y [[buffer(3)]],
+                              constant G27LayerNormParams &p [[buffer(4)]],
+                              uint tg_x [[threadgroup_position_in_grid]],
+                              uint tid [[thread_index_in_threadgroup]],
+                              uint sg_id [[simdgroup_index_in_threadgroup]],
+                              uint lane [[thread_index_in_simdgroup]]) {
+    const uint row = tg_x;
+    if (row >= p.num_rows || p.dim == 0u) {
+        return;
+    }
+
+    threadgroup float tg_red[4];
+    const ulong base = ulong(row) * p.dim;
+
+    float sum_x = 0.0f;
+    for (uint d = tid; d < p.dim; d += 128u) {
+        sum_x += float(x[base + d]);
+    }
+    const float sg_sum = simd_sum(sum_x);
+    if (lane == 0u) tg_red[sg_id] = sg_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float mean = ((tg_red[0] + tg_red[1]) + (tg_red[2] + tg_red[3])) / float(p.dim);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float sum_sq = 0.0f;
+    for (uint d = tid; d < p.dim; d += 128u) {
+        const float diff = float(x[base + d]) - mean;
+        sum_sq = fma(diff, diff, sum_sq);
+    }
+    const float sg_sq = simd_sum(sum_sq);
+    if (lane == 0u) tg_red[sg_id] = sg_sq;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float var = ((tg_red[0] + tg_red[1]) + (tg_red[2] + tg_red[3])) / float(p.dim);
+    const float inv_std = rsqrt(var + p.eps);
+
+    for (uint d = tid; d < p.dim; d += 128u) {
+        const float norm_v = (float(x[base + d]) - mean) * inv_std;
+        const float wv = g27_load_scalar_f32(weight, d, p.w_dtype);
+        const float bv = (p.has_bias != 0u) ? g27_load_scalar_f32(bias, d, p.b_dtype) : 0.0f;
+        y[base + d] = half(fma(norm_v, wv, bv));
+    }
+}
+
+// Writes compressed FP16 MLA KV (`latent [kv_lora_rank]` + optional `rope [qk_rope_head_dim]`)
+// into `[max_seq_len, kv_lora_rank + qk_rope_head_dim]` cache (linear or tree commit).
+// Grid: (num_tokens, 1, 1), 256 threads.
+kernel void ami_g27_mla_kv_write(const device half *latent_in [[buffer(0)]],
+                                 const device half *rope_in [[buffer(1)]],
+                                 device half *kv_cache [[buffer(2)]],
+                                 constant G27MlaKvWriteParams &p [[buffer(3)]],
+                                 uint tg_x [[threadgroup_position_in_grid]],
+                                 uint tid [[thread_index_in_threadgroup]]) {
+    const uint i = tg_x;
+    if (i >= p.num_tokens) {
+        return;
+    }
+
+    const uint src_row = (p.is_tree_commit != 0u) ? uint(p.inline_nodes[i]) : i;
+    const uint dst_pos = p.start_pos + i;
+    const uint row_stride = p.kv_lora_rank + p.qk_rope_head_dim;
+    device half *dst = kv_cache + ulong(dst_pos) * row_stride;
+
+    const device half *lat_src = latent_in + ulong(src_row) * p.kv_lora_rank;
+    for (uint d = tid; d < p.kv_lora_rank; d += 256u) {
+        dst[d] = lat_src[d];
+    }
+    if (p.qk_rope_head_dim > 0u) {
+        const device half *rope_src = rope_in + ulong(src_row) * p.qk_rope_head_dim;
+        for (uint r = tid; r < p.qk_rope_head_dim; r += 256u) {
+            dst[p.kv_lora_rank + r] = rope_src[r];
+        }
+    }
+}
+
+// Writes FP16 indexer K (`[M, D]`) + optional k-pool gate scores (`[M, D]`) into indexer caches.
+// Grid: (num_tokens, 1, 1), 128 threads.
+kernel void ami_g27_dsa_idx_kv_write(const device half *k_in [[buffer(0)]],
+                                     const device half *gate_in [[buffer(1)]],
+                                     device half *k_cache [[buffer(2)]],
+                                     device half *gate_cache [[buffer(3)]],
+                                     constant G27DsaIdxKvWriteParams &p [[buffer(4)]],
+                                     uint tg_x [[threadgroup_position_in_grid]],
+                                     uint tid [[thread_index_in_threadgroup]]) {
+    const uint i = tg_x;
+    if (i >= p.num_tokens) {
+        return;
+    }
+
+    const uint src_row = (p.is_tree_commit != 0u) ? uint(p.inline_nodes[i]) : i;
+    const uint dst_pos = p.start_pos + i;
+    const ulong src_off = ulong(src_row) * p.index_head_dim;
+    const ulong dst_off = ulong(dst_pos) * p.index_head_dim;
+
+    for (uint d = tid; d < p.index_head_dim; d += 128u) {
+        k_cache[dst_off + d] = k_in[src_off + d];
+        if (p.has_gate != 0u) {
+            gate_cache[dst_off + d] = gate_in[src_off + d];
+        }
+    }
+}
+
+// Builds compressed k-pool keys `pool_k[pool, d] = sum_{j=0..kpool-1} softmax_j(gate[pool*kpool+j, d] + ape[j, d]) * k[pool*kpool+j, d]`.
+// Grid: (end_pool - start_pool, 1, 1), 128 threads.
+kernel void ami_g27_dsa_kpool_build(const device half *k_cache [[buffer(0)]],
+                                    const device half *gate_cache [[buffer(1)]],
+                                    const device uchar *kpool_ape [[buffer(2)]],
+                                    device half *pool_k_cache [[buffer(3)]],
+                                    constant G27DsaKpoolBuildParams &p [[buffer(4)]],
+                                    uint tg_x [[threadgroup_position_in_grid]],
+                                    uint tid [[thread_index_in_threadgroup]]) {
+    const uint pool = p.start_pool + tg_x;
+    if (pool >= p.end_pool || p.kpool == 0u) {
+        return;
+    }
+
+    const uint dim = p.index_head_dim;
+    const uint tok0 = pool * p.kpool;
+
+    if (p.kpool == 4u) {
+        for (uint d = tid; d < dim; d += 128u) {
+            const float g0 = float(gate_cache[ulong(tok0 + 0u) * dim + d]) + g27_load_scalar_f32(kpool_ape, 0ul * dim + d, p.ape_dtype);
+            const float g1 = float(gate_cache[ulong(tok0 + 1u) * dim + d]) + g27_load_scalar_f32(kpool_ape, 1ul * dim + d, p.ape_dtype);
+            const float g2 = float(gate_cache[ulong(tok0 + 2u) * dim + d]) + g27_load_scalar_f32(kpool_ape, 2ul * dim + d, p.ape_dtype);
+            const float g3 = float(gate_cache[ulong(tok0 + 3u) * dim + d]) + g27_load_scalar_f32(kpool_ape, 3ul * dim + d, p.ape_dtype);
+            const float m = max(max(g0, g1), max(g2, g3));
+            const float4 e = exp(float4(g0, g1, g2, g3) - m);
+            const float4 pr = e * (1.0f / (e.x + e.y + e.z + e.w));
+            const float4 kv = float4(
+                float(k_cache[ulong(tok0 + 0u) * dim + d]),
+                float(k_cache[ulong(tok0 + 1u) * dim + d]),
+                float(k_cache[ulong(tok0 + 2u) * dim + d]),
+                float(k_cache[ulong(tok0 + 3u) * dim + d]));
+            pool_k_cache[ulong(pool) * dim + d] = half(dot(pr, kv));
+        }
+    } else {
+        for (uint d = tid; d < dim; d += 128u) {
+            float m = -INFINITY;
+            for (uint j = 0u; j < p.kpool; ++j) {
+                const float lv = float(gate_cache[ulong(tok0 + j) * dim + d]) + g27_load_scalar_f32(kpool_ape, ulong(j) * dim + d, p.ape_dtype);
+                m = max(m, lv);
+            }
+            float denom = 0.0f;
+            float num = 0.0f;
+            for (uint j = 0u; j < p.kpool; ++j) {
+                const float lv = float(gate_cache[ulong(tok0 + j) * dim + d]) + g27_load_scalar_f32(kpool_ape, ulong(j) * dim + d, p.ape_dtype);
+                const float ev = exp(lv - m);
+                denom += ev;
+                num = fma(ev, float(k_cache[ulong(tok0 + j) * dim + d]), num);
+            }
+            pool_k_cache[ulong(pool) * dim + d] = half((denom > 0.0f) ? (num / denom) : 0.0f);
+        }
+    }
+}
+
+// Reconstructs root-to-node ancestor chain into `tg_path` (length = popcount(mask)).
+static inline void g27_build_tree_path(const device ulong *ancestor_masks,
+                                       uint num_rows,
+                                       uint node,
+                                       threadgroup uchar *tg_path,
+                                       threadgroup uint &tg_path_len) {
+    ulong rem = ancestor_masks[node];
+    const uint depth_n = uint(popcount(rem));
+    tg_path_len = depth_n;
+    while (rem != 0ul) {
+        const uint j = uint(ctz(rem));
+        rem &= (rem - 1ul);
+        if (j < num_rows) {
+            const uint pos = uint(popcount(ancestor_masks[j])) - 1u;
+            if (pos < depth_n && pos < 64u) {
+                tg_path[pos] = uchar(j);
+            }
+        }
+    }
+}
+
+// Parallel DSA Indexer scoring kernel for BOTH token-level (`kpool = 1`, `glm_moe_dsa`)
+// and pooled-key (`kpool = 4`, `glm5_next`) modes, supporting linear causal and tree masks.
+//   score[tok, c] = sum_{h=0..H_idx-1} (weights[tok, h] * H_idx^-0.5) * relu((q[tok, h] . k_cand[c]) * D_idx^-0.5)
+// Grid: (ceil(num_candidates / 64), num_rows, 1), 64 threads (2 simdgroups).
+kernel void ami_g27_dsa_scores(const device half *q_idx [[buffer(0)]],
+                               const device uchar *weights_raw [[buffer(1)]],
+                               const device half *k_cand_cache [[buffer(2)]],
+                               const device half *k_raw_cache [[buffer(3)]],
+                               const device half *k_tree [[buffer(4)]],
+                               const device half *gate_cache [[buffer(5)]],
+                               const device half *gate_tree [[buffer(6)]],
+                               const device uchar *kpool_ape [[buffer(7)]],
+                               const device ulong *ancestor_masks [[buffer(8)]],
+                               device float *scores_out [[buffer(9)]],
+                               constant G27DsaScoresParams &p [[buffer(10)]],
+                               uint2 tg_pos [[threadgroup_position_in_grid]],
+                               uint tid [[thread_index_in_threadgroup]]) {
+    const uint c = tg_pos.x * 64u + tid;
+    const uint tok = tg_pos.y;
+    if (tok >= p.num_rows) {
+        return;
+    }
+
+    threadgroup uchar tg_path[64];
+    threadgroup uint tg_path_len;
+    if (p.is_tree != 0u && tid == 0u) {
+        g27_build_tree_path(ancestor_masks, p.num_rows, tok, tg_path, tg_path_len);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (c >= p.num_candidates) {
+        return;
+    }
+
+    const uint dim = p.index_head_dim;
+    const ulong out_idx = ulong(tok) * p.num_candidates + c;
+
+    // Determine candidate visibility and whether it is a boundary tree pool (kpool > 1).
+    bool visible = false;
+    bool use_tree_key = false;
+    uint tree_node_idx = 0u;
+    bool is_boundary_pool = false;
+
+    if (p.kpool <= 1u) {
+        if (p.is_tree == 0u) {
+            const uint q_pos = p.causal_base_pos + tok;
+            visible = (c <= q_pos);
+        } else {
+            if (c < p.committed_kv_len) {
+                visible = true;
+            } else {
+                const uint j = c - p.committed_kv_len;
+                if (j < p.num_rows && (((ancestor_masks[tok] >> j) & 1ul) != 0ul)) {
+                    visible = true;
+                    use_tree_key = true;
+                    tree_node_idx = j;
+                }
+            }
+        }
+    } else {
+        const uint pool_end = c * p.kpool + (p.kpool - 1u);
+        if (p.is_tree == 0u) {
+            const uint q_pos = p.causal_base_pos + tok;
+            visible = (pool_end <= q_pos);
+        } else {
+            const uint visible_count = p.committed_kv_len + tg_path_len;
+            if (pool_end < visible_count) {
+                visible = true;
+                if (pool_end >= p.committed_kv_len) {
+                    is_boundary_pool = true;
+                }
+            }
+        }
+    }
+
+    if (!visible) {
+        scores_out[out_idx] = -INFINITY;
+        return;
+    }
+
+    const ulong q_tok_base = ulong(tok) * p.index_n_heads * dim;
+    const ulong w_tok_base = ulong(tok) * p.index_n_heads;
+    float total_score = 0.0f;
+
+    if (!is_boundary_pool) {
+        const device half *k_ptr = use_tree_key
+            ? (k_tree + ulong(tree_node_idx) * dim)
+            : (k_cand_cache + ulong(c) * dim);
+
+        for (uint h = 0u; h < p.index_n_heads; ++h) {
+            const device half *q_ptr = q_tok_base + q_idx + ulong(h) * dim;
+            float dot_v = 0.0f;
+            if ((dim & 3u) == 0u) {
+                const uint vdim = dim >> 2;
+                const device half4 *q4 = (const device half4 *)q_ptr;
+                const device half4 *k4 = (const device half4 *)k_ptr;
+                for (uint d = 0u; d < vdim; ++d) {
+                    dot_v += dot(float4(q4[d]), float4(k4[d]));
+                }
+            } else {
+                for (uint d = 0u; d < dim; ++d) {
+                    dot_v = fma(float(q_ptr[d]), float(k_ptr[d]), dot_v);
+                }
+            }
+            const float relu_s = max(dot_v * p.softmax_scale, 0.0f);
+            const float w_raw = (p.weights_f16 != 0u)
+                ? float(((const device half *)weights_raw)[w_tok_base + h])
+                : ((const device float *)weights_raw)[w_tok_base + h];
+            total_score = fma(w_raw * p.head_weight_scale, relu_s, total_score);
+        }
+    } else {
+        // Boundary pool formed by uncommitted prefix tail + tree ancestors (`kpool == 4` fast path).
+        const uint tok0 = c * p.kpool;
+        for (uint h = 0u; h < p.index_n_heads; ++h) {
+            const device half *q_ptr = q_idx + q_tok_base + ulong(h) * dim;
+            float dot_v = 0.0f;
+            for (uint d = 0u; d < dim; ++d) {
+                float m_l = -INFINITY;
+                for (uint j = 0u; j < p.kpool; ++j) {
+                    const uint seq_p = tok0 + j;
+                    const float gv = (seq_p < p.committed_kv_len)
+                        ? float(gate_cache[ulong(seq_p) * dim + d])
+                        : float(gate_tree[ulong(uint(tg_path[seq_p - p.committed_kv_len])) * dim + d]);
+                    m_l = max(m_l, gv + g27_load_scalar_f32(kpool_ape, ulong(j) * dim + d, p.ape_dtype));
+                }
+                float denom = 0.0f;
+                float num = 0.0f;
+                for (uint j = 0u; j < p.kpool; ++j) {
+                    const uint seq_p = tok0 + j;
+                    const float gv = (seq_p < p.committed_kv_len)
+                        ? float(gate_cache[ulong(seq_p) * dim + d])
+                        : float(gate_tree[ulong(uint(tg_path[seq_p - p.committed_kv_len])) * dim + d]);
+                    const float kv = (seq_p < p.committed_kv_len)
+                        ? float(k_raw_cache[ulong(seq_p) * dim + d])
+                        : float(k_tree[ulong(uint(tg_path[seq_p - p.committed_kv_len])) * dim + d]);
+                    const float ev = exp(gv + g27_load_scalar_f32(kpool_ape, ulong(j) * dim + d, p.ape_dtype) - m_l);
+                    denom += ev;
+                    num = fma(ev, kv, num);
+                }
+                const float pk = (denom > 0.0f) ? float(half(num / denom)) : 0.0f;
+                dot_v = fma(float(q_ptr[d]), pk, dot_v);
+            }
+            const float relu_s = max(dot_v * p.softmax_scale, 0.0f);
+            const float w_raw = (p.weights_f16 != 0u)
+                ? float(((const device half *)weights_raw)[w_tok_base + h])
+                : ((const device float *)weights_raw)[w_tok_base + h];
+            total_score = fma(w_raw * p.head_weight_scale, relu_s, total_score);
+        }
+    }
+
+    scores_out[out_idx] = total_score;
+}
+
+static inline uint g27_float_to_ordered_key(float s) {
+    const uint bits = as_type<uint>(s);
+    return ((bits & 0x80000000u) != 0u) ? ~bits : (bits ^ 0x80000000u);
+}
+
+static inline uint g27_map_seq_pos_to_kv_index(uint seq_pos,
+                                               uint committed_kv_len,
+                                               uint is_tree,
+                                               const threadgroup uchar *tg_path) {
+    if (is_tree == 0u || seq_pos < committed_kv_len) {
+        return seq_pos;
+    }
+    return committed_kv_len + uint(tg_path[seq_pos - committed_kv_len]);
+}
+
+// Exact 4-pass 8-bit MSB radix Top-K selector in 1 KiB SRAM (`0` stack spills!).
+// Handles arbitrary `index_topk` (including `2048`), k-pool expansion (`kpool = 4`),
+// and mandatory visible tail selection (`always_select_tail = 1`).
+// Grid: (num_rows, 1, 1), 256 threads (8 simdgroups).
+kernel void ami_g27_dsa_select_topk(const device float *scores [[buffer(0)]],
+                                    const device ulong *ancestor_masks [[buffer(1)]],
+                                    device uint *out_indices [[buffer(2)]],
+                                    device uint *out_counts [[buffer(3)]],
+                                    constant G27DsaSelectTopKParams &p [[buffer(4)]],
+                                    uint tg_x [[threadgroup_position_in_grid]],
+                                    uint tid [[thread_index_in_threadgroup]]) {
+    const uint tok = tg_x;
+    if (tok >= p.num_rows) {
+        return;
+    }
+
+    threadgroup atomic_uint tg_hist[256];
+    threadgroup atomic_uint tg_count;
+    threadgroup atomic_uint tg_tie_taken;
+    threadgroup uint tg_meta[4]; // [0]=prefix, [1]=remaining, [2]=num_valid, [3]=path_len
+    threadgroup uchar tg_path[64];
+
+    if (tid == 0u) {
+        atomic_store_explicit(&tg_count, 0u, memory_order_relaxed);
+        tg_meta[3] = 0u;
+        if (p.is_tree != 0u) {
+            g27_build_tree_path(ancestor_masks, p.num_rows, tok, tg_path, tg_meta[3]);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const device float *row_s = scores + ulong(tok) * p.num_candidates;
+    device uint *row_out = out_indices + ulong(tok) * p.max_out_k;
+
+    // Count valid (finite) candidates for this query row.
+    uint local_valid = 0u;
+    for (uint c = tid; c < p.num_candidates; c += 256u) {
+        if (isfinite(row_s[c])) {
+            local_valid++;
+        }
+    }
+    if (local_valid > 0u) {
+        atomic_fetch_add_explicit(&tg_count, local_valid, memory_order_relaxed);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tid == 0u) {
+        tg_meta[2] = atomic_load_explicit(&tg_count, memory_order_relaxed);
+        atomic_store_explicit(&tg_count, 0u, memory_order_relaxed);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const uint num_valid = tg_meta[2];
+    const uint kpool = max(p.kpool, 1u);
+    const uint pool_budget = p.index_topk / kpool;
+    const uint select_k = min(pool_budget, num_valid);
+
+    if (select_k > 0u) {
+        if (num_valid <= select_k) {
+            // Fast path: emit ALL valid candidates directly.
+            for (uint c = tid; c < p.num_candidates; c += 256u) {
+                if (isfinite(row_s[c])) {
+                    const uint slot = atomic_fetch_add_explicit(&tg_count, kpool, memory_order_relaxed);
+                    if (kpool == 1u) {
+                        if (slot < p.max_out_k) row_out[slot] = c;
+                    } else {
+                        for (uint j = 0u; j < kpool; ++j) {
+                            if (slot + j < p.max_out_k) {
+                                row_out[slot + j] = g27_map_seq_pos_to_kv_index(
+                                    c * kpool + j, p.committed_kv_len, p.is_tree, tg_path);
+                            }
+                        }
+                    }
+                }
+            }
+        } else {
+            // Exact 4-pass 8-bit MSB radix threshold selection in 1 KiB SRAM.
+            if (tid == 0u) {
+                tg_meta[0] = 0u;
+                tg_meta[1] = select_k;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            for (uint pass = 0u; pass < 4u; ++pass) {
+                const uint shift = 24u - pass * 8u;
+                atomic_store_explicit(&tg_hist[tid], 0u, memory_order_relaxed);
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+
+                const uint cur_prefix = tg_meta[0];
+                for (uint c = tid; c < p.num_candidates; c += 256u) {
+                    const float s = row_s[c];
+                    if (isfinite(s)) {
+                        const uint key = g27_float_to_ordered_key(s);
+                        const bool matches = (pass == 0u) || ((key >> (shift + 8u)) == cur_prefix);
+                        if (matches) {
+                            const uint bucket = (key >> shift) & 0xFFu;
+                            atomic_fetch_add_explicit(&tg_hist[bucket], 1u, memory_order_relaxed);
+                        }
+                    }
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+
+                if (tid == 0u) {
+                    uint acc = 0u;
+                    uint chosen = 0u;
+                    const uint rem = tg_meta[1];
+                    for (int b = 255; b >= 0; --b) {
+                        const uint cnt = atomic_load_explicit(&tg_hist[uint(b)], memory_order_relaxed);
+                        if (acc + cnt >= rem) {
+                            chosen = uint(b);
+                            tg_meta[1] = rem - acc;
+                            break;
+                        }
+                        acc += cnt;
+                    }
+                    tg_meta[0] = (cur_prefix << 8u) | chosen;
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+
+            const uint thr_key = tg_meta[0];
+            const uint tie_limit = tg_meta[1];
+            if (tid == 0u) {
+                atomic_store_explicit(&tg_tie_taken, 0u, memory_order_relaxed);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            // Emit strictly greater candidates first, then ties up to exact `select_k`.
+            for (uint c = tid; c < p.num_candidates; c += 256u) {
+                const float s = row_s[c];
+                if (isfinite(s) && g27_float_to_ordered_key(s) > thr_key) {
+                    const uint slot = atomic_fetch_add_explicit(&tg_count, kpool, memory_order_relaxed);
+                    if (kpool == 1u) {
+                        if (slot < p.max_out_k) row_out[slot] = c;
+                    } else {
+                        for (uint j = 0u; j < kpool; ++j) {
+                            if (slot + j < p.max_out_k) {
+                                row_out[slot + j] = g27_map_seq_pos_to_kv_index(
+                                    c * kpool + j, p.committed_kv_len, p.is_tree, tg_path);
+                            }
+                        }
+                    }
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            for (uint c = tid; c < p.num_candidates; c += 256u) {
+                const float s = row_s[c];
+                if (isfinite(s) && g27_float_to_ordered_key(s) == thr_key) {
+                    const uint taken = atomic_fetch_add_explicit(&tg_tie_taken, 1u, memory_order_relaxed);
+                    if (taken < tie_limit) {
+                        const uint slot = atomic_fetch_add_explicit(&tg_count, kpool, memory_order_relaxed);
+                        if (kpool == 1u) {
+                            if (slot < p.max_out_k) row_out[slot] = c;
+                        } else {
+                            for (uint j = 0u; j < kpool; ++j) {
+                                if (slot + j < p.max_out_k) {
+                                    row_out[slot + j] = g27_map_seq_pos_to_kv_index(
+                                        c * kpool + j, p.committed_kv_len, p.is_tree, tg_path);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Append visible incomplete tail tokens when `kpool > 1` and `always_select_tail != 0`.
+    if (tid == 0u) {
+        uint cur_cnt = min(atomic_load_explicit(&tg_count, memory_order_relaxed), p.max_out_k);
+        if (kpool > 1u && p.always_select_tail != 0u) {
+            const uint visible_count = (p.is_tree != 0u)
+                ? (p.committed_kv_len + tg_meta[3])
+                : (p.causal_base_pos + tok + 1u);
+            const uint tail_cnt = visible_count % kpool;
+            const uint tail_start = visible_count - tail_cnt;
+            for (uint t = 0u; t < tail_cnt && cur_cnt < p.max_out_k; ++t) {
+                row_out[cur_cnt++] = g27_map_seq_pos_to_kv_index(
+                    tail_start + t, p.committed_kv_len, p.is_tree, tg_path);
+            }
+        }
+        out_counts[tok] = cur_cnt;
+        atomic_store_explicit(&tg_count, cur_cnt, memory_order_relaxed);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Pad remaining slots with sentinel `0xFFFFFFFFu`.
+    const uint final_cnt = atomic_load_explicit(&tg_count, memory_order_relaxed);
+    for (uint i = final_cnt + tid; i < p.max_out_k; i += 256u) {
+        row_out[i] = 0xFFFFFFFFu;
+    }
+}
+
+// Sparse absorbed MLA attention over DSA-selected token indices.
+// Supports BOTH `qk_rope_head_dim > 0` (`glm_moe_dsa`) and `qk_rope_head_dim == 0` (`NoPE MLA`, `glm5_next`),
+// across decode, prefill, and `verifyTree` (reading `idx >= committed_kv_len` from tree scratch).
+// Grid: (num_q_heads, num_rows, 1), 256 threads (8 simdgroups).
+kernel void ami_g27_mla_sparse_attend(const device half *q_nope [[buffer(0)]],
+                                      const device half *q_pe [[buffer(1)]],
+                                      const device half *kv_cache [[buffer(2)]],
+                                      const device half *kv_tree_latent [[buffer(3)]],
+                                      const device half *kv_tree_rope [[buffer(4)]],
+                                      const device uint *selected_indices [[buffer(5)]],
+                                      const device uint *selected_counts [[buffer(6)]],
+                                      device half *out [[buffer(7)]],
+                                      constant G27MlaSparseAttnParams &p [[buffer(8)]],
+                                      uint2 tg_pos [[threadgroup_position_in_grid]],
+                                      uint tid [[thread_index_in_threadgroup]],
+                                      uint sg_id [[simdgroup_index_in_threadgroup]],
+                                      uint lane [[thread_index_in_simdgroup]]) {
+    const uint q_head = tg_pos.x;
+    const uint tok = tg_pos.y;
+    if (q_head >= p.num_q_heads || tok >= p.num_rows) {
+        return;
+    }
+
+    const uint d_lat = p.kv_lora_rank;
+    const uint d_rope = p.qk_rope_head_dim;
+    const uint kv_stride = d_lat + d_rope;
+    const uint k_cnt = min(selected_counts[tok], p.max_out_k);
+    const ulong qn_base = (ulong(tok) * p.num_q_heads + q_head) * d_lat;
+    const ulong qp_base = (ulong(tok) * p.num_q_heads + q_head) * d_rope;
+    const device uint *idx_row = selected_indices + ulong(tok) * p.max_out_k;
+    device half *out_row = out + qn_base;
+
+    if (k_cnt == 0u) {
+        for (uint d = tid; d < d_lat; d += 256u) {
+            out_row[d] = half(0.0f);
+        }
+        return;
+    }
+
+    // Stage query in threadgroup SRAM (up to 1024-dim latent + 256-dim RoPE = 5 KiB SRAM).
+    threadgroup float tg_qn[1024];
+    threadgroup float tg_qp[256];
+    threadgroup float tg_red[8];
+
+    if (d_lat <= 1024u) {
+        for (uint d = tid; d < d_lat; d += 256u) {
+            tg_qn[d] = float(q_nope[qn_base + d]);
+        }
+    }
+    if (d_rope > 0u) {
+        for (uint r = tid; r < d_rope; r += 256u) {
+            tg_qp[r] = float(q_pe[qp_base + r]);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (d_lat <= 1024u) {
+        // Fast single-pass path (covers `kv_lora_rank = 512` on GLM-5.2/5.3/5.3-Flash!).
+        // 4 scalar registers `o0..o3` per thread -> 0 stack spills, 1 KV read per selected token.
+        float m_val = -INFINITY;
+        float l_val = 0.0f;
+        float o0 = 0.0f, o1 = 0.0f, o2 = 0.0f, o3 = 0.0f;
+
+        const uint d0 = tid;
+        const uint d1 = tid + 256u;
+        const uint d2 = tid + 512u;
+        const uint d3 = tid + 768u;
+        const float q0 = (d0 < d_lat) ? tg_qn[d0] : 0.0f;
+        const float q1 = (d1 < d_lat) ? tg_qn[d1] : 0.0f;
+        const float q2 = (d2 < d_lat) ? tg_qn[d2] : 0.0f;
+        const float q3 = (d3 < d_lat) ? tg_qn[d3] : 0.0f;
+        const float qr = (d_rope > 0u && tid < d_rope) ? tg_qp[tid] : 0.0f;
+
+        for (uint si = 0u; si < k_cnt; ++si) {
+            const uint kv_idx = idx_row[si];
+            if (kv_idx == 0xFFFFFFFFu) {
+                continue;
+            }
+            const bool is_tree_tok = (kv_idx >= p.committed_kv_len);
+            const device half *k_lat_ptr = is_tree_tok
+                ? (kv_tree_latent + ulong(kv_idx - p.committed_kv_len) * d_lat)
+                : (kv_cache + ulong(kv_idx) * kv_stride);
+            const device half *k_rope_ptr = is_tree_tok
+                ? (kv_tree_rope + ulong(kv_idx - p.committed_kv_len) * d_rope)
+                : (kv_cache + ulong(kv_idx) * kv_stride + d_lat);
+
+            const float k0 = (d0 < d_lat) ? float(k_lat_ptr[d0]) : 0.0f;
+            const float k1 = (d1 < d_lat) ? float(k_lat_ptr[d1]) : 0.0f;
+            const float k2 = (d2 < d_lat) ? float(k_lat_ptr[d2]) : 0.0f;
+            const float k3 = (d3 < d_lat) ? float(k_lat_ptr[d3]) : 0.0f;
+
+            float part = fma(q0, k0, fma(q1, k1, fma(q2, k2, q3 * k3)));
+            if (d_rope > 0u && tid < d_rope) {
+                part = fma(qr, float(k_rope_ptr[tid]), part);
+            }
+
+            const float sg_dot = simd_sum(part);
+            if (lane == 0u) tg_red[sg_id] = sg_dot;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            const float score = (((tg_red[0] + tg_red[1]) + (tg_red[2] + tg_red[3])) +
+                                 ((tg_red[4] + tg_red[5]) + (tg_red[6] + tg_red[7]))) * p.scale;
+
+            const float m_new = max(m_val, score);
+            const float alpha = (m_val == -INFINITY) ? 0.0f : exp(m_val - m_new);
+            const float w = exp(score - m_new);
+            l_val = fma(l_val, alpha, w);
+            m_val = m_new;
+
+            o0 = fma(w, k0, o0 * alpha);
+            o1 = fma(w, k1, o1 * alpha);
+            o2 = fma(w, k2, o2 * alpha);
+            o3 = fma(w, k3, o3 * alpha);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        const float inv_l = (l_val > 0.0f) ? (1.0f / l_val) : 0.0f;
+        if (d0 < d_lat) out_row[d0] = half(o0 * inv_l);
+        if (d1 < d_lat) out_row[d1] = half(o1 * inv_l);
+        if (d2 < d_lat) out_row[d2] = half(o2 * inv_l);
+        if (d3 < d_lat) out_row[d3] = half(o3 * inv_l);
+    } else {
+        // General tiled path for `kv_lora_rank > 1024` (0 stack spills).
+        for (uint d_base = 0u; d_base < d_lat; d_base += 256u) {
+            const uint d_cur = d_base + tid;
+            float m_val = -INFINITY;
+            float l_val = 0.0f;
+            float o_acc = 0.0f;
+
+            for (uint si = 0u; si < k_cnt; ++si) {
+                const uint kv_idx = idx_row[si];
+                if (kv_idx == 0xFFFFFFFFu) {
+                    continue;
+                }
+                const bool is_tree_tok = (kv_idx >= p.committed_kv_len);
+                const device half *k_lat_ptr = is_tree_tok
+                    ? (kv_tree_latent + ulong(kv_idx - p.committed_kv_len) * d_lat)
+                    : (kv_cache + ulong(kv_idx) * kv_stride);
+                const device half *k_rope_ptr = is_tree_tok
+                    ? (kv_tree_rope + ulong(kv_idx - p.committed_kv_len) * d_rope)
+                    : (kv_cache + ulong(kv_idx) * kv_stride + d_lat);
+
+                float part = 0.0f;
+                for (uint d = tid; d < d_lat; d += 256u) {
+                    part = fma(float(q_nope[qn_base + d]), float(k_lat_ptr[d]), part);
+                }
+                if (d_rope > 0u && tid < d_rope) {
+                    part = fma(tg_qp[tid], float(k_rope_ptr[tid]), part);
+                }
+                const float sg_dot = simd_sum(part);
+                if (lane == 0u) tg_red[sg_id] = sg_dot;
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                const float score = (((tg_red[0] + tg_red[1]) + (tg_red[2] + tg_red[3])) +
+                                     ((tg_red[4] + tg_red[5]) + (tg_red[6] + tg_red[7]))) * p.scale;
+
+                const float m_new = max(m_val, score);
+                const float alpha = (m_val == -INFINITY) ? 0.0f : exp(m_val - m_new);
+                const float w = exp(score - m_new);
+                l_val = fma(l_val, alpha, w);
+                m_val = m_new;
+
+                const float kv_d = (d_cur < d_lat) ? float(k_lat_ptr[d_cur]) : 0.0f;
+                o_acc = fma(w, kv_d, o_acc * alpha);
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+
+            const float inv_l = (l_val > 0.0f) ? (1.0f / l_val) : 0.0f;
+            if (d_cur < d_lat) {
+                out_row[d_cur] = half(o_acc * inv_l);
+            }
+        }
+    }
+}
