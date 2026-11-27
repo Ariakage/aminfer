@@ -251,13 +251,24 @@ pub const LoadedDSparkProposer = struct {
     slot_norm: ?[]f32,
     workspace: dspark_mod.DSparkWorkspace,
     proposer: dspark_mod.DSparkProposer,
+    /// Non-null when auto-detected as real-HF `3L DSpark` (`mtp.0..2.*`, `draft_format: "dspark_3l_mtp"`).
+    real_hf_3l: ?*dspark_mod.DSpark3LRuntime = null,
 
     pub const LoadError = error{
         MissingTensor,
         InvalidWeights,
         UnsupportedDType,
         OutOfMemory,
-    } || amf.ParseError || amf.IoError || dspark_mod.Error;
+    } || amf.ParseError || amf.IoError || dspark_mod.LoadError;
+
+    fn readTargetEmbedCb(
+        ctx: ?*anyopaque,
+        token_id: u32,
+        out_f32: []f32,
+    ) dspark_mod.Error!void {
+        const gm: *graph.GraphModel = @ptrCast(@alignCast(ctx orelse return error.InvalidWeights));
+        gm.readTokenEmbedF32(token_id, out_f32) catch return error.CallbackFailed;
+    }
 
     fn evalTargetLmHeadCb(
         ctx: ?*anyopaque,
@@ -272,6 +283,68 @@ pub const LoadedDSparkProposer = struct {
             return error.DimensionMismatch;
         }
         gm.evalLmHeadBatchF32(slot_hiddens, block_width, out_logits) catch return error.CallbackFailed;
+    }
+
+    fn readOptionalConfigFileAlloc(allocator: std.mem.Allocator, amf_path: [:0]const u8) error{OutOfMemory}!?[]u8 {
+        const path_slice: []const u8 = amf_path;
+        const slash_idx = std.mem.lastIndexOfScalar(u8, path_slice, '/');
+        const dir_prefix = if (slash_idx) |idx| path_slice[0 .. idx + 1] else "";
+        const file_name = if (slash_idx) |idx| path_slice[idx + 1 ..] else path_slice;
+        const dot_idx = std.mem.lastIndexOfScalar(u8, file_name, '.');
+        const stem = if (dot_idx) |idx| file_name[0..idx] else file_name;
+
+        var cand_bufs: [2][std.fs.max_path_bytes]u8 = undefined;
+        var cand_paths: [2]?[:0]const u8 = .{ null, null };
+        if (std.fmt.bufPrint(cand_bufs[0][0 .. cand_bufs[0].len - 1], "{s}{s}_config.json", .{ dir_prefix, stem })) |s0| {
+            cand_bufs[0][s0.len] = 0;
+            cand_paths[0] = cand_bufs[0][0..s0.len :0];
+        } else |_| {}
+        if (std.fmt.bufPrint(cand_bufs[1][0 .. cand_bufs[1].len - 1], "{s}dspark_config.json", .{dir_prefix})) |s1| {
+            cand_bufs[1][s1.len] = 0;
+            cand_paths[1] = cand_bufs[1][0..s1.len :0];
+        } else |_| {}
+
+        for (cand_paths) |p_opt| {
+            const p = p_opt orelse continue;
+            const fd = std.c.open(p.ptr, .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+            if (fd < 0) continue;
+            defer _ = std.c.close(fd);
+            var list: std.ArrayList(u8) = .empty;
+            errdefer list.deinit(allocator);
+            var tmp: [4096]u8 = undefined;
+            while (true) {
+                const rc = std.c.read(fd, &tmp, tmp.len);
+                if (rc < 0) {
+                    if (std.c.errno(rc) == .INTR) continue;
+                    list.deinit(allocator);
+                    break;
+                }
+                if (rc == 0) {
+                    return try list.toOwnedSlice(allocator);
+                }
+                if (list.items.len + @as(usize, @intCast(rc)) > 1024 * 1024) {
+                    list.deinit(allocator);
+                    break;
+                }
+                try list.appendSlice(allocator, tmp[0..@intCast(rc)]);
+            }
+        }
+        return null;
+    }
+
+    /// Maps `dspark_target_layer_ids` into clamped 0-indexed `GraphLoadOptions.aux_layer_ids`
+    /// (`[3]u32`) so a target `GraphModel` captures the exact 3 layers expected by `mtp.0.main_proj`.
+    pub fn auxLayerIdsForTarget(cfg: dspark_mod.DSpark3LConfig, num_target_layers: u32) [3]u32 {
+        const max_l: u32 = if (num_target_layers > 0) num_target_layers - 1 else 0;
+        const taps = cfg.targetLayerIdsSlice();
+        var out: [3]u32 = .{ 0, max_l / 2, max_l };
+        for (0..@min(taps.len, 3)) |i| {
+            out[i] = @min(@as(u32, taps[i]), max_l);
+        }
+        if (taps.len > 0 and taps.len < 3) {
+            for (taps.len..3) |i| out[i] = out[taps.len - 1];
+        }
+        return out;
     }
 
     fn loadFloatTensorF32(
@@ -334,7 +407,77 @@ pub const LoadedDSparkProposer = struct {
         cfg_override: ?dspark_mod.DSparkConfig,
         budget_override: ?budget_mod.Budget,
     ) LoadError!*LoadedDSparkProposer {
+        return loadFromFileWithOptions(allocator, target, amf_path, cfg_override, .{}, budget_override);
+    }
+
+    /// Loads either legacy M7 `dspark.slot.{s}.*` or real-HF `3L DSpark` (`mtp.0..2.*`)
+    /// by auto-detecting the `.amf` directory (`mtp.0.main_proj` vs `dspark.slot.0.proj.weight`),
+    /// reading adjacent `dspark_config.json` / embedded metadata when present, and binding
+    /// target `readTokenEmbedF32` + `evalLmHeadBatchF32` callbacks with zero hot-path allocs.
+    pub fn loadFromFileWithOptions(
+        allocator: std.mem.Allocator,
+        target: *graph.GraphModel,
+        amf_path: [:0]const u8,
+        cfg_override: ?dspark_mod.DSparkConfig,
+        opts_3l: dspark_mod.DSpark3LLoadOptions,
+        budget_override: ?budget_mod.Budget,
+    ) LoadError!*LoadedDSparkProposer {
         var amf_file = try amf.AmfFile.open(allocator, amf_path);
+        const is_real_3l = dspark_mod.DSpark3LRuntime.isRealHf3LAmf(&amf_file.parsed);
+        if (is_real_3l) {
+            amf_file.close(allocator);
+            var cfg_3l_opt: ?dspark_mod.DSpark3LConfig = null;
+            if (try readOptionalConfigFileAlloc(allocator, amf_path)) |cfg_json| {
+                defer allocator.free(cfg_json);
+                cfg_3l_opt = try dspark_mod.DSpark3LConfig.fromJson(allocator, cfg_json);
+            }
+            if (cfg_override) |co| {
+                var base: dspark_mod.DSpark3LConfig = cfg_3l_opt orelse .{
+                    .hidden_size = co.hidden_size,
+                    .vocab_size = co.vocab_size,
+                };
+                base.block_size = co.block_width;
+                base.top_k_per_pos = co.top_k_per_pos;
+                base.max_tree_nodes = co.max_tree_nodes;
+                base.rms_eps = co.rms_eps;
+                base.temperature = co.temperature;
+                base.l1_seed_step_prob = co.l1_seed_step_prob;
+                base.l1_branch_step_prob = co.l1_branch_step_prob;
+                base.l1_max_draft_len = co.l1_max_draft_len;
+                cfg_3l_opt = base;
+            }
+            var eff_opts = opts_3l;
+            if (eff_opts.embed_hook == null) {
+                eff_opts.embed_hook = .{
+                    .ctx = @ptrCast(target),
+                    .read_fn = readTargetEmbedCb,
+                };
+            }
+            if (eff_opts.lm_head_hook == null) {
+                eff_opts.lm_head_hook = .{ .callback = .{
+                    .ctx = @ptrCast(target),
+                    .eval_fn = evalTargetLmHeadCb,
+                } };
+            }
+            if (eff_opts.budget_override == null) {
+                eff_opts.budget_override = budget_override;
+            }
+
+            const rt = try dspark_mod.DSpark3LRuntime.loadFromFile(allocator, amf_path, cfg_3l_opt, eff_opts);
+            errdefer rt.deinit(allocator);
+            const bundle = try allocator.create(LoadedDSparkProposer);
+            bundle.* = .{
+                .enc_proj = null,
+                .dec_proj = null,
+                .slot_projs = &.{},
+                .slot_embed = &.{},
+                .slot_norm = null,
+                .workspace = undefined,
+                .proposer = dspark_mod.DSparkProposer.init3L(rt),
+                .real_hf_3l = rt,
+            };
+            return bundle;
+        }
         defer amf_file.close(allocator);
 
         const h: u32 = target.config.hidden_size;
@@ -417,6 +560,12 @@ pub const LoadedDSparkProposer = struct {
     }
 
     pub fn deinit(self: *LoadedDSparkProposer, allocator: std.mem.Allocator) void {
+        if (self.real_hf_3l) |rt| {
+            rt.deinit(allocator);
+            self.real_hf_3l = null;
+            allocator.destroy(self);
+            return;
+        }
         self.workspace.deinit();
         if (self.enc_proj) |p| allocator.free(p);
         if (self.dec_proj) |p| allocator.free(p);
@@ -1641,6 +1790,7 @@ pub const SpecEngine = struct {
     grammar_mask: []u32,
     router_emb_scratch: []f32,
     router_logits_scratch: []f32,
+    dspark_aux_taps_scratch: []f32 = &.{},
     penalty_tracker: *sampling_mod.DefaultPenaltyTracker,
     gpu_sampler: ?gpu_sampler_mod.GpuSampler,
     gpu_sampler_wired_bytes: u64,
@@ -1806,7 +1956,7 @@ pub const SpecEngine = struct {
         else if (small_draft) |sd|
             sd.totalWiredBytes()
         else if (dspark_proposer) |dp|
-            dp.workspace.totalWiredBytes()
+            dp.totalWiredBytes()
         else if (dflare_proposer) |dfp|
             dfp.workspace.totalWiredBytes()
         else if (dfly2_proposer) |df2|
@@ -1844,6 +1994,11 @@ pub const SpecEngine = struct {
         errdefer allocator.free(router_emb_scratch);
         const router_logits_scratch = try allocator.alloc(f32, tree_mod.ExpertBitset.MAX_EXPERTS);
         errdefer allocator.free(router_logits_scratch);
+        const dspark_aux_taps_scratch: []f32 = if (dspark_proposer != null and dspark_proposer.?.is3L())
+            try allocator.alloc(f32, 3 * @max(@as(usize, 1), target.hiddenSize()))
+        else
+            &.{};
+        errdefer if (dspark_aux_taps_scratch.len > 0) allocator.free(dspark_aux_taps_scratch);
         const penalty_tracker = try allocator.create(sampling_mod.DefaultPenaltyTracker);
         errdefer allocator.destroy(penalty_tracker);
         penalty_tracker.* = sampling_mod.DefaultPenaltyTracker.init();
@@ -1992,6 +2147,7 @@ pub const SpecEngine = struct {
             .grammar_mask = grammar_mask,
             .router_emb_scratch = router_emb_scratch,
             .router_logits_scratch = router_logits_scratch,
+            .dspark_aux_taps_scratch = dspark_aux_taps_scratch,
             .penalty_tracker = penalty_tracker,
             .gpu_sampler = gpu_sampler_opt,
             .gpu_sampler_wired_bytes = gpu_sampler_wired,
@@ -2025,6 +2181,7 @@ pub const SpecEngine = struct {
         if (self.expert_bytes_sampled.len > 0) allocator.free(self.expert_bytes_sampled);
         if (self.expert_bw_sampled.len > 0) allocator.free(self.expert_bw_sampled);
         allocator.destroy(self.penalty_tracker);
+        if (self.dspark_aux_taps_scratch.len > 0) allocator.free(self.dspark_aux_taps_scratch);
         allocator.free(self.router_logits_scratch);
         allocator.free(self.router_emb_scratch);
         allocator.free(self.grammar_mask);
@@ -2094,6 +2251,7 @@ pub const SpecEngine = struct {
         self.target.resetState();
         if (self.draft_head) |dh| dh.reset();
         if (self.small_draft) |sd| sd.reset();
+        if (self.dspark_proposer) |dp| dp.reset3LWindow();
         self.sam.reset();
         self.has_pearl_ready_tree = false;
         self.pearl_pending_sync_len = 0;
@@ -2130,7 +2288,7 @@ pub const SpecEngine = struct {
         else if (self.small_draft) |sd|
             sd.totalWiredBytes()
         else if (self.dspark_proposer) |dp|
-            dp.workspace.totalWiredBytes()
+            dp.totalWiredBytes()
         else if (self.dflare_proposer) |dfp|
             dfp.workspace.totalWiredBytes()
         else if (self.dfly2_proposer) |df2|
@@ -2603,6 +2761,17 @@ pub const SpecEngine = struct {
             _ = try nt.prefetch(self.sam.historySlice());
         }
 
+        // Seed real-HF 3L DSpark sliding-window KV cache from prefill target taps (0 hot-path allocs).
+        if (self.dspark_proposer) |dp| {
+            if (dp.is3L() and self.target == .graph) {
+                var taps_buf: [dspark_mod.MAX_DSPARK_TARGET_TAPS][]const f32 = undefined;
+                const n_taps = self.fillDSpark3LTaps(self.target.graph, &taps_buf);
+                if (n_taps > 0) {
+                    try dp.seed3LWindow(taps_buf[0..n_taps], @intCast(prompt_tokens.len - 1));
+                }
+            }
+        }
+
         // Prefill standalone same-family small draft model (`D4`, zero target hidden-state dep).
         if (self.small_draft) |sd| {
             try sd.prefillAndSeedRoot(prompt_tokens, first_tok, self.queryDraftTopK(sd.model.config.vocab_size));
@@ -2976,6 +3145,13 @@ pub const SpecEngine = struct {
                 if (self.dspark_proposer) |dp| {
                     if (max_allowed_depth >= 1 and candidate_cap > 1) {
                         const g = self.target.graph;
+                        if (dp.is3L()) {
+                            var taps_buf: [dspark_mod.MAX_DSPARK_TARGET_TAPS][]const f32 = undefined;
+                            const n_taps = self.fillDSpark3LTaps(g, &taps_buf);
+                            if (n_taps > 0) {
+                                dp.set3LTargetTaps(taps_buf[0..n_taps], base_pos);
+                            }
+                        }
                         var dp_state = self.grammar_state.snapshot();
                         const pr = if (grammar_active)
                             try dp.proposeIntoConstrained(
@@ -4180,6 +4356,71 @@ pub const SpecEngine = struct {
         return .{ .sampled = sampled, .has_cold = has_cold };
     }
 
+    /// Populates up to 3 target hidden taps (`[H]` f32 each) for real-HF `3L DSpark`
+    /// (`mtp.0.main_proj [H, 3*H]`) with zero dynamic heap allocations:
+    /// 1) `GraphModel.dflareTargetTaps()` when available,
+    /// 2) `GraphModel.readAuxConcatF16(1)` (`aux_layer_ids` 3-layer capture) unpacked
+    ///    into preallocated `self.dspark_aux_taps_scratch`,
+    /// 3) fallback `(encoderSummaryF32 orelse lastDecoderHiddenF32, lastDecoderHiddenF32, lastDecoderHiddenF32)`.
+    fn fillDSpark3LTaps(
+        self: *SpecEngine,
+        g: *const graph.GraphModel,
+        out_taps: *[dspark_mod.MAX_DSPARK_TARGET_TAPS][]const f32,
+    ) usize {
+        const h: usize = g.config.hidden_size;
+        if (h == 0) return 0;
+
+        const df_taps = g.dflareTargetTaps();
+        if (df_taps.len >= 3 and df_taps[0].len == h and df_taps[1].len == h and df_taps[2].len == h) {
+            out_taps[0] = df_taps[0];
+            out_taps[1] = df_taps[1];
+            out_taps[2] = df_taps[2];
+            return 3;
+        }
+        if (g.enable_feature_taps and self.dspark_aux_taps_scratch.len >= 3 * h) {
+            const aux_f16 = g.readAuxConcatF16(1);
+            if (aux_f16.len >= 3 * h) {
+                var any_nonzero = false;
+                for (0..3 * h) |i| {
+                    const v: f32 = @floatCast(aux_f16[i]);
+                    self.dspark_aux_taps_scratch[i] = v;
+                    if (v != 0.0) any_nonzero = true;
+                }
+                if (any_nonzero) {
+                    out_taps[0] = self.dspark_aux_taps_scratch[0..h];
+                    out_taps[1] = self.dspark_aux_taps_scratch[h .. 2 * h];
+                    out_taps[2] = self.dspark_aux_taps_scratch[2 * h .. 3 * h];
+                    return 3;
+                }
+            }
+        }
+        const last_h = g.lastDecoderHiddenF32();
+        if (last_h.len != h) return 0;
+        out_taps[0] = g.encoderSummaryF32() orelse last_h;
+        out_taps[1] = last_h;
+        out_taps[2] = last_h;
+        return 3;
+    }
+
+    /// Zero-allocation `D7` expert predictor using `DraftHead`'s native MTP MoE router
+    /// weights (`layers[0].moe.router`, e.g. `Qwen3.8-Flash-Next` `512E` top-10 `qwen4_exp_mtp`).
+    pub fn predictMtpRouterExpertsForTokens(
+        self: *SpecEngine,
+        dh: *const draft_mod.DraftHead,
+        g: *const graph.GraphModel,
+        tokens: []const u32,
+    ) RunError!u32 {
+        if (!dh.hasMtpMoeRouter()) return 0;
+        const h: usize = g.config.hidden_size;
+        if (h == 0 or h != dh.config.hidden_size) return 0;
+        const emb = self.router_emb_scratch[0..h];
+        for (tokens, 0..) |tid, ni| {
+            try g.readTokenEmbedF32(tid, emb);
+            self.node_experts[ni] = dh.predictRouterTopK(emb, self.router_logits_scratch) orelse return 0;
+        }
+        return 1;
+    }
+
     fn pruneTreeInPlace(
         self: *SpecEngine,
         t: *tree_mod.DraftTree(MAX_TREE_NODES),
@@ -4215,6 +4456,15 @@ pub const SpecEngine = struct {
                         cost.num_layers = pred.sampled;
                         bitset_opt = self.node_experts[0 .. @as(usize, m) * pred.sampled];
                         if (pred.has_cold) cold_opt = self.cold_masks[0..pred.sampled];
+                    } else if (self.draft_head) |dh| {
+                        // Fallback / MTP-router D7 prediction (`qwen4_exp_mtp` `512E` top-10)
+                        // when target MoE routers are quantized or unavailable in float format.
+                        const mtp_sampled = try self.predictMtpRouterExpertsForTokens(dh, g, self.verify_tokens[0..m]);
+                        if (mtp_sampled > 0) {
+                            cost.num_layers = mtp_sampled;
+                            cost.num_experts = dh.config.num_experts;
+                            bitset_opt = self.node_experts[0 .. @as(usize, m) * mtp_sampled];
+                        }
                     }
                 },
             }
@@ -7114,4 +7364,217 @@ test "M9.3 D15 SpecEngine Ling-3.1 bailing_hybrid Gated-MLA 1L MTP + 512E n_grou
         try std.testing.expect(!bs.contains(510));
         for (win_e) |e| try std.testing.expect(bs.contains(e));
     }
+}
+
+fn readEngineTestFileAlloc(allocator: std.mem.Allocator, path: [:0]const u8) !?[]u8 {
+    const fd = std.c.open(path.ptr, .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+    if (fd < 0) return null;
+    defer _ = std.c.close(fd);
+    var list: std.ArrayList(u8) = .empty;
+    errdefer list.deinit(allocator);
+    var buf: [4096]u8 = undefined;
+    while (true) {
+        const rc = std.c.read(fd, &buf, buf.len);
+        if (rc < 0) {
+            if (std.c.errno(rc) == .INTR) continue;
+            return error.ReadFailed;
+        }
+        if (rc == 0) return try list.toOwnedSlice(allocator);
+        try list.appendSlice(allocator, buf[0..@intCast(rc)]);
+    }
+}
+
+test "M9.4 D10 SpecEngine real-HF 3L DSpark (deepseek41-real-hf-synth/dspark.amf, 138 tensors, cold-tier + markov_head + confidence_head + D7 pruning) matches stepDecode 100% bit-for-bit at T=0" {
+    const allocator = std.testing.allocator;
+    const dspark_path: [:0]const u8 = "/Volumes/AriDisk/models/amf/deepseek41-real-hf-synth/dspark.amf";
+    const dspark_cfg_path: [:0]const u8 = "/Volumes/AriDisk/models/amf/deepseek41-real-hf-synth/dspark_config.json";
+
+    const cfg_bytes = (try readEngineTestFileAlloc(allocator, dspark_cfg_path)) orelse return error.SkipZigTest;
+    defer allocator.free(cfg_bytes);
+    const cfg_3l = try dspark_mod.DSpark3LConfig.fromJson(allocator, cfg_bytes);
+
+    const tmp_dir = try graph.makeTestTempDir(allocator, "m94-dspark-3l-spec");
+    defer allocator.free(tmp_dir);
+    defer graph.removeTestDir(allocator, tmp_dir);
+
+    // Matching geometry (`hidden_size = 256, vocab_size = 2048`) CED target model.
+    var bundle = try graph.buildSynthDeepSeek41Bundle(allocator, .{
+        .hidden_size = 256,
+        .vocab_size = 2048,
+        .num_encoder_layers = 2,
+        .num_decoder_layers = 2,
+        .engram_num_shards = 1,
+        .include_dspark = false,
+        .tmp_dir = tmp_dir,
+    });
+    defer bundle.deinit(allocator);
+
+    const eng_const = try allocator.alloc([:0]const u8, bundle.engram_paths.len);
+    defer allocator.free(eng_const);
+    for (bundle.engram_paths, 0..) |p, i| eng_const[i] = p;
+
+    const aux_ids = LoadedDSparkProposer.auxLayerIdsForTarget(cfg_3l, bundle.cfg.num_hidden_layers);
+    const prompt = [_]u32{ 5, 11, 23, 7, 19, 31, 5, 11, 23, 7 };
+
+    // 1. Reference non-speculative greedy CED decode.
+    var ref_model = try graph.GraphModel.loadFromFile(allocator, bundle.amf_file_path.?, bundle.cfg, .{
+        .max_seq_len = 128,
+        .max_tree_nodes = 32,
+        .ple_paths = eng_const,
+        .startup_canary = false,
+    });
+    defer ref_model.deinit(allocator);
+
+    var expected: [12]u32 = undefined;
+    expected[0] = try ref_model.prefillChunk(&prompt, 0, true);
+    for (1..expected.len) |i| {
+        expected[i] = try ref_model.stepDecode(expected[i - 1], @intCast(prompt.len + i - 1));
+    }
+
+    // 2. Speculative `DraftMode.dspark` backed by auto-detected real-HF `3L DSpark` (`138` tensors,
+    //    cold-tiered F_NOCACHE + C27 hot cache + markov_head + confidence_head + D7 pruning).
+    var spec_model = try graph.GraphModel.loadFromFile(allocator, bundle.amf_file_path.?, bundle.cfg, .{
+        .max_seq_len = 128,
+        .max_tree_nodes = 32,
+        .ple_paths = eng_const,
+        .enable_feature_taps = true,
+        .aux_layer_ids = aux_ids,
+        .startup_canary = false,
+    });
+    defer spec_model.deinit(allocator);
+
+    var dspark_loaded = try LoadedDSparkProposer.loadFromFileWithOptions(
+        allocator,
+        &spec_model,
+        dspark_path,
+        null,
+        .{
+            .force_cold_experts = true,
+            .cold_slot_pool_slots = 12,
+            .lm_head_mode = .markov_low_rank,
+            .verify_crcs = true,
+        },
+        null,
+    );
+    defer dspark_loaded.deinit(allocator);
+
+    try std.testing.expect(dspark_loaded.proposer.is3L());
+    try std.testing.expect(dspark_loaded.real_hf_3l != null);
+
+    var eng = try SpecEngine.initWithDSpark(allocator, &spec_model, &dspark_loaded.proposer, .{
+        .mode = .dspark,
+        .max_tree_nodes = 32,
+        .max_draft_depth = 6,
+        .enable_pruning = true,
+        .temperature = 0.0,
+    });
+    defer eng.deinit(allocator);
+
+    var got: [12]u32 = undefined;
+    got[0] = try eng.prefill(&prompt, null);
+    var p_out: usize = 1;
+    while (p_out < got.len) {
+        const rs = try eng.stepRound(null, got[p_out..]);
+        p_out += rs.emitted_count;
+    }
+
+    try std.testing.expectEqualSlices(u32, &expected, &got);
+    try std.testing.expect(eng.stats.dspark_rounds > 0);
+    try std.testing.expect(eng.stats.dspark_inserted_nodes > 0);
+    const rt3l = dspark_loaded.real_hf_3l.?;
+    try std.testing.expect(rt3l.total_markov_evals >= eng.stats.dspark_rounds * 5);
+    try std.testing.expect(rt3l.total_lm_head_sweeps_avoided >= eng.stats.dspark_rounds * 5);
+    try std.testing.expect(rt3l.coldStats().cache_misses > 0);
+    try std.testing.expect(rt3l.coldStats().cache_hits > 0);
+    try std.testing.expectEqual(@as(u64, 0), spec_model.m7Stats().encoder_layer_dispatches_decode);
+}
+
+test "M9.4 SpecEngine real-HF Qwen3.8-Flash-Next 1L MTP (qwen4-real-hf-synth/mtp.amf, 56 tensors, D13 SME2 + D7 MTP router pruning) matches stepDecode 100% bit-for-bit at T=0" {
+    const allocator = std.testing.allocator;
+    const mtp_path: [:0]const u8 = "/Volumes/AriDisk/models/amf/qwen4-real-hf-synth/mtp.amf";
+    const mtp_cfg_path: [:0]const u8 = "/Volumes/AriDisk/models/amf/qwen4-real-hf-synth/mtp_config.json";
+
+    const cfg_bytes = (try readEngineTestFileAlloc(allocator, mtp_cfg_path)) orelse return error.SkipZigTest;
+    defer allocator.free(cfg_bytes);
+    const mtp_cfg = try draft_mod.DraftConfig.fromJson(allocator, cfg_bytes);
+
+    const tmp_dir = try graph.makeTestTempDir(allocator, "m94-qwen4-mtp-spec");
+    defer allocator.free(tmp_dir);
+    defer graph.removeTestDir(allocator, tmp_dir);
+
+    var synth = try graph.buildSynthQwen4Bundle(allocator, .{
+        .hidden_size = 128,
+        .vocab_size = 512,
+        .num_attention_heads = 2,
+        .num_key_value_heads = 1,
+        .head_dim = 64,
+        .moe_inter = 64,
+        .shared_inter = 64,
+        .num_experts = 8,
+        .top_k = 2,
+        .tmp_dir = tmp_dir,
+    });
+    defer synth.deinit(allocator);
+
+    const prompt = [_]u32{ 5, 11, 23, 7, 19, 31, 5, 11, 23, 7 };
+
+    // 1. Reference non-speculative greedy decode.
+    var ref_model = try graph.GraphModel.loadFromBytes(allocator, synth.amf_bytes, synth.cfg, .{
+        .max_seq_len = 128,
+        .max_tree_nodes = 32,
+        .startup_canary = false,
+    });
+    defer ref_model.deinit(allocator);
+
+    var expected: [12]u32 = undefined;
+    expected[0] = try ref_model.prefillChunk(&prompt, 0, true);
+    for (1..expected.len) |i| {
+        expected[i] = try ref_model.stepDecode(expected[i - 1], @intCast(prompt.len + i - 1));
+    }
+
+    // 2. SpecEngine with real-HF `qwen4_exp_mtp` 1L MTP (`mtp.amf`, 56 tensors) under D13 L2 SME2 + D7 pruning.
+    var spec_model = try graph.GraphModel.loadFromBytes(allocator, synth.amf_bytes, synth.cfg, .{
+        .max_seq_len = 128,
+        .max_tree_nodes = 32,
+        .enable_feature_taps = true,
+        .startup_canary = false,
+    });
+    defer spec_model.deinit(allocator);
+
+    var dh = try draft_mod.DraftHead.loadFromFileForGraph(allocator, &spec_model, mtp_path, mtp_cfg, .{
+        .placement = .cpu_sme2,
+        .max_seq_len = 128,
+        .max_tree_slots = 32,
+    });
+    defer dh.deinitForGraph(allocator, &spec_model);
+
+    var eng = try SpecEngine.initWithGraph(allocator, &spec_model, &dh, .{
+        .mode = .mtp,
+        .max_tree_nodes = 24,
+        .max_draft_depth = 4,
+        .enable_pruning = true,
+        .temperature = 0.0,
+    });
+    defer eng.deinit(allocator);
+
+    // Exercise direct zero-allocation MTP-router D7 prediction (`predictMtpRouterExpertsForTokens`).
+    const pred_toks = [_]u32{ 5, 11, 23 };
+    const mtp_layers = try eng.predictMtpRouterExpertsForTokens(&dh, &spec_model, &pred_toks);
+    try std.testing.expectEqual(@as(u32, 1), mtp_layers);
+    for (0..pred_toks.len) |ni| {
+        try std.testing.expectEqual(@as(u32, 2), eng.node_experts[ni].count());
+    }
+
+    var got: [12]u32 = undefined;
+    got[0] = try eng.prefill(&prompt, null);
+    var p_out: usize = 1;
+    while (p_out < got.len) {
+        const rs = try eng.stepRound(null, got[p_out..]);
+        p_out += rs.emitted_count;
+    }
+
+    try std.testing.expectEqualSlices(u32, &expected, &got);
+    try std.testing.expect(dh.sme2_eval_count > 0);
+    try std.testing.expectEqual(@as(u64, 0), dh.gpu_eh_proj_dispatches);
+    try std.testing.expect(dh.indexer_dispatches > 0);
 }

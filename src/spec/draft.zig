@@ -14,6 +14,7 @@ const page = @import("../mem/page.zig");
 const budget_mod = @import("../mem/budget.zig");
 const arena_mod = @import("../mem/arena.zig");
 const quant = @import("../quant/spec.zig");
+const quant_cpu_formats = @import("../quant/formats.zig");
 const amf = @import("../format/amf.zig");
 const dequant = @import("../gpu/dequant.zig");
 const quant_formats = @import("../gpu/quant_formats.zig");
@@ -23,6 +24,7 @@ const qwen3 = @import("../model/qwen3.zig");
 const graph = @import("../model/graph.zig");
 const sme = @import("../cpu/sme.zig");
 const vmstat = @import("../platform/vmstat.zig");
+const tree_mod = @import("tree.zig");
 
 /// Maximum top-K candidates extracted per draft node via `encodeTopKLogitsRows`.
 pub const MAX_DRAFT_TOP_K: u32 = moe.MAX_TOP_K;
@@ -104,12 +106,14 @@ pub const MtpArch = enum {
     glm_moe_dsa,
     glm5_next,
     bailing_hybrid,
+    qwen4_exp,
 
     pub fn parse(s: []const u8) ?MtpArch {
         if (std.mem.eql(u8, s, "standard")) return .standard;
         if (std.mem.eql(u8, s, "glm_moe_dsa") or std.mem.eql(u8, s, "glm_moe_dsa_mtp")) return .glm_moe_dsa;
         if (std.mem.eql(u8, s, "glm5_next") or std.mem.eql(u8, s, "glm5_next_mtp")) return .glm5_next;
         if (std.mem.eql(u8, s, "bailing_hybrid") or std.mem.eql(u8, s, "bailing_hybrid_mtp") or std.mem.eql(u8, s, "bailing_moe_v3")) return .bailing_hybrid;
+        if (std.mem.eql(u8, s, "qwen4_exp") or std.mem.eql(u8, s, "qwen4_exp_mtp") or std.mem.eql(u8, s, "qwen4_exp_text")) return .qwen4_exp;
         return null;
     }
 };
@@ -185,6 +189,17 @@ pub const DraftConfig = struct {
     /// When `mtp_chained == true` and requested draft depth exceeds `num_hidden_layers`,
     /// cycle the last MTP stage (`false` = cleanly stop at `num_hidden_layers`).
     mtp_cycle_last_stage: bool = false,
+    /// Optional `Qwen3.8-Flash-Next` (`qwen4_exp_mtp`) 4-branch Gated Residual geometry.
+    hc_count: u32 = 1,
+    hc_lowrank: u32 = 0,
+    /// Elementwise sigmoid attention output gate (`self_attn.q_gate_proj`, `output_gate_type = "sigmoid"`).
+    q_output_gate_sigmoid: bool = false,
+    /// Optional `Qwen3.8-Flash-Next` QSA block indexer geometry (`layers.0.attn.idx.*`).
+    indexer_n_heads: u32 = 0,
+    indexer_kv_heads: u32 = 0,
+    indexer_head_dim: u32 = 0,
+    indexer_compress_ratio: u32 = 4,
+    indexer_budget: u32 = 2048,
     intermediate_size: u32,
     rms_norm_eps: f32 = 1e-6,
     rope_theta: f32 = 10_000.0,
@@ -208,6 +223,10 @@ pub const DraftConfig = struct {
 
     pub fn isMoeMtp(self: DraftConfig) bool {
         return self.format == .mtp and self.num_experts > 0;
+    }
+
+    pub fn isQwen4ExpMtp(self: DraftConfig) bool {
+        return self.format == .mtp and self.mtp_arch == .qwen4_exp;
     }
 
     pub fn effectiveQkHeadDim(self: DraftConfig) u32 {
@@ -258,6 +277,8 @@ pub const DraftConfig = struct {
     pub fn usesCustomMtpAttn(self: DraftConfig) bool {
         return self.isMlaMtp() or
             self.isMoeMtp() or
+            self.isQwen4ExpMtp() or
+            self.q_output_gate_sigmoid or
             self.index_share_for_mtp_iteration or
             self.swiglu_limit > 0.0 or
             self.effectiveVHeadDim() != self.effectiveQkHeadDim() or
@@ -359,6 +380,9 @@ pub const DraftConfig = struct {
             if (jsonOptString(obj, "mtp_arch")) |s| {
                 if (MtpArch.parse(s)) |a| break :blk a;
             }
+            if (jsonOptString(obj, "draft_format")) |s| {
+                if (MtpArch.parse(s)) |a| break :blk a;
+            }
             if (jsonOptString(obj, "model_type")) |s| {
                 if (MtpArch.parse(s)) |a| break :blk a;
             }
@@ -402,14 +426,15 @@ pub const DraftConfig = struct {
             jsonOptU32(layer_obj, "rotary_dim") orelse
             jsonOptU32(obj, "rotary_dim");
         const partial_rotary_factor = jsonOptF32(layer_obj, "partial_rotary_factor") orelse
-            jsonOptF32(obj, "partial_rotary_factor") orelse 1.0;
+            jsonOptF32(obj, "partial_rotary_factor") orelse
+            (if (mtp_arch == .qwen4_exp) @as(f32, 0.25) else @as(f32, 1.0));
         const rope_dim: u32 = if (is_mla)
             qk_rope_head_dim
         else if (explicit_rope_dim) |rd|
             rd
         else if (partial_rotary_factor > 0.0 and partial_rotary_factor < 1.0) blk: {
             const raw: u32 = @intFromFloat(@floor(@as(f32, @floatFromInt(head_dim)) * partial_rotary_factor));
-            break :blk raw & ~@as(u32, 1);
+            break :blk @max(@as(u32, 2), raw & ~@as(u32, 1));
         } else head_dim;
 
         const rope_interleave = jsonOptBool(layer_obj, "rope_interleave") orelse
@@ -489,6 +514,27 @@ pub const DraftConfig = struct {
             jsonOptBool(obj, "add_swa_attention_sink_bias") orelse false;
         const mtp_chained = jsonOptBool(obj, "mtp_chained") orelse false;
         const mtp_cycle_last = jsonOptBool(obj, "mtp_cycle_last_stage") orelse false;
+        const hc_count = jsonOptU32(layer_obj, "hc_count") orelse
+            jsonOptU32(obj, "hc_count") orelse
+            (if (mtp_arch == .qwen4_exp) @as(u32, 4) else @as(u32, 1));
+        const hc_lowrank = jsonOptU32(layer_obj, "hc_lowrank") orelse
+            jsonOptU32(obj, "hc_lowrank") orelse 0;
+        const q_output_gate_sigmoid: bool = blk: {
+            if (jsonOptString(layer_obj, "output_gate_type") orelse jsonOptString(obj, "output_gate_type")) |ogt| {
+                break :blk std.mem.eql(u8, ogt, "sigmoid");
+            }
+            break :blk (mtp_arch == .qwen4_exp);
+        };
+        const idx_n_heads = jsonOptU32(layer_obj, "indexer_n_heads") orelse
+            jsonOptU32(obj, "indexer_n_heads") orelse 0;
+        const idx_kv_heads = jsonOptU32(layer_obj, "indexer_kv_heads") orelse
+            jsonOptU32(obj, "indexer_kv_heads") orelse (if (idx_n_heads > 0) @as(u32, 1) else @as(u32, 0));
+        const idx_hd = jsonOptU32(layer_obj, "indexer_head_dim") orelse
+            jsonOptU32(obj, "indexer_head_dim") orelse 0;
+        const idx_compress = jsonOptU32(layer_obj, "indexer_compress_ratio") orelse
+            jsonOptU32(obj, "indexer_compress_ratio") orelse 4;
+        const idx_budget = jsonOptU32(layer_obj, "indexer_budget") orelse
+            jsonOptU32(obj, "indexer_budget") orelse 2048;
         const inter = jsonOptU32(layer_obj, "intermediate_size") orelse
             jsonOptU32(obj, "intermediate_size") orelse
             (if (moe_inter > 0) moe_inter else return error.InvalidJson);
@@ -565,6 +611,14 @@ pub const DraftConfig = struct {
             .add_swa_attention_sink_bias = add_swa_sink,
             .mtp_chained = mtp_chained,
             .mtp_cycle_last_stage = mtp_cycle_last,
+            .hc_count = hc_count,
+            .hc_lowrank = hc_lowrank,
+            .q_output_gate_sigmoid = q_output_gate_sigmoid,
+            .indexer_n_heads = idx_n_heads,
+            .indexer_kv_heads = idx_kv_heads,
+            .indexer_head_dim = idx_hd,
+            .indexer_compress_ratio = @max(@as(u32, 1), idx_compress),
+            .indexer_budget = @max(@as(u32, 1), idx_budget),
             .intermediate_size = inter,
             .rms_norm_eps = rms_eps,
             .rope_theta = rope_theta,
@@ -588,12 +642,12 @@ fn detectFormat(obj: std.json.ObjectMap) ?DraftMode {
     if (jsonOptString(obj, "draft_format")) |s| {
         if (std.mem.eql(u8, s, "eagle3")) return .eagle3;
         if (std.mem.eql(u8, s, "eagle2")) return .eagle2;
-        if (std.mem.eql(u8, s, "mtp")) return .mtp;
+        if (std.mem.eql(u8, s, "mtp") or std.mem.eql(u8, s, "qwen4_exp_mtp") or std.mem.eql(u8, s, "glm_moe_dsa_mtp") or std.mem.eql(u8, s, "glm5_next_mtp") or std.mem.eql(u8, s, "bailing_hybrid_mtp")) return .mtp;
     }
     if (jsonOptString(obj, "model_type")) |s| {
         if (std.mem.eql(u8, s, "eagle3")) return .eagle3;
         if (std.mem.eql(u8, s, "eagle")) return .eagle2;
-        if (std.mem.eql(u8, s, "mtp") or std.mem.eql(u8, s, "glm_moe_dsa_mtp") or std.mem.eql(u8, s, "glm5_next_mtp") or std.mem.eql(u8, s, "bailing_hybrid_mtp")) return .mtp;
+        if (std.mem.eql(u8, s, "mtp") or std.mem.eql(u8, s, "qwen4_exp_mtp") or std.mem.eql(u8, s, "glm_moe_dsa_mtp") or std.mem.eql(u8, s, "glm5_next_mtp") or std.mem.eql(u8, s, "bailing_hybrid_mtp")) return .mtp;
     }
     if (obj.get("architectures")) |v| {
         if (v == .array and v.array.items.len > 0) {
@@ -868,6 +922,27 @@ const MtpMlaLayerWeights = struct {
     head_gate_mode: u32 = 0,
 };
 
+/// `Qwen3.8-Flash-Next` (`qwen4_exp_mtp`) 4-branch Gated Residual weights (`attn_hc`, `mlp_hc`, `hc_mixer`).
+const Qwen4HcWeights = struct {
+    /// Pre-adjusted `(1.0 + w)` `[hc_count * H]` f32 slice in `weights_arena` for zero-copy group RMSNorm.
+    hc_norm_f32: []const f32,
+    in_mix_dn: qwen3.LinearBinding,
+    in_mix_up: qwen3.LinearBinding,
+    /// Present on `attn_hc` & `mlp_hc` (`[hc_count, hc_count * H]`); `null` on final `hc_mixer`.
+    blk_inj: ?qwen3.LinearBinding = null,
+};
+
+/// `Qwen3.8-Flash-Next` (`qwen4_exp_mtp`) QSA block indexer weights (`layers.0.attn.idx.*`).
+const Qwen4IdxWeights = struct {
+    qk_proj: qwen3.LinearBinding,
+    /// Pre-adjusted `(1.0 + w)` `[indexer_head_dim]` f32 slices in `weights_arena`.
+    q_norm_f32: []const f32,
+    k_norm_f32: []const f32,
+    n_q_heads: u32,
+    n_kv_heads: u32,
+    head_dim: u32,
+};
+
 const MtpMoeLayerWeights = struct {
     router: qwen3.LinearBinding,
     router_bias: ?metal.BufferBinding = null,
@@ -879,6 +954,8 @@ const MtpMoeLayerWeights = struct {
     shared_up_proj: ?qwen3.LinearBinding = null,
     shared_down_proj: ?qwen3.LinearBinding = null,
     shared_inter: u32 = 0,
+    /// Optional `Qwen3.8-Flash-Next` scalar shared-expert sigmoid gate `[H]` (`mlp.shared_expert_gate.weight [1, H]`).
+    shared_expert_gate_f32: ?[]const f32 = null,
 };
 
 const DraftLayerWeights = struct {
@@ -890,11 +967,17 @@ const DraftLayerWeights = struct {
     stage_eh_proj: ?qwen3.LinearBinding = null,
     stage_final_norm: ?qwen3.NormBinding = null,
     q_proj: qwen3.LinearBinding,
+    /// Optional `Qwen3.8-Flash-Next` (`qwen4_exp_mtp`) elementwise sigmoid output gate (`self_attn.q_gate_proj [q_dim, H]`).
+    q_gate_proj: ?qwen3.LinearBinding = null,
     k_proj: qwen3.LinearBinding,
     v_proj: qwen3.LinearBinding,
     o_proj: qwen3.LinearBinding,
     /// Optional `GLM-5.2/5.3` MLA / `GLM-5.3-Flash` NoPE-MLA projections for `1L` `MTP` (`D15`).
     mla: ?MtpMlaLayerWeights = null,
+    /// Optional `Qwen3.8-Flash-Next` (`qwen4_exp_mtp`) 4-branch Gated Residual & QSA Indexer weights.
+    qwen4_attn_hc: ?Qwen4HcWeights = null,
+    qwen4_mlp_hc: ?Qwen4HcWeights = null,
+    qwen4_idx: ?Qwen4IdxWeights = null,
     q_norm: ?metal.BufferBinding,
     k_norm: ?metal.BufferBinding,
     qk_norm_dtype: quant.FloatDType,
@@ -905,7 +988,7 @@ const DraftLayerWeights = struct {
     gate_proj: qwen3.LinearBinding,
     up_proj: qwen3.LinearBinding,
     down_proj: qwen3.LinearBinding,
-    /// Optional `GLM-5.2/5.3` (`256E`) / `GLM-5.3-Flash` (`288E`) routed MoE + shared_experts inside `1L` `MTP`.
+    /// Optional `GLM-5.2/5.3` (`256E`) / `GLM-5.3-Flash` (`288E`) / `Qwen3.8` (`512E`) routed MoE + shared_expert inside `1L` `MTP`.
     moe: ?MtpMoeLayerWeights = null,
     kv_tiles_binding: metal.BufferBinding,
 };
@@ -1069,6 +1152,7 @@ const SmeProjectionKind = enum {
     eagle3_fc,
     eagle2_fc,
     mtp_eh_proj,
+    qwen4_fc_hidden,
 };
 
 const SmeProjectionRuntime = struct {
@@ -1127,6 +1211,13 @@ pub const DraftHead = struct {
     hnorm: ?qwen3.NormBinding,
     eh_proj: ?qwen3.LinearBinding,
     final_norm: qwen3.NormBinding,
+    /// Optional `Qwen3.8-Flash-Next` (`qwen4_exp_mtp`) fusion & 4-branch HC mixer bindings.
+    qwen4_pre_fc_norm_emb: ?qwen3.NormBinding = null,
+    qwen4_pre_fc_norm_hid: ?qwen3.NormBinding = null,
+    qwen4_pre_fc_norm_hid_full_f32: []const f32 = &.{},
+    qwen4_fc_embedding: ?qwen3.LinearBinding = null,
+    qwen4_fc_hidden: ?qwen3.LinearBinding = null,
+    qwen4_hc_mixer: ?Qwen4HcWeights = null,
 
     // Optional zero-copy CoreML ANE projection for `layers[0].o_proj` (D5).
     ane_proj: ?AneProjection,
@@ -1179,6 +1270,23 @@ pub const DraftHead = struct {
     h_in_host: []f16,
     emb_host: []f16,
     x_host: []f16,
+    x_norm_host: []f16 = &.{},
+    proj_out_host: []f16 = &.{},
+
+    // Preallocated zero-alloc `Qwen3.8-Flash-Next` (`qwen4_exp_mtp`) 4-branch HC & QSA indexer scratch.
+    qwen4_hc_state_host: []f16 = &.{},
+    qwen4_hc_norm_host: []f16 = &.{},
+    qwen4_hc_dn_host: []f16 = &.{},
+    qwen4_hc_up_host: []f16 = &.{},
+    qwen4_hc_inj_host: []f16 = &.{},
+    qwen4_idx_qk_host: []f16 = &.{},
+    qwen4_idx_k_ring_host: []f16 = &.{},
+    qwen4_idx_scores_host: []f32 = &.{},
+    qwen4_hc_norm_bind: metal.BufferBinding = undefined,
+    qwen4_hc_dn_bind: metal.BufferBinding = undefined,
+    qwen4_hc_up_bind: metal.BufferBinding = undefined,
+    qwen4_hc_inj_bind: metal.BufferBinding = undefined,
+    qwen4_idx_qk_bind: metal.BufferBinding = undefined,
 
     token_ids_bind: metal.BufferBinding,
     parent_slots_bind: metal.BufferBinding,
@@ -1330,6 +1438,7 @@ pub const DraftHead = struct {
         self.zero_reindex_hits = 0;
         self.indexer_dispatches = 0;
         self.gpu_eh_proj_dispatches = 0;
+        if (self.qwen4_idx_k_ring_host.len > 0) @memset(self.qwen4_idx_k_ring_host, @as(f16, 0.0));
         self.clearSharedSparseIndices();
     }
 
@@ -1457,6 +1566,114 @@ pub const DraftHead = struct {
     /// predicted for the root node by the most recent `syncAccepted`.
     pub fn rootCandidates(self: *const DraftHead) []const moe.TopKCandidate {
         return self.root_candidates[0..self.root_top_k_count];
+    }
+
+    /// Returns whether this `DraftHead` carries native MoE router weights (`layers[0].moe.router`)
+    /// usable for zero-allocation `D7` expert-byte-budget tree pruning (`512E` top-10 on Qwen3.8).
+    pub fn hasMtpMoeRouter(self: *const DraftHead) bool {
+        return self.layers.len > 0 and self.layers[0].moe != null and self.config.num_experts > 0;
+    }
+
+    /// Zero-allocation `D7` expert predictor using this `DraftHead`'s native MTP MoE
+    /// router weights (`layers[0].moe.router`, supporting unquantized `f16`/`bf16` and
+    /// quantized `.amf` routers via `row_scratch`).
+    pub fn predictRouterTopK(
+        self: *const DraftHead,
+        hidden_row_f32: []const f32,
+        logits_scratch: []f32,
+    ) ?tree_mod.ExpertBitset {
+        if (!self.hasMtpMoeRouter()) return null;
+        const moe_l = self.layers[0].moe orelse return null;
+        const n_experts: u32 = self.config.num_experts;
+        const top_k: u32 = self.config.num_experts_per_tok;
+        const h: u32 = self.config.hidden_size;
+        if (n_experts == 0 or n_experts > tree_mod.ExpertBitset.MAX_EXPERTS or top_k == 0 or hidden_row_f32.len < h) {
+            return null;
+        }
+        const rt = moe_l.router;
+        const amf_dt = rt.effectiveAmfDType();
+        const fmt_opt: ?tree_mod.RouterWeightFormat = switch (amf_dt) {
+            .f32 => .f32,
+            .f16 => .f16,
+            .bf16 => .bf16,
+            else => null,
+        };
+        var bias_f32_buf: [tree_mod.ExpertBitset.MAX_EXPERTS]f32 = undefined;
+        var bias_opt: ?[]const f32 = null;
+        if (moe_l.router_bias) |rb| {
+            const w_bytes = self.weights_arena.bytes();
+            const off: usize = @intCast(rb.offset);
+            const eb: usize = if (moe_l.router_bias_dtype == 2) 4 else 2;
+            if (off + @as(usize, n_experts) * eb <= w_bytes.len) {
+                const raw = w_bytes[off .. off + @as(usize, n_experts) * eb];
+                if (moe_l.router_bias_dtype == 2) {
+                    const vals: []const f32 = @alignCast(std.mem.bytesAsSlice(f32, raw));
+                    bias_opt = vals[0..n_experts];
+                } else if (moe_l.router_bias_dtype == 0) {
+                    const vals: []const f16 = @alignCast(std.mem.bytesAsSlice(f16, raw));
+                    for (0..n_experts) |e| bias_f32_buf[e] = @floatCast(vals[e]);
+                    bias_opt = bias_f32_buf[0..n_experts];
+                } else {
+                    const vals: []const u16 = @alignCast(std.mem.bytesAsSlice(u16, raw));
+                    for (0..n_experts) |e| bias_f32_buf[e] = quant.bf16ToF32(vals[e]);
+                    bias_opt = bias_f32_buf[0..n_experts];
+                }
+            }
+        }
+        if (fmt_opt) |fmt| {
+            return tree_mod.predictRouterTopKGrouped(
+                rt.weight_host,
+                fmt,
+                hidden_row_f32[0..h],
+                n_experts,
+                top_k,
+                bias_opt,
+                self.config.moe_scoring_sigmoid,
+                self.config.n_group,
+                self.config.topk_group,
+                logits_scratch,
+            );
+        }
+        // Quantized router fallback: dequantize row-by-row with bounded stack buffer.
+        if (h > 8192 or logits_scratch.len < n_experts) return null;
+        var row_buf: [8192]f32 = undefined;
+        const params_bytes = rt.scale_bias_host orelse &.{};
+        for (0..n_experts) |e| {
+            quant_cpu_formats.dequantRowCpuRef(
+                amf_dt,
+                rt.weight_host,
+                params_bytes,
+                n_experts,
+                h,
+                e,
+                rt.group_size,
+                row_buf[0..h],
+            ) catch return null;
+            var acc: f32 = 0.0;
+            for (0..h) |d| acc += row_buf[d] * hidden_row_f32[d];
+            if (self.config.moe_scoring_sigmoid) {
+                acc = 1.0 / (1.0 + @exp(-acc));
+            }
+            if (bias_opt) |b| acc += b[e];
+            logits_scratch[e] = acc;
+        }
+        var bs = tree_mod.ExpertBitset.empty();
+        var picked: u32 = 0;
+        while (picked < top_k) : (picked += 1) {
+            var best_e: u32 = 0;
+            var best_v: f32 = -std.math.inf(f32);
+            for (0..n_experts) |e_u| {
+                const e: u32 = @intCast(e_u);
+                if (bs.contains(e)) continue;
+                const val = logits_scratch[e_u];
+                if (val > best_v or (val == best_v and e < best_e)) {
+                    best_v = val;
+                    best_e = e;
+                }
+            }
+            bs.set(best_e);
+        }
+        return bs;
     }
 
     fn kvTileAt(self: *const DraftHead, layer_idx: usize, chunk_idx: usize) struct { k: metal.KvTile, v: metal.KvTile } {
@@ -2354,6 +2571,19 @@ pub const DraftHead = struct {
         logits_last_row_only: bool,
         active_stage_idx: usize,
     ) DraftStepError!void {
+        if (self.config.isQwen4ExpMtp()) {
+            return self.runQwen4ExpMtpForward(
+                target,
+                m,
+                slot_start,
+                base_pos,
+                is_target_sync,
+                target_features_bind,
+                commit_kv,
+                top_k,
+                logits_last_row_only,
+            );
+        }
         const h = self.config.hidden_size;
         const total_tree_nodes = slot_start + m;
         const chained_mtp = self.isChainedMtp();
@@ -2457,6 +2687,7 @@ pub const DraftHead = struct {
                                 self.sme2_eval_count += 1;
                             }
                         },
+                        .qwen4_fc_hidden => {},
                     }
                 }
             }
@@ -2773,7 +3004,802 @@ pub const DraftHead = struct {
         const sig = try frame.commit();
         try target.compute.wait(sig, self.timeout_ms);
     }
+
+    /// Executes one `Qwen4ExpTextGatedResidual` (`attn_hc`, `mlp_hc`, or final `hc_mixer`)
+    /// over `self.qwen4_hc_state_host [m, hc_count * H]` using unified memory + GPU linears
+    /// (`0` dynamic heap allocations). Writes `mixed [m, H]` into `self.x_host` and, when
+    /// `want_inj == true`, writes `inj [m, hc_count] = 2 * sigmoid(blk_inj(h_n) / hc_count)`
+    /// into `self.qwen4_hc_inj_host`.
+    fn runQwen4HcMix(
+        self: *DraftHead,
+        target: anytype,
+        hc_w: Qwen4HcWeights,
+        m: u32,
+        want_inj: bool,
+    ) DraftStepError!void {
+        const h: usize = self.config.hidden_size;
+        const hc: usize = self.config.hc_count;
+        const hc_h: usize = hc * h;
+        const lr: usize = self.config.hc_lowrank;
+        const m_usize: usize = m;
+        const eps: f64 = self.config.rms_norm_eps;
+        const inv_hc_f32: f32 = 1.0 / @as(f32, @floatFromInt(hc));
+
+        // 1. Group RMSNorm (`group_size = H`, `(1+w)` pre-baked in `hc_w.hc_norm_f32`).
+        for (0..m_usize) |r| {
+            const src_row = self.qwen4_hc_state_host[r * hc_h ..][0..hc_h];
+            const dst_row = self.qwen4_hc_norm_host[r * hc_h ..][0..hc_h];
+            for (0..hc) |s| {
+                const s_off = s * h;
+                var sq: f64 = 0.0;
+                for (0..h) |d| {
+                    const xf: f64 = @floatCast(src_row[s_off + d]);
+                    sq += xf * xf;
+                }
+                const inv_rms: f32 = @floatCast(1.0 / @sqrt(sq / @as(f64, @floatFromInt(h)) + eps));
+                for (0..h) |d| {
+                    const xf: f32 = @floatCast(src_row[s_off + d]);
+                    dst_row[s_off + d] = @floatCast(xf * inv_rms * hc_w.hc_norm_f32[s_off + d]);
+                }
+            }
+        }
+
+        // 2. GPU `in_mix_dn [hc_lowrank, hc*H]` + optional `blk_inj [hc, hc*H]`.
+        {
+            var frame = try target.compute.beginFrame(self.timeout_ms);
+            errdefer frame.abort();
+            try self.encodeDraftLinearBatched(target, &frame, hc_w.in_mix_dn, self.qwen4_hc_norm_bind, self.qwen4_hc_dn_bind, m, false);
+            if (want_inj) {
+                if (hc_w.blk_inj) |bi| {
+                    try self.encodeDraftLinearBatched(target, &frame, bi, self.qwen4_hc_norm_bind, self.qwen4_hc_inj_bind, m, false);
+                }
+            }
+            const sig = try frame.commit();
+            try target.compute.wait(sig, self.timeout_ms);
+        }
+
+        // 3. `silu(in_mix_dn(h_n) / hc_count)` in-place on unified-memory host view.
+        for (self.qwen4_hc_dn_host[0 .. m_usize * lr]) |*val| {
+            const z: f32 = @as(f32, @floatCast(val.*)) * inv_hc_f32;
+            const sg: f32 = if (z >= 0.0) 1.0 / (1.0 + @exp(-z)) else blk: {
+                const ez = @exp(z);
+                break :blk ez / (1.0 + ez);
+            };
+            val.* = @floatCast(z * sg);
+        }
+
+        // 4. GPU `in_mix_up [hc*H, hc_lowrank]`.
+        {
+            var frame = try target.compute.beginFrame(self.timeout_ms);
+            errdefer frame.abort();
+            try self.encodeDraftLinearBatched(target, &frame, hc_w.in_mix_up, self.qwen4_hc_dn_bind, self.qwen4_hc_up_bind, m, false);
+            const sig = try frame.commit();
+            try target.compute.wait(sig, self.timeout_ms);
+        }
+
+        // 5. `mixed = mean_s(sigmoid(up) * h_n)` -> `self.x_host`; `inj = 2 * sigmoid(blk_inj / hc_count)`.
+        for (0..m_usize) |r| {
+            const hn_row = self.qwen4_hc_norm_host[r * hc_h ..][0..hc_h];
+            const up_row = self.qwen4_hc_up_host[r * hc_h ..][0..hc_h];
+            const dst_x = self.x_host[r * h ..][0..h];
+            for (0..h) |d| {
+                var acc: f32 = 0.0;
+                for (0..hc) |s| {
+                    const u: f32 = @floatCast(up_row[s * h + d]);
+                    const sg: f32 = if (u >= 0.0) 1.0 / (1.0 + @exp(-u)) else blk: {
+                        const eu = @exp(u);
+                        break :blk eu / (1.0 + eu);
+                    };
+                    acc += sg * @as(f32, @floatCast(hn_row[s * h + d]));
+                }
+                dst_x[d] = @floatCast(acc * inv_hc_f32);
+            }
+            if (want_inj and hc_w.blk_inj != null) {
+                const inj_row = self.qwen4_hc_inj_host[r * hc ..][0..hc];
+                for (0..hc) |s| {
+                    const z: f32 = @as(f32, @floatCast(inj_row[s])) * inv_hc_f32;
+                    const sg: f32 = if (z >= 0.0) 1.0 / (1.0 + @exp(-z)) else blk: {
+                        const ez = @exp(z);
+                        break :blk ez / (1.0 + ez);
+                    };
+                    inj_row[s] = @floatCast(2.0 * sg);
+                }
+            }
+        }
+    }
+
+    /// Executes `Qwen4ExpTextQSAIndexer` (`layers.0.attn.idx.*`): caches raw indexer keys
+    /// on `commit_kv`, scores compressed blocks `sum_h(relu(q @ k_blk^T)) / sqrt(idx_hd)`
+    /// when `base_pos > indexer_budget`, and writes selected KV indices into
+    /// `self.shared_sparse_indices_host` (`0` dynamic heap allocations).
+    fn runQwen4QsaIndexer(
+        self: *DraftHead,
+        idx_w: Qwen4IdxWeights,
+        m: u32,
+        base_pos: u32,
+        commit_kv: bool,
+    ) u32 {
+        const n_q: usize = idx_w.n_q_heads;
+        const hd: usize = idx_w.head_dim;
+        const row_stride: usize = (@as(usize, idx_w.n_q_heads) + idx_w.n_kv_heads) * hd;
+        const cr: usize = @max(@as(usize, self.config.indexer_compress_ratio), 1);
+        const budget: usize = @max(@as(usize, self.config.indexer_budget), cr);
+        const rope_d: usize = @min(hd, @max(@as(usize, 2), (self.config.effectiveRopeDim()) & ~@as(usize, 1)));
+        const eps: f64 = self.config.rms_norm_eps;
+
+        // Cache raw keys (`raw_keys` before block pooling, matching `modeling_qwen4_exp.py:851`).
+        if (commit_kv and self.kv_ring_cap > 0) {
+            for (0..m) |r| {
+                const slot = (@as(usize, base_pos) + r) % self.kv_ring_cap;
+                const src_k = self.qwen4_idx_qk_host[r * row_stride + n_q * hd ..][0..hd];
+                @memcpy(self.qwen4_idx_k_ring_host[slot * hd ..][0..hd], src_k);
+            }
+        }
+
+        self.indexer_dispatches += 1;
+
+        // When visible KV fits inside `indexer_budget`, full causal attention is exact.
+        if (base_pos <= budget or self.kv_ring_cap == 0) {
+            return 0;
+        }
+        const visible: usize = @min(@as(usize, base_pos), self.kv_ring_cap);
+        const num_blocks: usize = visible / cr;
+        const block_topk: usize = @min(num_blocks, budget / cr);
+        if (num_blocks == 0 or block_topk == 0 or num_blocks > self.qwen4_idx_scores_host.len) {
+            return 0;
+        }
+
+        // Normalize & RoPE query row `0` (`m` rows share prefix budget selection).
+        var q_buf: [8 * 256]f32 = undefined;
+        var k_blk: [256]f32 = undefined;
+        const eff_nq = @min(n_q, 8);
+        const eff_hd = @min(hd, 256);
+        const q_pos: u32 = self.positions_host[0];
+        for (0..eff_nq) |qh| {
+            const src_q = self.qwen4_idx_qk_host[qh * hd ..][0..eff_hd];
+            const dst_q = q_buf[qh * eff_hd ..][0..eff_hd];
+            var sq: f64 = 0.0;
+            for (0..eff_hd) |d| {
+                const xf: f64 = @floatCast(src_q[d]);
+                sq += xf * xf;
+            }
+            const inv_rms: f32 = @floatCast(1.0 / @sqrt(sq / @as(f64, @floatFromInt(eff_hd)) + eps));
+            for (0..eff_hd) |d| {
+                dst_q[d] = @as(f32, @floatCast(src_q[d])) * inv_rms * idx_w.q_norm_f32[d];
+            }
+            applyNeoXRopeHalfInPlace(dst_q[0..@min(rope_d, eff_hd)], q_pos, self.config.rope_theta);
+        }
+
+        const inv_sqrt_d: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(eff_hd)));
+        const inv_cr: f32 = 1.0 / @as(f32, @floatFromInt(cr));
+        for (0..num_blocks) |bi| {
+            @memset(k_blk[0..eff_hd], 0.0);
+            for (0..cr) |j| {
+                const pos_k = bi * cr + j;
+                const k_row = self.qwen4_idx_k_ring_host[(pos_k % self.kv_ring_cap) * hd ..][0..eff_hd];
+                for (0..eff_hd) |d| k_blk[d] += @as(f32, @floatCast(k_row[d])) * inv_cr;
+            }
+            var sq: f64 = 0.0;
+            for (0..eff_hd) |d| sq += @as(f64, k_blk[d]) * @as(f64, k_blk[d]);
+            const inv_rms: f32 = @floatCast(1.0 / @sqrt(sq / @as(f64, @floatFromInt(eff_hd)) + eps));
+            for (0..eff_hd) |d| k_blk[d] *= inv_rms * idx_w.k_norm_f32[d];
+            applyNeoXRopeHalfInPlace(k_blk[0..@min(rope_d, eff_hd)], @intCast(bi * cr), self.config.rope_theta);
+
+            var s_sum: f32 = 0.0;
+            for (0..eff_nq) |qh| {
+                const q_vec = q_buf[qh * eff_hd ..][0..eff_hd];
+                var dot: f32 = 0.0;
+                for (0..eff_hd) |d| dot += q_vec[d] * k_blk[d];
+                if (dot > 0.0) s_sum += dot;
+            }
+            self.qwen4_idx_scores_host[bi] = s_sum * inv_sqrt_d;
+        }
+
+        // Select top `block_topk` blocks + ungrouped tail tokens into `shared_sparse_indices_host`.
+        var written: usize = 0;
+        const max_out = self.shared_sparse_indices_host.len;
+        for (0..block_topk) |_| {
+            var best_b: usize = 0;
+            var best_s: f32 = -std.math.inf(f32);
+            for (0..num_blocks) |bi| {
+                const sc = self.qwen4_idx_scores_host[bi];
+                if (sc > best_s) {
+                    best_s = sc;
+                    best_b = bi;
+                }
+            }
+            self.qwen4_idx_scores_host[best_b] = -std.math.inf(f32);
+            for (0..cr) |j| {
+                if (written < max_out) {
+                    self.shared_sparse_indices_host[written] = @intCast(best_b * cr + j);
+                    written += 1;
+                }
+            }
+        }
+        for (num_blocks * cr..visible) |tail_pos| {
+            if (written < max_out) {
+                self.shared_sparse_indices_host[written] = @intCast(tail_pos);
+                written += 1;
+            }
+        }
+        return @intCast(written);
+    }
+
+    /// Executes the real-HF `Qwen3.8-Flash-Next` `1L` `MTP` (`qwen4_exp_mtp`) forward pass:
+    /// 1) `pre_fc_norm_embedding` (`(1+w)`) + `fc_embedding` + `pre_fc_norm_hidden` (`(1+w)`)
+    ///    + `fc_hidden` (`D13` L2 `SME2` offloadable when `.cpu_sme2` / `sme2_panel64`!),
+    /// 2) 4-branch `attn_hc` -> `input_layernorm` -> `attn.idx` QSA indexer + `self_attn`
+    ///    (`q_proj`, `q_gate_proj` sigmoid output gate, `k_proj`, `v_proj`, `(1+w)` `q_norm`/`k_norm`, `o_proj`),
+    /// 3) 4-branch `mlp_hc` -> `post_attention_layernorm` -> `512E` top-10 routed MoE +
+    ///    `sigmoid(shared_expert_gate) * shared_expert`,
+    /// 4) `hc_mixer` -> `hidden_pool` -> `lm_head` -> `top_k` (`0` dynamic heap allocations!).
+    fn runQwen4ExpMtpForward(
+        self: *DraftHead,
+        target: anytype,
+        m: u32,
+        slot_start: u32,
+        base_pos: u32,
+        is_target_sync: bool,
+        target_features_bind: metal.BufferBinding,
+        commit_kv: bool,
+        top_k: u32,
+        logits_last_row_only: bool,
+    ) DraftStepError!void {
+        const h: u32 = self.config.hidden_size;
+        const h_usize: usize = h;
+        const m_usize: usize = m;
+        const hc: usize = self.config.hc_count;
+        const hc_h: usize = hc * h_usize;
+        const total_tree_nodes = slot_start + m;
+        const row_bytes = @as(u64, h) * @sizeOf(f16);
+        const seq_b = target.act_quant_policy.isEnabled();
+
+        const pre_emb_norm = self.qwen4_pre_fc_norm_emb.?;
+        const pre_hid_norm = self.qwen4_pre_fc_norm_hid.?;
+        const fc_emb = self.qwen4_fc_embedding.?;
+        const fc_hid = self.qwen4_fc_hidden.?;
+        const hc_mixer = self.qwen4_hc_mixer.?;
+
+        // 1. Optional D13 L2 SME2 offload for `fc_hidden(pre_fc_norm_hidden(h_in))` -> `proj_out_host`.
+        var sme_did_fc_hidden = false;
+        if (self.effective_placement == .cpu_sme2) {
+            if (self.sme_proj) |sp| {
+                if (sp.kind == .qwen4_fc_hidden and m <= sp.proj.max_m) {
+                    const h_src: []const f16 = if (is_target_sync) blk: {
+                        const off_bytes: usize = @intCast(target_features_bind.offset - target.accepted_top_bind.offset);
+                        const off_elems = off_bytes / @sizeOf(f16);
+                        break :blk target.accepted_top_host[off_elems .. off_elems + m_usize * h_usize];
+                    } else blk: {
+                        for (0..m_usize) |r| {
+                            const prow = self.parent_slots_host[r];
+                            @memcpy(
+                                self.h_in_host[r * h_usize ..][0..h_usize],
+                                self.hidden_pool_host[@as(usize, prow) * h_usize ..][0..h_usize],
+                            );
+                        }
+                        break :blk self.h_in_host[0 .. m_usize * h_usize];
+                    };
+                    try sp.proj.evalFusedNormLinear(
+                        &sp.dispatcher,
+                        .{ .f16 = h_src },
+                        normToSmeSlice(pre_hid_norm, h),
+                        self.config.rms_norm_eps,
+                        null,
+                        std.mem.sliceAsBytes(self.proj_out_host[0 .. m_usize * h_usize]),
+                        m,
+                        .{ .out_dtype = .f16 },
+                    );
+                    sme_did_fc_hidden = true;
+                    self.sme2_eval_count += 1;
+                }
+            }
+        }
+
+        // 2. Fusion frame: `x = fc_embedding(pre_fc_norm_emb(emb)) + fc_hidden(pre_fc_norm_hid(h_in))`.
+        {
+            var frame = try target.compute.beginFrame(self.timeout_ms);
+            errdefer frame.abort();
+
+            var h_in_active = self.h_in_bind;
+            if (!sme_did_fc_hidden) {
+                if (is_target_sync) {
+                    h_in_active = target_features_bind;
+                } else {
+                    try target.moe_pipes.encodeGatherRows(&frame, .{
+                        .src = self.hidden_pool_bind,
+                        .indices = self.parent_slots_bind,
+                        .dst = self.h_in_bind,
+                        .count = m,
+                        .row_elems = h,
+                    }, false);
+                }
+            }
+
+            const emb_amf = self.embed.effectiveAmfDType();
+            if (dequant.usesQuantFormats(emb_amf, self.embed.group_size)) {
+                cpuEmbedLookupRowsWithScratch(self.embed, self.token_ids_host[0..m], h, self.emb_host, self.embed_dequant_f32);
+            } else {
+                try target.moe_pipes.encodeEmbedLookup(&frame, self.embed.dtype, .{
+                    .weight = self.embed.weight,
+                    .scale_bias = self.embed.scale_bias,
+                    .tokens = .{ .token_ids = self.token_ids_bind },
+                    .out = self.emb_bind,
+                    .m = m,
+                    .vocab_size = self.config.vocab_size,
+                    .hidden_size = h,
+                }, false);
+            }
+
+            try target.attn_pipes.encodeRmsNorm(&frame, .{
+                .x = self.emb_bind,
+                .w = pre_emb_norm.binding,
+                .y = self.e_norm_bind,
+                .num_rows = m,
+                .hidden_dim = h,
+                .eps = self.config.rms_norm_eps,
+                .w_dtype = pre_emb_norm.dtype,
+            }, true);
+            if (!sme_did_fc_hidden) {
+                try target.attn_pipes.encodeRmsNorm(&frame, .{
+                    .x = h_in_active,
+                    .w = pre_hid_norm.binding,
+                    .y = self.h_norm_bind,
+                    .num_rows = m,
+                    .hidden_dim = h,
+                    .eps = self.config.rms_norm_eps,
+                    .w_dtype = pre_hid_norm.dtype,
+                }, false);
+            }
+            try self.encodeDraftLinearBatched(target, &frame, fc_emb, self.e_norm_bind, self.x_bind, m, true);
+            if (!sme_did_fc_hidden) {
+                try self.encodeDraftLinearBatched(target, &frame, fc_hid, self.h_norm_bind, self.proj_out_bind, m, seq_b);
+                self.gpu_eh_proj_dispatches += 1;
+            }
+            try target.moe_pipes.encodeResidualAdd(&frame, .{
+                .x = self.x_bind,
+                .delta = self.proj_out_bind,
+                .count = m * h,
+            }, true);
+
+            const sig = try frame.commit();
+            try target.compute.wait(sig, self.timeout_ms);
+        }
+
+        // Expand fused `x [m, H]` across `hc_count` (= 4) streams in `qwen4_hc_state_host`.
+        for (0..m_usize) |r| {
+            const src_x = self.x_host[r * h_usize ..][0..h_usize];
+            for (0..hc) |s| {
+                @memcpy(self.qwen4_hc_state_host[r * hc_h + s * h_usize ..][0..h_usize], src_x);
+            }
+        }
+
+        // 3. Execute `layers.0..num_layers-1` (`attn_hc` -> QSA+GatedGQA -> `mlp_hc` -> MoE+SharedGate).
+        const q_dim = self.config.qDim();
+        const o_in_dim = self.config.oInDim();
+        const kv_heads = self.config.effectiveKvHeads();
+        const mp = self.mtp_pipes.?;
+        const dummy_b = self.x_bind;
+
+        for (0..self.layers.len) |l| {
+            const layer = self.layers[l];
+            const q_slot_bind: metal.BufferBinding = .{
+                .buffer = self.scratch_buf,
+                .offset = self.q_pool_bind.offset + @as(u64, slot_start) * q_dim * @sizeOf(f16),
+            };
+            const attn_slot_bind: metal.BufferBinding = .{
+                .buffer = self.scratch_buf,
+                .offset = self.attn_pool_bind.offset + @as(u64, slot_start) * o_in_dim * @sizeOf(f16),
+            };
+
+            // 3a. `attn_hc` 4-branch gated residual mix.
+            if (layer.qwen4_attn_hc) |ahc| {
+                try self.runQwen4HcMix(target, ahc, m, true);
+            }
+
+            // 3b. `input_layernorm` + optional QSA indexer (`layers.0.attn.idx.*`).
+            var idx_selected: u32 = 0;
+            if (layer.qwen4_idx) |idx_w| {
+                var frame = try target.compute.beginFrame(self.timeout_ms);
+                errdefer frame.abort();
+                try target.attn_pipes.encodeRmsNorm(&frame, .{
+                    .x = self.x_bind,
+                    .w = layer.input_layernorm.binding,
+                    .y = self.x_norm_bind,
+                    .num_rows = m,
+                    .hidden_dim = h,
+                    .eps = self.config.rms_norm_eps,
+                    .w_dtype = layer.input_layernorm.dtype,
+                }, false);
+                try self.encodeDraftLinearBatched(target, &frame, idx_w.qk_proj, self.x_norm_bind, self.qwen4_idx_qk_bind, m, true);
+                const sig = try frame.commit();
+                try target.compute.wait(sig, self.timeout_ms);
+                idx_selected = self.runQwen4QsaIndexer(idx_w, m, base_pos, commit_kv);
+            }
+
+            // 3c. Self-attention (`q_proj`, `q_gate_proj`, `k_proj`, `v_proj`, QK-norm + RoPE, GQA + sigmoid gate, `o_proj`).
+            {
+                var frame = try target.compute.beginFrame(self.timeout_ms);
+                errdefer frame.abort();
+
+                if (layer.qwen4_idx == null) {
+                    try target.attn_pipes.encodeRmsNorm(&frame, .{
+                        .x = self.x_bind,
+                        .w = layer.input_layernorm.binding,
+                        .y = self.x_norm_bind,
+                        .num_rows = m,
+                        .hidden_dim = h,
+                        .eps = self.config.rms_norm_eps,
+                        .w_dtype = layer.input_layernorm.dtype,
+                    }, false);
+                }
+
+                try self.encodeDraftLinearBatched(target, &frame, layer.q_proj, self.x_norm_bind, q_slot_bind, m, layer.qwen4_idx == null);
+                if (layer.q_gate_proj) |qg| {
+                    try self.encodeDraftLinearBatched(target, &frame, qg, self.x_norm_bind, self.mla_gate_bind, m, seq_b);
+                }
+                try self.encodeDraftLinearBatched(target, &frame, layer.k_proj, self.x_norm_bind, self.k_bind, m, seq_b);
+                try self.encodeDraftLinearBatched(target, &frame, layer.v_proj, self.x_norm_bind, self.v_bind, m, seq_b);
+
+                const norm_dt_u32: u32 = switch (layer.qk_norm_dtype) {
+                    .f16 => 0,
+                    .bf16 => 1,
+                };
+                const qkp: MtpTreeQkNormRopeParams = .{
+                    .num_nodes = m,
+                    .num_q_heads = self.config.num_attention_heads,
+                    .num_kv_heads = self.config.num_key_value_heads,
+                    .head_dim = self.config.head_dim,
+                    .v_head_dim = self.config.effectiveVHeadDim(),
+                    .rope_dim = self.config.effectiveRopeDim(),
+                    .has_q_norm = if (layer.q_norm != null) 1 else 0,
+                    .has_k_norm = if (layer.k_norm != null) 1 else 0,
+                    .norm_dtype = norm_dt_u32,
+                    .rms_eps = self.config.rms_norm_eps,
+                    .rope_theta = self.config.rope_theta,
+                    .v_scale = self.config.attention_value_scale,
+                };
+                try frame.encodeThreadgroups(
+                    mp.qk_norm_rope_vscale,
+                    &.{
+                        q_slot_bind,
+                        self.k_bind,
+                        self.v_bind,
+                        layer.q_norm orelse dummy_b,
+                        layer.k_norm orelse dummy_b,
+                        self.positions_bind,
+                        self.treeKBinding(l, slot_start),
+                        self.treeVBinding(l, slot_start),
+                    },
+                    std.mem.asBytes(&qkp),
+                    .{ self.config.num_attention_heads + self.config.num_key_value_heads, m, 1 },
+                    .{ 128, 1, 1 },
+                    true,
+                );
+
+                const use_idx_sparse = (idx_selected > 0);
+                const use_shared_sparse = (!use_idx_sparse) and self.config.index_share_for_mtp_iteration and
+                    self.active_sparse_bind != null and self.active_sparse_count > 0;
+                if (use_shared_sparse) self.zero_reindex_hits += 1;
+                const sparse_active = use_idx_sparse or use_shared_sparse;
+                const sparse_bind = if (use_idx_sparse) self.shared_sparse_indices_bind else (self.active_sparse_bind orelse self.shared_sparse_indices_bind);
+                const sparse_k: u32 = if (use_idx_sparse) idx_selected else if (use_shared_sparse) self.active_sparse_count else 0;
+                const sparse_stride: u32 = if (use_idx_sparse) idx_selected else if (use_shared_sparse) self.active_sparse_stride else 0;
+                const sparse_rows: u32 = if (use_idx_sparse) 1 else if (use_shared_sparse) self.active_sparse_rows else 0;
+
+                const kv_k_layer_elems: u32 = @intCast(@as(u64, l) * self.kv_ring_cap * self.config.kvDim());
+                const kv_v_layer_elems: u32 = @intCast(@as(u64, l) * self.kv_ring_cap * self.config.vDim());
+                const gqa_p: MtpGqaTreeAttnParams = .{
+                    .num_nodes = total_tree_nodes,
+                    .slot_start = slot_start,
+                    .q_count = m,
+                    .base_pos = base_pos,
+                    .kv_cap = self.kv_ring_cap,
+                    .sliding_window = self.config.sliding_window,
+                    .num_q_heads = self.config.num_attention_heads,
+                    .num_kv_heads = kv_heads,
+                    .head_dim = self.config.head_dim,
+                    .v_head_dim = self.config.effectiveVHeadDim(),
+                    .layer_k_elem_off = kv_k_layer_elems,
+                    .layer_v_elem_off = kv_v_layer_elems,
+                    .has_sink_bias = if (layer.sink_bias != null) 1 else 0,
+                    .sink_dtype = layer.sink_bias_dtype,
+                    .scale = 1.0 / @sqrt(@as(f32, @floatFromInt(self.config.head_dim))),
+                    .has_sparse_indices = if (sparse_active) 1 else 0,
+                    .sparse_k = sparse_k,
+                    .sparse_row_stride = sparse_stride,
+                    .sparse_num_rows = sparse_rows,
+                    .head_gate_mode = if (layer.q_gate_proj != null) 2 else 0,
+                };
+                try frame.encodeThreadgroups(
+                    mp.gqa_tree_verify_attn,
+                    &.{
+                        q_slot_bind,
+                        self.kv_ring_k_bind,
+                        self.kv_ring_v_bind,
+                        self.treeKBinding(l, 0),
+                        self.treeVBinding(l, 0),
+                        self.positions_pool_bind,
+                        self.ancestor_masks_bind,
+                        layer.sink_bias orelse dummy_b,
+                        attn_slot_bind,
+                        sparse_bind,
+                        if (layer.q_gate_proj != null) self.mla_gate_bind else dummy_b,
+                    },
+                    std.mem.asBytes(&gqa_p),
+                    .{ self.config.num_attention_heads, m, 1 },
+                    .{ 128, 1, 1 },
+                    true,
+                );
+
+                try self.encodeDraftLinearBatched(target, &frame, layer.o_proj, attn_slot_bind, self.proj_out_bind, m, true);
+
+                if (commit_kv) {
+                    const cp: MtpKvCommitParams = .{
+                        .num_nodes = m,
+                        .num_kv_heads = kv_heads,
+                        .head_dim = self.config.head_dim,
+                        .v_head_dim = self.config.effectiveVHeadDim(),
+                        .base_pos = base_pos,
+                        .kv_cap = self.kv_ring_cap,
+                        .layer_k_elem_off = kv_k_layer_elems,
+                        .layer_v_elem_off = kv_v_layer_elems,
+                    };
+                    try frame.encodeThreadgroups(
+                        mp.kv_ring_commit,
+                        &.{
+                            self.treeKBinding(l, 0),
+                            self.treeVBinding(l, 0),
+                            self.kv_ring_k_bind,
+                            self.kv_ring_v_bind,
+                        },
+                        std.mem.asBytes(&cp),
+                        .{ kv_heads, m, 1 },
+                        .{ 128, 1, 1 },
+                        true,
+                    );
+                }
+
+                const sig = try frame.commit();
+                try target.compute.wait(sig, self.timeout_ms);
+            }
+
+            // 3d. `attn_hc` residual injection: `h_hc[:, s, :] += attn_out * inj[:, s]`.
+            for (0..m_usize) |r| {
+                const sub_r = self.proj_out_host[r * h_usize ..][0..h_usize];
+                for (0..hc) |s| {
+                    const inj_s: f32 = if (layer.qwen4_attn_hc != null) @floatCast(self.qwen4_hc_inj_host[r * hc + s]) else 1.0;
+                    const dst_s = self.qwen4_hc_state_host[r * hc_h + s * h_usize ..][0..h_usize];
+                    for (0..h_usize) |d| {
+                        dst_s[d] = @floatCast(@as(f32, @floatCast(dst_s[d])) + @as(f32, @floatCast(sub_r[d])) * inj_s);
+                    }
+                }
+            }
+
+            // 3e. `mlp_hc` 4-branch gated residual mix.
+            if (layer.qwen4_mlp_hc) |mhc| {
+                try self.runQwen4HcMix(target, mhc, m, true);
+            }
+
+            // 3f. `post_attention_layernorm` + routed MoE (`512E` top-10) + gated `shared_expert`.
+            {
+                var frame = try target.compute.beginFrame(self.timeout_ms);
+                errdefer frame.abort();
+
+                try target.attn_pipes.encodeRmsNorm(&frame, .{
+                    .x = self.x_bind,
+                    .w = layer.post_attention_layernorm.binding,
+                    .y = self.x_norm_bind,
+                    .num_rows = m,
+                    .hidden_dim = h,
+                    .eps = self.config.rms_norm_eps,
+                    .w_dtype = layer.post_attention_layernorm.dtype,
+                }, false);
+
+                if (layer.moe) |moe_l| {
+                    if (moe_l.shared_gate_proj != null and moe_l.shared_up_proj != null and moe_l.shared_down_proj != null) {
+                        try self.encodeDraftLinearBatched(target, &frame, moe_l.shared_gate_proj.?, self.x_norm_bind, self.mlp_gate_bind, m, true);
+                        try self.encodeDraftLinearBatched(target, &frame, moe_l.shared_up_proj.?, self.x_norm_bind, self.mlp_up_bind, m, seq_b);
+                        try target.moe_pipes.encodeSiluMul(&frame, .{
+                            .gate = self.mlp_gate_bind,
+                            .up = self.mlp_up_bind,
+                            .out = self.mlp_act_bind,
+                            .count = m * moe_l.shared_inter,
+                        }, true);
+                        try self.encodeDraftLinearBatched(target, &frame, moe_l.shared_down_proj.?, self.mlp_act_bind, self.proj_out_bind, m, true);
+                    }
+                    try self.encodeDraftLinearBatched(target, &frame, moe_l.router, self.x_norm_bind, self.moe_router_logits_bind, m, true);
+                    const rp: MtpMoeRouteParams = .{
+                        .m = m,
+                        .num_experts = self.config.num_experts,
+                        .top_k = self.config.num_experts_per_tok,
+                        .use_sigmoid = if (self.config.moe_scoring_sigmoid) 1 else 0,
+                        .has_bias = if (moe_l.router_bias != null) 1 else 0,
+                        .bias_dtype = moe_l.router_bias_dtype,
+                        .norm_topk_prob = if (self.config.norm_topk_prob) 1 else 0,
+                        .routed_scaling_factor = self.config.routed_scaling_factor,
+                        .n_group = self.config.n_group,
+                        .topk_group = self.config.topk_group,
+                    };
+                    try frame.encodeThreadgroups(
+                        mp.moe_route_topk_sigmoid,
+                        &.{
+                            self.moe_router_logits_bind,
+                            moe_l.router_bias orelse dummy_b,
+                            self.moe_expert_ids_bind,
+                            self.moe_expert_weights_bind,
+                        },
+                        std.mem.asBytes(&rp),
+                        .{ m, 1, 1 },
+                        .{ 128, 1, 1 },
+                        true,
+                    );
+                    const ep: MtpMoeExpertParams = .{
+                        .m = m,
+                        .hidden_size = h,
+                        .moe_inter = self.config.moe_intermediate_size,
+                        .top_k = self.config.num_experts_per_tok,
+                        .weight_dtype = moe_l.expert_weight_dtype,
+                        .group_size = moe_l.expert_group_size,
+                        .swiglu_limit = self.config.swiglu_limit,
+                    };
+                    const weights_root: metal.BufferBinding = .{ .buffer = self.weights_buf, .offset = 0 };
+                    try frame.encodeThreadgroups(
+                        mp.moe_gate_up_swiglu,
+                        &.{
+                            self.x_norm_bind,
+                            weights_root,
+                            moe_l.expert_meta_bind,
+                            self.moe_expert_ids_bind,
+                            self.moe_act_bind,
+                        },
+                        std.mem.asBytes(&ep),
+                        .{ (self.config.moe_intermediate_size + 3) / 4, self.config.num_experts_per_tok, m },
+                        .{ 128, 1, 1 },
+                        true,
+                    );
+                    // Wait to zero `x_bind` cleanly before `moe_down_reduce` accumulates into `x_bind`,
+                    // or accumulate into `h_in_bind` after zeroing `h_in_host` before frame!
+                    const sig_pre = try frame.commit();
+                    try target.compute.wait(sig_pre, self.timeout_ms);
+
+                    @memset(self.h_in_host[0 .. m_usize * h_usize], @as(f16, 0.0));
+                    frame = try target.compute.beginFrame(self.timeout_ms);
+                    try frame.encodeThreadgroups(
+                        mp.moe_down_reduce,
+                        &.{
+                            self.moe_act_bind,
+                            weights_root,
+                            moe_l.expert_meta_bind,
+                            self.moe_expert_ids_bind,
+                            self.moe_expert_weights_bind,
+                            self.h_in_bind,
+                        },
+                        std.mem.asBytes(&ep),
+                        .{ (h + 3) / 4, m, 1 },
+                        .{ 128, 1, 1 },
+                        false,
+                    );
+                    const sig = try frame.commit();
+                    try target.compute.wait(sig, self.timeout_ms);
+                } else {
+                    try self.encodeDraftLinearBatched(target, &frame, layer.gate_proj, self.x_norm_bind, self.mlp_gate_bind, m, true);
+                    try self.encodeDraftLinearBatched(target, &frame, layer.up_proj, self.x_norm_bind, self.mlp_up_bind, m, seq_b);
+                    try target.moe_pipes.encodeSiluMul(&frame, .{
+                        .gate = self.mlp_gate_bind,
+                        .up = self.mlp_up_bind,
+                        .out = self.mlp_act_bind,
+                        .count = m * layer.gate_proj.n,
+                    }, true);
+                    try self.encodeDraftLinearBatched(target, &frame, layer.down_proj, self.mlp_act_bind, self.h_in_bind, m, true);
+                    const sig = try frame.commit();
+                    try target.compute.wait(sig, self.timeout_ms);
+                }
+            }
+
+            // 3g. Combine routed MoE (`h_in_host`) + `sigmoid(shared_expert_gate) * shared_expert` (`proj_out_host`)
+            //     and inject into 4-branch residual stream via `mlp_hc`.
+            const has_shared = if (layer.moe) |ml| (ml.shared_down_proj != null) else false;
+            const shared_gate_w = if (layer.moe) |ml| ml.shared_expert_gate_f32 else null;
+            for (0..m_usize) |r| {
+                const routed_r = self.h_in_host[r * h_usize ..][0..h_usize];
+                const shared_r = self.proj_out_host[r * h_usize ..][0..h_usize];
+                var s_gate: f32 = 1.0;
+                if (has_shared) {
+                    if (shared_gate_w) |gw| {
+                        const xn_r = self.x_norm_host[r * h_usize ..][0..h_usize];
+                        var dot: f32 = 0.0;
+                        for (0..h_usize) |d| dot += @as(f32, @floatCast(xn_r[d])) * gw[d];
+                        s_gate = if (dot >= 0.0) 1.0 / (1.0 + @exp(-dot)) else blk: {
+                            const ed = @exp(dot);
+                            break :blk ed / (1.0 + ed);
+                        };
+                    }
+                }
+                for (0..hc) |s| {
+                    const inj_s: f32 = if (layer.qwen4_mlp_hc != null) @floatCast(self.qwen4_hc_inj_host[r * hc + s]) else 1.0;
+                    const dst_s = self.qwen4_hc_state_host[r * hc_h + s * h_usize ..][0..h_usize];
+                    for (0..h_usize) |d| {
+                        const mlp_d: f32 = @as(f32, @floatCast(routed_r[d])) + (if (has_shared) s_gate * @as(f32, @floatCast(shared_r[d])) else 0.0);
+                        dst_s[d] = @floatCast(@as(f32, @floatCast(dst_s[d])) + mlp_d * inj_s);
+                    }
+                }
+            }
+        }
+
+        // 4. Final `hc_mixer` collapses 4-branch stream directly into `self.x_host [m, H]` (no extra `norm.weight`).
+        try self.runQwen4HcMix(target, hc_mixer, m, false);
+
+        // 5. Persist feedback hidden state into `hidden_pool` + run `lm_head` -> `top_k`.
+        var frame = try target.compute.beginFrame(self.timeout_ms);
+        errdefer frame.abort();
+
+        if (commit_kv) {
+            const last_src: metal.BufferBinding = .{
+                .buffer = self.scratch_buf,
+                .offset = self.x_bind.offset + @as(u64, m - 1) * row_bytes,
+            };
+            try target.moe_pipes.encodeCopyStrided(&frame, .{
+                .src = last_src,
+                .dst = self.hidden_pool_bind,
+                .num_rows = 1,
+                .copy_cols = h,
+                .src_stride = h,
+                .dst_stride = h,
+            }, false);
+        } else {
+            const dst_pool: metal.BufferBinding = .{
+                .buffer = self.scratch_buf,
+                .offset = self.hidden_pool_bind.offset + @as(u64, 1 + slot_start) * row_bytes,
+            };
+            try target.moe_pipes.encodeCopyStrided(&frame, .{
+                .src = self.x_bind,
+                .dst = dst_pool,
+                .num_rows = m,
+                .copy_cols = h,
+                .src_stride = h,
+                .dst_stride = h,
+            }, false);
+        }
+
+        if (top_k > 0) {
+            const eff_k = @min(top_k, self.config.draft_vocab_size);
+            const logit_rows: u32 = if (logits_last_row_only) 1 else m;
+            const lm_src: metal.BufferBinding = if (logits_last_row_only) .{
+                .buffer = self.scratch_buf,
+                .offset = self.x_bind.offset + @as(u64, m - 1) * row_bytes,
+            } else self.x_bind;
+            try self.encodeDraftLinearBatched(target, &frame, self.lm_head, lm_src, self.logits_bind, logit_rows, true);
+            try target.moe_pipes.encodeTopKLogitsRows(&frame, .{
+                .logits = self.logits_bind,
+                .out_candidates = self.topk_bind,
+                .num_rows = logit_rows,
+                .vocab_size = self.config.draft_vocab_size,
+                .top_k = eff_k,
+                .logits_dtype = .f16,
+            }, true);
+        }
+
+        const sig = try frame.commit();
+        try target.compute.wait(sig, self.timeout_ms);
+    }
 };
+
+fn applyNeoXRopeHalfInPlace(vec: []f32, pos: u32, theta: f32) void {
+    const half = vec.len / 2;
+    const pos_f: f64 = @floatFromInt(pos);
+    const dim_f: f64 = @floatFromInt(half * 2);
+    const theta_f: f64 = theta;
+    for (0..half) |i| {
+        const exp_val = @as(f64, @floatFromInt(2 * i)) / dim_f;
+        const angle = pos_f / std.math.pow(f64, theta_f, exp_val);
+        const c: f32 = @floatCast(@cos(angle));
+        const s: f32 = @floatCast(@sin(angle));
+        const x0 = vec[i];
+        const x1 = vec[i + half];
+        vec[i] = x0 * c - x1 * s;
+        vec[i + half] = x1 * c + x0 * s;
+    }
+}
 
 pub const SmallDraftLoadError = error{
     TargetIncompatible,
@@ -3659,6 +4685,176 @@ fn loadNormBindingIntoArena(
     return blob.asNormBinding(out_dt);
 }
 
+/// Loads a `Qwen4ExpTextRMSNorm` weight `[dim]` into `arena` and applies the exact
+/// `(1.0 + weight)` offset in place once at startup so standard GPU `ami_rmsnorm` /
+/// `mtp_tree_qk_norm_rope_vscale` and L2 SME2 `evalFusedNormLinear` match `(1+w)` identically.
+fn loadNormBindingPlusOneIntoArena(
+    source: AmfSource,
+    entry: *const amf.TensorEntry,
+    dim: u32,
+    arena: *arena_mod.WiredArena,
+    buf: metal.Buffer,
+    verify_crc: bool,
+) DraftLoadError!qwen3.NormBinding {
+    const nb = try loadNormBindingIntoArena(source, entry, dim, arena, buf, verify_crc);
+    const mut_bytes: []u8 = @constCast(nb.host_bytes);
+    switch (nb.dtype) {
+        .f16 => {
+            for (0..dim) |i| {
+                const bits = std.mem.readInt(u16, mut_bytes[i * 2 ..][0..2], .little);
+                const v: f32 = @as(f32, @floatCast(@as(f16, @bitCast(bits)))) + 1.0;
+                std.mem.writeInt(u16, mut_bytes[i * 2 ..][0..2], @bitCast(@as(f16, @floatCast(v))), .little);
+            }
+        },
+        .bf16 => {
+            for (0..dim) |i| {
+                const bits = std.mem.readInt(u16, mut_bytes[i * 2 ..][0..2], .little);
+                const v: f32 = quant.bf16ToF32(bits) + 1.0;
+                std.mem.writeInt(u16, mut_bytes[i * 2 ..][0..2], quant.f32ToBf16(v), .little);
+            }
+        },
+    }
+    return nb;
+}
+
+/// Loads a 1D (or `[1, dim]`) float weight into an aligned `[]const f32` slice inside
+/// `arena`, optionally adding `1.0` (`Qwen4ExpTextRMSNorm` `(1+w)` semantics).
+fn loadVecF32IntoArena(
+    allocator: std.mem.Allocator,
+    source: AmfSource,
+    entry: *const amf.TensorEntry,
+    dim: u32,
+    add_one: bool,
+    arena: *arena_mod.WiredArena,
+    verify_crc: bool,
+) DraftLoadError![]const f32 {
+    const dt = try entry.dataType();
+    const elem_bytes: usize = switch (dt) {
+        .f16, .bf16 => 2,
+        .f32 => 4,
+        else => return error.UnexpectedTensorDType,
+    };
+    const need_raw: usize = @as(usize, dim) * elem_bytes;
+    const blob_len: usize = @intCast(entry.blob_bytes);
+    if (blob_len < need_raw) return error.UnexpectedTensorShape;
+    const raw = try allocator.alloc(u8, blob_len);
+    defer allocator.free(raw);
+    switch (source) {
+        .bytes => |b| {
+            const start: usize = @intCast(entry.blob_offset);
+            if (start + blob_len > b.raw.len) return error.BlobOutOfBounds;
+            @memcpy(raw, b.raw[start .. start + blob_len]);
+        },
+        .file => |f| {
+            var done: usize = 0;
+            while (done < blob_len) {
+                const rc = std.c.pread(f.fd, raw.ptr + done, blob_len - done, @intCast(entry.blob_offset + done));
+                if (rc < 0) {
+                    if (std.c.errno(rc) == .INTR) continue;
+                    return error.ReadFailed;
+                }
+                if (rc == 0) return error.ShortRead;
+                done += @intCast(rc);
+            }
+        },
+    }
+    if (verify_crc and std.hash.Crc32.hash(raw) != entry.blob_crc32) return error.BlobChecksumMismatch;
+    const dst_raw = try arena.allocAligned(@as(usize, dim) * @sizeOf(f32), 64);
+    const out: []f32 = @as([]f32, @alignCast(std.mem.bytesAsSlice(f32, dst_raw)))[0..dim];
+    const bias: f32 = if (add_one) 1.0 else 0.0;
+    switch (dt) {
+        .f16 => {
+            for (0..dim) |i| {
+                const bits = std.mem.readInt(u16, raw[i * 2 ..][0..2], .little);
+                out[i] = @as(f32, @floatCast(@as(f16, @bitCast(bits)))) + bias;
+            }
+        },
+        .bf16 => {
+            for (0..dim) |i| {
+                const bits = std.mem.readInt(u16, raw[i * 2 ..][0..2], .little);
+                out[i] = quant.bf16ToF32(bits) + bias;
+            }
+        },
+        .f32 => {
+            for (0..dim) |i| {
+                const v: f32 = @bitCast(std.mem.readInt(u32, raw[i * 4 ..][0..4], .little));
+                out[i] = v + bias;
+            }
+        },
+        else => unreachable,
+    }
+    return out;
+}
+
+/// Loads `pre_fc_norm_hidden.weight` (`[hc_count * H]` or `[H]`) for `qwen4_exp_mtp`:
+/// returns both the full `(1+w)` f32 slice and a collapsed `[H]` `bf16` `NormBinding`
+/// (`1 + mean_s(w_s)` for `[m, H]` single-stream target hidden states).
+fn loadQwen4PreFcHiddenNorm(
+    allocator: std.mem.Allocator,
+    source: AmfSource,
+    entry: *const amf.TensorEntry,
+    h: u32,
+    hc_count: u32,
+    arena: *arena_mod.WiredArena,
+    buf: metal.Buffer,
+    verify_crc: bool,
+) DraftLoadError!struct { collapsed: qwen3.NormBinding, full_f32: []const f32 } {
+    const dim = entry.shape[0];
+    if (dim != h and dim != hc_count * h) return error.UnexpectedTensorShape;
+    const full_f32 = try loadVecF32IntoArena(allocator, source, entry, dim, true, arena, verify_crc);
+    const dst_raw = try arena.allocAligned(@as(usize, h) * 2, 64);
+    const streams: usize = dim / h;
+    const inv_s: f32 = 1.0 / @as(f32, @floatFromInt(streams));
+    for (0..h) |d| {
+        var acc: f32 = 0.0;
+        for (0..streams) |s| acc += full_f32[s * h + d];
+        std.mem.writeInt(u16, dst_raw[d * 2 ..][0..2], quant.f32ToBf16(acc * inv_s), .little);
+    }
+    return .{
+        .collapsed = .{
+            .binding = .{ .buffer = buf, .offset = arena.offsetOf(dst_raw.ptr) },
+            .dtype = .bf16,
+            .host_bytes = dst_raw[0 .. @as(usize, h) * 2],
+        },
+        .full_f32 = full_f32,
+    };
+}
+
+fn loadQwen4HcWeights(
+    allocator: std.mem.Allocator,
+    source: AmfSource,
+    parsed: *const amf.Parsed,
+    prefix: []const u8,
+    hc_count: u32,
+    h: u32,
+    hc_lowrank: u32,
+    require_inj: bool,
+    arena: *arena_mod.WiredArena,
+    buf: metal.Buffer,
+    verify_crc: bool,
+) DraftLoadError!Qwen4HcWeights {
+    var nb: [96]u8 = undefined;
+    const hc_h = hc_count * h;
+    const norm_e = try findRequired(parsed, std.fmt.bufPrint(&nb, "{s}.hc_norm.weight", .{prefix}) catch unreachable);
+    const norm_f32 = try loadVecF32IntoArena(allocator, source, norm_e, hc_h, true, arena, verify_crc);
+    const dn_e = try findLinearReq(parsed, std.fmt.bufPrint(&nb, "{s}.in_mix_dn", .{prefix}) catch unreachable);
+    const dn_b = (try loadLinearBlobAndBindingIntoArena(source, dn_e, hc_lowrank, hc_h, arena, buf, verify_crc)).binding;
+    const up_e = try findLinearReq(parsed, std.fmt.bufPrint(&nb, "{s}.in_mix_up", .{prefix}) catch unreachable);
+    const up_b = (try loadLinearBlobAndBindingIntoArena(source, up_e, hc_h, hc_lowrank, arena, buf, verify_crc)).binding;
+    var inj_b: ?qwen3.LinearBinding = null;
+    if (findLinearOpt(parsed, std.fmt.bufPrint(&nb, "{s}.blk_inj", .{prefix}) catch unreachable)) |ie| {
+        inj_b = (try loadLinearBlobAndBindingIntoArena(source, ie, hc_count, hc_h, arena, buf, verify_crc)).binding;
+    } else if (require_inj) {
+        return error.MissingTensor;
+    }
+    return .{
+        .hc_norm_f32 = norm_f32,
+        .in_mix_dn = dn_b,
+        .in_mix_up = up_b,
+        .blk_inj = inj_b,
+    };
+}
+
 const LoadedLinearResult = struct {
     blob: LoadedBlob,
     dtype: quant.WeightDType,
@@ -3877,7 +5073,38 @@ fn loadInternal(
 ) DraftLoadError!DraftHead {
     const parsed = source.parsed();
     var config = config_in;
-    if (config.format == .mtp and !config.mtp_chained and config.num_hidden_layers > 1) {
+    if (config.format == .mtp and config.mtp_arch == .standard) {
+        if (parsed.find("pre_fc_norm_embedding.weight") != null and findLinearOpt(parsed, "fc_embedding") != null) {
+            config.mtp_arch = .qwen4_exp;
+            if (config.hc_count <= 1) config.hc_count = 4;
+            config.q_output_gate_sigmoid = true;
+        }
+    }
+    if (config.isQwen4ExpMtp()) {
+        if (findLinearOpt(parsed, "hc_mixer.in_mix_dn") orelse findLinearOpt(parsed, "layers.0.attn_hc.in_mix_dn")) |dn_e| {
+            if (dn_e.shape[0] > 0) config.hc_lowrank = dn_e.shape[0];
+            if (config.hidden_size > 0 and dn_e.shape[1] >= config.hidden_size and (dn_e.shape[1] % config.hidden_size) == 0) {
+                config.hc_count = dn_e.shape[1] / config.hidden_size;
+            }
+        }
+        if (findLinearOpt(parsed, "layers.0.attn.idx.qk_proj")) |iqk| {
+            if (parsed.find("layers.0.attn.idx.q_norm.weight")) |iqn| {
+                const ihd = iqn.shape[0];
+                if (ihd > 0 and (iqk.shape[0] % ihd) == 0) {
+                    const tot_h = iqk.shape[0] / ihd;
+                    if (config.indexer_head_dim == 0) config.indexer_head_dim = ihd;
+                    if (config.indexer_kv_heads == 0) config.indexer_kv_heads = 1;
+                    if (config.indexer_n_heads == 0 and tot_h > config.indexer_kv_heads) {
+                        config.indexer_n_heads = tot_h - config.indexer_kv_heads;
+                    }
+                }
+            }
+        }
+        if (findLinearOpt(parsed, "layers.0.self_attn.q_gate_proj") != null) {
+            config.q_output_gate_sigmoid = true;
+        }
+    }
+    if (config.format == .mtp and !config.mtp_chained and config.num_hidden_layers > 1 and !config.isQwen4ExpMtp()) {
         if (findLinearOpt(parsed, "eh_proj") == null and findLinearOpt(parsed, "layers.0.eh_proj") != null) {
             config.mtp_chained = true;
         }
@@ -3901,6 +5128,7 @@ fn loadInternal(
     const o_in_dim = config.oInDim();
     const is_mla = config.isMlaMtp();
     const is_moe = config.isMoeMtp();
+    const is_qwen4_mtp = config.isQwen4ExpMtp();
     const qk_hd = config.effectiveQkHeadDim();
     const kv_heads = config.effectiveKvHeads();
     const eff_mlp_inter = config.effectiveMlpInter();
@@ -3952,33 +5180,75 @@ fn loadInternal(
         .l1_only, .small_draft, .self_recurrent, .dspark, .dflare, .dfly2 => unreachable,
     };
 
-    const enorm_entry: ?*const amf.TensorEntry = if (config.format == .mtp and !chained_mtp) blk: {
+    const enorm_entry: ?*const amf.TensorEntry = if (config.format == .mtp and !chained_mtp and !is_qwen4_mtp) blk: {
         const e = parsed.find("enorm.weight") orelse parsed.find("layers.0.enorm.weight") orelse return error.MissingTensor;
         _ = try validateNorm1D(e, h);
         weights_bytes += e.blob_bytes;
         break :blk e;
     } else null;
-    const hnorm_entry: ?*const amf.TensorEntry = if (config.format == .mtp and !chained_mtp) blk: {
+    const hnorm_entry: ?*const amf.TensorEntry = if (config.format == .mtp and !chained_mtp and !is_qwen4_mtp) blk: {
         const e = parsed.find("hnorm.weight") orelse parsed.find("layers.0.hnorm.weight") orelse return error.MissingTensor;
         _ = try validateNorm1D(e, h);
         weights_bytes += e.blob_bytes;
         break :blk e;
     } else null;
-    const eh_proj_entry: ?*const amf.TensorEntry = if (config.format == .mtp and !chained_mtp) blk: {
+    const eh_proj_entry: ?*const amf.TensorEntry = if (config.format == .mtp and !chained_mtp and !is_qwen4_mtp) blk: {
         const e = findLinearOpt(parsed, "eh_proj") orelse findLinearOpt(parsed, "layers.0.eh_proj") orelse return error.MissingTensor;
         _ = try validateLinear2D(e, h, 2 * h);
         weights_bytes += e.blob_bytes;
         break :blk e;
     } else null;
 
-    const root_final_norm_entry: ?*const amf.TensorEntry = if (config.format == .mtp)
+    // Real-HF `Qwen3.8-Flash-Next` (`qwen4_exp_mtp`) fusion & final 4-branch HC mixer entries.
+    const q4_pre_emb_e: ?*const amf.TensorEntry = if (is_qwen4_mtp) blk: {
+        const e = try findRequired(parsed, "pre_fc_norm_embedding.weight");
+        _ = try validateNorm1D(e, h);
+        weights_bytes += try page.alignUp(@intCast(e.blob_bytes));
+        break :blk e;
+    } else null;
+    const q4_pre_hid_e: ?*const amf.TensorEntry = if (is_qwen4_mtp) blk: {
+        const e = try findRequired(parsed, "pre_fc_norm_hidden.weight");
+        const dim = e.shape[0];
+        if (dim != h and dim != config.hc_count * h) return error.UnexpectedTensorShape;
+        _ = try validateNorm1D(e, dim);
+        weights_bytes += amf.align64(@as(usize, dim) * 4) + amf.align64(@as(usize, h) * 2) + page.APPLE_PAGE_SIZE;
+        break :blk e;
+    } else null;
+    const q4_fc_emb_e: ?*const amf.TensorEntry = if (is_qwen4_mtp) blk: {
+        const e = try findLinearReq(parsed, "fc_embedding");
+        _ = try validateLinear2D(e, h, h);
+        weights_bytes += try page.alignUp(@intCast(e.blob_bytes));
+        break :blk e;
+    } else null;
+    const q4_fc_hid_e: ?*const amf.TensorEntry = if (is_qwen4_mtp) blk: {
+        const e = try findLinearReq(parsed, "fc_hidden");
+        _ = try validateLinear2D(e, h, h);
+        weights_bytes += try page.alignUp(@intCast(e.blob_bytes));
+        break :blk e;
+    } else null;
+    if (is_qwen4_mtp) {
+        const hc_h = config.hc_count * h;
+        const m_norm = try findRequired(parsed, "hc_mixer.hc_norm.weight");
+        _ = try validateNorm1D(m_norm, hc_h);
+        const m_dn = try findLinearReq(parsed, "hc_mixer.in_mix_dn");
+        _ = try validateLinear2D(m_dn, config.hc_lowrank, hc_h);
+        const m_up = try findLinearReq(parsed, "hc_mixer.in_mix_up");
+        _ = try validateLinear2D(m_up, hc_h, config.hc_lowrank);
+        weights_bytes += amf.align64(@as(usize, hc_h) * 4) +
+            (try page.alignUp(@intCast(m_dn.blob_bytes))) +
+            (try page.alignUp(@intCast(m_up.blob_bytes))) + page.APPLE_PAGE_SIZE;
+    }
+
+    const root_final_norm_entry: ?*const amf.TensorEntry = if (is_qwen4_mtp)
+        null
+    else if (config.format == .mtp)
         parsed.find("shared_head.norm.weight") orelse parsed.find("layers.0.final_layernorm.weight") orelse parsed.find("norm.weight")
     else
         try findRequired(parsed, "norm.weight");
     if (root_final_norm_entry) |fne| {
         _ = try validateNorm1D(fne, h);
         weights_bytes += fne.blob_bytes;
-    } else if (!chained_mtp) {
+    } else if (!chained_mtp and !is_qwen4_mtp) {
         return error.MissingTensor;
     }
 
@@ -4063,6 +5333,14 @@ fn loadInternal(
             _ = try validateLinear2D(qe, q_dim, qkv_in);
             weights_bytes += qe.blob_bytes;
 
+            if (findLinearOpt(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.self_attn.q_gate_proj", .{l}) catch unreachable)) |qge| {
+                _ = try validateLinear2D(qge, q_dim, qkv_in);
+                weights_bytes += try page.alignUp(@intCast(qge.blob_bytes));
+                if (q_dim > max_mla_gate_dim) max_mla_gate_dim = q_dim;
+            } else if (config.q_output_gate_sigmoid) {
+                return error.MissingTensor;
+            }
+
             const ke = try findLinearReq(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.self_attn.k_proj", .{l}) catch unreachable);
             _ = try validateLinear2D(ke, kv_dim, qkv_in);
             weights_bytes += ke.blob_bytes;
@@ -4070,6 +5348,34 @@ fn loadInternal(
             const ve = try findLinearReq(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.self_attn.v_proj", .{l}) catch unreachable);
             _ = try validateLinear2D(ve, v_dim, qkv_in);
             weights_bytes += ve.blob_bytes;
+        }
+
+        if (is_qwen4_mtp) {
+            const hc_h = config.hc_count * h;
+            inline for (.{ "attn_hc", "mlp_hc" }) |hc_tag| {
+                const hcn = try findRequired(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.{s}.hc_norm.weight", .{ l, hc_tag }) catch unreachable);
+                _ = try validateNorm1D(hcn, hc_h);
+                const hcdn = try findLinearReq(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.{s}.in_mix_dn", .{ l, hc_tag }) catch unreachable);
+                _ = try validateLinear2D(hcdn, config.hc_lowrank, hc_h);
+                const hcup = try findLinearReq(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.{s}.in_mix_up", .{ l, hc_tag }) catch unreachable);
+                _ = try validateLinear2D(hcup, hc_h, config.hc_lowrank);
+                const hcinj = try findLinearReq(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.{s}.blk_inj", .{ l, hc_tag }) catch unreachable);
+                _ = try validateLinear2D(hcinj, config.hc_count, hc_h);
+                weights_bytes += amf.align64(@as(usize, hc_h) * 4) +
+                    (try page.alignUp(@intCast(hcdn.blob_bytes))) +
+                    (try page.alignUp(@intCast(hcup.blob_bytes))) +
+                    (try page.alignUp(@intCast(hcinj.blob_bytes))) + page.APPLE_PAGE_SIZE;
+            }
+            if (findLinearOpt(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.attn.idx.qk_proj", .{l}) catch unreachable)) |iqk| {
+                const ihd = config.indexer_head_dim;
+                const iqk_n = (config.indexer_n_heads + config.indexer_kv_heads) * ihd;
+                _ = try validateLinear2D(iqk, iqk_n, h);
+                const iqn = try findRequired(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.attn.idx.q_norm.weight", .{l}) catch unreachable);
+                _ = try validateNorm1D(iqn, ihd);
+                const ikn = try findRequired(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.attn.idx.k_norm.weight", .{l}) catch unreachable);
+                _ = try validateNorm1D(ikn, ihd);
+                weights_bytes += (try page.alignUp(@intCast(iqk.blob_bytes))) + 2 * amf.align64(@as(usize, ihd) * 4) + page.APPLE_PAGE_SIZE;
+            }
         }
 
         const oe = try findLinearReq(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.self_attn.o_proj", .{l}) catch unreachable);
@@ -4109,16 +5415,27 @@ fn loadInternal(
                 _ = try validateSink1D(rb, config.num_experts);
                 weights_bytes += rb.blob_bytes;
             }
-            if (findLinearOpt(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.shared_experts.gate_proj", .{l}) catch unreachable)) |sgp| {
+            const sgp_opt = findLinearOpt(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.shared_experts.gate_proj", .{l}) catch unreachable) orelse
+                findLinearOpt(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.shared_expert.gate_proj", .{l}) catch unreachable);
+            if (sgp_opt) |sgp| {
                 const s_inter = sgp.shape[0];
                 if (s_inter == 0 or (s_inter % 4) != 0) return error.UnexpectedTensorShape;
                 _ = try validateLinear2D(sgp, s_inter, h);
-                const sup = try findLinearReq(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.shared_experts.up_proj", .{l}) catch unreachable);
+                const sup = findLinearOpt(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.shared_experts.up_proj", .{l}) catch unreachable) orelse
+                    try findLinearReq(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.shared_expert.up_proj", .{l}) catch unreachable);
                 _ = try validateLinear2D(sup, s_inter, h);
-                const sdp = try findLinearReq(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.shared_experts.down_proj", .{l}) catch unreachable);
+                const sdp = findLinearOpt(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.shared_experts.down_proj", .{l}) catch unreachable) orelse
+                    try findLinearReq(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.shared_expert.down_proj", .{l}) catch unreachable);
                 _ = try validateLinear2D(sdp, h, s_inter);
-                weights_bytes += sgp.blob_bytes + sup.blob_bytes + sdp.blob_bytes;
+                weights_bytes += (try page.alignUp(@intCast(sgp.blob_bytes))) +
+                    (try page.alignUp(@intCast(sup.blob_bytes))) +
+                    (try page.alignUp(@intCast(sdp.blob_bytes)));
                 if (s_inter > max_shared_inter) max_shared_inter = s_inter;
+            }
+            if (parsed.find(std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.shared_expert_gate.weight", .{l}) catch unreachable)) |seg| {
+                const seg_elems: u32 = if (seg.rank == 2) seg.shape[0] * seg.shape[1] else seg.shape[0];
+                if (seg_elems != h) return error.UnexpectedTensorShape;
+                weights_bytes += amf.align64(@as(usize, h) * 4) + page.APPLE_PAGE_SIZE;
             }
             weights_bytes += amf.align64(@as(usize, config.num_experts) * @sizeOf(MtpExpertMeta)) + page.APPLE_PAGE_SIZE;
             for (0..config.num_experts) |e_idx| {
@@ -4185,7 +5502,32 @@ fn loadInternal(
     const mla_kv_a_bytes: usize = if (is_mla) amf.align64(m_cap * @as(usize, config.kv_lora_rank + config.qk_rope_head_dim) * @sizeOf(f16)) else 64;
     const mla_kv_pass_bytes: usize = if (is_mla) amf.align64(m_cap * @as(usize, config.kv_lora_rank) * @sizeOf(f16)) else 64;
     const mla_kv_b_bytes: usize = if (is_mla) amf.align64(m_cap * @as(usize, config.num_attention_heads) * @as(usize, config.qk_nope_head_dim + config.effectiveVHeadDim()) * @sizeOf(f16)) else 64;
-    const mla_gate_bytes: usize = if (is_mla and max_mla_gate_dim > 0) amf.align64(m_cap * @as(usize, max_mla_gate_dim) * @sizeOf(f16)) else 64;
+    const mla_gate_bytes: usize = if ((is_mla or config.q_output_gate_sigmoid or is_qwen4_mtp) and max_mla_gate_dim > 0) amf.align64(m_cap * @as(usize, max_mla_gate_dim) * @sizeOf(f16)) else 64;
+    const q4_hc_h: usize = if (is_qwen4_mtp) @as(usize, config.hc_count) * h else 1;
+    const q4_hc_lr: usize = if (is_qwen4_mtp) @max(@as(usize, config.hc_lowrank), 1) else 1;
+    const q4_hc_state_bytes: usize = if (is_qwen4_mtp) amf.align64(m_cap * q4_hc_h * @sizeOf(f16)) else 64;
+    const q4_hc_dn_bytes: usize = if (is_qwen4_mtp) amf.align64(m_cap * q4_hc_lr * @sizeOf(f16)) else 64;
+    const q4_hc_inj_bytes: usize = if (is_qwen4_mtp) amf.align64(m_cap * @as(usize, config.hc_count) * @sizeOf(f16)) else 64;
+    const q4_idx_tot_dim: usize = if (is_qwen4_mtp and config.indexer_head_dim > 0)
+        @as(usize, config.indexer_n_heads + config.indexer_kv_heads) * config.indexer_head_dim
+    else
+        1;
+    const q4_idx_qk_bytes: usize = if (is_qwen4_mtp and config.indexer_head_dim > 0)
+        amf.align64(m_cap * q4_idx_tot_dim * @sizeOf(f16))
+    else
+        64;
+    const q4_idx_k_ring_bytes: usize = if (is_qwen4_mtp and config.indexer_head_dim > 0)
+        amf.align64(@as(usize, kv_ring_cap) * @as(usize, config.indexer_head_dim) * @sizeOf(f16))
+    else
+        64;
+    const q4_idx_max_blocks: usize = if (is_qwen4_mtp and config.indexer_head_dim > 0)
+        @max(@as(usize, 16), @as(usize, kv_ring_cap) / @max(@as(usize, config.indexer_compress_ratio), 1) + 1)
+    else
+        16;
+    const q4_idx_scores_bytes: usize = if (is_qwen4_mtp and config.indexer_head_dim > 0)
+        amf.align64(q4_idx_max_blocks * @sizeOf(f32))
+    else
+        64;
     const moe_router_bytes: usize = if (any_layer_is_moe) amf.align64(m_cap * @as(usize, config.num_experts) * @sizeOf(f16)) else 64;
     const moe_ids_bytes: usize = if (any_layer_is_moe) amf.align64(m_cap * @as(usize, config.num_experts_per_tok) * @sizeOf(u32)) else 64;
     const moe_w_bytes: usize = if (any_layer_is_moe) amf.align64(m_cap * @as(usize, config.num_experts_per_tok) * @sizeOf(f32)) else 64;
@@ -4213,6 +5555,12 @@ fn loadInternal(
         mla_kv_pass_bytes * 2 +
         mla_kv_b_bytes +
         mla_gate_bytes +
+        q4_hc_state_bytes * 3 +
+        q4_hc_dn_bytes +
+        q4_hc_inj_bytes +
+        q4_idx_qk_bytes +
+        q4_idx_k_ring_bytes +
+        q4_idx_scores_bytes +
         moe_router_bytes +
         moe_ids_bytes +
         moe_w_bytes +
@@ -4371,6 +5719,14 @@ fn loadInternal(
     const mla_kvn_raw = try scratch_arena.allocAligned(mla_kv_pass_bytes, 64);
     const mla_kvb_raw = try scratch_arena.allocAligned(mla_kv_b_bytes, 64);
     const mla_gate_raw = try scratch_arena.allocAligned(mla_gate_bytes, 64);
+    const q4_hc_st_raw = try scratch_arena.allocAligned(q4_hc_state_bytes, 64);
+    const q4_hc_n_raw = try scratch_arena.allocAligned(q4_hc_state_bytes, 64);
+    const q4_hc_u_raw = try scratch_arena.allocAligned(q4_hc_state_bytes, 64);
+    const q4_hc_d_raw = try scratch_arena.allocAligned(q4_hc_dn_bytes, 64);
+    const q4_hc_i_raw = try scratch_arena.allocAligned(q4_hc_inj_bytes, 64);
+    const q4_idx_qk_raw = try scratch_arena.allocAligned(q4_idx_qk_bytes, 64);
+    const q4_idx_kr_raw = try scratch_arena.allocAligned(q4_idx_k_ring_bytes, 64);
+    const q4_idx_sc_raw = try scratch_arena.allocAligned(q4_idx_scores_bytes, 64);
     const moe_rt_raw = try scratch_arena.allocAligned(moe_router_bytes, 64);
     const moe_id_raw = try scratch_arena.allocAligned(moe_ids_bytes, 64);
     const moe_w_raw = try scratch_arena.allocAligned(moe_w_bytes, 64);
@@ -4448,6 +5804,29 @@ fn loadInternal(
     else
         null;
 
+    // Load real-HF `Qwen3.8-Flash-Next` (`qwen4_exp_mtp`) fusion & final 4-branch HC mixer weights.
+    var q4_pre_emb_b: ?qwen3.NormBinding = null;
+    var q4_pre_hid_b: ?qwen3.NormBinding = null;
+    var q4_pre_hid_full_f32: []const f32 = &.{};
+    var q4_fc_emb_b: ?qwen3.LinearBinding = null;
+    var q4_fc_hid_b: ?qwen3.LinearBinding = null;
+    var q4_fc_hid_blob_opt: ?LoadedBlob = null;
+    var q4_fc_hid_dt_opt: ?quant.WeightDType = null;
+    var q4_hc_mixer_w: ?Qwen4HcWeights = null;
+    if (is_qwen4_mtp) {
+        q4_pre_emb_b = try loadNormBindingPlusOneIntoArena(source, q4_pre_emb_e.?, h, &weights_arena, weights_buf, options.verify_crcs);
+        const hid_norm_loaded = try loadQwen4PreFcHiddenNorm(allocator, source, q4_pre_hid_e.?, h, config.hc_count, &weights_arena, weights_buf, options.verify_crcs);
+        q4_pre_hid_b = hid_norm_loaded.collapsed;
+        q4_pre_hid_full_f32 = hid_norm_loaded.full_f32;
+        q4_fc_emb_b = (try loadLinearBlobAndBindingIntoArena(source, q4_fc_emb_e.?, h, h, &weights_arena, weights_buf, options.verify_crcs)).binding;
+        const fch_res = try loadLinearBlobAndBindingIntoArena(source, q4_fc_hid_e.?, h, h, &weights_arena, weights_buf, options.verify_crcs);
+        q4_fc_hid_b = fch_res.binding;
+        q4_fc_hid_blob_opt = fch_res.blob;
+        q4_fc_hid_dt_opt = fch_res.dtype;
+        q4_hc_mixer_w = try loadQwen4HcWeights(allocator, source, parsed, "hc_mixer", config.hc_count, h, config.hc_lowrank, false, &weights_arena, weights_buf, options.verify_crcs);
+        if (final_norm_opt == null) final_norm_opt = q4_pre_emb_b;
+    }
+
     // --- 6. Load draft layer weights & build bindless KV tile tables ---
     const layers = try allocator.alloc(DraftLayerWeights, num_layers);
     errdefer allocator.free(layers);
@@ -4505,7 +5884,10 @@ fn loadInternal(
         }
 
         const in_ln_e = try findRequired(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.input_layernorm.weight", .{l}) catch unreachable);
-        const in_ln_b = try loadNormBindingIntoArena(source, in_ln_e, h, &weights_arena, weights_buf, options.verify_crcs);
+        const in_ln_b = if (is_qwen4_mtp)
+            try loadNormBindingPlusOneIntoArena(source, in_ln_e, h, &weights_arena, weights_buf, options.verify_crcs)
+        else
+            try loadNormBindingIntoArena(source, in_ln_e, h, &weights_arena, weights_buf, options.verify_crcs);
 
         const hid_ln_b: ?qwen3.NormBinding = if (config.format == .eagle3 and l == 0) blk: {
             const hn_e = try findRequired(parsed, "layers.0.hidden_norm.weight");
@@ -4513,9 +5895,13 @@ fn loadInternal(
         } else null;
 
         var q_b: qwen3.LinearBinding = undefined;
+        var q_gate_b: ?qwen3.LinearBinding = null;
         var k_b: qwen3.LinearBinding = undefined;
         var v_b: qwen3.LinearBinding = undefined;
         var mla_w: ?MtpMlaLayerWeights = null;
+        var q4_attn_hc_w: ?Qwen4HcWeights = null;
+        var q4_mlp_hc_w: ?Qwen4HcWeights = null;
+        var q4_idx_w: ?Qwen4IdxWeights = null;
         if (is_mla) {
             const qa_e = try findLinearReq(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.self_attn.q_a_proj", .{l}) catch unreachable);
             const qa_b = (try loadLinearBlobAndBindingIntoArena(source, qa_e, config.q_lora_rank, h, &weights_arena, weights_buf, options.verify_crcs)).binding;
@@ -4561,11 +5947,38 @@ fn loadInternal(
             const q_e = try findLinearReq(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.self_attn.q_proj", .{l}) catch unreachable);
             q_b = (try loadLinearBlobAndBindingIntoArena(source, q_e, q_dim, qkv_in, &weights_arena, weights_buf, options.verify_crcs)).binding;
 
+            if (findLinearOpt(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.self_attn.q_gate_proj", .{l}) catch unreachable)) |qg_e| {
+                q_gate_b = (try loadLinearBlobAndBindingIntoArena(source, qg_e, q_dim, qkv_in, &weights_arena, weights_buf, options.verify_crcs)).binding;
+            }
+
             const k_e = try findLinearReq(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.self_attn.k_proj", .{l}) catch unreachable);
             k_b = (try loadLinearBlobAndBindingIntoArena(source, k_e, kv_dim, qkv_in, &weights_arena, weights_buf, options.verify_crcs)).binding;
 
             const v_e = try findLinearReq(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.self_attn.v_proj", .{l}) catch unreachable);
             v_b = (try loadLinearBlobAndBindingIntoArena(source, v_e, v_dim, qkv_in, &weights_arena, weights_buf, options.verify_crcs)).binding;
+        }
+
+        if (is_qwen4_mtp) {
+            var hc_pfx_buf: [48]u8 = undefined;
+            const ahc_pfx = std.fmt.bufPrint(&hc_pfx_buf, "layers.{d}.attn_hc", .{l}) catch unreachable;
+            q4_attn_hc_w = try loadQwen4HcWeights(allocator, source, parsed, ahc_pfx, config.hc_count, h, config.hc_lowrank, true, &weights_arena, weights_buf, options.verify_crcs);
+            const mhc_pfx = std.fmt.bufPrint(&hc_pfx_buf, "layers.{d}.mlp_hc", .{l}) catch unreachable;
+            q4_mlp_hc_w = try loadQwen4HcWeights(allocator, source, parsed, mhc_pfx, config.hc_count, h, config.hc_lowrank, true, &weights_arena, weights_buf, options.verify_crcs);
+            if (findLinearOpt(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.attn.idx.qk_proj", .{l}) catch unreachable)) |iqk_e| {
+                const ihd = config.indexer_head_dim;
+                const iqk_n = (config.indexer_n_heads + config.indexer_kv_heads) * ihd;
+                const iqk_b = (try loadLinearBlobAndBindingIntoArena(source, iqk_e, iqk_n, h, &weights_arena, weights_buf, options.verify_crcs)).binding;
+                const iqn_e = try findRequired(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.attn.idx.q_norm.weight", .{l}) catch unreachable);
+                const ikn_e = try findRequired(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.attn.idx.k_norm.weight", .{l}) catch unreachable);
+                q4_idx_w = .{
+                    .qk_proj = iqk_b,
+                    .q_norm_f32 = try loadVecF32IntoArena(allocator, source, iqn_e, ihd, true, &weights_arena, options.verify_crcs),
+                    .k_norm_f32 = try loadVecF32IntoArena(allocator, source, ikn_e, ihd, true, &weights_arena, options.verify_crcs),
+                    .n_q_heads = config.indexer_n_heads,
+                    .n_kv_heads = config.indexer_kv_heads,
+                    .head_dim = ihd,
+                };
+            }
         }
 
         const o_e = try findLinearReq(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.self_attn.o_proj", .{l}) catch unreachable);
@@ -4581,12 +5994,18 @@ fn loadInternal(
         var qk_norm_dtype: quant.FloatDType = .f16;
         if (!is_mla) {
             if (parsed.find(std.fmt.bufPrint(&name_buf, "layers.{d}.self_attn.q_norm.weight", .{l}) catch unreachable)) |qn_e| {
-                const qnb = try loadNormBindingIntoArena(source, qn_e, config.head_dim, &weights_arena, weights_buf, options.verify_crcs);
+                const qnb = if (is_qwen4_mtp)
+                    try loadNormBindingPlusOneIntoArena(source, qn_e, config.head_dim, &weights_arena, weights_buf, options.verify_crcs)
+                else
+                    try loadNormBindingIntoArena(source, qn_e, config.head_dim, &weights_arena, weights_buf, options.verify_crcs);
                 qk_norm_dtype = qnb.dtype;
                 q_norm_bind = qnb.binding;
             }
             if (parsed.find(std.fmt.bufPrint(&name_buf, "layers.{d}.self_attn.k_norm.weight", .{l}) catch unreachable)) |kn_e| {
-                const knb = try loadNormBindingIntoArena(source, kn_e, config.head_dim, &weights_arena, weights_buf, options.verify_crcs);
+                const knb = if (is_qwen4_mtp)
+                    try loadNormBindingPlusOneIntoArena(source, kn_e, config.head_dim, &weights_arena, weights_buf, options.verify_crcs)
+                else
+                    try loadNormBindingIntoArena(source, kn_e, config.head_dim, &weights_arena, weights_buf, options.verify_crcs);
                 if (knb.dtype != qk_norm_dtype) return error.UnexpectedTensorDType;
                 k_norm_bind = knb.binding;
             }
@@ -4600,7 +6019,10 @@ fn loadInternal(
         }
 
         const pln_e = try findLayerPostNormReq(parsed, l, &name_buf);
-        const pln_b = try loadNormBindingIntoArena(source, pln_e, h, &weights_arena, weights_buf, options.verify_crcs);
+        const pln_b = if (is_qwen4_mtp)
+            try loadNormBindingPlusOneIntoArena(source, pln_e, h, &weights_arena, weights_buf, options.verify_crcs)
+        else
+            try loadNormBindingIntoArena(source, pln_e, h, &weights_arena, weights_buf, options.verify_crcs);
 
         var gp_b: qwen3.LinearBinding = undefined;
         var up_b: qwen3.LinearBinding = undefined;
@@ -4623,13 +6045,21 @@ fn loadInternal(
             var su_b: ?qwen3.LinearBinding = null;
             var sd_b: ?qwen3.LinearBinding = null;
             var s_inter: u32 = 0;
-            if (findLinearOpt(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.shared_experts.gate_proj", .{l}) catch unreachable)) |sg_e| {
+            const sg_opt = findLinearOpt(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.shared_experts.gate_proj", .{l}) catch unreachable) orelse
+                findLinearOpt(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.shared_expert.gate_proj", .{l}) catch unreachable);
+            if (sg_opt) |sg_e| {
                 s_inter = sg_e.shape[0];
                 sg_b = (try loadLinearBlobAndBindingIntoArena(source, sg_e, s_inter, h, &weights_arena, weights_buf, options.verify_crcs)).binding;
-                const su_e = try findLinearReq(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.shared_experts.up_proj", .{l}) catch unreachable);
+                const su_e = findLinearOpt(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.shared_experts.up_proj", .{l}) catch unreachable) orelse
+                    try findLinearReq(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.shared_expert.up_proj", .{l}) catch unreachable);
                 su_b = (try loadLinearBlobAndBindingIntoArena(source, su_e, s_inter, h, &weights_arena, weights_buf, options.verify_crcs)).binding;
-                const sd_e = try findLinearReq(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.shared_experts.down_proj", .{l}) catch unreachable);
+                const sd_e = findLinearOpt(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.shared_experts.down_proj", .{l}) catch unreachable) orelse
+                    try findLinearReq(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.shared_expert.down_proj", .{l}) catch unreachable);
                 sd_b = (try loadLinearBlobAndBindingIntoArena(source, sd_e, h, s_inter, &weights_arena, weights_buf, options.verify_crcs)).binding;
+            }
+            var shared_gate_f32: ?[]const f32 = null;
+            if (parsed.find(std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.shared_expert_gate.weight", .{l}) catch unreachable)) |seg_e| {
+                shared_gate_f32 = try loadVecF32IntoArena(allocator, source, seg_e, h, false, &weights_arena, options.verify_crcs);
             }
 
             const meta_raw = try weights_arena.allocAligned(@as(usize, config.num_experts) * @sizeOf(MtpExpertMeta), 64);
@@ -4683,6 +6113,7 @@ fn loadInternal(
                 .shared_up_proj = su_b,
                 .shared_down_proj = sd_b,
                 .shared_inter = s_inter,
+                .shared_expert_gate_f32 = shared_gate_f32,
             };
             gp_b = rt_b;
             up_b = rt_b;
@@ -4707,10 +6138,14 @@ fn loadInternal(
             .stage_eh_proj = stage_eh_proj_b,
             .stage_final_norm = stage_final_norm_b,
             .q_proj = q_b,
+            .q_gate_proj = q_gate_b,
             .k_proj = k_b,
             .v_proj = v_b,
             .o_proj = o_b,
             .mla = mla_w,
+            .qwen4_attn_hc = q4_attn_hc_w,
+            .qwen4_mlp_hc = q4_mlp_hc_w,
+            .qwen4_idx = q4_idx_w,
             .q_norm = q_norm_bind,
             .k_norm = k_norm_bind,
             .qk_norm_dtype = qk_norm_dtype,
@@ -4751,15 +6186,18 @@ fn loadInternal(
     var wired_total_out: u64 = total_wired_bytes;
 
     const dev_info = try target.device.info();
-    const can_ane = (dev_info.aneCoreCount() > 0) and
+    const can_ane = (!is_qwen4_mtp) and (dev_info.aneCoreCount() > 0) and
         (l0_o_proj_dtype == .f16 or l0_o_proj_dtype == .bf16) and
         (o_in_dim % metal.KV_TILE_ROW_ALIGN_F16 == 0) and
         (h % metal.KV_TILE_ROW_ALIGN_F16 == 0);
 
-    // Prepare candidate D13 L2-resident (`<= 16 MiB`) SME2 projection for `fc` or `eh_proj`.
+    // Prepare candidate D13 L2-resident (`<= 16 MiB`) SME2 projection for `fc`, `eh_proj`, or `qwen4_exp_mtp` `fc_hidden`.
     const eh_is_sme_packed: bool = switch (config.format) {
         .eagle3, .eagle2 => (fc_lin != null and fc_lin.?.layout == .sme2_panel64),
-        .mtp => (eh_proj_b != null and eh_proj_b.?.layout == .sme2_panel64),
+        .mtp => if (is_qwen4_mtp)
+            (q4_fc_hid_b != null and q4_fc_hid_b.?.layout == .sme2_panel64)
+        else
+            (eh_proj_b != null and eh_proj_b.?.layout == .sme2_panel64),
         else => false,
     };
     if (eh_is_sme_packed and options.placement == .gpu) {
@@ -4780,7 +6218,14 @@ fn loadInternal(
                 }
             },
             .mtp => {
-                if (eh_blob_opt != null and eh_dt_opt != null and eh_proj_b != null) {
+                if (is_qwen4_mtp) {
+                    if (q4_fc_hid_blob_opt != null and q4_fc_hid_dt_opt != null and q4_fc_hid_b != null) {
+                        sme_proj = try tryInitSmeProjectionRuntime(allocator, q4_fc_hid_blob_opt.?, q4_fc_hid_dt_opt.?, .qwen4_fc_hidden, options.max_tree_slots, draft_budget);
+                        sme_gpu_lin_opt = q4_fc_hid_b;
+                        sme_gpu_in_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(hn_raw.ptr) };
+                        sme_gpu_out_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(po_raw.ptr) };
+                    }
+                } else if (eh_blob_opt != null and eh_dt_opt != null and eh_proj_b != null) {
                     sme_proj = try tryInitSmeProjectionRuntime(allocator, eh_blob_opt.?, eh_dt_opt.?, .mtp_eh_proj, options.max_tree_slots, draft_budget);
                     sme_gpu_lin_opt = eh_proj_b;
                     sme_gpu_in_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(xcat_raw.ptr) };
@@ -4965,6 +6410,12 @@ fn loadInternal(
         .hnorm = hnorm_b,
         .eh_proj = eh_proj_b,
         .final_norm = final_norm_b,
+        .qwen4_pre_fc_norm_emb = q4_pre_emb_b,
+        .qwen4_pre_fc_norm_hid = q4_pre_hid_b,
+        .qwen4_pre_fc_norm_hid_full_f32 = q4_pre_hid_full_f32,
+        .qwen4_fc_embedding = q4_fc_emb_b,
+        .qwen4_fc_hidden = q4_fc_hid_b,
+        .qwen4_hc_mixer = q4_hc_mixer_w,
         .ane_proj = ane_proj,
         .sme_proj = sme_proj,
         .extra_stage_sme_projs = extra_stage_sme_projs,
@@ -5005,6 +6456,21 @@ fn loadInternal(
         .h_in_host = @alignCast(std.mem.bytesAsSlice(f16, hin_raw)),
         .emb_host = @alignCast(std.mem.bytesAsSlice(f16, emb_raw)),
         .x_host = @alignCast(std.mem.bytesAsSlice(f16, x_raw)),
+        .x_norm_host = @alignCast(std.mem.bytesAsSlice(f16, xn_raw)),
+        .proj_out_host = @alignCast(std.mem.bytesAsSlice(f16, po_raw)),
+        .qwen4_hc_state_host = @alignCast(std.mem.bytesAsSlice(f16, q4_hc_st_raw)),
+        .qwen4_hc_norm_host = @alignCast(std.mem.bytesAsSlice(f16, q4_hc_n_raw)),
+        .qwen4_hc_dn_host = @alignCast(std.mem.bytesAsSlice(f16, q4_hc_d_raw)),
+        .qwen4_hc_up_host = @alignCast(std.mem.bytesAsSlice(f16, q4_hc_u_raw)),
+        .qwen4_hc_inj_host = @alignCast(std.mem.bytesAsSlice(f16, q4_hc_i_raw)),
+        .qwen4_idx_qk_host = @alignCast(std.mem.bytesAsSlice(f16, q4_idx_qk_raw)),
+        .qwen4_idx_k_ring_host = @alignCast(std.mem.bytesAsSlice(f16, q4_idx_kr_raw)),
+        .qwen4_idx_scores_host = @alignCast(std.mem.bytesAsSlice(f32, q4_idx_sc_raw)),
+        .qwen4_hc_norm_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(q4_hc_n_raw.ptr) },
+        .qwen4_hc_dn_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(q4_hc_d_raw.ptr) },
+        .qwen4_hc_up_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(q4_hc_u_raw.ptr) },
+        .qwen4_hc_inj_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(q4_hc_i_raw.ptr) },
+        .qwen4_idx_qk_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(q4_idx_qk_raw.ptr) },
         .token_ids_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(tok_raw.ptr) },
         .parent_slots_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(par_raw.ptr) },
         .positions_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(pos_raw.ptr) },
@@ -7342,4 +8808,162 @@ test "M9.3 D15 Ling-3.1 bailing_hybrid Gated-MLA 1L MTP (qk=192 v=128 head-wise 
     try dh_dense.syncAccepted(&target, &prompt, target.accepted_top_bind, 0, 4);
     try std.testing.expectEqual(@as(u64, 0), dh_dense.gpu_eh_proj_dispatches);
     try std.testing.expect(std.math.isFinite(dh_dense.rootCandidates()[0].prob) and dh_dense.rootCandidates()[0].prob > 0.0);
+}
+
+fn readDraftTestFileAlloc(allocator: std.mem.Allocator, path: [:0]const u8) !?[]u8 {
+    const fd = std.c.open(path.ptr, .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+    if (fd < 0) return null;
+    defer _ = std.c.close(fd);
+    var list: std.ArrayList(u8) = .empty;
+    errdefer list.deinit(allocator);
+    var buf: [4096]u8 = undefined;
+    while (true) {
+        const rc = std.c.read(fd, &buf, buf.len);
+        if (rc < 0) {
+            if (std.c.errno(rc) == .INTR) continue;
+            return error.ReadFailed;
+        }
+        if (rc == 0) return try list.toOwnedSlice(allocator);
+        try list.appendSlice(allocator, buf[0..@intCast(rc)]);
+    }
+}
+
+test "M9.4 real-HF Qwen3.8-Flash-Next 1L MTP (qwen4_exp_mtp) loads qwen4-real-hf-synth/mtp.amf (56 tensors), GPU == D13 L2 SME2 fc_hidden parity & 512E predictRouterTopK" {
+    const allocator = std.testing.allocator;
+    const mtp_path: [:0]const u8 = "/Volumes/AriDisk/models/amf/qwen4-real-hf-synth/mtp.amf";
+    const mtp_cfg_path: [:0]const u8 = "/Volumes/AriDisk/models/amf/qwen4-real-hf-synth/mtp_config.json";
+
+    const cfg_bytes = (try readDraftTestFileAlloc(allocator, mtp_cfg_path)) orelse return error.SkipZigTest;
+    defer allocator.free(cfg_bytes);
+
+    var amf_chk = amf.AmfFile.open(allocator, mtp_path) catch return error.SkipZigTest;
+    try std.testing.expectEqual(@as(usize, 56), amf_chk.parsed.entries.len);
+    amf_chk.close(allocator);
+
+    const mtp_cfg = try DraftConfig.fromJson(allocator, cfg_bytes);
+    try std.testing.expectEqual(DraftMode.mtp, mtp_cfg.format);
+    try std.testing.expectEqual(MtpArch.qwen4_exp, mtp_cfg.mtp_arch);
+    try std.testing.expect(mtp_cfg.isQwen4ExpMtp());
+    try std.testing.expectEqual(@as(u32, 128), mtp_cfg.hidden_size);
+    try std.testing.expectEqual(@as(u32, 512), mtp_cfg.vocab_size);
+    try std.testing.expectEqual(@as(u32, 4), mtp_cfg.hc_count);
+    try std.testing.expectEqual(@as(u32, 16), mtp_cfg.hc_lowrank);
+    try std.testing.expect(mtp_cfg.q_output_gate_sigmoid);
+    try std.testing.expectEqual(@as(u32, 2), mtp_cfg.indexer_n_heads);
+    try std.testing.expectEqual(@as(u32, 1), mtp_cfg.indexer_kv_heads);
+    try std.testing.expectEqual(@as(u32, 32), mtp_cfg.indexer_head_dim);
+    try std.testing.expectEqual(@as(u32, 8), mtp_cfg.num_experts);
+    try std.testing.expectEqual(@as(u32, 2), mtp_cfg.num_experts_per_tok);
+
+    // Build a matching-geometry (h=128, vocab=512) qwen4_exp GraphModel target for real Metal 4 execution.
+    const tmp_dir = try graph.makeTestTempDir(allocator, "m94-qwen4-mtp");
+    defer {
+        graph.removeTestDir(allocator, tmp_dir);
+        allocator.free(tmp_dir);
+    }
+    var synth = try graph.buildSynthQwen4Bundle(allocator, .{
+        .hidden_size = 128,
+        .vocab_size = 512,
+        .num_attention_heads = 2,
+        .num_key_value_heads = 1,
+        .head_dim = 64,
+        .moe_inter = 64,
+        .shared_inter = 64,
+        .num_experts = 8,
+        .top_k = 2,
+        .tmp_dir = tmp_dir,
+    });
+    defer synth.deinit(allocator);
+
+    var target = try graph.GraphModel.loadFromBytes(allocator, synth.amf_bytes, synth.cfg, .{
+        .max_seq_len = 64,
+        .max_tree_nodes = 16,
+        .enable_feature_taps = true,
+        .startup_canary = false,
+    });
+    defer target.deinit(allocator);
+
+    const prompt = [_]u32{ 5, 11, 23, 7 };
+    _ = try target.prefillChunkWithOptions(&prompt, 0, .{ .compute_logits = true, .preserve_all_top_hidden = true });
+
+    var dh_gpu = try DraftHead.loadFromFileForGraph(allocator, &target, mtp_path, mtp_cfg, .{
+        .placement = .gpu,
+        .max_seq_len = 64,
+        .max_tree_slots = 16,
+    });
+    defer dh_gpu.deinitForGraph(allocator, &target);
+
+    var dh_sme = try DraftHead.loadFromFileForGraph(allocator, &target, mtp_path, mtp_cfg, .{
+        .placement = .cpu_sme2,
+        .max_seq_len = 64,
+        .max_tree_slots = 16,
+    });
+    defer dh_sme.deinitForGraph(allocator, &target);
+
+    try std.testing.expectEqual(Placement.gpu, dh_gpu.effective_placement);
+    try std.testing.expectEqual(Placement.cpu_sme2, dh_sme.effective_placement);
+    try std.testing.expect(dh_gpu.layers[0].q_gate_proj != null);
+    try std.testing.expect(dh_gpu.layers[0].qwen4_attn_hc != null);
+    try std.testing.expect(dh_gpu.layers[0].qwen4_mlp_hc != null);
+    try std.testing.expect(dh_gpu.layers[0].qwen4_idx != null);
+    try std.testing.expect(dh_gpu.layers[0].moe != null);
+    try std.testing.expect(dh_gpu.layers[0].moe.?.shared_expert_gate_f32 != null);
+    try std.testing.expect(dh_gpu.qwen4_hc_mixer != null);
+
+    try dh_gpu.syncAcceptedForGraph(&target, &prompt, target.accepted_top_bind, 0, 4);
+    try dh_sme.syncAcceptedForGraph(&target, &prompt, target.accepted_top_bind, 0, 4);
+
+    const tree_toks = [_]u32{ 17, 29 };
+    const tree_parents = [_]u32{ 0, 0 };
+    const tree_pos = [_]u32{ 4, 4 };
+    const tree_masks = [_]u64{ 0b01, 0b10 };
+    var c_gpu: [2 * 4]moe.TopKCandidate = undefined;
+    var c_sme: [2 * 4]moe.TopKCandidate = undefined;
+    try dh_gpu.stepTreeBatchForGraph(&target, &tree_toks, &tree_parents, &tree_pos, &tree_masks, 0, 4, &c_gpu);
+    try dh_sme.stepTreeBatchForGraph(&target, &tree_toks, &tree_parents, &tree_pos, &tree_masks, 0, 4, &c_sme);
+
+    try std.testing.expectEqual(@as(u64, 2), dh_gpu.gpu_eh_proj_dispatches);
+    try std.testing.expectEqual(@as(u64, 0), dh_sme.gpu_eh_proj_dispatches);
+    try std.testing.expect(dh_sme.sme2_eval_count >= 2);
+    try std.testing.expect(dh_gpu.indexer_dispatches >= 2);
+
+    // GPU vs D13 L2 SME2 `fc_hidden` parity check across root + tree hidden pool rows.
+    const h: usize = 128;
+    var dot: f64 = 0.0;
+    var na: f64 = 0.0;
+    var nb: f64 = 0.0;
+    for (0..3 * h) |i| {
+        const a: f64 = @floatCast(dh_gpu.hidden_pool_host[i]);
+        const b: f64 = @floatCast(dh_sme.hidden_pool_host[i]);
+        dot += a * b;
+        na += a * a;
+        nb += b * b;
+    }
+    const cos = dot / (@sqrt(na) * @sqrt(nb) + 1e-12);
+    try std.testing.expect(cos >= 0.999);
+    try std.testing.expectEqual(dh_gpu.rootCandidates()[0].token_id, dh_sme.rootCandidates()[0].token_id);
+    try std.testing.expectEqual(c_gpu[0].token_id, c_sme[0].token_id);
+
+    // Verify zero-allocation `predictRouterTopK` on the loaded real-HF `mtp.amf` router.
+    try std.testing.expect(dh_gpu.hasMtpMoeRouter());
+    var hidden_probe: [128]f32 = undefined;
+    for (0..128) |i| hidden_probe[i] = @sin(@as(f32, @floatFromInt(i + 1)) * 0.11);
+    var r_scratch: [tree_mod.ExpertBitset.MAX_EXPERTS]f32 = undefined;
+    const bs = dh_gpu.predictRouterTopK(&hidden_probe, &r_scratch).?;
+    try std.testing.expectEqual(@as(u32, 2), bs.count());
+
+    // Verify 512E top-10 D7 router prediction directly (`Qwen3.8-Flash-Next` full expert width).
+    const ne512: u32 = 512;
+    const rw512 = try allocator.alloc(f32, ne512 * h);
+    defer allocator.free(rw512);
+    @memset(rw512, 0.0);
+    const winners = [_]u32{ 3, 41, 77, 128, 205, 256, 319, 400, 488, 511 };
+    for (winners, 0..) |e, rank| {
+        rw512[@as(usize, e) * h + 0] = 10.0 - @as(f32, @floatFromInt(rank)) * 0.2;
+    }
+    var probe512: [h]f32 = @splat(0.0);
+    probe512[0] = 1.0;
+    const bs512 = tree_mod.predictRouterTopK(std.mem.sliceAsBytes(rw512), .f32, &probe512, ne512, 10, null, false, &r_scratch);
+    try std.testing.expectEqual(@as(u32, 10), bs512.count());
+    for (winners) |e| try std.testing.expect(bs512.contains(e));
 }
