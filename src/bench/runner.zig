@@ -1496,6 +1496,7 @@ pub const DecodeBenchOptions = struct {
     prefill_backend_mode: dequant.PrefillBackendMode = .auto,
     strict_nax: bool = false,
     bus_bandwidth_gbs_override: ?f64 = null,
+    cold_expert_min_weight: f32 = 0.0,
 };
 
 pub const DecodeBenchResult = struct {
@@ -1660,6 +1661,7 @@ pub const DecodeBenchResult = struct {
             try out.print(
                 \\decode_bench.cold_experts        {d} (slots={d}, backend={s}, ane_pred={s})
                 \\decode_bench.cold_hits           hot={d} cache={d} prefetch={d} sync_miss={d}
+                \\decode_bench.cold_promotions     session={d} promoted_hits={d} probation_evict={d} skipped_min_w={d}
                 \\decode_bench.cold_hit_rates      prefetch={d:.3} cold_total={d:.3} bytes_read={d} evictions={d}
                 \\
             , .{
@@ -1671,6 +1673,10 @@ pub const DecodeBenchResult = struct {
                 ct.cache_hits,
                 ct.prefetch_hits,
                 ct.sync_misses,
+                ct.session_promotions,
+                ct.promoted_hits,
+                ct.probation_evictions,
+                ct.cold_skipped_min_weight,
                 ct.prefetchHitRate(),
                 ct.coldHitRate(),
                 ct.bytes_read,
@@ -1722,6 +1728,7 @@ pub fn runDecodeBenchFromFile(
         .prefill_backend_mode = opts.prefill_backend_mode,
         .strict_nax = opts.strict_nax,
         .bus_bandwidth_gbs_override = opts.bus_bandwidth_gbs_override,
+        .cold_expert_min_weight = opts.cold_expert_min_weight,
     });
     defer model.deinit(allocator);
     const load_t1 = try vmstat.nowNs();
@@ -6029,6 +6036,7 @@ pub const GraphDecodeBenchOptions = struct {
     prefill_backend_mode: dequant.PrefillBackendMode = .auto,
     strict_nax: bool = false,
     bus_bandwidth_gbs_override: ?f64 = null,
+    cold_expert_min_weight: f32 = 0.0,
     cluster_coordinator: ?*expert_parallel.ExpertParallelCoordinator = null,
 };
 
@@ -6154,6 +6162,33 @@ pub const GraphDecodeBenchResult = struct {
                 @as(f64, @floatFromInt(self.retired_kv_wired_bytes)) / (1024.0 * 1024.0),
             });
         }
+        if (self.cold_stats) |cs| {
+            const ct = cs.cache_telemetry;
+            try out.print(
+                \\graph_bench.cold_experts         {d} (slots={d}, backend={s}, ane_pred={s})
+                \\graph_bench.cold_hits            hot={d} cache={d} prefetch={d} sync_miss={d}
+                \\graph_bench.cold_promotions      session={d} promoted_hits={d} probation_evict={d} skipped_min_w={d}
+                \\graph_bench.cold_hit_rates       prefetch={d:.3} cold_total={d:.3} bytes_read={d} evictions={d}
+                \\
+            , .{
+                cs.total_cold_experts,
+                cs.slot_count,
+                cs.io_backend.label(),
+                if (cs.ane_predictor_active) "on" else "off",
+                ct.hot_hits,
+                ct.cache_hits,
+                ct.prefetch_hits,
+                ct.sync_misses,
+                ct.session_promotions,
+                ct.promoted_hits,
+                ct.probation_evictions,
+                ct.cold_skipped_min_weight,
+                ct.prefetchHitRate(),
+                ct.coldHitRate(),
+                ct.bytes_read,
+                ct.evictions,
+            });
+        }
     }
 };
 
@@ -6183,6 +6218,7 @@ pub fn runGraphDecodeBenchFromFile(
         .prefill_backend_mode = opts.prefill_backend_mode,
         .strict_nax = opts.strict_nax,
         .bus_bandwidth_gbs_override = opts.bus_bandwidth_gbs_override,
+        .cold_expert_min_weight = opts.cold_expert_min_weight,
         .cluster_coordinator = opts.cluster_coordinator,
     });
     defer model.deinit(allocator);

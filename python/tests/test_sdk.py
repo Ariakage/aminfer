@@ -637,6 +637,36 @@ class TestAminferPythonSdk(unittest.TestCase):
             self.assertEqual(after_unload.token_ids, base_out.token_ids)
             self.assertEqual(bytes(engine.logits_view(DType.F32)), base_logits)
 
+    def test_09_c27_cold_expert_min_weight_setter_and_validation(self) -> None:
+        lib = load_lib()
+        with Engine(self.amf_path, max_seq_len=64, startup_canary=False) as engine:
+            self.assertEqual(engine.cold_expert_min_weight, 0.0)
+            cfg = GenerationConfig(max_tokens=4, temperature=0.0, ignore_eos=True)
+            base_out = engine.generate([1, 2, 3], cfg)
+
+            engine.set_cold_expert_min_weight(0.03)
+            self.assertAlmostEqual(engine.cold_expert_min_weight, 0.03, places=6)
+
+            engine.set_cold_expert_min_weight(0.0)
+            self.assertEqual(engine.cold_expert_min_weight, 0.0)
+            restored_out = engine.generate([1, 2, 3], cfg)
+            self.assertEqual(restored_out.token_ids, base_out.token_ids)
+
+            bad_values: list[object] = [-0.01, 1.0, 1.5, math.nan, math.inf, -math.inf, True, "0.02"]
+            for bad_val in bad_values:
+                with self.subTest(bad_val=bad_val):
+                    with self.assertRaises(InvalidArgumentError):
+                        engine.set_cold_expert_min_weight(bad_val)  # type: ignore[arg-type]
+
+            # Direct C-ABI invalid arguments must return AMI_SDK_ERR_INVALID_ARGUMENT (-1).
+            handle = engine._require_open()
+            self.assertEqual(lib.ami_sdk_engine_set_cold_expert_min_weight(handle, ctypes.c_float(-0.1)), -1)
+            self.assertEqual(lib.ami_sdk_engine_set_cold_expert_min_weight(handle, ctypes.c_float(1.0)), -1)
+            self.assertEqual(lib.ami_sdk_engine_set_cold_expert_min_weight(handle, ctypes.c_float(math.nan)), -1)
+
+        with self.assertRaises(InvalidArgumentError):
+            Engine(self.amf_path, max_seq_len=64, startup_canary=False, cold_expert_min_weight=1.0)
+
 
 if __name__ == "__main__":
     unittest.main()

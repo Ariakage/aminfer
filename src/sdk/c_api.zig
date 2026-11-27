@@ -2148,6 +2148,34 @@ pub export fn ami_sdk_engine_tokenizer(engine: ?*const SdkEngine) callconv(.c) ?
     return eng.owned_tokenizer;
 }
 
+pub export fn ami_sdk_engine_set_cold_expert_min_weight(
+    engine: ?*SdkEngine,
+    min_weight: f32,
+) callconv(.c) Status {
+    const eng = engine orelse return fail(AMI_SDK_ERR_INVALID_ARGUMENT, "engine is NULL");
+    if (!std.math.isFinite(min_weight) or min_weight < 0.0 or min_weight >= 1.0) {
+        return fail(AMI_SDK_ERR_INVALID_ARGUMENT, "cold_expert_min_weight must be finite in [0.0, 1.0)");
+    }
+    switch (eng.backend) {
+        .qwen3 => |*m| m.setColdExpertMinWeight(min_weight),
+        .graph => |*m| m.setColdExpertMinWeight(min_weight),
+    }
+    return AMI_SDK_OK;
+}
+
+pub export fn ami_sdk_engine_get_cold_expert_min_weight(
+    engine: ?*const SdkEngine,
+    out_min_weight: ?*f32,
+) callconv(.c) Status {
+    const eng = engine orelse return fail(AMI_SDK_ERR_INVALID_ARGUMENT, "engine is NULL");
+    const out = out_min_weight orelse return fail(AMI_SDK_ERR_INVALID_ARGUMENT, "out_min_weight is NULL");
+    out.* = switch (eng.backend) {
+        .qwen3 => |*m| m.coldExpertMinWeight(),
+        .graph => |*m| m.coldExpertMinWeight(),
+    };
+    return AMI_SDK_OK;
+}
+
 fn mapLoraError(err: anyerror) Status {
     return switch (err) {
         error.BudgetExceeded, error.PoolCapExceeded, error.PoolExhausted => AMI_SDK_ERR_BUDGET_EXCEEDED,
@@ -6183,4 +6211,8 @@ test "sdk.c_api: LoraInfo ABI layout and null-argument guards" {
     try std.testing.expectEqual(AMI_SDK_ERR_INVALID_ARGUMENT, ami_sdk_engine_set_active_lora(null, "a"));
     var info: LoraInfo = std.mem.zeroes(LoraInfo);
     try std.testing.expectEqual(AMI_SDK_ERR_INVALID_ARGUMENT, ami_sdk_engine_query_lora_info(null, &info));
+
+    var out_min_w: f32 = -1.0;
+    try std.testing.expectEqual(AMI_SDK_ERR_INVALID_ARGUMENT, ami_sdk_engine_set_cold_expert_min_weight(null, 0.02));
+    try std.testing.expectEqual(AMI_SDK_ERR_INVALID_ARGUMENT, ami_sdk_engine_get_cold_expert_min_weight(null, &out_min_w));
 }

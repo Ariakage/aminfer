@@ -57,12 +57,13 @@ const usage =
     \\                    [--repetition-penalty F] [--presence-penalty F] [--frequency-penalty F]
     \\                    [--seed N] [--image <path>] [--video <path>]
     \\                    [--max-seq-len N] [--prefix-cache-chunks N] [-D|--disk-prefix-cache <dir>]
+    \\                    [--cold-slots N] [--cold-expert-min-weight <float>]
     \\                    [-W|--wired-cap-mib N] [-S|--strict-live-ram] [-V|--no-verify-crc]
     \\  verify-amf <path> validate an .amf v0 file's alignment, CRCs and wired budget fit
     \\  quality-gate      run W24 f64 KL divergence, top-1 agreement and greedy rollout parity gate vs BF16/FP16 reference
     \\                    [-h] [--ref <ref.amf> --cand <cand.amf>] [-c|--config <path>] [-k|--tokenizer <path>]
     \\                    [--act-quant <none|emulate|mxfp8_g32|fp8_g128|nvfp4_g16|fouroversix_mae>]
-    \\                    [--steps N] [--no-synthetic]
+    \\                    [--cold-expert-min-weight <float>] [--steps N] [--no-synthetic]
     \\  bench             run full M1–M8.1 benchmark suites
     \\  bench-m1          run M1 C9 kernel bandwidth calibration and Spike S2 hot-path probe
     \\  bench-m2          run M2 Spike S1, G3 MoE, G4 GQA and end-to-end .amf decode benchmarks
@@ -101,6 +102,8 @@ const usage =
     \\                    [-h] [--json]
     \\  bench-m92         run M9.2 GLM-5 (glm_moe_dsa & glm5_next) G27/D15/W30 parity & throughput benchmark
     \\                    [-h] [--json] [--models-dir <dir>]
+    \\  bench-m93         run M9.3 Ling-3.1 (bailing_hybrid) W27/G28/D15/C27/W30 & W24 KL calibration suite
+    \\                    [-h] [--json] [--models-dir <dir>]
     \\  peer-worker       start a zero-allocation kqueue expert-parallel peer worker (M7 X1-X3)
     \\                    [-hRV] -l|--listen <ip:port> -m|--amf <path> -c|--config <path> -r|--rank N -w|--world-size N
     \\                    [--partition contiguous|round-robin] [--cluster-transport auto|tcp|rdma]
@@ -112,7 +115,7 @@ const usage =
     \\  bench-decode      benchmark end-to-end greedy decode on a specific .amf + config.json
     \\                    [-AEhlNRSV] -m|--amf <path> [-c|--config <path>] [--scale-layers N] [--prefill-tokens N]
     \\                    [--decode-steps N] [--cold-experts-per-layer N] [--heat-profile <path>]
-    \\                    [--cold-slots N] [-W|--wired-cap-mib N] [--io-backend auto|aio|pread]
+    \\                    [--cold-slots N] [--cold-expert-min-weight <float>] [-W|--wired-cap-mib N] [--io-backend auto|aio|pread]
     \\                    [--prefill-mode auto|gpu|hybrid] [--gpu-prefill-mode wide|tree64]
     \\                    [--prefill-matmul-backend auto|simdgroup|nax] [-N|--strict-nax] [--bus-bandwidth-gbs F]
     \\                    [-S|--strict-live-ram] [--ane-predictor <path>]
@@ -131,7 +134,7 @@ const usage =
     \\                    [--partition contiguous|round-robin] [--cluster-transport auto|tcp|rdma]
     \\                    [-R|--strict-tb5-rdma] [-l|--shutdown-peers]
     \\                    [--cold-experts-per-layer N] [--heat-profile <path>] [--cold-slots N]
-    \\                    [-W|--wired-cap-mib N] [--io-backend auto|aio|pread]
+    \\                    [--cold-expert-min-weight <float>] [-W|--wired-cap-mib N] [--io-backend auto|aio|pread]
     \\                    [--prefill-mode auto|gpu|hybrid] [--gpu-prefill-mode wide|tree64]
     \\                    [--prefill-matmul-backend auto|simdgroup|nax] [-N|--strict-nax] [--bus-bandwidth-gbs F]
     \\                    [--act-quant <none|emulate|mxfp8_g32|fp8_g128|nvfp4_g16|fouroversix_mae>]
@@ -153,7 +156,7 @@ const usage =
     \\                    [--max-tree-nodes N] [--max-draft-depth N] [--branch-width N]
     \\                    [--top-k N] [-P|--no-prune] [-t|--temperature T] [--seed N]
     \\                    [--cold-experts-per-layer N] [--heat-profile <path>] [--cold-slots N]
-    \\                    [-W|--wired-cap-mib N] [--io-backend auto|aio|pread]
+    \\                    [--cold-expert-min-weight <float>] [-W|--wired-cap-mib N] [--io-backend auto|aio|pread]
     \\                    [--prefill-mode auto|gpu|hybrid] [--gpu-prefill-mode wide|tree64]
     \\                    [--prefill-matmul-backend auto|simdgroup|nax] [-N|--strict-nax] [--bus-bandwidth-gbs F]
     \\                    [--act-quant <none|emulate|mxfp8_g32|fp8_g128|nvfp4_g16|fouroversix_mae>]
@@ -184,7 +187,7 @@ const usage =
     \\                    [--max-tree-nodes N] [--max-draft-depth N] [--branch-width N]
     \\                    [--top-k N] [-P|--no-prune]
     \\                    [--cold-experts-per-layer N] [--heat-profile <path>] [--cold-slots N]
-    \\                    [-W|--wired-cap-mib N] [--io-backend auto|aio|pread]
+    \\                    [--cold-expert-min-weight <float>] [-W|--wired-cap-mib N] [--io-backend auto|aio|pread]
     \\                    [--prefill-mode auto|gpu|hybrid] [--gpu-prefill-mode wide|tree64]
     \\                    [--prefill-matmul-backend auto|simdgroup|nax] [-N|--strict-nax] [--bus-bandwidth-gbs F]
     \\                    [-S|--strict-live-ram] [--ane-predictor <path>]
@@ -353,6 +356,12 @@ pub fn main(init: std.process.Init) !void {
             try out.writeAll(usage);
         } else {
             try runBenchM92(arena, args[2..], out);
+        }
+    } else if (args.len >= 2 and std.mem.eql(u8, args[1], "bench-m93")) {
+        if (hasHelpFlag(args[2..])) {
+            try out.writeAll(usage);
+        } else {
+            try runBenchM93(arena, args[2..], out);
         }
     } else if (args.len >= 2 and std.mem.eql(u8, args[1], "peer-worker")) {
         if (hasHelpFlag(args[2..])) {
@@ -702,11 +711,6 @@ fn writeColdExpertStats(prefix: []const u8, stats: aminfer.qwen3.ColdExpertStats
         \\{s}.cold_sync_misses          {d}
         \\{s}.cold_prefetch_hit_rate    {d:.3}
         \\{s}.cold_hit_rate             {d:.3}
-        \\{s}.cold_bytes_read           {d}
-        \\{s}.cold_evictions            {d}
-        \\{s}.cold_unused_prefetched    {d}
-        \\{s}.cold_prefetch_wait_us     {d:.1}
-        \\{s}.cold_sync_miss_wait_us    {d:.1}
         \\
     , .{
         prefix,                                           stats.total_cold_experts,
@@ -720,12 +724,35 @@ fn writeColdExpertStats(prefix: []const u8, stats: aminfer.qwen3.ColdExpertStats
         prefix,                                           ct.sync_misses,
         prefix,                                           ct.prefetchHitRate(),
         prefix,                                           ct.coldHitRate(),
-        prefix,                                           ct.bytes_read,
-        prefix,                                           ct.evictions,
-        prefix,                                           ct.unused_prefetched_experts,
-        prefix,                                           ct.prefetchWaitUs(),
-        prefix,                                           ct.syncMissWaitUs(),
     });
+    try out.print(
+        \\{s}.cold_bytes_read           {d}
+        \\{s}.cold_evictions            {d}
+        \\{s}.cold_unused_prefetched    {d}
+        \\{s}.cold_session_promotions   {d}
+        \\{s}.cold_promoted_hits        {d}
+        \\{s}.cold_probation_evictions  {d}
+        \\{s}.cold_skipped_min_weight   {d}
+        \\{s}.cold_prefetch_wait_us     {d:.1}
+        \\{s}.cold_sync_miss_wait_us    {d:.1}
+        \\
+    , .{
+        prefix, ct.bytes_read,
+        prefix, ct.evictions,
+        prefix, ct.unused_prefetched_experts,
+        prefix, ct.session_promotions,
+        prefix, ct.promoted_hits,
+        prefix, ct.probation_evictions,
+        prefix, ct.cold_skipped_min_weight,
+        prefix, ct.prefetchWaitUs(),
+        prefix, ct.syncMissWaitUs(),
+    });
+}
+
+fn parseColdExpertMinWeight(raw: []const u8) !f32 {
+    const val = std.fmt.parseFloat(f32, raw) catch return error.InvalidFlagValue;
+    if (!std.math.isFinite(val) or val < 0.0 or val >= 1.0) return error.InvalidFlagValue;
+    return val;
 }
 
 fn readFileAllocPosix(allocator: std.mem.Allocator, path: [:0]const u8, max_bytes: usize) ![]u8 {
@@ -1589,6 +1616,7 @@ const DecodeCliArgs = struct {
     cold_experts_per_layer: u32 = 0,
     heat_profile_path: ?[:0]const u8 = null,
     cold_slots: u32 = 64,
+    cold_expert_min_weight: f32 = 0.0,
     wired_cap_mib: ?u64 = null,
     io_backend: aminfer.aio.IoBackend = .auto,
     prefill_mode: aminfer.qwen3.PrefillMode = .auto,
@@ -1624,6 +1652,7 @@ fn parseDecodeArgs(args: []const [:0]const u8) !DecodeCliArgs {
     var cold_experts_per_layer: u32 = 0;
     var heat_profile_path: ?[:0]const u8 = null;
     var cold_slots: u32 = 64;
+    var cold_expert_min_weight: f32 = 0.0;
     var wired_cap_mib: ?u64 = null;
     var io_backend: aminfer.aio.IoBackend = .auto;
     var prefill_mode: aminfer.qwen3.PrefillMode = .auto;
@@ -1700,6 +1729,12 @@ fn parseDecodeArgs(args: []const [:0]const u8) !DecodeCliArgs {
             i += 1;
             if (i >= args.len) return error.MissingFlagValue;
             cold_slots = try std.fmt.parseInt(u32, args[i], 10);
+        } else if (std.mem.eql(u8, flag, "--cold-expert-min-weight")) {
+            i += 1;
+            if (i >= args.len) return error.MissingFlagValue;
+            cold_expert_min_weight = try parseColdExpertMinWeight(args[i]);
+        } else if (std.mem.startsWith(u8, flag, "--cold-expert-min-weight=")) {
+            cold_expert_min_weight = try parseColdExpertMinWeight(flag["--cold-expert-min-weight=".len..]);
         } else if (std.mem.eql(u8, flag, "--wired-cap-mib") or std.mem.eql(u8, flag, "-W")) {
             i += 1;
             if (i >= args.len) return error.MissingFlagValue;
@@ -1793,6 +1828,7 @@ fn parseDecodeArgs(args: []const [:0]const u8) !DecodeCliArgs {
         .cold_experts_per_layer = cold_experts_per_layer,
         .heat_profile_path = heat_profile_path,
         .cold_slots = cold_slots,
+        .cold_expert_min_weight = cold_expert_min_weight,
         .wired_cap_mib = wired_cap_mib,
         .io_backend = io_backend,
         .prefill_mode = prefill_mode,
@@ -1825,6 +1861,7 @@ const BenchDecodeCliArgs = struct {
     cold_experts_per_layer: u32 = 0,
     heat_profile_path: ?[:0]const u8 = null,
     cold_slots: u32 = 64,
+    cold_expert_min_weight: f32 = 0.0,
     wired_cap_mib: ?u64 = null,
     io_backend: aminfer.aio.IoBackend = .auto,
     prefill_mode: aminfer.qwen3.PrefillMode = .auto,
@@ -1849,6 +1886,7 @@ fn parseBenchDecodeArgs(args: []const [:0]const u8) !BenchDecodeCliArgs {
     var cold_experts_per_layer: u32 = 0;
     var heat_profile_path: ?[:0]const u8 = null;
     var cold_slots: u32 = 64;
+    var cold_expert_min_weight: f32 = 0.0;
     var wired_cap_mib: ?u64 = null;
     var io_backend: aminfer.aio.IoBackend = .auto;
     var prefill_mode: aminfer.qwen3.PrefillMode = .auto;
@@ -1902,6 +1940,12 @@ fn parseBenchDecodeArgs(args: []const [:0]const u8) !BenchDecodeCliArgs {
             i += 1;
             if (i >= args.len) return error.MissingFlagValue;
             cold_slots = try std.fmt.parseInt(u32, args[i], 10);
+        } else if (std.mem.eql(u8, flag, "--cold-expert-min-weight")) {
+            i += 1;
+            if (i >= args.len) return error.MissingFlagValue;
+            cold_expert_min_weight = try parseColdExpertMinWeight(args[i]);
+        } else if (std.mem.startsWith(u8, flag, "--cold-expert-min-weight=")) {
+            cold_expert_min_weight = try parseColdExpertMinWeight(flag["--cold-expert-min-weight=".len..]);
         } else if (std.mem.eql(u8, flag, "--wired-cap-mib") or std.mem.eql(u8, flag, "-W")) {
             i += 1;
             if (i >= args.len) return error.MissingFlagValue;
@@ -1961,6 +2005,7 @@ fn parseBenchDecodeArgs(args: []const [:0]const u8) !BenchDecodeCliArgs {
         .cold_experts_per_layer = cold_experts_per_layer,
         .heat_profile_path = heat_profile_path,
         .cold_slots = cold_slots,
+        .cold_expert_min_weight = cold_expert_min_weight,
         .wired_cap_mib = wired_cap_mib,
         .io_backend = io_backend,
         .prefill_mode = prefill_mode,
@@ -2134,6 +2179,7 @@ fn runDecodeGraph(
         .max_loops_override = cli.m6.max_loops,
         .enable_loop_early_exit = cli.m6.loop_early_exit,
         .cold_slot_count = cli.cold_slots,
+        .cold_expert_min_weight = cli.cold_expert_min_weight,
         .kv_retire_q8_after_chunks = cli.kv_retire_q8_after_chunks,
         .gpu_prefill_mode = cli.gpu_prefill_mode,
         .strict_live_ram = cli.strict_live_ram,
@@ -2405,6 +2451,10 @@ fn runDecodeGraph(
             \\decode.m82.index_shared_reuses   {d}
             \\decode.m82.cold_expert_fetches   {d}
             \\decode.m82.cold_expert_hits      {d}
+            \\decode.m82.session_promotions    {d}
+            \\decode.m82.promoted_hits         {d}
+            \\decode.m82.probation_evictions   {d}
+            \\decode.m82.cold_skipped_min_w    {d}
             \\
         , .{
             gcfg.m82_family.label(),
@@ -2417,6 +2467,10 @@ fn runDecodeGraph(
             ms.hy4_index_shared_reuses,
             ms.cold_expert_fetches,
             ms.cold_expert_cache_hits,
+            ms.session_promotions,
+            ms.promoted_hits,
+            ms.probation_evictions,
+            ms.cold_skipped_min_weight,
         });
     }
     if (model.coldExpertStats()) |cs| {
@@ -2488,6 +2542,7 @@ fn runDecode(allocator: std.mem.Allocator, raw_args: []const [:0]const u8, out: 
             .ignore_eos = cli.ignore_eos,
             .verify_crcs = cli.verify_crcs,
             .cold_slots = cli.cold_slots,
+            .cold_expert_min_weight = cli.cold_expert_min_weight,
             .wired_cap_mib = cli.wired_cap_mib,
             .io_backend = cli.io_backend,
             .prefill_mode = cli.prefill_mode,
@@ -2547,6 +2602,7 @@ fn runDecode(allocator: std.mem.Allocator, raw_args: []const [:0]const u8, out: 
         .cold_experts_per_layer = cli.cold_experts_per_layer,
         .heat_profile_json = heat_bytes,
         .cold_slot_count = cli.cold_slots,
+        .cold_expert_min_weight = cli.cold_expert_min_weight,
         .io_backend = cli.io_backend,
         .enable_ane_predictor = cli.enable_ane_predictor,
         .ane_predictor_path = cli.ane_predictor_path,
@@ -2800,6 +2856,7 @@ fn runBenchDecode(allocator: std.mem.Allocator, raw_args: []const [:0]const u8, 
             .max_loops_override = cli.m6.max_loops,
             .enable_loop_early_exit = cli.m6.loop_early_exit,
             .cold_slot_count = cli.cold_slots,
+            .cold_expert_min_weight = cli.cold_expert_min_weight,
             .kv_retire_q8_after_chunks = cli.kv_retire_q8_after_chunks,
             .gpu_prefill_mode = cli.gpu_prefill_mode,
             .strict_live_ram = cli.strict_live_ram,
@@ -2844,6 +2901,7 @@ fn runBenchDecode(allocator: std.mem.Allocator, raw_args: []const [:0]const u8, 
         .cold_experts_per_layer = cli.cold_experts_per_layer,
         .heat_profile_json = heat_bytes,
         .cold_slot_count = cli.cold_slots,
+        .cold_expert_min_weight = cli.cold_expert_min_weight,
         .io_backend = cli.io_backend,
         .enable_ane_predictor = cli.enable_ane_predictor,
         .ane_predictor_path = cli.ane_predictor_path,
@@ -3262,6 +3320,43 @@ fn runBenchM92(allocator: std.mem.Allocator, raw_args: []const [:0]const u8, out
     if (!report.all_passed) return error.BenchmarkGateFailed;
 }
 
+const BenchM93CliArgs = struct {
+    json: bool = false,
+    models_dir: ?[]const u8 = null,
+};
+
+fn parseBenchM93Args(raw_args: []const [:0]const u8) !BenchM93CliArgs {
+    var parsed: BenchM93CliArgs = .{};
+    var i: usize = 0;
+    while (i < raw_args.len) : (i += 1) {
+        const flag = raw_args[i];
+        if (std.mem.eql(u8, flag, "--json")) {
+            parsed.json = true;
+        } else if (std.mem.eql(u8, flag, "--models-dir")) {
+            i += 1;
+            if (i >= raw_args.len) return error.MissingFlagValue;
+            parsed.models_dir = raw_args[i];
+        } else {
+            return error.UnknownFlag;
+        }
+    }
+    return parsed;
+}
+
+fn runBenchM93(allocator: std.mem.Allocator, raw_args: []const [:0]const u8, out: *Io.Writer) !void {
+    const cli = try parseBenchM93Args(raw_args);
+    const report = try aminfer.bench_m93.runM93WithConfig(allocator, .{
+        .models_dir = cli.models_dir,
+    });
+    if (cli.json) {
+        try report.writeJson(out);
+    } else {
+        try report.write(out);
+    }
+    try out.flush();
+    if (!report.all_passed) return error.BenchmarkGateFailed;
+}
+
 fn parseQualityGateArgs(args: []const [:0]const u8) !aminfer.bench.QualityGateConfig {
     var cfg: aminfer.bench.QualityGateConfig = .{};
     var i: usize = 0;
@@ -3291,6 +3386,12 @@ fn parseQualityGateArgs(args: []const [:0]const u8) !aminfer.bench.QualityGateCo
         } else if (std.mem.startsWith(u8, flag, "--act-quant=")) {
             cfg.act_quant_policy = aminfer.quant_formats.ActQuantPolicy.parse(flag["--act-quant=".len..]) orelse
                 return error.InvalidActQuantPolicy;
+        } else if (std.mem.eql(u8, flag, "--cold-expert-min-weight")) {
+            i += 1;
+            if (i >= args.len) return error.MissingFlagValue;
+            cfg.cold_expert_min_weight = try parseColdExpertMinWeight(args[i]);
+        } else if (std.mem.startsWith(u8, flag, "--cold-expert-min-weight=")) {
+            cfg.cold_expert_min_weight = try parseColdExpertMinWeight(flag["--cold-expert-min-weight=".len..]);
         } else if (std.mem.eql(u8, flag, "--steps")) {
             i += 1;
             if (i >= args.len) return error.MissingFlagValue;
@@ -3582,6 +3683,7 @@ const SpecDecodeCliArgs = struct {
     cold_experts_per_layer: u32 = 0,
     heat_profile_path: ?[:0]const u8 = null,
     cold_slots: u32 = 64,
+    cold_expert_min_weight: f32 = 0.0,
     wired_cap_mib: ?u64 = null,
     io_backend: aminfer.aio.IoBackend = .auto,
     prefill_mode: aminfer.qwen3.PrefillMode = .auto,
@@ -3624,6 +3726,7 @@ fn parseSpecDecodeArgs(args: []const [:0]const u8) !SpecDecodeCliArgs {
     var cold_experts_per_layer: u32 = 0;
     var heat_profile_path: ?[:0]const u8 = null;
     var cold_slots: u32 = 64;
+    var cold_expert_min_weight: f32 = 0.0;
     var wired_cap_mib: ?u64 = null;
     var io_backend: aminfer.aio.IoBackend = .auto;
     var prefill_mode: aminfer.qwen3.PrefillMode = .auto;
@@ -3745,6 +3848,12 @@ fn parseSpecDecodeArgs(args: []const [:0]const u8) !SpecDecodeCliArgs {
             i += 1;
             if (i >= args.len) return error.MissingFlagValue;
             cold_slots = try std.fmt.parseInt(u32, args[i], 10);
+        } else if (std.mem.eql(u8, flag, "--cold-expert-min-weight")) {
+            i += 1;
+            if (i >= args.len) return error.MissingFlagValue;
+            cold_expert_min_weight = try parseColdExpertMinWeight(args[i]);
+        } else if (std.mem.startsWith(u8, flag, "--cold-expert-min-weight=")) {
+            cold_expert_min_weight = try parseColdExpertMinWeight(flag["--cold-expert-min-weight=".len..]);
         } else if (std.mem.eql(u8, flag, "--wired-cap-mib") or std.mem.eql(u8, flag, "-W")) {
             i += 1;
             if (i >= args.len) return error.MissingFlagValue;
@@ -3823,6 +3932,7 @@ fn parseSpecDecodeArgs(args: []const [:0]const u8) !SpecDecodeCliArgs {
         .cold_experts_per_layer = cold_experts_per_layer,
         .heat_profile_path = heat_profile_path,
         .cold_slots = cold_slots,
+        .cold_expert_min_weight = cold_expert_min_weight,
         .wired_cap_mib = wired_cap_mib,
         .io_backend = io_backend,
         .prefill_mode = prefill_mode,
@@ -3958,6 +4068,7 @@ fn runSpecDecodeGraph(
         .max_loops_override = cli.m6.max_loops,
         .enable_loop_early_exit = cli.m6.loop_early_exit,
         .cold_slot_count = cli.cold_slots,
+        .cold_expert_min_weight = cli.cold_expert_min_weight,
         .kv_retire_q8_after_chunks = cli.kv_retire_q8_after_chunks,
         .gpu_prefill_mode = cli.gpu_prefill_mode,
         .strict_live_ram = cli.strict_live_ram,
@@ -4253,6 +4364,10 @@ fn runSpecDecodeGraph(
             \\spec.m82.index_shared_reuses     {d}
             \\spec.m82.cold_expert_fetches     {d}
             \\spec.m82.cold_expert_hits        {d}
+            \\spec.m82.session_promotions      {d}
+            \\spec.m82.promoted_hits           {d}
+            \\spec.m82.probation_evictions     {d}
+            \\spec.m82.cold_skipped_min_w      {d}
             \\
         , .{
             gcfg.m82_family.label(),
@@ -4265,6 +4380,10 @@ fn runSpecDecodeGraph(
             ms.hy4_index_shared_reuses,
             ms.cold_expert_fetches,
             ms.cold_expert_cache_hits,
+            ms.session_promotions,
+            ms.promoted_hits,
+            ms.probation_evictions,
+            ms.cold_skipped_min_weight,
         });
     }
     if (model.pleStats()) |ps| {
@@ -4385,6 +4504,7 @@ fn runSpecDecode(allocator: std.mem.Allocator, raw_args: []const [:0]const u8, o
         .cold_experts_per_layer = cli.cold_experts_per_layer,
         .heat_profile_json = heat_bytes,
         .cold_slot_count = cli.cold_slots,
+        .cold_expert_min_weight = cli.cold_expert_min_weight,
         .io_backend = cli.io_backend,
         .enable_ane_predictor = cli.enable_ane_predictor,
         .ane_predictor_path = cli.ane_predictor_path,
@@ -4818,6 +4938,7 @@ const ServeCliArgs = struct {
     cold_experts_per_layer: u32 = 0,
     heat_profile_path: ?[:0]const u8 = null,
     cold_slots: u32 = 64,
+    cold_expert_min_weight: f32 = 0.0,
     wired_cap_mib: ?u64 = null,
     io_backend: aminfer.aio.IoBackend = .auto,
     prefill_mode: aminfer.qwen3.PrefillMode = .auto,
@@ -4878,6 +4999,7 @@ fn parseServeArgs(args: []const [:0]const u8) !ServeCliArgs {
     var cold_experts_per_layer: u32 = 0;
     var heat_profile_path: ?[:0]const u8 = null;
     var cold_slots: u32 = 64;
+    var cold_expert_min_weight: f32 = 0.0;
     var wired_cap_mib: ?u64 = null;
     var io_backend: aminfer.aio.IoBackend = .auto;
     var prefill_mode: aminfer.qwen3.PrefillMode = .auto;
@@ -5034,6 +5156,12 @@ fn parseServeArgs(args: []const [:0]const u8) !ServeCliArgs {
             i += 1;
             if (i >= args.len) return error.MissingFlagValue;
             cold_slots = try std.fmt.parseInt(u32, args[i], 10);
+        } else if (std.mem.eql(u8, flag, "--cold-expert-min-weight")) {
+            i += 1;
+            if (i >= args.len) return error.MissingFlagValue;
+            cold_expert_min_weight = try parseColdExpertMinWeight(args[i]);
+        } else if (std.mem.startsWith(u8, flag, "--cold-expert-min-weight=")) {
+            cold_expert_min_weight = try parseColdExpertMinWeight(flag["--cold-expert-min-weight=".len..]);
         } else if (std.mem.eql(u8, flag, "--wired-cap-mib") or std.mem.eql(u8, flag, "-W")) {
             i += 1;
             if (i >= args.len) return error.MissingFlagValue;
@@ -5184,6 +5312,7 @@ fn parseServeArgs(args: []const [:0]const u8) !ServeCliArgs {
         .cold_experts_per_layer = cold_experts_per_layer,
         .heat_profile_path = heat_profile_path,
         .cold_slots = cold_slots,
+        .cold_expert_min_weight = cold_expert_min_weight,
         .wired_cap_mib = wired_cap_mib,
         .io_backend = io_backend,
         .prefill_mode = prefill_mode,
@@ -7269,6 +7398,7 @@ fn runServeGraph(
         .max_loops_override = cli.m6.max_loops,
         .enable_loop_early_exit = cli.m6.loop_early_exit,
         .cold_slot_count = cli.cold_slots,
+        .cold_expert_min_weight = cli.cold_expert_min_weight,
         .kv_retire_q8_after_chunks = cli.kv_retire_q8_after_chunks,
         .gpu_prefill_mode = cli.gpu_prefill_mode,
         .strict_live_ram = cli.strict_live_ram,
@@ -7740,6 +7870,7 @@ fn runServe(allocator: std.mem.Allocator, raw_args: []const [:0]const u8, out: *
         .cold_experts_per_layer = cli.cold_experts_per_layer,
         .heat_profile_json = heat_bytes,
         .cold_slot_count = cli.cold_slots,
+        .cold_expert_min_weight = cli.cold_expert_min_weight,
         .io_backend = cli.io_backend,
         .enable_ane_predictor = cli.enable_ane_predictor,
         .ane_predictor_path = cli.ane_predictor_path,
@@ -8365,6 +8496,7 @@ const ChatCliArgs = struct {
     draft_amf_path: ?[:0]const u8 = null,
     draft_config_path: ?[:0]const u8 = null,
     cold_slots: u32 = 64,
+    cold_expert_min_weight: f32 = 0.0,
     m6: M6GraphCliFlags = .{},
     chat_cfg: aminfer.chat_repl.ChatConfig = .{},
 };
@@ -8410,6 +8542,12 @@ fn parseChatCliArgs(args: []const [:0]const u8) !ChatCliArgs {
             i += 1;
             if (i >= args.len) return error.MissingFlagValue;
             out.cold_slots = try std.fmt.parseInt(u32, args[i], 10);
+        } else if (std.mem.eql(u8, flag, "--cold-expert-min-weight")) {
+            i += 1;
+            if (i >= args.len) return error.MissingFlagValue;
+            out.cold_expert_min_weight = try parseColdExpertMinWeight(args[i]);
+        } else if (std.mem.startsWith(u8, flag, "--cold-expert-min-weight=")) {
+            out.cold_expert_min_weight = try parseColdExpertMinWeight(flag["--cold-expert-min-weight=".len..]);
         } else if (std.mem.eql(u8, flag, "--lora") or std.mem.eql(u8, flag, "-L")) {
             i += 1;
             if (i >= args.len) return error.MissingFlagValue;
@@ -9357,6 +9495,7 @@ fn runChatGraph(
         .max_loops_override = cli.m6.max_loops,
         .enable_loop_early_exit = cli.m6.loop_early_exit,
         .cold_slot_count = cli.cold_slots,
+        .cold_expert_min_weight = cli.cold_expert_min_weight,
         .strict_live_ram = cli.strict_live_ram,
         .act_quant_policy = cli.act_quant_policy,
     });
@@ -9485,6 +9624,7 @@ fn runChat(allocator: std.mem.Allocator, raw_args: []const [:0]const u8) !void {
         .verify_crcs = cli.verify_crcs,
         .budget_override = budget_override,
         .strict_live_ram = cli.strict_live_ram,
+        .cold_expert_min_weight = cli.cold_expert_min_weight,
         .act_quant_policy = cli.act_quant_policy,
         .continuous_batch_only = true,
     });
@@ -11196,4 +11336,48 @@ test "M9.5 & M9.6 CLI parsers, M82Runtime auto-serial routing, and vision prompt
     );
     try std.testing.expectEqualStrings("<|im_start|>user\n<|vision_start|>", qwen_split.prefix);
     try std.testing.expectEqualStrings("<|vision_end|>what is this?<|im_end|>\n<|im_start|>assistant\n", qwen_split.suffix);
+}
+
+test "M9.3 C27 --cold-expert-min-weight and bench-m93 CLI parsers" {
+    try std.testing.expectEqual(@as(f32, 0.0), try parseColdExpertMinWeight("0"));
+    try std.testing.expectEqual(@as(f32, 0.0), try parseColdExpertMinWeight("0.0"));
+    try std.testing.expectApproxEqAbs(@as(f32, 0.03), try parseColdExpertMinWeight("0.03"), 1e-6);
+    try std.testing.expectError(error.InvalidFlagValue, parseColdExpertMinWeight("-0.01"));
+    try std.testing.expectError(error.InvalidFlagValue, parseColdExpertMinWeight("1.0"));
+    try std.testing.expectError(error.InvalidFlagValue, parseColdExpertMinWeight("1.5"));
+    try std.testing.expectError(error.InvalidFlagValue, parseColdExpertMinWeight("nan"));
+    try std.testing.expectError(error.InvalidFlagValue, parseColdExpertMinWeight("inf"));
+    try std.testing.expectError(error.InvalidFlagValue, parseColdExpertMinWeight(""));
+    try std.testing.expectError(error.InvalidFlagValue, parseColdExpertMinWeight("abc"));
+
+    const d_def = try parseDecodeArgs(&.{ "--amf", "m.amf" });
+    try std.testing.expectEqual(@as(f32, 0.0), d_def.cold_expert_min_weight);
+    const d_set = try parseDecodeArgs(&.{ "--amf", "m.amf", "--cold-expert-min-weight", "0.05" });
+    try std.testing.expectApproxEqAbs(@as(f32, 0.05), d_set.cold_expert_min_weight, 1e-6);
+    try std.testing.expectError(error.InvalidFlagValue, parseDecodeArgs(&.{ "--amf", "m.amf", "--cold-expert-min-weight=1.0" }));
+
+    const bd_set = try parseBenchDecodeArgs(&.{ "--amf", "m.amf", "--cold-expert-min-weight=0.02" });
+    try std.testing.expectApproxEqAbs(@as(f32, 0.02), bd_set.cold_expert_min_weight, 1e-6);
+
+    const sd_set = try parseSpecDecodeArgs(&.{ "--amf", "m.amf", "--cold-expert-min-weight", "0.04" });
+    try std.testing.expectApproxEqAbs(@as(f32, 0.04), sd_set.cold_expert_min_weight, 1e-6);
+
+    const sv_set = try parseServeArgs(&.{ "--amf", "m.amf", "--cold-expert-min-weight=0.03" });
+    try std.testing.expectApproxEqAbs(@as(f32, 0.03), sv_set.cold_expert_min_weight, 1e-6);
+
+    const ch_set = try parseChatCliArgs(&.{ "--amf", "m.amf", "--cold-expert-min-weight", "0.06" });
+    try std.testing.expectApproxEqAbs(@as(f32, 0.06), ch_set.cold_expert_min_weight, 1e-6);
+
+    const qg_set = try parseQualityGateArgs(&.{ "--ref", "r.amf", "--cand", "c.amf", "--cold-expert-min-weight=0.03" });
+    try std.testing.expectApproxEqAbs(@as(f32, 0.03), qg_set.cold_expert_min_weight, 1e-6);
+    try std.testing.expectError(error.InvalidFlagValue, parseQualityGateArgs(&.{ "--cold-expert-min-weight", "-0.1" }));
+
+    const m93_def = try parseBenchM93Args(&.{});
+    try std.testing.expect(!m93_def.json);
+    try std.testing.expect(m93_def.models_dir == null);
+    const m93_cli = try parseBenchM93Args(&.{ "--json", "--models-dir", "/tmp/models" });
+    try std.testing.expect(m93_cli.json);
+    try std.testing.expectEqualStrings("/tmp/models", m93_cli.models_dir.?);
+    try std.testing.expectError(error.MissingFlagValue, parseBenchM93Args(&.{"--models-dir"}));
+    try std.testing.expectError(error.UnknownFlag, parseBenchM93Args(&.{"--bad"}));
 }

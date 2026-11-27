@@ -465,6 +465,10 @@ def _configure_cdll(lib: ctypes.CDLL) -> None:
     lib.ami_sdk_engine_query_stats.restype = ctypes.c_int32
     lib.ami_sdk_engine_tokenizer.argtypes = [ctypes.c_void_p]
     lib.ami_sdk_engine_tokenizer.restype = ctypes.c_void_p
+    lib.ami_sdk_engine_set_cold_expert_min_weight.argtypes = [ctypes.c_void_p, ctypes.c_float]
+    lib.ami_sdk_engine_set_cold_expert_min_weight.restype = ctypes.c_int32
+    lib.ami_sdk_engine_get_cold_expert_min_weight.argtypes = [ctypes.c_void_p, c_f32_p]
+    lib.ami_sdk_engine_get_cold_expert_min_weight.restype = ctypes.c_int32
 
     # Speculative Decoding (M8.2 D14: L1 / DFlare / DFly2 / Auto)
     lib.ami_sdk_spec_options_init.argtypes = [ctypes.POINTER(SpecOptionsC)]

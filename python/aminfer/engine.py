@@ -898,6 +898,7 @@ class Engine:
         spec_max_tree_nodes: int = 16,
         spec_enable_pruning: bool = False,
         spec_confidence_threshold: float = 0.0,
+        cold_expert_min_weight: float = 0.0,
         lib_path: str | os.PathLike[str] | None = None,
     ) -> None:
         self._lib = load_lib(lib_path)
@@ -940,6 +941,11 @@ class Engine:
             )
         self._vocab_size: int = self.stats.vocab_size
         self._active_lora: str | None = None
+        try:
+            self.set_cold_expert_min_weight(cold_expert_min_weight)
+        except Exception:
+            self.close()
+            raise
         if draft_mode is not None or draft_amf_path is not None or draft_config_path is not None:
             try:
                 self.configure_speculative(
@@ -1179,6 +1185,31 @@ class Engine:
 
     def reset_kv_cache(self) -> None:
         check_status(self._lib, self._lib.ami_sdk_engine_reset_kv(self._require_open()))
+
+    def set_cold_expert_min_weight(self, min_weight: float) -> None:
+        """Sets the C27 opt-in cold-tail skipping weight threshold in [0.0, 1.0)."""
+        handle = self._require_open()
+        if isinstance(min_weight, bool) or not isinstance(min_weight, (int, float)):
+            raise _invalid_arg("cold_expert_min_weight must be a finite float in [0.0, 1.0)")
+        val = float(min_weight)
+        if not math.isfinite(val) or val < 0.0 or val >= 1.0:
+            raise _invalid_arg("cold_expert_min_weight must be finite in [0.0, 1.0)")
+        check_status(
+            self._lib,
+            self._lib.ami_sdk_engine_set_cold_expert_min_weight(handle, ctypes.c_float(val)),
+        )
+
+    @property
+    def cold_expert_min_weight(self) -> float:
+        """Queries the active C27 cold-tail skipping weight threshold (0.0 = lossless)."""
+        out = ctypes.c_float(0.0)
+        check_status(
+            self._lib,
+            self._lib.ami_sdk_engine_get_cold_expert_min_weight(
+                self._require_open(), ctypes.byref(out)
+            ),
+        )
+        return float(out.value)
 
     def _prompt_to_ids(self, prompt: str | bytes | Sequence[int]) -> list[int]:
         if isinstance(prompt, (str, bytes)):

@@ -41,6 +41,7 @@ pub const bench = @import("bench/runner.zig");
 pub const bench_m83 = @import("bench/m83.zig");
 pub const bench_m91 = @import("bench/m91.zig");
 pub const bench_m92 = @import("bench/m92.zig");
+pub const bench_m93 = @import("bench/m93.zig");
 pub const bench_m95_m96 = @import("bench/m95_m96.zig");
 pub const bench_m97 = @import("bench/m97.zig");
 pub const sam = @import("spec/sam.zig");
@@ -110,6 +111,7 @@ test {
     _ = bench_m83;
     _ = bench_m91;
     _ = bench_m92;
+    _ = bench_m93;
     _ = bench_m95_m96;
     _ = bench_m97;
     _ = sam;

@@ -223,6 +223,7 @@ pub const QualityGateConfig = struct {
     config_path: ?[:0]const u8 = null,
     tokenizer_path: ?[:0]const u8 = null,
     act_quant_policy: quant_formats.ActQuantPolicy = .none,
+    cold_expert_min_weight: f32 = 0.0,
     steps: u32 = 8,
     max_seq_len: u32 = 256,
     prompt_tokens: ?[]const u32 = null,
@@ -1054,6 +1055,32 @@ pub fn runFileQualityGate(
     max_seq_len: u32,
     explicit_tokens: ?[]const u32,
 ) !QualityGatePairResult {
+    return runFileQualityGateWithMinWeight(
+        allocator,
+        ref_amf_path,
+        cand_amf_path,
+        config_path,
+        tokenizer_path,
+        act_quant_policy,
+        0.0,
+        steps_in,
+        max_seq_len,
+        explicit_tokens,
+    );
+}
+
+pub fn runFileQualityGateWithMinWeight(
+    allocator: std.mem.Allocator,
+    ref_amf_path: [:0]const u8,
+    cand_amf_path: [:0]const u8,
+    config_path: ?[:0]const u8,
+    tokenizer_path: ?[:0]const u8,
+    act_quant_policy: quant_formats.ActQuantPolicy,
+    cold_expert_min_weight: f32,
+    steps_in: u32,
+    max_seq_len: u32,
+    explicit_tokens: ?[]const u32,
+) !QualityGatePairResult {
     var res: QualityGatePairResult = .{
         .act_quant = act_quant_policy,
         .status = "skipped_missing",
@@ -1129,11 +1156,7 @@ pub fn runFileQualityGate(
     }
 
     // Dispatch to `GraphModel` when the config belongs to `M8.2` (`Inkling 2` / `Hy4`) or non-Qwen3 graph arch.
-    const use_graph_model = blk: {
-        var gcfg_probe = graph.GraphConfig.fromJson(allocator, cfg_meta.bytes) catch break :blk false;
-        defer gcfg_probe.deinit(allocator);
-        break :blk (gcfg_probe.m82_family != .none);
-    };
+    const use_graph_model = graph.GraphConfig.isGraphConfigJson(cfg_meta.bytes);
     if (use_graph_model) {
         return runGraphFileQualityGate(
             allocator,
@@ -1142,6 +1165,7 @@ pub fn runFileQualityGate(
             cfg_meta.bytes,
             if (tok_meta_opt) |tm| tm.bytes else null,
             act_quant_policy,
+            cold_expert_min_weight,
             steps_in,
             max_seq_len,
             explicit_tokens,
@@ -1253,6 +1277,7 @@ pub fn runFileQualityGate(
             .verify_crcs = false,
             .startup_canary = false,
             .gpu_prefill_mode = .tree64,
+            .cold_slot_count = 64,
         });
         defer ref_model.deinit(allocator);
 
@@ -1288,6 +1313,8 @@ pub fn runFileQualityGate(
             .verify_crcs = false,
             .startup_canary = false,
             .gpu_prefill_mode = .tree64,
+            .cold_slot_count = 64,
+            .cold_expert_min_weight = cold_expert_min_weight,
             .act_quant_policy = act_quant_policy,
         });
         defer cand_model.deinit(allocator);
@@ -1408,6 +1435,7 @@ fn runGraphFileQualityGate(
     cfg_bytes: []const u8,
     tok_bytes_opt: ?[]const u8,
     act_quant_policy: quant_formats.ActQuantPolicy,
+    cold_expert_min_weight: f32,
     steps_in: u32,
     max_seq_len: u32,
     explicit_tokens: ?[]const u32,
@@ -1548,6 +1576,7 @@ fn runGraphFileQualityGate(
             .max_tree_nodes = 1,
             .startup_canary = false,
             .cold_slot_count = 64,
+            .cold_expert_min_weight = cold_expert_min_weight,
             .act_quant_policy = act_quant_policy,
         });
         defer cand_model.deinit(allocator);
@@ -1716,13 +1745,14 @@ pub fn runQualityGate(allocator: std.mem.Allocator, cfg: QualityGateConfig) !Qua
     }
 
     if (cfg.ref_amf_path != null and cfg.cand_amf_path != null) {
-        report.file_pair = try runFileQualityGate(
+        report.file_pair = try runFileQualityGateWithMinWeight(
             allocator,
             cfg.ref_amf_path.?,
             cfg.cand_amf_path.?,
             cfg.config_path,
             cfg.tokenizer_path,
             cfg.act_quant_policy,
+            cfg.cold_expert_min_weight,
             cfg.steps,
             cfg.max_seq_len,
             cfg.prompt_tokens,

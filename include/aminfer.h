@@ -424,6 +424,16 @@ ami_sdk_status ami_sdk_engine_reset_kv(ami_sdk_engine *engine);
 ami_sdk_status ami_sdk_engine_query_stats(const ami_sdk_engine *engine,
                                           ami_sdk_engine_stats *out_stats);
 
+/*
+ * Sets or queries the C27 opt-in approximate cold-tail skipping threshold
+ * (`0.0f` default = strictly lossless; values `< 0.0f`, `>= 1.0f`, or NaN
+ * are rejected with `AMI_SDK_ERR_INVALID_ARGUMENT`).
+ */
+ami_sdk_status ami_sdk_engine_set_cold_expert_min_weight(ami_sdk_engine *engine,
+                                                         float min_weight);
+ami_sdk_status ami_sdk_engine_get_cold_expert_min_weight(const ami_sdk_engine *engine,
+                                                         float *out_min_weight);
+
 /* Borrowed pointer to the engine's loaded tokenizer, or NULL if none was loaded. */
 const ami_sdk_tokenizer *ami_sdk_engine_tokenizer(const ami_sdk_engine *engine);
 
