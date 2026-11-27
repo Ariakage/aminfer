@@ -8830,8 +8830,13 @@ fn readDraftTestFileAlloc(allocator: std.mem.Allocator, path: [:0]const u8) !?[]
 
 test "M9.4 real-HF Qwen3.8-Flash-Next 1L MTP (qwen4_exp_mtp) loads qwen4-real-hf-synth/mtp.amf (56 tensors), GPU == D13 L2 SME2 fc_hidden parity & 512E predictRouterTopK" {
     const allocator = std.testing.allocator;
-    const mtp_path: [:0]const u8 = "/Volumes/AriDisk/models/amf/qwen4-real-hf-synth/mtp.amf";
-    const mtp_cfg_path: [:0]const u8 = "/Volumes/AriDisk/models/amf/qwen4-real-hf-synth/mtp_config.json";
+    const env_c = std.c.getenv("AMINFER_MODELS_DIR") orelse return error.SkipZigTest;
+    const models_dir = std.mem.span(env_c);
+    if (models_dir.len == 0) return error.SkipZigTest;
+    const mtp_path = try std.fs.path.joinZ(allocator, &.{ models_dir, "qwen4-real-hf-synth", "mtp.amf" });
+    defer allocator.free(mtp_path);
+    const mtp_cfg_path = try std.fs.path.joinZ(allocator, &.{ models_dir, "qwen4-real-hf-synth", "mtp_config.json" });
+    defer allocator.free(mtp_cfg_path);
 
     const cfg_bytes = (try readDraftTestFileAlloc(allocator, mtp_cfg_path)) orelse return error.SkipZigTest;
     defer allocator.free(cfg_bytes);

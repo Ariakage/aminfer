@@ -30356,12 +30356,12 @@ test "M9.3 C27: GraphModel dynamic two-tier cold cache + cold_expert_min_weight 
     try std.testing.expectEqual(skipped_before, m_skip.cold_rt.?.expert_cache.telemetry().cold_skipped_min_weight);
 }
 
-fn m94ResolveModelsDir() []const u8 {
+fn m94ResolveModelsDir() ?[]const u8 {
     if (std.c.getenv("AMINFER_MODELS_DIR")) |env_c| {
         const s = std.mem.span(env_c);
         if (s.len > 0) return s;
     }
-    return "/Volumes/AriDisk/models/amf";
+    return null;
 }
 
 fn m94ReadFileBytesPosix(allocator: std.mem.Allocator, path_z: [:0]const u8) ![]u8 {
@@ -30431,7 +30431,7 @@ fn m94ExpectAllFiniteF16(slice: []const f16) !void {
 
 test "M9.4 Qwen3.8 real-HF synth bundle (4-stream HC + PLE shards + QSA real indexer + sigmoid gate + wide/decode/tree parity)" {
     const allocator = std.testing.allocator;
-    const models_dir = m94ResolveModelsDir();
+    const models_dir = m94ResolveModelsDir() orelse return error.SkipZigTest;
     const bundle_dir = try std.fs.path.join(allocator, &.{ models_dir, "qwen4-real-hf-synth" });
     defer allocator.free(bundle_dir);
     const model_path = try std.fs.path.joinZ(allocator, &.{ bundle_dir, "model.amf" });
@@ -30544,7 +30544,7 @@ test "M9.4 Qwen3.8 real-HF synth bundle (4-stream HC + PLE shards + QSA real ind
 
 test "M9.4 Qwen3.8 real-HF qwen4-tiny-random-bf16 (no input/post/final layernorm, hc_mixer direct to lm_head)" {
     const allocator = std.testing.allocator;
-    const models_dir = m94ResolveModelsDir();
+    const models_dir = m94ResolveModelsDir() orelse return error.SkipZigTest;
     const bundle_dir = try std.fs.path.join(allocator, &.{ models_dir, "qwen4-tiny-random-bf16" });
     defer allocator.free(bundle_dir);
     const model_path = try std.fs.path.joinZ(allocator, &.{ bundle_dir, "model.amf" });
@@ -30621,7 +30621,7 @@ test "M9.4 Qwen3.8 real-HF qwen4-tiny-random-bf16 (no input/post/final layernorm
 
 test "M9.4 DeepSeek-V4.1 real-HF synth bundle (ds_v41_mla + compressor + indexer + sqrtsoftplus + MXFP8/MXFP4 + Engram + CED cold encoder)" {
     const allocator = std.testing.allocator;
-    const models_dir = m94ResolveModelsDir();
+    const models_dir = m94ResolveModelsDir() orelse return error.SkipZigTest;
     const bundle_dir = try std.fs.path.join(allocator, &.{ models_dir, "deepseek41-real-hf-synth" });
     defer allocator.free(bundle_dir);
     const model_path = try std.fs.path.joinZ(allocator, &.{ bundle_dir, "model.amf" });

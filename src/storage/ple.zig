@@ -3296,8 +3296,13 @@ test "M9.4 Qwen3.8 PLE multi-head hash with EOS reset and MXFP8_G32 Engram shard
     try std.testing.expectEqual((exp_tri % 16) + 48, ids_after_eos[3]);
 
     // 2. Verify staged `qwen4-tiny-random-bf16` PLE shards (if present) with r >= 1 zero-NVMe-read isolation.
-    const q4_p0: [:0]const u8 = "/Volumes/AriDisk/models/amf/qwen4-tiny-random-bf16/ple-shard-00-of-02.amf";
-    const q4_p1: [:0]const u8 = "/Volumes/AriDisk/models/amf/qwen4-tiny-random-bf16/ple-shard-01-of-02.amf";
+    const env_c = std.c.getenv("AMINFER_MODELS_DIR") orelse return error.SkipZigTest;
+    const models_dir = std.mem.span(env_c);
+    if (models_dir.len == 0) return error.SkipZigTest;
+    const q4_p0 = try std.fs.path.joinZ(gpa, &.{ models_dir, "qwen4-tiny-random-bf16", "ple-shard-00-of-02.amf" });
+    defer gpa.free(q4_p0);
+    const q4_p1 = try std.fs.path.joinZ(gpa, &.{ models_dir, "qwen4-tiny-random-bf16", "ple-shard-01-of-02.amf" });
+    defer gpa.free(q4_p1);
     if (std.c.access(q4_p0.ptr, std.c.F_OK) == 0 and std.c.access(q4_p1.ptr, std.c.F_OK) == 0) {
         const paths = [_][:0]const u8{ q4_p0, q4_p1 };
         var store = try PleStore.open(gpa, &paths, .{
@@ -3329,8 +3334,10 @@ test "M9.4 Qwen3.8 PLE multi-head hash with EOS reset and MXFP8_G32 Engram shard
     }
 
     // 3. Verify staged `deepseek41-real-hf-synth` MXFP8_G32 Engram shards (if present).
-    const ds_p0: [:0]const u8 = "/Volumes/AriDisk/models/amf/deepseek41-real-hf-synth/engram-shard-00-of-02.amf";
-    const ds_p1: [:0]const u8 = "/Volumes/AriDisk/models/amf/deepseek41-real-hf-synth/engram-shard-01-of-02.amf";
+    const ds_p0 = try std.fs.path.joinZ(gpa, &.{ models_dir, "deepseek41-real-hf-synth", "engram-shard-00-of-02.amf" });
+    defer gpa.free(ds_p0);
+    const ds_p1 = try std.fs.path.joinZ(gpa, &.{ models_dir, "deepseek41-real-hf-synth", "engram-shard-01-of-02.amf" });
+    defer gpa.free(ds_p1);
     if (std.c.access(ds_p0.ptr, std.c.F_OK) == 0 and std.c.access(ds_p1.ptr, std.c.F_OK) == 0) {
         const paths = [_][:0]const u8{ ds_p0, ds_p1 };
         var store = try PleStore.open(gpa, &paths, .{

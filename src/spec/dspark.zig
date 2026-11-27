@@ -3876,8 +3876,13 @@ fn readTestFileAlloc(allocator: std.mem.Allocator, path: [:0]const u8) !?[]u8 {
 
 test "M9.4 D10 real-HF 3L DSpark loads deepseek41-real-hf-synth/dspark.amf (138 tensors), cold-tier + markov_head + confidence_head + 0 hot-path allocs" {
     const allocator = std.testing.allocator;
-    const amf_path: [:0]const u8 = "/Volumes/AriDisk/models/amf/deepseek41-real-hf-synth/dspark.amf";
-    const cfg_path: [:0]const u8 = "/Volumes/AriDisk/models/amf/deepseek41-real-hf-synth/dspark_config.json";
+    const env_c = std.c.getenv("AMINFER_MODELS_DIR") orelse return error.SkipZigTest;
+    const models_dir = std.mem.span(env_c);
+    if (models_dir.len == 0) return error.SkipZigTest;
+    const amf_path = try std.fs.path.joinZ(allocator, &.{ models_dir, "deepseek41-real-hf-synth", "dspark.amf" });
+    defer allocator.free(amf_path);
+    const cfg_path = try std.fs.path.joinZ(allocator, &.{ models_dir, "deepseek41-real-hf-synth", "dspark_config.json" });
+    defer allocator.free(cfg_path);
 
     const cfg_bytes = (try readTestFileAlloc(allocator, cfg_path)) orelse return error.SkipZigTest;
     defer allocator.free(cfg_bytes);

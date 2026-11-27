@@ -805,6 +805,7 @@ static inline float qf_fp_row_scale_at(const device uchar *scales,
                                         uint num_groups,
                                         uint scale_stride,
                                         float outer_scale) {
+    (void)n_cols;
     if (QF_DTYPE == QF_DT_FP8_BLOCK) {
         const device float *sf = (const device float *)scales;
         return sf[ulong(row >> 7) * scale_stride + (col >> 7)];
