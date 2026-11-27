@@ -109,7 +109,7 @@ class HfMetadataValidatorTests(unittest.TestCase):
             self.assertEqual(rep.ple_shards_detected, 2)
             self.assertEqual(rep.mtp_tensor_count, 1)
             self.assertEqual(rep.stacked_expert_tensor_count, 1)
-            self.assertEqual(len(rep.long_backbone_names), 1)
+            self.assertEqual(len(rep.long_backbone_names), 0)
             self.assertEqual(rep.kv_bytes_per_token_fp16, 1 * 2 * 2 * 256 * 2)
 
             buf = io.StringIO()
@@ -215,6 +215,9 @@ class HfMetadataValidatorTests(unittest.TestCase):
             self.assertEqual(q_rep.operator_axes.residual_kind, "gated_4branch")
             self.assertEqual(q_rep.operator_axes.memory_lookup_kind, "ple_ngram")
             self.assertEqual(q_rep.vision_tensor_count, 333)
+            self.assertEqual(len(q_rep.long_backbone_names), 0)
+            self.assertEqual(q_rep.dense_ple_tensor_count, 9)
+            self.assertTrue(q_rep.header_summary_verified)
 
         ds_dir = meta_root / "deepseek-ai__DeepSeek-V4.1-Flash-1017"
         if (ds_dir / "config.json").is_file() and (ds_dir / "model.safetensors.index.json").is_file():
@@ -228,6 +231,8 @@ class HfMetadataValidatorTests(unittest.TestCase):
             self.assertEqual(d_rep.engram_layer_ids, (1, 14))
             self.assertEqual(len(d_rep.long_backbone_names), 0)
             self.assertFalse(d_rep.tier_admission["24gb-m4"]["fits_all_wired_q3"])
+            self.assertTrue(d_rep.tier_admission["24gb-m4"]["encoder_cold_decoder_hot"]["fits_encoder_cold_decoder_hot"])
+            self.assertTrue(d_rep.header_summary_verified)
 
 
 def _write_mimo_metadata_dir(

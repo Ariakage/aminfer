@@ -93,6 +93,7 @@ from aminfer_tools.lora import (
 )
 from aminfer_tools.gsq_rco import gsq_convert
 from aminfer_tools.qwen4_exp import (
+    generate_real_hf_qwen4_synth_bundle,
     pack_qwen4_checkpoint,
     validate_hf_metadata_dir as validate_qwen4_metadata_dir,
 )
@@ -452,6 +453,24 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Optional output config.json path with canonical operator_axes & loop_schedule metadata",
     )
     pack.add_argument(
+        "--mtp-config-output",
+        type=pathlib.Path,
+        default=None,
+        help="Optional output mtp_config.json path alongside standalone MTP .amf (W28)",
+    )
+    pack.add_argument(
+        "--target-tier",
+        choices=VALID_TARGET_TIERS,
+        default="auto",
+        help="Optional target hardware tier for qwen4 GSQ-RCO profiles (auto, 24gb-m4, 128gb-max, 512gb-ultra)",
+    )
+    pack.add_argument(
+        "--host-ram-gib",
+        type=float,
+        default=None,
+        help="Optional host RAM (GiB) override for hardware tier budget check",
+    )
+    pack.add_argument(
         "--embed-metadata",
         action="store_true",
         help=(
@@ -765,6 +784,14 @@ def _build_parser() -> argparse.ArgumentParser:
     sq4.add_argument("--cold-experts-per-layer", type=int, default=0, help="Mark last N experts per layer as cold")
     sq4.add_argument("--model-id", default=None, help="Override model identifier stored in .amf header")
     sq4.add_argument("--seed", type=int, default=42, help="Deterministic PRNG seed (default: 42)")
+    sq4.add_argument(
+        "--real-hf-schema",
+        action="store_true",
+        help="Synthesize real-HF Qwen3.8-Flash-Next schema (hc_count=4, dense+NVMe PLE, 3D experts, QSA indexer, 1L MTP) (W28)",
+    )
+    sq4.add_argument("--quant-profile", choices=QUANT_PROFILES, default="uniform", help="Quantization profile for --real-hf-schema")
+    sq4.add_argument("--target-bits", type=float, default=None, help="Target bits for --real-hf-schema --quant-profile gsq-rco")
+    sq4.add_argument("--vision-sidecar", action="store_true", help="Include standalone ViT sidecar vision.amf with --real-hf-schema")
 
     sloop = sub.add_parser(
         "synth-loop",
@@ -852,6 +879,16 @@ def _build_parser() -> argparse.ArgumentParser:
     sds41.add_argument("--cold-experts-per-layer", type=int, default=0, help="Mark last N experts per layer as cold")
     sds41.add_argument("--model-id", default=None, help="Override model identifier stored in .amf header")
     sds41.add_argument("--seed", type=int, default=42, help="Deterministic PRNG seed (default: 42)")
+    sds41.add_argument(
+        "--real-hf-schema",
+        action="store_true",
+        help="Synthesize real-HF DeepSeek-V4.1-Flash-1017 schema ([32,32] MXFP8 + I8/E8M0 MXFP4 + mHC + Engram + 3L DSpark) (W28)",
+    )
+    sds41.add_argument("--quant-profile", choices=QUANT_PROFILES, default="uniform", help="Quantization profile for --real-hf-schema")
+    sds41.add_argument("--target-bits", type=float, default=None, help="Target bits for --real-hf-schema --quant-profile gsq-rco")
+    sds41.add_argument("--target-tier", choices=VALID_TARGET_TIERS, default="auto", help="Target hardware tier check for --real-hf-schema")
+    sds41.add_argument("--encoder-cold-decoder-hot", action="store_true", help="Enable 24gb-m4 encoder-cold / decoder-hot wired policy")
+    sds41.add_argument("--allow-tier-override", action="store_true", help="Bypass ADR-0015 hardware tier rejection")
 
     pds41 = sub.add_parser(
         "pack-deepseek41",
@@ -911,6 +948,24 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Expert partition strategy when --world-size > 1",
     )
     pds41.add_argument("--allow-tier-override", action="store_true", help="Bypass ADR-0015 hardware-tier rejection (expert use)")
+    pds41.add_argument(
+        "--encoder-cold-decoder-hot",
+        action="store_true",
+        help="Tag all Causal Encoder experts cold on NVMe and fit hot Decoder experts inside target tier budget (24gb-m4)",
+    )
+    pds41.add_argument(
+        "--dspark-quant-profile",
+        choices=QUANT_PROFILES,
+        default="uniform",
+        help="Quantization profile for 3L DSpark (uniform or gsq-rco, W28)",
+    )
+    pds41.add_argument(
+        "--dspark-cold-experts-per-layer",
+        type=int,
+        default=None,
+        help="Tag tail N experts per layer in 3L DSpark as cold_expert",
+    )
+    pds41.add_argument("--dspark-config-output", type=pathlib.Path, default=None, help="Optional output path for dspark_config.json")
     pds41.add_argument("--workers", type=int, default=1, help="Worker threads for GSQ+RCO quantization")
     pds41.add_argument("--include-vision", action="store_true", help="Include vision.* + aligner.* tensors (default for full ViT towers, W20)")
     pds41.add_argument("--strip-vision", action="store_true", help="Strip vision.* + aligner.* tensors from output .amf")
@@ -1802,6 +1857,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.ple_output is not None
             or args.ple_shards != 1
             or args.mtp_output is not None
+            or args.mtp_config_output is not None
             or args.loop_adapter_input is not None
             or args.config_output is not None
         )
@@ -1869,8 +1925,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                 ple_output=args.ple_output,
                 ple_shards=args.ple_shards,
                 mtp_output=args.mtp_output,
+                mtp_config_output=args.mtp_config_output,
                 loop_adapter_input=args.loop_adapter_input,
                 config_output=args.config_output,
+                target_tier=args.target_tier,
+                host_ram_gib=args.host_ram_gib,
             )
             metas = rep_q4.metas
             if args.embed_metadata or args.config is not None or args.tokenizer is not None:
@@ -2356,6 +2415,28 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
 
     if args.command == "synth-qwen4":
+        if args.real_hf_schema:
+            rhf_bundle = generate_real_hf_qwen4_synth_bundle(
+                args.output_dir,
+                num_layers=args.num_layers or 4,
+                hidden_size=args.hidden_size or 128,
+                vocab_size=args.vocab_size or 512,
+                num_experts=args.num_experts or 8,
+                num_experts_per_tok=args.top_k or 2,
+                ple_shards=args.ple_shards or 2,
+                ple_rows_per_shard=max(16, (args.ple_rows or 128) // max(1, args.ple_shards or 2)),
+                include_mtp=not args.no_mtp,
+                include_vision_sidecar=args.vision_sidecar,
+                quant_profile=args.quant_profile,
+                target_bits=args.target_bits,
+                seed=args.seed,
+            )
+            print(
+                f"synthesized real-HF qwen4_exp ({len(rhf_bundle.report.metas)} backbone tensors, "
+                f"{len(rhf_bundle.ple_paths)} PLE shard(s), "
+                f"{len(rhf_bundle.report.mtp_metas)} MTP tensors) into {rhf_bundle.amf_path.parent}"
+            )
+            return 0
         cfg = QWEN4_PRESETS[args.preset]
         overrides: dict[str, object] = {}
         if args.num_layers is not None:
@@ -2470,6 +2551,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                 cold_experts_per_layer=args.cold_experts_per_layer,
                 world_size=args.world_size,
                 partition_strategy=args.partition_strategy,
+                real_hf_schema=args.real_hf_schema,
+                target_dtype=args.dtype,
+                quant_profile=args.quant_profile,
+                target_bits=args.target_bits,
+                target_tier=args.target_tier,
+                encoder_cold_decoder_hot=args.encoder_cold_decoder_hot,
+                allow_tier_override=args.allow_tier_override,
             )
         except HardwareTierError as exc:
             print(f"error: {exc}", file=sys.stderr)
@@ -2522,6 +2610,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                 rank_dir=args.rank_dir,
                 partition_strategy=args.partition_strategy,
                 allow_tier_override=args.allow_tier_override,
+                encoder_cold_decoder_hot=args.encoder_cold_decoder_hot,
+                dspark_quant_profile=args.dspark_quant_profile,
+                dspark_cold_experts_per_layer=args.dspark_cold_experts_per_layer,
+                dspark_config_output=args.dspark_config_output,
                 workers=args.workers,
             )
         except HardwareTierError as exc:
@@ -3205,8 +3297,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(
                 f"  index: {rep.total_index_entries} tensors / {rep.shard_file_count} shards ({gib:.2f} GiB raw, "
                 f"est q3 backbone={q3_gib:.2f} GiB); buckets: backbone={rep.backbone_tensor_count}, "
-                f"vision={rep.vision_tensor_count}, ple={rep.ple_tensor_count}, mtp={rep.mtp_tensor_count}, "
-                f"names>47B={len(rep.long_backbone_names)}"
+                f"vision={rep.vision_tensor_count}, ple={rep.ple_tensor_count}, dense_ple={rep.dense_ple_tensor_count}, "
+                f"mtp={rep.mtp_tensor_count}, names>47B={len(rep.long_backbone_names)}, "
+                f"header_summary={'verified' if rep.header_summary_verified else 'index-only'}"
             )
             for tier, info in rep.tier_admission.items():
                 print(
@@ -3232,9 +3325,17 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
             for tier, info in rep.tier_admission.items():
                 status = "FITS" if info["fits_all_wired_q3"] else "EXCEEDS"
+                ecd = info.get("encoder_cold_decoder_hot") if isinstance(info, dict) else None
+                ecd_note = ""
+                if isinstance(ecd, dict):
+                    ecd_note = (
+                        f" (enc_cold+dec_hot={ecd['fits_encoder_cold_decoder_hot']}: "
+                        f"non_exp={ecd['non_expert_q3_gib']} GiB, "
+                        f"dec_hot_frac={float(ecd['decoder_hot_expert_fraction']) * 100.0:.1f}%)"
+                    )
                 print(
                     f"  tier {tier} (ws={info['world_size']}): budget={info['per_rank_budget_gib']} GiB/rank, "
-                    f"q3_wired={info['per_rank_q3_wired_gib']} GiB/rank -> {status}"
+                    f"q3_wired={info['per_rank_q3_wired_gib']} GiB/rank -> {status}{ecd_note}"
                 )
         return 0
 

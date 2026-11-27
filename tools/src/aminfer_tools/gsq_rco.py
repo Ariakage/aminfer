@@ -153,6 +153,21 @@ _ROW_BATCH_SIZE = 128  # multiple of SME2_PANEL_COLS (16); bounds streaming RAM
 _NATIVE_ROW_BATCH_MAX = 1024  # multiple of SME2_PANEL_COLS (16)
 _NATIVE_BATCH_MAX_BYTES = 16 * 1024 * 1024  # <= 16 MiB raw input keeps host RSS < 32 MiB
 _NATIVE_DTYPE_F32 = 0
+
+# W28 GSQ-RCO hardware-tier profile presets for `qwen4_exp` & `deepseek41` (`24gb-m4` / `128gb-max` / `512gb-ultra`).
+GSQ_ARCH_TIER_PROFILES: dict[tuple[str, str], dict[str, object]] = {
+    ("qwen4_exp", "24gb-m4"): {"target_bits": 3.25, "fine_rungs": True, "wired_budget_gib": 18.186, "all_experts_cold_hint": False},
+    ("qwen4_exp", "128gb-max"): {"target_bits": 3.50, "fine_rungs": True, "wired_budget_gib": 96.0, "all_experts_cold_hint": False},
+    ("qwen4_exp", "512gb-ultra"): {"target_bits": 4.25, "fine_rungs": True, "wired_budget_gib": 400.0, "all_experts_cold_hint": False},
+    ("deepseek41", "24gb-m4"): {"target_bits": 3.25, "fine_rungs": True, "wired_budget_gib": 18.186, "encoder_cold_decoder_hot": True},
+    ("deepseek41", "128gb-max"): {"target_bits": 3.50, "fine_rungs": True, "wired_budget_gib": 96.0, "encoder_cold_decoder_hot": False},
+    ("deepseek41", "512gb-ultra"): {"target_bits": 4.25, "fine_rungs": True, "wired_budget_gib": 400.0, "encoder_cold_decoder_hot": False},
+}
+
+
+def resolve_gsq_arch_tier_profile(arch: str, target_tier: str) -> dict[str, object] | None:
+    """Return preset GSQ-RCO target bits & tier hints for `(arch, target_tier)` when defined."""
+    return GSQ_ARCH_TIER_PROFILES.get((arch.lower(), target_tier.lower()))
 _NATIVE_DTYPE_F16 = 1
 _NATIVE_DTYPE_BF16 = 2
 _NATIVE_FLOAT_DTYPES = {
@@ -1996,7 +2011,7 @@ def _role_of_tensor(name: str, kind: TensorKind, *, dense_kda_rco_q3: bool = Fal
         return "norm"
     if (
         kind == TensorKind.ROUTER
-        or lower.endswith((".gate", ".gate.weight", ".gate.bias", ".gate.e_score_correction_bias"))
+        or lower.endswith((".gate", ".gate.weight", ".gate.bias", ".gate.bias_vl", ".gate.e_score_correction_bias"))
         or "router" in lower
     ):
         return "router"
@@ -2019,6 +2034,8 @@ def _role_of_tensor(name: str, kind: TensorKind, *, dense_kda_rco_q3: bool = Fal
         or "_mgate" in lower
         or ".linear_attn.a_proj" in lower
         or ".linear_attn.b_proj" in lower
+        or ".linear_attn.in_proj_a" in lower
+        or ".linear_attn.in_proj_b" in lower
         or ".linear_attn.f_a_proj" in lower
         or ".linear_attn.g_a_proj" in lower
         or is_inkling2_controller_tensor(name)
@@ -2063,6 +2080,7 @@ def _role_of_tensor(name: str, kind: TensorKind, *, dense_kda_rco_q3: bool = Fal
         or "routed_expert_down_proj" in lower
         or ".engram_layer." in lower
         or ".engram." in lower
+        or ".ple." in lower
     ):
         return "latent_moe_proj"
     if is_vision_tensor(name):
@@ -3030,6 +3048,7 @@ class _UnifiedSource:
             eff_mimo_cfg = None
             eff_mimo_tp = 1
             eff_qwen35_cfg = None
+            eff_qwen4_cfg = None
             eff_glm5_cfg = None
             eff_ling3_cfg = None
             if resolved.config_path is not None and resolved.config_path.is_file():
@@ -3041,6 +3060,7 @@ class _UnifiedSource:
                     is_mimo_v2_config,
                     is_qwen35_config,
                 )
+                from aminfer_tools.qwen4_exp import _effective_text_config, is_qwen4_config
 
                 probe_cfg = json.loads(resolved.config_path.read_text(encoding="utf-8"))
                 if isinstance(probe_cfg, dict):
@@ -3053,6 +3073,8 @@ class _UnifiedSource:
                         eff_mimo_tp = infer_mimo_qkv_tp_degree(probe_cfg, raw_tensors)
                     elif is_qwen35_config(probe_cfg):
                         eff_qwen35_cfg = _effective_mimo_cfg(probe_cfg)
+                    elif is_qwen4_config(probe_cfg):
+                        eff_qwen4_cfg = _effective_text_config(probe_cfg)
             planned = plan_amf_entries(
                 raw_tensors,
                 group_size=group_size,
@@ -3067,6 +3089,7 @@ class _UnifiedSource:
                 mimo_config=eff_mimo_cfg,
                 mimo_qkv_tp_degree=eff_mimo_tp,
                 qwen35_config=eff_qwen35_cfg,
+                qwen4_config=eff_qwen4_cfg,
                 glm5_config=eff_glm5_cfg,
                 ling3_config=eff_ling3_cfg,
             )
@@ -4617,6 +4640,10 @@ def gsq_convert(
                     ".linear_attn.a_proj",
                     ".linear_attn.b_proj.weight",
                     ".linear_attn.b_proj",
+                    ".linear_attn.in_proj_a.weight",
+                    ".linear_attn.in_proj_a",
+                    ".linear_attn.in_proj_b.weight",
+                    ".linear_attn.in_proj_b",
                     ".linear_attn.f_a_proj.weight",
                     ".linear_attn.f_a_proj",
                     ".linear_attn.g_a_proj.weight",
@@ -4631,6 +4658,12 @@ def gsq_convert(
                     ".attn.idx.kpool_gate.weight",
                     ".attn.idx.weights_proj",
                     ".attn.idx.weights_proj.weight",
+                    ".attn.idx.qk_proj",
+                    ".attn.idx.qk_proj.weight",
+                    ".ple.conv1d",
+                    ".ple.conv1d.weight",
+                    ".engram.q_weight",
+                    ".engram.k_weight",
                 )
             )
             is_ctrl = is_inkling2_controller_tensor(t.name) and t.layer != NO_LAYER

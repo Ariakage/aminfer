@@ -26,9 +26,11 @@ from __future__ import annotations
 import json
 import os
 import pathlib
+import random
 import re
 import struct
-from collections.abc import Iterable, Sequence
+import tempfile
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 
 from aminfer_tools import APPLE_PAGE_SIZE
@@ -68,6 +70,7 @@ from aminfer_tools.amf import (
     f16_bytes_to_bf16_bytes,
     f16_bytes_to_f32_list,
     f32_bytes_to_f32_list,
+    normalize_vision_name,
     VISION_BLOCK_DTYPES,
     extract_vision_config_summary,
     gsq_convert_with_vision,
@@ -183,8 +186,76 @@ class LoopScheduleConfig:
         }
 
 
+QWEN4_HC_COMPACT_MAP: tuple[tuple[str, str], ...] = (
+    ("hyper_connection_mixer.", "hc_mixer."),
+    (".attn_hyper_connection.", ".attn_hc."),
+    (".mlp_hyper_connection.", ".mlp_hc."),
+    (".input_mix_weight_down.", ".in_mix_dn."),
+    (".input_mix_weight_up.", ".in_mix_up."),
+    (".block_inject_weight.", ".blk_inj."),
+)
+
+QWEN4_IDX_COMPACT_MAP: tuple[tuple[str, str], ...] = (
+    (".self_attn.indexer.index_qk_proj.", ".attn.idx.qk_proj."),
+    (".self_attn.indexer.q_layernorm.", ".attn.idx.q_norm."),
+    (".self_attn.indexer.k_layernorm.", ".attn.idx.k_norm."),
+    (".self_attn.indexer.", ".attn.idx."),
+)
+
+QWEN4_PLE_COMPACT_MAP: tuple[tuple[str, str], ...] = (
+    (".ple.ple_embedding.layer_multipliers", ".ple.layer_mult"),
+    (".ple.ple_embedding.ngram_heads_offsets", ".ple.ngram_offsets"),
+    (".ple.ple_embedding.ngram_heads_vocab_sizes", ".ple.ngram_vocabs"),
+)
+
+QWEN4_GDN_COMPACT_MAP: tuple[tuple[str, str], ...] = (
+    (".linear_attn.in_proj_z.", ".linear_attn.g_proj."),
+    (".linear_attn.out_proj.", ".linear_attn.o_proj."),
+    (".linear_attn.in_proj_a.", ".linear_attn.a_proj."),
+    (".linear_attn.in_proj_b.", ".linear_attn.b_proj."),
+)
+
+_DENSE_PLE_MARKERS: tuple[str, ...] = (
+    ".ple.conv1d",
+    ".ple.key_proj",
+    ".ple.value_proj",
+    ".ple.norm_conv",
+    ".ple.norm_key",
+    ".ple.norm_query",
+    ".ple.layer_mult",
+    ".ple.ngram_offsets",
+    ".ple.ngram_vocabs",
+    ".ple.ple_embedding.layer_multipliers",
+    ".ple.ple_embedding.ngram_heads_offsets",
+    ".ple.ple_embedding.ngram_heads_vocab_sizes",
+)
+
+
+def is_qwen4_config(config: Mapping[str, object] | None) -> bool:
+    """Return True if `config` describes a `qwen4_exp` (`Qwen3.8-Flash-Next`) checkpoint."""
+    if not isinstance(config, Mapping):
+        return False
+    mt = str(config.get("model_type") or "").lower()
+    tc = config.get("text_config")
+    tc_mt = str(tc.get("model_type") or "").lower() if isinstance(tc, Mapping) else ""
+    if mt in ("qwen4_exp", "qwen4_exp_text") or tc_mt in ("qwen4_exp", "qwen4_exp_text"):
+        return True
+    archs = config.get("architectures")
+    if isinstance(archs, list) and any("qwen4exp" in str(a).lower() for a in archs):
+        return True
+    return False
+
+
+def is_dense_ple_tensor(raw_name: str) -> bool:
+    """Return True for wired dense PLE conditioning weights/buffers (kept in `model.amf`)."""
+    norm = _strip_model_prefix(raw_name).lower()
+    return ".ple." in norm and any(tok in norm for tok in _DENSE_PLE_MARKERS)
+
+
 def is_ple_tensor(raw_name: str) -> bool:
     """Return True if `raw_name` is an external PLE / Engram sparse lookup table."""
+    if is_dense_ple_tensor(raw_name):
+        return False
     norm = _strip_model_prefix(raw_name).lower()
     return (
         norm.startswith("ple.")
@@ -193,6 +264,23 @@ def is_ple_tensor(raw_name: str) -> bool:
         or ".engram." in norm
         or norm.startswith("sparse_table.")
     )
+
+
+def normalize_qwen4_tensor_name(raw_name: str, *, mtp_standalone: bool = False) -> str:
+    """Normalize a `qwen4_exp` (`Qwen3.8-Flash-Next`) name deterministically to `<= 47 B` `.amf` form."""
+    if is_vision_tensor(raw_name):
+        return normalize_vision_name(raw_name)
+    if is_ple_tensor(raw_name):
+        return normalize_ple_name(raw_name)
+    name = strip_mtp_prefix(raw_name) if mtp_standalone else _strip_model_prefix(raw_name)
+    for suf in (".scales", ".biases", ".weight_packed", ".weight_scale", ".weight_scale_inv"):
+        if name.endswith(suf):
+            name = name[: -len(suf)] + ".weight"
+            break
+    for mapping in (QWEN4_GDN_COMPACT_MAP, QWEN4_HC_COMPACT_MAP, QWEN4_IDX_COMPACT_MAP, QWEN4_PLE_COMPACT_MAP):
+        for src_seg, dst_seg in mapping:
+            name = name.replace(src_seg, dst_seg)
+    return name
 
 
 def is_mtp_tensor(raw_name: str) -> bool:
@@ -344,9 +432,15 @@ def pack_ple_shards_from_safetensors(
                 )
             )
 
-    for name in sorted(ple_tensors):
-        if name in consumed:
-            continue
+    unconsumed = [name for name in sorted(ple_tensors) if name not in consumed]
+    presharded_pairs: list[tuple[int, str]] = []
+    for name in unconsumed:
+        sm = _PLE_SHARD_RE.search(_strip_model_prefix(name))
+        if sm is not None:
+            presharded_pairs.append((int(sm.group(1)), name))
+    use_presharded = len(unconsumed) > 1 and len(presharded_pairs) == len(unconsumed) and num_shards <= len(presharded_pairs)
+
+    for idx_in_list, name in enumerate(unconsumed):
         t = ple_tensors[name]
         if len(t.shape) != 2:
             raise ValueError(f"PLE tensor {name!r} must be 2D [num_rows, embed_dim], got {t.shape}")
@@ -354,6 +448,36 @@ def pack_ple_shards_from_safetensors(
         n_rows, embed_dim = t.shape
         m = _PLE_LAYER_RE.search(_strip_model_prefix(name))
         layer = int(m.group(1)) if m else 0
+        if use_presharded:
+            orig_s, _ = presharded_pairs[idx_in_list]
+            s_idx = orig_s % num_shards if num_shards > 1 else 0
+            entry_name = normalize_ple_name(name, shard_idx=orig_s, quantized=False)
+            d_rng = _slice_row_byte_range(t, 0, n_rows)
+            data_bytes = d_rng.length
+            blob_bytes = _align_up(max(data_bytes, 1), APPLE_PAGE_SIZE)
+            per_shard_entries[s_idx].append(
+                _PlannedEntry(
+                    name=entry_name,
+                    kind=TensorKind.SPARSE_TABLE,
+                    dtype=amf_dtype,
+                    quant_bits=0,
+                    group_size=0,
+                    layer=layer,
+                    expert=NO_EXPERT,
+                    shape=(n_rows, embed_dim),
+                    data=d_rng,
+                    data_convert=convert,
+                    scales=None,
+                    biases=None,
+                    data_bytes=data_bytes,
+                    params_offset=0,
+                    params_bytes=0,
+                    blob_bytes=blob_bytes,
+                    layout=TensorLayout.ROW_MAJOR,
+                    quant_param_kind=QuantParamKind.AFFINE_SCALE_BIAS,
+                )
+            )
+            continue
         ranges = _split_row_ranges(n_rows, num_shards)
         for s_idx, (r0, r1) in enumerate(ranges):
             cnt = r1 - r0
@@ -650,21 +774,27 @@ def infer_operator_axes_and_loop_schedule(
 
     has_linear_attn = any(".linear_attn." in nm for nm in names)
     has_qsa_idx = (
-        any(".idx_wq" in nm or ".idx_wk" in nm or ".qsa_" in nm or ".self_attn.indexer." in nm for nm in names)
+        any(
+            ".idx_wq" in nm or ".idx_wk" in nm or ".qsa_" in nm or ".self_attn.indexer." in nm or ".attn.idx." in nm
+            for nm in names
+        )
         or int(cfg.get("indexer_n_heads", 0) or 0) > 0
     )
     has_gr = (
-        any(".gr." in nm or "hyper_connection" in nm for nm in names)
+        any(
+            ".gr." in nm or "hyper_connection" in nm or ".attn_hc." in nm or ".mlp_hc." in nm or "hc_mixer." in nm
+            for nm in names
+        )
         or int(cfg.get("hc_count", 0) or 0) >= 2
     )
     has_shared_expert = (
-        any(".shared_expert." in nm or ".shared_experts." in nm for nm in names)
+        any(".shared_expert." in nm or ".shared_experts." in nm or ".shared_expert_gate" in nm for nm in names)
         or int(cfg.get("shared_expert_intermediate_size", 0) or 0) > 0
     )
     has_moe = any(".mlp.experts." in nm or ".mlp.gate" in nm for nm in names) or int(cfg.get("num_experts", 0) or 0) > 0
     has_ple = (
         ple_shard_count > 0
-        or any(is_ple_tensor(nm) for nm in names)
+        or any(is_ple_tensor(nm) or is_dense_ple_tensor(nm) for nm in names)
         or bool(cfg.get("ple_layer_ids"))
         or int(cfg.get("ngram_vocab_size_base", 0) or 0) > 0
     )
@@ -824,6 +954,7 @@ class Qwen4PackReport:
     vision_amf_path: pathlib.Path | None = None
     vision_metas: list[PackedTensorMeta] = field(default_factory=list)
     included_vision_tensors: int = 0
+    mtp_config_path: pathlib.Path | None = None
 
 
 def _write_backbone_with_adapters(
@@ -999,6 +1130,10 @@ def pack_qwen4_checkpoint(
     loop_adapter_input: pathlib.Path | None = None,
     force_zero_r0_alpha: bool = False,
     config_output: pathlib.Path | None = None,
+    mtp_config_output: pathlib.Path | None = None,
+    target_tier: str = "auto",
+    host_ram_gib: float | None = None,
+    split_stacked_gate_up: bool | None = None,
 ) -> Qwen4PackReport:
     """Import a `qwen4_exp` / `Qwen3.8` / `Qwen3-VL` or native/adapter-extended `LoopLM` safetensors checkpoint.
 
@@ -1039,6 +1174,32 @@ def pack_qwen4_checkpoint(
             src_config = loaded
 
     all_tensors = _collect_tensors(resolved.shard_paths)
+    has_real_hf_q4_keys = any(
+        (
+            ".attn_hyper_connection." in k
+            or ".mlp_hyper_connection." in k
+            or "hyper_connection_mixer." in k
+            or ".linear_attn.in_proj_" in k
+            or ".mlp.experts.gate_up_proj" in k
+            or ".self_attn.indexer." in k
+            or is_dense_ple_tensor(k)
+        )
+        for k in all_tensors
+    )
+    eff_qwen4_cfg: dict[str, object] | None = (
+        _effective_text_config(src_config) if (is_qwen4_config(src_config) or has_real_hf_q4_keys) else None
+    )
+    eff_split_gate_up = True if split_stacked_gate_up is None else bool(split_stacked_gate_up)
+    eff_target_bits = target_bits
+    if quant_profile == "gsq-rco" and eff_target_bits is None and target_tier != "auto":
+        tier_bits_map = {
+            "24gb-m4": 3.25,
+            "128gb-max": 3.50,
+            "512gb-ultra": 4.25,
+        }
+        if target_tier in tier_bits_map:
+            eff_target_bits = tier_bits_map[target_tier]
+    _ = host_ram_gib  # Reserved for tier-guided GSQ admission policies.
     vision_mode = resolve_vision_mode(
         all_tensors.keys(),
         include_vision=include_vision,
@@ -1117,6 +1278,7 @@ def pack_qwen4_checkpoint(
 
     # Pack MTP draft head when MTP tensors exist.
     mtp_path: pathlib.Path | None = None
+    mtp_cfg_out_path: pathlib.Path | None = None
     mtp_metas: list[PackedTensorMeta] = []
     if mtp_tensors:
         eff_mtp_out = pathlib.Path(mtp_output) if mtp_output is not None else out_path.with_name(out_path.stem + "-mtp.amf")
@@ -1138,6 +1300,9 @@ def pack_qwen4_checkpoint(
             tie_word_embeddings=False,
             sme2_pack=sme2_pack,
             strip_vision=False,
+            qwen4_config=eff_qwen4_cfg,
+            qwen4_mtp_standalone=True,
+            split_stacked_gate_up=eff_split_gate_up,
         )
         readers_mtp = _ShardReaders()
         try:
@@ -1153,6 +1318,39 @@ def pack_qwen4_checkpoint(
         finally:
             readers_mtp.close()
         mtp_path = eff_mtp_out
+        if mtp_config_output is not None or config_output is not None or mtp_output is not None:
+            mtp_cfg_out_path = (
+                pathlib.Path(mtp_config_output)
+                if mtp_config_output is not None
+                else eff_mtp_out.with_name(
+                    "mtp_config.json" if eff_mtp_out.name == "mtp.amf" else f"{eff_mtp_out.stem}_config.json"
+                )
+            )
+            eff_tc = eff_qwen4_cfg if eff_qwen4_cfg is not None else _effective_text_config(src_config)
+            mtp_cfg_obj = {
+                "draft_format": "qwen4_exp_mtp",
+                "amf_file": mtp_path.name,
+                "num_hidden_layers": int(eff_tc.get("mtp_num_hidden_layers", 1) or 1),
+                "hidden_size": int(eff_tc.get("hidden_size", 0) or 0),
+                "vocab_size": int(eff_tc.get("vocab_size", 0) or 0),
+                "num_attention_heads": int(eff_tc.get("num_attention_heads", 0) or 0),
+                "num_key_value_heads": int(eff_tc.get("num_key_value_heads", 0) or 0),
+                "head_dim": int(eff_tc.get("head_dim", 0) or 0),
+                "hc_count": int(eff_tc.get("hc_count", 4) or 4),
+                "hc_lowrank": int(eff_tc.get("hc_lowrank", 0) or 0),
+                "output_gate_type": str(eff_tc.get("output_gate_type", "sigmoid") or "sigmoid"),
+                "indexer_n_heads": int(eff_tc.get("indexer_n_heads", 0) or 0),
+                "indexer_kv_heads": int(eff_tc.get("indexer_kv_heads", 1) or 1),
+                "indexer_head_dim": int(eff_tc.get("indexer_head_dim", 0) or 0),
+                "num_experts": int(eff_tc.get("num_experts", 0) or 0),
+                "num_experts_per_tok": int(eff_tc.get("num_experts_per_tok", 0) or 0),
+                "moe_intermediate_size": int(eff_tc.get("moe_intermediate_size", 0) or 0),
+                "shared_expert_intermediate_size": int(eff_tc.get("shared_expert_intermediate_size", 0) or 0),
+                "tensor_count": len(mtp_metas),
+                "tensor_names_max_bytes": max((len(m.name.encode("utf-8")) for m in mtp_metas), default=0),
+            }
+            mtp_cfg_out_path.parent.mkdir(parents=True, exist_ok=True)
+            mtp_cfg_out_path.write_text(json.dumps(mtp_cfg_obj, indent=2) + "\n", encoding="utf-8")
 
     # Prepare loop adapters (validates r=0 alpha == 0.0 and packs into sme2_panel64).
     readers = _ShardReaders()
@@ -1184,7 +1382,7 @@ def pack_qwen4_checkpoint(
                 sme2_pack=sme2_pack,
                 lut16_sme2=lut16_sme2,
                 quant_profile="gsq-rco",
-                target_bits=target_bits,
+                target_bits=eff_target_bits,
                 use_rco=use_rco,
                 manifest_path=manifest_path,
                 workers=workers,
@@ -1192,6 +1390,8 @@ def pack_qwen4_checkpoint(
                 include_vision=(vision_mode == "include"),
                 vision_block_dtype=vision_block_dtype,
                 stats_out=stats_map,
+                qwen4_config=eff_qwen4_cfg,
+                split_stacked_gate_up=eff_split_gate_up,
             )
             if vision_mode == "strip":
                 stripped_vision = stats_map.get("stripped_vision_tensors", stripped_vision)
@@ -1207,6 +1407,8 @@ def pack_qwen4_checkpoint(
                 exclude_tensors=exclude_tensors,
                 sme2_pack=eff_sme2,
                 strip_vision=False,
+                qwen4_config=eff_qwen4_cfg,
+                split_stacked_gate_up=eff_split_gate_up,
             )
             metas = _write_backbone_with_adapters(
                 backbone_plan,
@@ -1221,7 +1423,7 @@ def pack_qwen4_checkpoint(
                 metas = gsq_convert_with_vision(
                     out_path,
                     out_path,
-                    target_bits=target_bits,
+                    target_bits=eff_target_bits,
                     model_id=model_id,
                     group_size=group_size,
                     dtype_mode=dtype_mode,
@@ -1237,6 +1439,8 @@ def pack_qwen4_checkpoint(
                     include_vision=(vision_mode == "include"),
                     strip_vision=(vision_mode != "include"),
                     vision_block_dtype=vision_block_dtype,
+                    qwen4_config=eff_qwen4_cfg,
+                    split_stacked_gate_up=eff_split_gate_up,
                 )
     finally:
         readers.close()
@@ -1265,22 +1469,60 @@ def pack_qwen4_checkpoint(
             vis_summary = extract_vision_config_summary(metas, src_config=src_config)
             vis_summary["mode"] = "embedded"
             out_cfg["vision"] = vis_summary
-        if ple_paths:
+        if ple_paths or any(is_dense_ple_tensor(k) for k in backbone_tensors):
             ple_meta0 = ple_metas[0][0] if ple_metas and ple_metas[0] else None
-            total_ple_rows = sum(m.shape[0] for sm in ple_metas for m in sm if m.layer == (ple_meta0.layer if ple_meta0 else 0))
-            out_cfg["ple"] = {
+            total_ple_rows = sum(
+                m.shape[0]
+                for sm in ple_metas
+                for m in sm
+                if ple_meta0 is not None and m.layer == ple_meta0.layer
+            )
+            eff_tc = eff_qwen4_cfg if eff_qwen4_cfg is not None else _effective_text_config(src_config)
+            ple_obj: dict[str, object] = {
                 "num_shards": len(ple_paths),
                 "shard_files": [p.name for p in ple_paths],
                 "num_rows": total_ple_rows,
-                "embed_dim": ple_meta0.shape[1] if ple_meta0 else 0,
+                "embed_dim": ple_meta0.shape[1] if ple_meta0 else int(eff_tc.get("ple_embed_dim", 0) or 0),
                 "dtype": ple_meta0.dtype.name.lower() if ple_meta0 else "f16",
-                "ngram_order": int(src_config.get("ple_ngram_order", 2) or 2),
+                "ngram_order": int(eff_tc.get("ple_ngram_order", src_config.get("ple_ngram_order", 2)) or 2),
+                "ple_layer_ids": list(eff_tc.get("ple_layer_ids", []))
+                if isinstance(eff_tc.get("ple_layer_ids"), list)
+                else [],
+                "dense_conditioning": any(is_dense_ple_tensor(k) for k in backbone_tensors),
             }
+            # Preserve exact 64-bit PLE primes / offsets / vocab sizes in config.json alongside U32x2 AMF entries.
+            i64_readers = _ShardReaders()
+            try:
+                for raw_name, st in backbone_tensors.items():
+                    if st.dtype == "I64" and len(st.shape) == 1 and is_dense_ple_tensor(raw_name):
+                        raw_i64 = _read_exact(i64_readers.get(st.path), st.offset, st.length)
+                        vals_i64 = list(struct.unpack(f"<{st.shape[0]}q", raw_i64))
+                        if raw_name.endswith("layer_multipliers"):
+                            ple_obj["layer_multipliers"] = vals_i64
+                        elif raw_name.endswith("ngram_heads_offsets"):
+                            ple_obj["ngram_heads_offsets"] = vals_i64
+                        elif raw_name.endswith("ngram_heads_vocab_sizes"):
+                            ple_obj["ngram_heads_vocab_sizes"] = vals_i64
+            finally:
+                i64_readers.close()
+            out_cfg["ple"] = ple_obj
+        if eff_qwen4_cfg is not None:
+            og_t = str(eff_qwen4_cfg.get("output_gate_type") or "").lower()
+            out_cfg.setdefault("attn_output_gate", bool(eff_qwen4_cfg.get("attn_output_gate", False)) or og_t == "sigmoid")
+            if eff_qwen4_cfg.get("hc_count") is not None:
+                out_cfg.setdefault("hc_count", eff_qwen4_cfg["hc_count"])
+            if eff_qwen4_cfg.get("hc_lowrank") is not None:
+                out_cfg.setdefault("hc_lowrank", eff_qwen4_cfg["hc_lowrank"])
+            if eff_qwen4_cfg.get("mamba_ssm_dtype") is not None:
+                out_cfg.setdefault("mamba_ssm_dtype", eff_qwen4_cfg["mamba_ssm_dtype"])
         if mtp_path is not None:
-            out_cfg["mtp"] = {
+            mtp_entry_cfg: dict[str, object] = {
                 "amf_file": mtp_path.name,
                 "tensor_count": len(mtp_metas),
             }
+            if mtp_cfg_out_path is not None:
+                mtp_entry_cfg["config_file"] = mtp_cfg_out_path.name
+            out_cfg["mtp"] = mtp_entry_cfg
         cfg_out_path.parent.mkdir(parents=True, exist_ok=True)
         cfg_out_path.write_text(json.dumps(out_cfg, indent=2) + "\n", encoding="utf-8")
 
@@ -1299,6 +1541,7 @@ def pack_qwen4_checkpoint(
         vision_amf_path=vision_amf_path,
         vision_metas=vision_metas,
         included_vision_tensors=included_vision,
+        mtp_config_path=mtp_cfg_out_path,
     )
 
 
@@ -1351,6 +1594,9 @@ class Qwen4MetadataReport:
     loop_schedule: LoopScheduleConfig
     tier_admission: dict[str, dict[str, object]]
     tokenizer_present: bool
+    dense_ple_tensor_count: int = 0
+    header_summary_verified: bool = False
+    header_summary_notes: tuple[str, ...] = ()
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -1385,6 +1631,7 @@ class Qwen4MetadataReport:
                 "backbone": self.backbone_tensor_count,
                 "vision_strippable": self.vision_tensor_count,
                 "ple_nvme_table": self.ple_tensor_count,
+                "ple_dense_conditioning": self.dense_ple_tensor_count,
                 "mtp_draft_head": self.mtp_tensor_count,
                 "loop_adapter": self.loop_adapter_tensor_count,
                 "stacked_experts": self.stacked_expert_tensor_count,
@@ -1403,6 +1650,8 @@ class Qwen4MetadataReport:
             "loop_schedule": self.loop_schedule.to_dict(),
             "tier_admission": self.tier_admission,
             "tokenizer_present": self.tokenizer_present,
+            "header_summary_verified": self.header_summary_verified,
+            "header_summary_notes": list(self.header_summary_notes),
         }
 
 
@@ -1484,6 +1733,7 @@ def validate_hf_metadata_dir(
 
     vision_cnt = 0
     ple_cnt = 0
+    dense_ple_cnt = 0
     mtp_cnt = 0
     loop_cnt = 0
     backbone_names: list[str] = []
@@ -1508,20 +1758,37 @@ def validate_hf_metadata_dir(
             continue
         if is_mtp_tensor(raw_name):
             mtp_cnt += 1
+            mtp_norm = normalize_qwen4_tensor_name(raw_name, mtp_standalone=True)
+            if len(mtp_norm.encode("utf-8")) > 47:
+                long_names.append(f"mtp:{mtp_norm}")
             continue
         if is_loop_adapter_tensor(raw_name):
             loop_cnt += 1
             continue
-        norm = _strip_model_prefix(raw_name)
+        if is_dense_ple_tensor(raw_name):
+            dense_ple_cnt += 1
+        norm = normalize_qwen4_tensor_name(raw_name)
         backbone_names.append(norm)
         if len(norm.encode("utf-8")) > 47:
             long_names.append(norm)
         lower = norm.lower()
+        raw_lower = raw_name.lower()
         if ".linear_attn." in lower:
             gdn_cnt += 1
-        if ".self_attn.indexer." in lower or ".idx_wq" in lower or ".idx_wk" in lower:
+        if (
+            ".self_attn.indexer." in raw_lower
+            or ".attn.idx." in lower
+            or ".idx_wq" in lower
+            or ".idx_wk" in lower
+        ):
             qsa_idx_cnt += 1
-        if "hyper_connection" in lower or ".gr." in lower:
+        if (
+            "hyper_connection" in raw_lower
+            or ".attn_hc." in lower
+            or ".mlp_hc." in lower
+            or lower.startswith("hc_mixer.")
+            or ".gr." in lower
+        ):
             hc_cnt += 1
         if ".shared_expert." in lower or ".shared_experts." in lower or "shared_expert_gate" in lower:
             shared_exp_cnt += 1
@@ -1607,6 +1874,65 @@ def validate_hf_metadata_dir(
             "mode": mode,
         }
 
+    summary_verified = False
+    summary_notes: list[str] = []
+    summary_path = base / "safetensors_headers_summary.json"
+    if summary_path.is_file():
+        sum_obj = json.loads(summary_path.read_text(encoding="utf-8"))
+        pat_map = sum_obj.get("pattern_summary") if isinstance(sum_obj, dict) else None
+        if isinstance(pat_map, dict) and pat_map:
+            if len(shard_files) != int(sum_obj.get("total_shards", len(shard_files)) or len(shard_files)):
+                raise ValueError(
+                    f"safetensors_headers_summary total_shards mismatch: {sum_obj.get('total_shards')} vs {len(shard_files)}"
+                )
+            hc_lr_cfg = int(cfg.get("hc_lowrank", 0) or 0)
+            og_sigmoid = str(cfg.get("output_gate_type") or "").lower() == "sigmoid" or bool(
+                cfg.get("attn_output_gate", False)
+            )
+            for pat_k, pat_v in pat_map.items():
+                if not isinstance(pat_v, dict):
+                    continue
+                shp = pat_v.get("shape")
+                dt_s = pat_v.get("dtype")
+                if not isinstance(shp, list):
+                    continue
+                if pat_k.endswith("hyper_connection_mixer.hc_norm.weight") and hidden_size > 0:
+                    exp = [hc_count * hidden_size]
+                    if shp != exp:
+                        raise ValueError(f"{pat_k} shape {shp} != expected {exp}")
+                elif pat_k.endswith("hyper_connection_mixer.input_mix_weight_down.weight") and hc_lr_cfg > 0:
+                    exp = [hc_lr_cfg, hc_count * hidden_size]
+                    if shp != exp:
+                        raise ValueError(f"{pat_k} shape {shp} != expected {exp}")
+                elif pat_k.endswith(".attn_hyper_connection.block_inject_weight.weight") and hidden_size > 0:
+                    exp = [hc_count, hc_count * hidden_size]
+                    if shp != exp:
+                        raise ValueError(f"{pat_k} shape {shp} != expected {exp}")
+                elif ".self_attn.q_proj.weight" in pat_k and num_heads > 0 and head_dim > 0 and "mtp." not in pat_k:
+                    exp_rows = (2 if og_sigmoid else 1) * num_heads * head_dim
+                    if shp != [exp_rows, hidden_size]:
+                        raise ValueError(f"{pat_k} shape {shp} != expected {[exp_rows, hidden_size]}")
+                elif pat_k.endswith(".ple.conv1d.weight"):
+                    if len(shp) != 3 or shp[1] != 1:
+                        raise ValueError(f"{pat_k} expected 3D [C, 1, K], got {shp}")
+                elif pat_k.endswith(
+                    (
+                        ".ple_embedding.layer_multipliers",
+                        ".ple_embedding.ngram_heads_offsets",
+                        ".ple_embedding.ngram_heads_vocab_sizes",
+                    )
+                ):
+                    if dt_s != "I64":
+                        raise ValueError(f"{pat_k} expected I64, got {dt_s}")
+                elif pat_k.endswith(".mlp.experts.gate_up_proj") and num_experts > 0 and moe_i > 0:
+                    exp = [num_experts, 2 * moe_i, hidden_size]
+                    if shp != exp:
+                        raise ValueError(f"{pat_k} shape {shp} != expected {exp}")
+            summary_verified = True
+            summary_notes.append(
+                f"verified {len(pat_map)} patterns across {sum_obj.get('total_keys', len(weight_map))} tensors"
+            )
+
     raw_archs = raw_cfg.get("architectures")
     archs = tuple(str(a) for a in raw_archs) if isinstance(raw_archs, list) else ()
     return Qwen4MetadataReport(
@@ -1655,4 +1981,286 @@ def validate_hf_metadata_dir(
         loop_schedule=ls,
         tier_admission=tier_admission,
         tokenizer_present=(base / "tokenizer.json").is_file(),
+        dense_ple_tensor_count=dense_ple_cnt,
+        header_summary_verified=summary_verified,
+        header_summary_notes=tuple(summary_notes),
+    )
+
+
+@dataclass(frozen=True)
+class Qwen4RealHfSynthBundle:
+    """Deterministic real-HF-schema `qwen4_exp` synthetic bundle produced via `pack_qwen4_checkpoint`."""
+
+    amf_path: pathlib.Path
+    ple_paths: list[pathlib.Path]
+    mtp_path: pathlib.Path | None
+    mtp_config_path: pathlib.Path | None
+    vision_path: pathlib.Path | None
+    config_path: pathlib.Path
+    tokenizer_path: pathlib.Path
+    report: Qwen4PackReport
+
+
+def _write_simple_safetensors(path: pathlib.Path, tensors: dict[str, tuple[str, tuple[int, ...], bytes]]) -> None:
+    hdr: dict[str, object] = {}
+    cur = 0
+    chunks: list[bytes] = []
+    for nm, (dt, shp, raw) in tensors.items():
+        hdr[nm] = {"dtype": dt, "shape": list(shp), "data_offsets": [cur, cur + len(raw)]}
+        chunks.append(raw)
+        cur += len(raw)
+    hb = json.dumps(hdr, separators=(",", ":")).encode("utf-8")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("wb") as fh:
+        fh.write(struct.pack("<Q", len(hb)))
+        fh.write(hb)
+        for c in chunks:
+            fh.write(c)
+
+
+def _det_bf16_bytes(rng: random.Random, count: int, scale: float = 0.08) -> bytes:
+    u16s = []
+    for _ in range(count):
+        v = (rng.random() * 2.0 - 1.0) * scale
+        u32 = struct.unpack("<I", struct.pack("<f", v))[0]
+        u16s.append((u32 >> 16) & 0xFFFF)
+    return struct.pack(f"<{count}H", *u16s)
+
+
+def _det_f32_bytes(rng: random.Random, count: int, lo: float = -0.5, hi: float = 0.5) -> bytes:
+    return struct.pack(f"<{count}f", *(lo + rng.random() * (hi - lo) for _ in range(count)))
+
+
+def generate_real_hf_qwen4_synth_bundle(
+    output_dir: pathlib.Path,
+    *,
+    num_layers: int = 4,
+    hidden_size: int = 128,
+    vocab_size: int = 512,
+    num_experts: int = 8,
+    num_experts_per_tok: int = 2,
+    moe_intermediate_size: int = 64,
+    shared_expert_intermediate_size: int = 64,
+    hc_count: int = 4,
+    hc_lowrank: int = 16,
+    ple_shards: int = 2,
+    ple_rows_per_shard: int = 64,
+    ple_embed_dim: int = 64,
+    include_mtp: bool = True,
+    include_vision_sidecar: bool = False,
+    quant_profile: str = "uniform",
+    target_bits: float | None = None,
+    seed: int = 42,
+) -> Qwen4RealHfSynthBundle:
+    """Synthesize a real-HF schema `Qwen4ExpForConditionalGeneration` checkpoint and pack it to `.amf`.
+
+    Exercises:
+    - `hc_count=4` `attn_hyper_connection`, `mlp_hyper_connection`, and `hyper_connection_mixer` (`<= 47 B`)
+    - 3:1 `linear_attention` (`in_proj_qkv` split + `in_proj_z/a/b` + `out_proj` + `F32` SSM) : `full_attention`
+    - QSA `self_attn.q_proj` doubled output-gate (`output_gate_type='sigmoid'`) + `self_attn.indexer.*`
+    - Dense PLE conditioning (`conv1d`, `key_proj`, `value_proj`, `norm_*`, `I64` multipliers/offsets/vocabs) in backbone + external `ngram_embedding.shard_*` in `SPARSE_TABLE` `.amf`
+    - 3D stacked `mlp.experts.{gate_up_proj,down_proj}` + `shared_expert_gate.weight`
+    - Standalone 1L real-HF `mtp.amf` + `mtp_config.json`
+    """
+    from aminfer_tools.synth import QWEN4_PRESETS, build_qwen3_tokenizer_dict
+
+    out = pathlib.Path(output_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    rng = random.Random(seed)
+    h = hidden_size
+    n_heads = 4
+    n_kv = 2
+    hd = 32
+    lin_kh = 2
+    lin_kd = 32
+    lin_vh = 4
+    lin_vd = 32
+    kq = lin_kh * lin_kd
+    vd = lin_vh * lin_vd
+    idx_heads = 2
+    idx_kv = 1
+    idx_hd = 32
+    ple_layer_ids = [min(2, num_layers)] if num_layers >= 1 else [1]
+    ple_src_l = ple_layer_ids[0] - 1
+
+    layer_types = ["full_attention" if (i + 1) % 4 == 0 else "linear_attention" for i in range(num_layers)]
+    cfg = {
+        "model_type": "qwen4_exp",
+        "architectures": ["Qwen4ExpForConditionalGeneration"],
+        "text_config": {
+            "model_type": "qwen4_exp_text",
+            "vocab_size": vocab_size,
+            "hidden_size": h,
+            "num_hidden_layers": num_layers,
+            "layer_types": layer_types,
+            "full_attention_interval": 4,
+            "num_attention_heads": n_heads,
+            "num_key_value_heads": n_kv,
+            "head_dim": hd,
+            "output_gate_type": "sigmoid",
+            "partial_rotary_factor": 0.25,
+            "linear_num_key_heads": lin_kh,
+            "linear_key_head_dim": lin_kd,
+            "linear_num_value_heads": lin_vh,
+            "linear_value_head_dim": lin_vd,
+            "linear_conv_kernel_dim": 4,
+            "mamba_ssm_dtype": "float32",
+            "indexer_n_heads": idx_heads,
+            "indexer_kv_heads": idx_kv,
+            "indexer_head_dim": idx_hd,
+            "indexer_compress_ratio": 4,
+            "indexer_budget": 64,
+            "hc_count": hc_count,
+            "hc_lowrank": hc_lowrank,
+            "num_experts": num_experts,
+            "num_experts_per_tok": num_experts_per_tok,
+            "moe_intermediate_size": moe_intermediate_size,
+            "shared_expert_intermediate_size": shared_expert_intermediate_size,
+            "ple_layer_ids": ple_layer_ids,
+            "ple_embed_dim": ple_embed_dim,
+            "split_ngram_parts": ple_shards,
+            "mtp_num_hidden_layers": 1 if include_mtp else 0,
+            "tie_word_embeddings": False,
+            "rms_norm_eps": 1e-6,
+        },
+    }
+    if include_vision_sidecar:
+        cfg["vision_config"] = {
+            "model_type": "qwen4_exp",
+            "depth": 1,
+            "hidden_size": 64,
+            "intermediate_size": 128,
+            "num_heads": 2,
+            "out_hidden_size": h,
+            "patch_size": 16,
+            "temporal_patch_size": 2,
+            "spatial_merge_size": 2,
+        }
+
+    tensors: dict[str, tuple[str, tuple[int, ...], bytes]] = {}
+    p_lm = "model.language_model"
+    tensors[f"{p_lm}.embed_tokens.weight"] = ("BF16", (vocab_size, h), _det_bf16_bytes(rng, vocab_size * h))
+    tensors["lm_head.weight"] = ("BF16", (vocab_size, h), _det_bf16_bytes(rng, vocab_size * h))
+    tensors[f"{p_lm}.norm.weight"] = ("BF16", (h,), _det_bf16_bytes(rng, h, 0.25))
+    tensors[f"{p_lm}.hyper_connection_mixer.hc_norm.weight"] = ("BF16", (hc_count * h,), _det_bf16_bytes(rng, hc_count * h, 0.25))
+    tensors[f"{p_lm}.hyper_connection_mixer.input_mix_weight_down.weight"] = ("BF16", (hc_lowrank, hc_count * h), _det_bf16_bytes(rng, hc_lowrank * hc_count * h))
+    tensors[f"{p_lm}.hyper_connection_mixer.input_mix_weight_up.weight"] = ("BF16", (hc_count * h, hc_lowrank), _det_bf16_bytes(rng, hc_count * h * hc_lowrank))
+
+    def _add_block(prefix: str, ltype: str, include_ple: bool) -> None:
+        tensors[f"{prefix}.input_layernorm.weight"] = ("BF16", (h,), _det_bf16_bytes(rng, h, 0.25))
+        tensors[f"{prefix}.post_attention_layernorm.weight"] = ("BF16", (h,), _det_bf16_bytes(rng, h, 0.25))
+        for hc_tag in ("attn_hyper_connection", "mlp_hyper_connection"):
+            tensors[f"{prefix}.{hc_tag}.hc_norm.weight"] = ("BF16", (hc_count * h,), _det_bf16_bytes(rng, hc_count * h, 0.25))
+            tensors[f"{prefix}.{hc_tag}.input_mix_weight_down.weight"] = ("BF16", (hc_lowrank, hc_count * h), _det_bf16_bytes(rng, hc_lowrank * hc_count * h))
+            tensors[f"{prefix}.{hc_tag}.input_mix_weight_up.weight"] = ("BF16", (hc_count * h, hc_lowrank), _det_bf16_bytes(rng, hc_count * h * hc_lowrank))
+            tensors[f"{prefix}.{hc_tag}.block_inject_weight.weight"] = ("BF16", (hc_count, hc_count * h), _det_bf16_bytes(rng, hc_count * hc_count * h))
+        if ltype == "linear_attention":
+            conv_c = 2 * kq + vd
+            tensors[f"{prefix}.linear_attn.in_proj_qkv.weight"] = ("BF16", (conv_c, h), _det_bf16_bytes(rng, conv_c * h))
+            tensors[f"{prefix}.linear_attn.in_proj_z.weight"] = ("BF16", (vd, h), _det_bf16_bytes(rng, vd * h))
+            tensors[f"{prefix}.linear_attn.in_proj_a.weight"] = ("BF16", (lin_vh, h), _det_bf16_bytes(rng, lin_vh * h))
+            tensors[f"{prefix}.linear_attn.in_proj_b.weight"] = ("BF16", (lin_vh, h), _det_bf16_bytes(rng, lin_vh * h))
+            tensors[f"{prefix}.linear_attn.out_proj.weight"] = ("BF16", (h, vd), _det_bf16_bytes(rng, h * vd))
+            tensors[f"{prefix}.linear_attn.A_log"] = ("F32", (lin_vh,), _det_f32_bytes(rng, lin_vh, -2.0, -0.1))
+            tensors[f"{prefix}.linear_attn.dt_bias"] = ("BF16", (lin_vh,), _det_bf16_bytes(rng, lin_vh, 0.25))
+            tensors[f"{prefix}.linear_attn.conv1d.weight"] = ("BF16", (conv_c, 1, 4), _det_bf16_bytes(rng, conv_c * 4))
+            tensors[f"{prefix}.linear_attn.norm.weight"] = ("BF16", (lin_vd,), _det_bf16_bytes(rng, lin_vd, 0.25))
+        else:
+            tensors[f"{prefix}.self_attn.q_proj.weight"] = ("BF16", (2 * n_heads * hd, h), _det_bf16_bytes(rng, 2 * n_heads * hd * h))
+            tensors[f"{prefix}.self_attn.k_proj.weight"] = ("BF16", (n_kv * hd, h), _det_bf16_bytes(rng, n_kv * hd * h))
+            tensors[f"{prefix}.self_attn.v_proj.weight"] = ("BF16", (n_kv * hd, h), _det_bf16_bytes(rng, n_kv * hd * h))
+            tensors[f"{prefix}.self_attn.o_proj.weight"] = ("BF16", (h, n_heads * hd), _det_bf16_bytes(rng, h * n_heads * hd))
+            tensors[f"{prefix}.self_attn.q_norm.weight"] = ("BF16", (hd,), _det_bf16_bytes(rng, hd, 0.25))
+            tensors[f"{prefix}.self_attn.k_norm.weight"] = ("BF16", (hd,), _det_bf16_bytes(rng, hd, 0.25))
+            tensors[f"{prefix}.self_attn.indexer.index_qk_proj.weight"] = (
+                "BF16",
+                ((idx_heads + idx_kv) * idx_hd, h),
+                _det_bf16_bytes(rng, (idx_heads + idx_kv) * idx_hd * h),
+            )
+            tensors[f"{prefix}.self_attn.indexer.q_layernorm.weight"] = ("BF16", (idx_hd,), _det_bf16_bytes(rng, idx_hd, 0.25))
+            tensors[f"{prefix}.self_attn.indexer.k_layernorm.weight"] = ("BF16", (idx_hd,), _det_bf16_bytes(rng, idx_hd, 0.25))
+        if include_ple:
+            tensors[f"{prefix}.ple.conv1d.weight"] = ("BF16", (hc_count * h, 1, 4), _det_bf16_bytes(rng, hc_count * h * 4))
+            tensors[f"{prefix}.ple.key_proj.weight"] = ("BF16", (hc_count * h, h), _det_bf16_bytes(rng, hc_count * h * h))
+            tensors[f"{prefix}.ple.value_proj.weight"] = ("BF16", (h, h), _det_bf16_bytes(rng, h * h))
+            tensors[f"{prefix}.ple.norm_conv.weight"] = ("BF16", (hc_count * h,), _det_bf16_bytes(rng, hc_count * h, 0.25))
+            tensors[f"{prefix}.ple.norm_key.weight"] = ("BF16", (hc_count * h,), _det_bf16_bytes(rng, hc_count * h, 0.25))
+            tensors[f"{prefix}.ple.norm_query.weight"] = ("BF16", (hc_count * h,), _det_bf16_bytes(rng, hc_count * h, 0.25))
+            tensors[f"{prefix}.ple.ple_embedding.layer_multipliers"] = ("I64", (3,), struct.pack("<3q", 1000003, 2000003, 3000017))
+            tensors[f"{prefix}.ple.ple_embedding.ngram_heads_offsets"] = ("I64", (4,), struct.pack("<4q", 0, 16, 32, 48))
+            tensors[f"{prefix}.ple.ple_embedding.ngram_heads_vocab_sizes"] = ("I64", (4,), struct.pack("<4q", 16, 16, 16, 16))
+            for s_i in range(ple_shards):
+                tensors[f"{prefix}.ple.ple_embedding.ngram_embedding.shard_{s_i}.weight"] = (
+                    "BF16",
+                    (ple_rows_per_shard, ple_embed_dim),
+                    _det_bf16_bytes(rng, ple_rows_per_shard * ple_embed_dim),
+                )
+        tensors[f"{prefix}.mlp.gate.weight"] = ("BF16", (num_experts, h), _det_bf16_bytes(rng, num_experts * h))
+        tensors[f"{prefix}.mlp.experts.gate_up_proj"] = ("BF16", (num_experts, 2 * moe_intermediate_size, h), _det_bf16_bytes(rng, num_experts * 2 * moe_intermediate_size * h))
+        tensors[f"{prefix}.mlp.experts.down_proj"] = ("BF16", (num_experts, h, moe_intermediate_size), _det_bf16_bytes(rng, num_experts * h * moe_intermediate_size))
+        tensors[f"{prefix}.mlp.shared_expert.gate_proj.weight"] = ("BF16", (shared_expert_intermediate_size, h), _det_bf16_bytes(rng, shared_expert_intermediate_size * h))
+        tensors[f"{prefix}.mlp.shared_expert.up_proj.weight"] = ("BF16", (shared_expert_intermediate_size, h), _det_bf16_bytes(rng, shared_expert_intermediate_size * h))
+        tensors[f"{prefix}.mlp.shared_expert.down_proj.weight"] = ("BF16", (h, shared_expert_intermediate_size), _det_bf16_bytes(rng, h * shared_expert_intermediate_size))
+        tensors[f"{prefix}.mlp.shared_expert_gate.weight"] = ("BF16", (1, h), _det_bf16_bytes(rng, h))
+
+    for l_idx in range(num_layers):
+        _add_block(f"{p_lm}.layers.{l_idx}", layer_types[l_idx], include_ple=(l_idx == ple_src_l))
+
+    if include_mtp:
+        tensors["mtp.fc_embedding.weight"] = ("BF16", (h, h), _det_bf16_bytes(rng, h * h))
+        tensors["mtp.fc_hidden.weight"] = ("BF16", (h, h), _det_bf16_bytes(rng, h * h))
+        tensors["mtp.pre_fc_norm_embedding.weight"] = ("BF16", (h,), _det_bf16_bytes(rng, h, 0.25))
+        tensors["mtp.pre_fc_norm_hidden.weight"] = ("BF16", (hc_count * h,), _det_bf16_bytes(rng, hc_count * h, 0.25))
+        tensors["mtp.hyper_connection_mixer.hc_norm.weight"] = ("BF16", (hc_count * h,), _det_bf16_bytes(rng, hc_count * h, 0.25))
+        tensors["mtp.hyper_connection_mixer.input_mix_weight_down.weight"] = ("BF16", (hc_lowrank, hc_count * h), _det_bf16_bytes(rng, hc_lowrank * hc_count * h))
+        tensors["mtp.hyper_connection_mixer.input_mix_weight_up.weight"] = ("BF16", (hc_count * h, hc_lowrank), _det_bf16_bytes(rng, hc_count * h * hc_lowrank))
+        _add_block("mtp.layers.0", "full_attention", include_ple=False)
+
+    if include_vision_sidecar:
+        tensors["model.visual.patch_embed.proj.weight"] = ("BF16", (64, 3, 2, 16, 16), _det_bf16_bytes(rng, 64 * 3 * 2 * 16 * 16))
+        tensors["model.visual.blocks.0.norm1.weight"] = ("BF16", (64,), _det_bf16_bytes(rng, 64, 0.25))
+        tensors["model.visual.blocks.0.attn.qkv.weight"] = ("BF16", (192, 64), _det_bf16_bytes(rng, 192 * 64))
+        tensors["model.visual.blocks.0.attn.proj.weight"] = ("BF16", (64, 64), _det_bf16_bytes(rng, 64 * 64))
+        tensors["model.visual.blocks.0.norm2.weight"] = ("BF16", (64,), _det_bf16_bytes(rng, 64, 0.25))
+        tensors["model.visual.blocks.0.mlp.linear_fc1.weight"] = ("BF16", (128, 64), _det_bf16_bytes(rng, 128 * 64))
+        tensors["model.visual.blocks.0.mlp.linear_fc2.weight"] = ("BF16", (64, 128), _det_bf16_bytes(rng, 64 * 128))
+        tensors["model.visual.merger.norm.weight"] = ("BF16", (64,), _det_bf16_bytes(rng, 64, 0.25))
+        tensors["model.visual.merger.linear_fc1.weight"] = ("BF16", (256, 256), _det_bf16_bytes(rng, 256 * 256))
+        tensors["model.visual.merger.linear_fc2.weight"] = ("BF16", (h, 256), _det_bf16_bytes(rng, h * 256))
+
+    tok_dict = build_qwen3_tokenizer_dict(QWEN4_PRESETS["tiny-qwen4"].with_overrides(vocab_size=vocab_size))  # type: ignore[arg-type]
+    with tempfile.TemporaryDirectory() as tmp_sf:
+        sf_dir = pathlib.Path(tmp_sf)
+        _write_simple_safetensors(sf_dir / "model.safetensors", tensors)
+        (sf_dir / "config.json").write_text(json.dumps(cfg, indent=2) + "\n", encoding="utf-8")
+        (sf_dir / "tokenizer.json").write_text(json.dumps(tok_dict) + "\n", encoding="utf-8")
+        amf_p = out / "model.amf"
+        ple_base = out / "ple.amf"
+        mtp_p = (out / "mtp.amf") if include_mtp else None
+        vis_p = (out / "vision.amf") if include_vision_sidecar else None
+        cfg_p = out / "config.json"
+        rep = pack_qwen4_checkpoint(
+            sf_dir,
+            amf_p,
+            model_id="qwen4-real-hf-synth",
+            quant_profile=quant_profile,
+            target_bits=target_bits,
+            cold_experts=[(l_i, num_experts - 1) for l_i in range(num_layers)],
+            ple_output=ple_base,
+            ple_shards=ple_shards,
+            mtp_output=mtp_p,
+            vision_sidecar=vis_p,
+            config_output=cfg_p,
+        )
+    tok_out = out / "tokenizer.json"
+    tok_out.write_text(json.dumps(tok_dict, indent=2) + "\n", encoding="utf-8")
+    return Qwen4RealHfSynthBundle(
+        amf_path=rep.amf_path,
+        ple_paths=rep.ple_shard_paths,
+        mtp_path=rep.mtp_amf_path,
+        mtp_config_path=rep.mtp_config_path,
+        vision_path=rep.vision_amf_path,
+        config_path=cfg_p,
+        tokenizer_path=tok_out,
+        report=rep,
     )

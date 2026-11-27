@@ -26,8 +26,10 @@ import array
 import json
 import math
 import pathlib
+import random
 import re
 import struct
+import tempfile
 import zlib
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field, replace
@@ -60,12 +62,15 @@ from aminfer_tools.amf import (
     _pack_directory,
     _pack_header,
     _PlannedEntry,
+    _read_exact,
     _ShardReaders,
     _ShardTensor,
     _stream_entry,
     _strip_model_prefix,
+    dequantize_mxfp8_row_f32,
     encode_reserved0,
     f16_bytes_to_bf16_bytes,
+    f32_to_bf16_bytes,
     interleave_scale_bias_f16,
     VISION_BLOCK_DTYPES,
     extract_vision_config_summary,
@@ -158,10 +163,19 @@ class HardwareTierError(ValueError):
     """Raised when a `deepseek41` wired memory plan violates ADR-0015 hardware-tier ceilings."""
 
 
+_DENSE_ENGRAM_MARKERS = ("wkv", "q_weight", "k_weight", "key_projs", "value_proj", "norm", "hc_scales", "unified_pre_gamma")
+
+
 def is_engram_tensor(raw_name: str) -> bool:
-    """Return True if `raw_name` belongs to the external 196B Engram conditional memory table."""
+    """Return True if `raw_name` is an external Engram `SPARSE_TABLE` lookup tensor (never dense wkv/q_weight/k_weight)."""
     norm = _strip_model_prefix(raw_name).lower()
-    return norm.startswith("engram.") or ".engram." in norm or norm.startswith("sparse_table.")
+    if norm.startswith(("engram.", "sparse_table.")):
+        return True
+    if ".engram." in norm:
+        if ".embed." in norm or ".lookup" in norm:
+            return True
+        return not any(tok in norm for tok in _DENSE_ENGRAM_MARKERS)
+    return False
 
 
 def is_dspark_tensor(raw_name: str) -> bool:
@@ -171,7 +185,10 @@ def is_dspark_tensor(raw_name: str) -> bool:
 
 def strip_dspark_prefix(raw_name: str) -> str:
     lower = raw_name.lower()
-    for prefix in _DSPARK_PREFIXES:
+    for prefix in ("mtp.", "model.mtp.", "language_model.mtp.", "language_model.model.mtp."):
+        if lower.startswith(prefix):
+            return "mtp." + raw_name[len(prefix) :]
+    for prefix in ("dspark.", "model.dspark.", "language_model.dspark.", "language_model.model.dspark."):
         if lower.startswith(prefix):
             return "dspark." + raw_name[len(prefix) :]
     return _strip_model_prefix(raw_name)
@@ -739,15 +756,29 @@ def validate_config_hardware_tier(
     host_ram_gib: float | None = None,
     world_size: int | None = None,
     allow_override: bool = False,
+    all_experts_cold: bool = False,
+    encoder_cold_decoder_hot: bool = False,
+    decoder_hot_fraction: float = 0.0,
 ) -> HardwareTierCheck:
     total_b, non_exp_b, exp_b = config.estimated_backbone_bytes()
+    if all_experts_cold:
+        eff_routed = 0
+        eff_total = non_exp_b
+    elif encoder_cold_decoder_hot:
+        dec_frac = config.num_decoder_layers / max(1, config.total_layers)
+        dec_b = int(exp_b * dec_frac * max(0.0, min(1.0, decoder_hot_fraction)))
+        eff_routed = dec_b
+        eff_total = non_exp_b + dec_b
+    else:
+        eff_routed = exp_b
+        eff_total = total_b
     return evaluate_hardware_tier(
-        total_b,
+        eff_total,
         target_tier=target_tier,
         host_ram_gib=host_ram_gib,
         world_size=config.world_size if world_size is None else world_size,
         non_expert_bytes=non_exp_b,
-        routed_expert_bytes=exp_b,
+        routed_expert_bytes=eff_routed,
         allow_override=allow_override,
     )
 
@@ -973,6 +1004,301 @@ def _generate_dspark_head(
     return amf_path, cfg_path, metas
 
 
+def _encode_mxfp8_bf16_like(rng: random.Random, rows: int, cols: int, scale: float = 0.08) -> tuple[bytes, bytes]:
+    """Synthesize deterministic `[32, 32]` UE8M0 FP8 (`F8_E4M3` + `F8_E8M0`) weight & scale payloads."""
+    nb32 = (rows + 31) // 32
+    kb32 = (cols + 31) // 32
+    e4m3_raw = bytearray(rows * cols)
+    sc_raw = bytearray(nb32 * kb32)
+    # Use exact representable normal E4M3 codes (sign bit 0/1, exp 4..10 -> modest range) + exponent 125..128.
+    for tr in range(nb32):
+        for tc in range(kb32):
+            exp_b = 123 + ((tr * 7 + tc * 13) % 5)  # 2^(exp-127)
+            sc_raw[tr * kb32 + tc] = exp_b
+    for i in range(rows * cols):
+        sgn = 0x80 if rng.random() < 0.5 else 0x00
+        mag = 0x20 + (i % 24)  # well within normal positive finite E4M3 codes [0.25..3.5]
+        e4m3_raw[i] = sgn | mag
+    _ = scale
+    return bytes(e4m3_raw), bytes(sc_raw)
+
+
+def _encode_mxfp8_rowwise(rng: random.Random, rows: int, cols: int) -> tuple[bytes, bytes]:
+    """Synthesize deterministic `1x32` row-wise UE8M0 FP8 (`F8_E4M3 [R, C]` + `F8_E8M0 [R, C//32]`) Engram payloads."""
+    kb32 = cols // 32
+    w_raw = bytes(((0x80 if (i * 7 + 3) % 5 == 0 else 0x00) | (0x20 + (i % 20))) for i in range(rows * cols))
+    s_raw = bytes((124 + ((i * 5) % 4)) for i in range(rows * kb32))
+    return w_raw, s_raw
+
+
+def _encode_hf_mxfp4(rng: random.Random, rows: int, cols: int) -> tuple[bytes, bytes]:
+    """Synthesize deterministic HF `MXFP4` (`I8 [R, C//2]` packed e2m1fn_x2 + `F8_E8M0 [R, C//32]`)."""
+    kb2 = cols // 2
+    kb32 = cols // 32
+    w_raw = bytes(((rng.randrange(0, 16) << 4) | rng.randrange(0, 16)) for _ in range(rows * kb2))
+    s_raw = bytes((125 + rng.randrange(0, 4)) for _ in range(rows * kb32))
+    return w_raw, s_raw
+
+
+def _write_sf_file(path: pathlib.Path, tensors: dict[str, tuple[str, tuple[int, ...], bytes]]) -> None:
+    hdr: dict[str, object] = {}
+    cur = 0
+    chunks: list[bytes] = []
+    for nm, (dt, shp, raw) in tensors.items():
+        hdr[nm] = {"dtype": dt, "shape": list(shp), "data_offsets": [cur, cur + len(raw)]}
+        chunks.append(raw)
+        cur += len(raw)
+    hb = json.dumps(hdr, separators=(",", ":")).encode("utf-8")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("wb") as fh:
+        fh.write(struct.pack("<Q", len(hb)))
+        fh.write(hb)
+        for c in chunks:
+            fh.write(c)
+
+
+def _det_bf16_raw(rng: random.Random, count: int, scale: float = 0.08) -> bytes:
+    u16s = []
+    for _ in range(count):
+        v = (rng.random() * 2.0 - 1.0) * scale
+        u32 = struct.unpack("<I", struct.pack("<f", v))[0]
+        u16s.append((u32 >> 16) & 0xFFFF)
+    return struct.pack(f"<{count}H", *u16s)
+
+
+def _det_f32_raw(rng: random.Random, count: int, lo: float = -0.25, hi: float = 0.25) -> bytes:
+    return struct.pack(f"<{count}f", *(lo + rng.random() * (hi - lo) for _ in range(count)))
+
+
+def _generate_real_hf_deepseek41_synth_bundle(
+    out_path: pathlib.Path,
+    cfg: DeepSeek41Config,
+    *,
+    seed: int,
+    cold_experts: Iterable[tuple[int, int]] = (),
+    cold_experts_per_layer: int = 0,
+    target_dtype: str = "auto",
+    quant_profile: str = "uniform",
+    target_bits: float | None = None,
+    world_size: int = 1,
+    partition_strategy: str = "contiguous_by_rank",
+    target_tier: str = "auto",
+    encoder_cold_decoder_hot: bool = False,
+    allow_tier_override: bool = False,
+) -> DeepSeek41SynthBundle:
+    """Synthesize a genuine real-HF `deepseek_v41` checkpoint and pack it via `convert_deepseek41_checkpoint`."""
+    rng = random.Random(seed)
+    h = max(64, cfg.hidden_size)
+    vocab = cfg.vocab_size
+    n_heads = max(2, min(8, cfg.num_attention_heads))
+    q_lora = max(64, min(h, cfg.q_lora_rank))
+    kv_lora = max(32, min(h, cfg.kv_lora_rank))
+    qk_nope = 32
+    qk_rope = 32
+    o_groups = 2
+    o_lora_cfg = int(getattr(cfg, "o_lora_rank", 512) or 512)
+    o_lora = max(64, min(h, o_lora_cfg // 8 if o_lora_cfg >= 512 else 64))
+    moe_i = max(64, cfg.moe_intermediate_size)
+    n_exp = cfg.num_experts
+    idx_hd = 64
+    idx_heads = 4
+    mhc_s = cfg.mhc_num_streams
+    engram_dim = 64
+    enc_l = cfg.num_encoder_layers
+    dec_l = cfg.num_decoder_layers
+    tot_l = enc_l + dec_l
+    eng_l = 1 if tot_l > 1 else 0
+    compress_ratios = [0 if i == 0 else (2 if i < enc_l else 1) for i in range(tot_l)]
+
+    hf_cfg = {
+        "model_type": "deepseek_v41",
+        "architectures": ["DeepseekV41ForCausalLM"],
+        "quantization_config": {"quant_method": "fp8", "expert_dtype": "fp4", "scale_block_size": [32, 32]},
+        "text_config": {
+            "model_type": "deepseek_v41_text",
+            "vocab_size": vocab,
+            "hidden_size": h,
+            "num_hidden_layers": tot_l,
+            "num_encoder_layers": enc_l,
+            "num_decoder_layers": dec_l,
+            "num_attention_heads": n_heads,
+            "num_key_value_heads": 1,
+            "head_dim": kv_lora,
+            "kv_lora_rank": kv_lora,
+            "q_lora_rank": q_lora,
+            "qk_nope_head_dim": qk_nope,
+            "qk_rope_head_dim": qk_rope,
+            "v_head_dim": qk_nope,
+            "o_lora_rank": o_lora,
+            "o_groups": o_groups,
+            "n_routed_experts": n_exp,
+            "n_shared_experts": 1 if cfg.has_shared_expert else 0,
+            "num_experts_per_tok": min(n_exp, cfg.encoder_moe_top_k),
+            "moe_intermediate_size": moe_i,
+            "hc_mult": mhc_s,
+            "hc_sinkhorn_iters": 20,
+            "hc_eps": 1e-6,
+            "compress_ratios": compress_ratios,
+            "kv_source_layer_ids": [0, max(0, enc_l - 1)] if enc_l > 1 else [0],
+            "engram_layer_ids": [eng_l],
+            "engram_num_embeddings": [cfg.engram_num_rows],
+            "engram_n_heads": 4,
+            "engram_head_dim": engram_dim,
+            "num_nextn_predict_layers": 3 if cfg.include_dspark else 0,
+            "dspark_block_size": 5,
+            "dspark_target_layer_ids": [0, max(0, tot_l - 2), tot_l - 1] if tot_l >= 2 else [0],
+            "dspark_n_routed_experts": min(n_exp, 8),
+            "dspark_routed_top_k": 3,
+            "routed_scaling_factor": 1.5,
+            "scoring_func": "sqrtsoftplus",
+            "topk_method": "noaux_tc",
+            "swiglu_limit": 10.0,
+            "tie_word_embeddings": False,
+        },
+    }
+
+    tensors: dict[str, tuple[str, tuple[int, ...], bytes]] = {}
+    tensors["embed.weight"] = ("BF16", (vocab, h), _det_bf16_raw(rng, vocab * h))
+    tensors["head.weight"] = ("BF16", (vocab, h), _det_bf16_raw(rng, vocab * h))
+    tensors["norm.weight"] = ("BF16", (h,), _det_bf16_raw(rng, h, 0.25))
+
+    def _add_mxfp8(key: str, rows: int, cols: int) -> None:
+        w_raw, s_raw = _encode_mxfp8_bf16_like(rng, rows, cols)
+        tensors[f"{key}.weight"] = ("F8_E4M3", (rows, cols), w_raw)
+        tensors[f"{key}.scale"] = ("F8_E8M0", ((rows + 31) // 32, (cols + 31) // 32), s_raw)
+
+    def _add_mxfp4(key: str, rows: int, cols: int) -> None:
+        w_raw, s_raw = _encode_hf_mxfp4(rng, rows, cols)
+        tensors[f"{key}.weight"] = ("I8", (rows, cols // 2), w_raw)
+        tensors[f"{key}.scale"] = ("F8_E8M0", (rows, cols // 32), s_raw)
+
+    def _add_moe_block(pfx: str, block_exp: int, *, include_router_vl: bool = True) -> None:
+        tensors[f"{pfx}.ffn.gate.weight"] = ("BF16", (block_exp, h), _det_bf16_raw(rng, block_exp * h))
+        tensors[f"{pfx}.ffn.gate.bias"] = ("F32", (block_exp,), _det_f32_raw(rng, block_exp))
+        if include_router_vl:
+            tensors[f"{pfx}.ffn.gate.bias_vl"] = ("F32", (block_exp,), _det_f32_raw(rng, block_exp))
+        if cfg.has_shared_expert:
+            _add_mxfp8(f"{pfx}.ffn.shared_experts.w1", moe_i, h)
+            _add_mxfp8(f"{pfx}.ffn.shared_experts.w2", h, moe_i)
+            _add_mxfp8(f"{pfx}.ffn.shared_experts.w3", moe_i, h)
+        for e in range(block_exp):
+            _add_mxfp4(f"{pfx}.ffn.experts.{e}.w1", moe_i, h)
+            _add_mxfp4(f"{pfx}.ffn.experts.{e}.w2", h, moe_i)
+            _add_mxfp4(f"{pfx}.ffn.experts.{e}.w3", moe_i, h)
+
+    for l_i in range(tot_l):
+        lp = f"layers.{l_i}"
+        tensors[f"{lp}.attn_norm.weight"] = ("BF16", (h,), _det_bf16_raw(rng, h, 0.25))
+        tensors[f"{lp}.ffn_norm.weight"] = ("BF16", (h,), _det_bf16_raw(rng, h, 0.25))
+        for tag in ("hc_attn", "hc_ffn"):
+            tensors[f"{lp}.{tag}_base"] = ("BF16", (mhc_s, mhc_s), _det_bf16_raw(rng, mhc_s * mhc_s, 0.25))
+            tensors[f"{lp}.{tag}_fn"] = ("BF16", (h, mhc_s), _det_bf16_raw(rng, h * mhc_s))
+            tensors[f"{lp}.{tag}_scale"] = ("F32", (3,), _det_f32_raw(rng, 3, 0.05, 0.2))
+        _add_mxfp8(f"{lp}.attn.wq_a", q_lora, h)
+        _add_mxfp8(f"{lp}.attn.wq_b", n_heads * (qk_nope + qk_rope), q_lora)
+        tensors[f"{lp}.attn.q_norm.weight"] = ("BF16", (q_lora,), _det_bf16_raw(rng, q_lora, 0.25))
+        _add_mxfp8(f"{lp}.attn.wkv", kv_lora + qk_rope, h)
+        tensors[f"{lp}.attn.kv_norm.weight"] = ("BF16", (kv_lora,), _det_bf16_raw(rng, kv_lora, 0.25))
+        _add_mxfp8(f"{lp}.attn.wo_a", o_lora * o_groups, n_heads * qk_nope)
+        _add_mxfp8(f"{lp}.attn.wo_b", h, o_lora)
+        tensors[f"{lp}.attn.attn_sink"] = ("F32", (n_heads,), _det_f32_raw(rng, n_heads, -0.5, 0.0))
+        if compress_ratios[l_i] > 1:
+            tensors[f"{lp}.attn.compressor.norm.weight"] = ("BF16", (kv_lora + qk_rope,), _det_bf16_raw(rng, kv_lora + qk_rope, 0.25))
+            tensors[f"{lp}.attn.compressor.wgate.weight"] = ("BF16", (compress_ratios[l_i], kv_lora + qk_rope), _det_bf16_raw(rng, compress_ratios[l_i] * (kv_lora + qk_rope)))
+            tensors[f"{lp}.attn.compressor.wkv.weight"] = ("BF16", (kv_lora + qk_rope, kv_lora + qk_rope), _det_bf16_raw(rng, (kv_lora + qk_rope) ** 2))
+        tensors[f"{lp}.attn.indexer.wk.weight"] = ("BF16", (idx_hd, h), _det_bf16_raw(rng, idx_hd * h))
+        _add_mxfp8(f"{lp}.attn.indexer.wq_b", idx_heads * idx_hd, q_lora)
+        tensors[f"{lp}.attn.indexer.k_norm.weight"] = ("BF16", (idx_hd,), _det_bf16_raw(rng, idx_hd, 0.25))
+        tensors[f"{lp}.attn.indexer.weights_proj.weight"] = ("BF16", (idx_heads, h), _det_bf16_raw(rng, idx_heads * h))
+        if l_i == eng_l:
+            ew_w, ew_s = _encode_mxfp8_rowwise(rng, cfg.engram_num_rows, engram_dim)
+            tensors[f"{lp}.engram.embed.weight"] = ("F8_E4M3", (cfg.engram_num_rows, engram_dim), ew_w)
+            tensors[f"{lp}.engram.embed.scale"] = ("F8_E8M0", (cfg.engram_num_rows, engram_dim // 32), ew_s)
+            _add_mxfp8(f"{lp}.engram.wkv", h, engram_dim * 2)
+            tensors[f"{lp}.engram.q_weight"] = ("BF16", (4, h), _det_bf16_raw(rng, 4 * h))
+            tensors[f"{lp}.engram.k_weight"] = ("BF16", (4, engram_dim * 2), _det_bf16_raw(rng, 4 * engram_dim * 2))
+        _add_moe_block(lp, n_exp)
+
+    if cfg.include_dspark:
+        ds_exp = min(n_exp, 8)
+        for m_idx in range(3):
+            mp = f"mtp.{m_idx}"
+            if m_idx == 0:
+                tensors[f"{mp}.main_norm.weight"] = ("BF16", (h,), _det_bf16_raw(rng, h, 0.25))
+                _add_mxfp8(f"{mp}.main_proj", h, h * 3)
+            tensors[f"{mp}.attn_norm.weight"] = ("BF16", (h,), _det_bf16_raw(rng, h, 0.25))
+            tensors[f"{mp}.ffn_norm.weight"] = ("BF16", (h,), _det_bf16_raw(rng, h, 0.25))
+            for tag in ("hc_attn", "hc_ffn"):
+                tensors[f"{mp}.{tag}_base"] = ("BF16", (mhc_s, mhc_s), _det_bf16_raw(rng, mhc_s * mhc_s, 0.25))
+                tensors[f"{mp}.{tag}_fn"] = ("BF16", (h, mhc_s), _det_bf16_raw(rng, h * mhc_s))
+                tensors[f"{mp}.{tag}_scale"] = ("F32", (3,), _det_f32_raw(rng, 3, 0.05, 0.2))
+            _add_mxfp8(f"{mp}.attn.wq_a", q_lora, h)
+            _add_mxfp8(f"{mp}.attn.wq_b", n_heads * (qk_nope + qk_rope), q_lora)
+            tensors[f"{mp}.attn.q_norm.weight"] = ("BF16", (q_lora,), _det_bf16_raw(rng, q_lora, 0.25))
+            _add_mxfp8(f"{mp}.attn.wkv", kv_lora + qk_rope, h)
+            tensors[f"{mp}.attn.kv_norm.weight"] = ("BF16", (kv_lora,), _det_bf16_raw(rng, kv_lora, 0.25))
+            _add_mxfp8(f"{mp}.attn.wo_a", o_lora * o_groups, n_heads * qk_nope)
+            _add_mxfp8(f"{mp}.attn.wo_b", h, o_lora)
+            _add_moe_block(mp, ds_exp, include_router_vl=False)
+            if m_idx == 2:
+                tensors[f"{mp}.norm.weight"] = ("BF16", (h,), _det_bf16_raw(rng, h, 0.25))
+                tensors[f"{mp}.confidence_head.proj.weight"] = ("BF16", (1, h + 64), _det_bf16_raw(rng, h + 64))
+                tensors[f"{mp}.markov_head.embed.weight"] = ("BF16", (vocab, 64), _det_bf16_raw(rng, vocab * 64))
+                tensors[f"{mp}.markov_head.head.weight"] = ("BF16", (vocab, 64), _det_bf16_raw(rng, vocab * 64))
+
+    cold_set = set(cold_experts)
+    if cold_experts_per_layer > 0:
+        for l_i in range(tot_l):
+            for e_i in range(n_exp - cold_experts_per_layer, n_exp):
+                cold_set.add((l_i, e_i))
+
+    tok_dict = build_qwen3_tokenizer_dict(cfg)  # type: ignore[arg-type]
+    with tempfile.TemporaryDirectory() as tmp_sf:
+        sf_dir = pathlib.Path(tmp_sf)
+        _write_sf_file(sf_dir / "model.safetensors", tensors)
+        (sf_dir / "config.json").write_text(json.dumps(hf_cfg, indent=2) + "\n", encoding="utf-8")
+        (sf_dir / "tokenizer.json").write_text(json.dumps(tok_dict) + "\n", encoding="utf-8")
+        rep = convert_deepseek41_checkpoint(
+            sf_dir,
+            out_path / "model.amf",
+            model_id=cfg.model_id,
+            target_dtype=target_dtype,
+            quant_profile=quant_profile,
+            target_bits=target_bits,
+            cold_experts=cold_set,
+            engram_output=out_path / "engram.amf",
+            engram_shards=cfg.engram_shards,
+            dspark_output=(out_path / "dspark.amf") if cfg.include_dspark else None,
+            config_output=out_path / "config.json",
+            target_tier=target_tier,
+            world_size=world_size,
+            rank_dir=(out_path / "shards") if world_size > 1 else None,
+            partition_strategy=partition_strategy,
+            allow_tier_override=allow_tier_override,
+            encoder_cold_decoder_hot=encoder_cold_decoder_hot,
+        )
+    tok_path = out_path / "tokenizer.json"
+    tok_path.write_text(json.dumps(tok_dict, separators=(",", ":"), ensure_ascii=False) + "\n", encoding="utf-8")
+    tot_b = rep.backbone_amf.stat().st_size + sum(p.stat().st_size for p in rep.engram_paths)
+    if rep.dspark_amf is not None:
+        tot_b += rep.dspark_amf.stat().st_size
+    return DeepSeek41SynthBundle(
+        amf_path=rep.backbone_amf,
+        engram_paths=rep.engram_paths,
+        dspark_amf_path=rep.dspark_amf,
+        dspark_config_path=rep.dspark_config_path,
+        config_path=rep.config_path or (out_path / "config.json"),
+        tokenizer_path=tok_path,
+        cluster_manifest_path=rep.partition_report.manifest_path if rep.partition_report is not None else None,
+        rank_amf_paths=rep.partition_report.rank_amf_paths if rep.partition_report is not None else [],
+        metas=rep.backbone_metas,
+        engram_metas=rep.engram_metas,
+        dspark_metas=rep.dspark_metas,
+        total_bytes=tot_b,
+        config=cfg,
+    )
+
+
 def generate_synth_deepseek41_bundle(
     out_dir: pathlib.Path,
     preset: str = "tiny-deepseek41",
@@ -984,6 +1310,13 @@ def generate_synth_deepseek41_bundle(
     world_size: int = 1,
     partition_strategy: str = "contiguous_by_rank",
     allow_huge_synth: bool = False,
+    real_hf_schema: bool = False,
+    target_dtype: str | None = None,
+    quant_profile: str = "uniform",
+    target_bits: float | None = None,
+    target_tier: str = "auto",
+    encoder_cold_decoder_hot: bool = False,
+    allow_tier_override: bool = False,
 ) -> DeepSeek41SynthBundle:
     """Generate a deterministic 16 KiB-aligned `deepseek41` synthetic bundle.
 
@@ -1017,6 +1350,23 @@ def generate_synth_deepseek41_bundle(
 
     out_path = pathlib.Path(out_dir)
     out_path.mkdir(parents=True, exist_ok=True)
+
+    if real_hf_schema:
+        return _generate_real_hf_deepseek41_synth_bundle(
+            out_path,
+            cfg,
+            seed=seed,
+            cold_experts=cold_experts,
+            cold_experts_per_layer=cold_experts_per_layer,
+            target_dtype=target_dtype if target_dtype is not None else "auto",
+            quant_profile=quant_profile,
+            target_bits=target_bits,
+            world_size=world_size,
+            partition_strategy=partition_strategy,
+            target_tier=target_tier,
+            encoder_cold_decoder_hot=encoder_cold_decoder_hot,
+            allow_tier_override=allow_tier_override,
+        )
 
     cold_set = set(cold_experts)
     if cold_experts_per_layer > 0:
@@ -1337,6 +1687,7 @@ class DeepSeek41ConvertReport:
     vision_amf: pathlib.Path | None = None
     vision_metas: list[PackedTensorMeta] = field(default_factory=list)
     included_vision_tensors: int = 0
+    dspark_config_path: pathlib.Path | None = None
 
 
 def _decode_row_to_f32(raw_row: bytes, src_dtype: str) -> list[float]:
@@ -1417,14 +1768,63 @@ def _pack_engram_shards_from_safetensors(
     shard_files = engram_shard_paths(output_base_path, num_shards)
 
     quant_prefixes: set[str] = set()
+    mxfp8_prefixes: set[str] = set()
     for name in engram_tensors:
         if name.endswith(".scales"):
             prefix = name[: -len(".scales")]
             if f"{prefix}.weight" in engram_tensors and f"{prefix}.biases" in engram_tensors:
                 quant_prefixes.add(prefix)
+        elif name.endswith(".scale"):
+            prefix = name[: -len(".scale")]
+            if f"{prefix}.weight" in engram_tensors and engram_tensors[f"{prefix}.weight"].dtype == "F8_E4M3":
+                mxfp8_prefixes.add(prefix)
 
     per_shard: list[list[_PlannedEntry]] = [[] for _ in range(num_shards)]
     consumed: set[str] = set()
+
+    for prefix in sorted(mxfp8_prefixes):
+        w = engram_tensors[f"{prefix}.weight"]
+        s = engram_tensors[f"{prefix}.scale"]
+        if s.dtype not in ("U8", "F8_E8M0") or len(w.shape) != 2 or len(s.shape) != 2:
+            raise ValueError(f"Engram MXFP8 tensor {prefix} must be 2D F8_E4M3 + F8_E8M0/U8, got {w.dtype}{w.shape} / {s.dtype}{s.shape}")
+        n_rows, dim = w.shape
+        if w.shape[0] != s.shape[0] or dim % 32 != 0 or s.shape[1] != dim // 32:
+            raise ValueError(f"Engram MXFP8 scale mismatch for {prefix}: weight={w.shape}, scale={s.shape}")
+        consumed.update((w.name, s.name))
+        m = _ENGRAM_LAYER_RE.search(_strip_model_prefix(prefix))
+        layer = int(m.group(1)) if m else 0
+        ranges = _split_row_ranges(n_rows, num_shards)
+        for s_idx, (r0, r1) in enumerate(ranges):
+            cnt = r1 - r0
+            entry_name = normalize_engram_name(prefix, shard_idx=(s_idx if num_shards > 1 else None), quantized=False)
+            d_rng = _slice_row_byte_range(w, r0, r1)
+            s_rng = _slice_row_byte_range(s, r0, r1)
+            data_bytes = d_rng.length
+            params_bytes = s_rng.length
+            params_offset = _align_up(data_bytes, 64)
+            blob_bytes = _align_up(params_offset + params_bytes, APPLE_PAGE_SIZE)
+            per_shard[s_idx].append(
+                _PlannedEntry(
+                    name=entry_name,
+                    kind=TensorKind.SPARSE_TABLE,
+                    dtype=DType.MXFP8_G32,
+                    quant_bits=8,
+                    group_size=32,
+                    layer=layer,
+                    expert=NO_EXPERT,
+                    shape=(cnt, dim),
+                    data=d_rng,
+                    data_convert=None,
+                    scales=s_rng,
+                    biases=None,
+                    data_bytes=data_bytes,
+                    params_offset=params_offset,
+                    params_bytes=params_bytes,
+                    blob_bytes=blob_bytes,
+                    params_mode="mxfp8",
+                    scale_tile_shape=None,
+                )
+            )
 
     for prefix in sorted(quant_prefixes):
         w = engram_tensors[f"{prefix}.weight"]
@@ -1574,6 +1974,47 @@ def _pack_engram_shards_from_safetensors(
     return shard_files, all_metas
 
 
+def _dequant_planned_entry_rows_f32(e: _PlannedEntry, readers: _ShardReaders) -> bytes:
+    """Dequantize a 2D MXFP8_G32 or HF/GGUF MXFP4 planned entry to packed little-endian float32 bytes."""
+    n_rows, k = e.shape
+    src_fh = readers.get(e.data.path)
+    out = bytearray()
+    if e.dtype == DType.MXFP8_G32:
+        if e.scales is None:
+            for r in range(n_rows):
+                d_raw = _read_exact(src_fh, e.data.offset + r * k, k)
+                ones = b"\x7f" * (k // 32)
+                vals = dequantize_mxfp8_row_f32(d_raw, ones, k)
+                out.extend(struct.pack(f"<{k}f", *vals))
+            return bytes(out)
+        s_fh = readers.get(e.scales.path)
+        kb32 = k // 32
+        for r in range(n_rows):
+            d_raw = _read_exact(src_fh, e.data.offset + r * k, k)
+            if e.scale_tile_shape is not None:
+                t_row = r // 32
+                s_raw = _read_exact(s_fh, e.scales.offset + t_row * kb32, kb32)
+            else:
+                s_raw = _read_exact(s_fh, e.scales.offset + r * kb32, kb32)
+            vals = dequantize_mxfp8_row_f32(d_raw, s_raw, k)
+            out.extend(struct.pack(f"<{k}f", *vals))
+        return bytes(out)
+    if e.dtype == DType.GGUF_MXFP4:
+        from aminfer_tools.mimo_v2 import dequantize_hf_mxfp4_row_f32
+
+        assert e.scales is not None
+        w_row_b = k // 2
+        s_row_b = k // 32
+        s_fh = readers.get(e.scales.path)
+        for r in range(n_rows):
+            d_raw = _read_exact(src_fh, e.data.offset + r * w_row_b, w_row_b)
+            s_raw = _read_exact(s_fh, e.scales.offset + r * s_row_b, s_row_b)
+            vals = dequantize_hf_mxfp4_row_f32(d_raw, s_raw, k)
+            out.extend(struct.pack(f"<{k}f", *vals))
+        return bytes(out)
+    raise ValueError(f"unsupported dequant source dtype {e.dtype.name} for {e.name!r}")
+
+
 def _write_backbone_stream(
     entries: Sequence[_PlannedEntry],
     output_path: pathlib.Path,
@@ -1581,10 +2022,11 @@ def _write_backbone_stream(
     readers: _ShardReaders,
     *,
     quantize_float_bits: int = 0,
+    dequantize_quant_to_bf16: bool = False,
     group_size: int = 64,
     vision_block_dtype: str = "auto",
 ) -> list[PackedTensorMeta]:
-    """Stream planned backbone entries to `output_path`, optionally quantizing 2D float weights."""
+    """Stream planned backbone entries to `output_path`, optionally quantizing or dequantizing 2D weights."""
     output_path.parent.mkdir(parents=True, exist_ok=True)
     dir_offset = APPLE_PAGE_SIZE
     dir_bytes = 0 if not entries else _align_up(len(entries) * ENTRY_STRUCT.size, APPLE_PAGE_SIZE)
@@ -1623,22 +2065,25 @@ def _write_backbone_stream(
                 else:
                     eff_bits = 0
 
+            is_float_src = e.quant_bits == 0 and e.data.dtype in ("BF16", "F16", "F32")
+            is_mxfp_src = e.dtype in (DType.MXFP8_G32, DType.GGUF_MXFP4)
             should_quant = (
                 eff_bits in (3, 4)
-                and e.quant_bits == 0
                 and e.kind in quant_kinds
                 and len(e.shape) == 2
                 and e.shape[1] % group_size == 0
-                and e.data.dtype in ("BF16", "F16", "F32")
+                and (is_float_src or is_mxfp_src)
             )
             if should_quant:
-                src_fh = readers.get(e.data.path)
-                src_fh.seek(e.data.offset)
-                raw = src_fh.read(e.data.length)
-                if len(raw) != e.data.length:
-                    raise EOFError(f"short read for {e.name!r}")
+                if is_float_src:
+                    src_fh = readers.get(e.data.path)
+                    raw = _read_exact(src_fh, e.data.offset, e.data.length)
+                    raw_dt = e.data.dtype
+                else:
+                    raw = _dequant_planned_entry_rows_f32(e, readers)
+                    raw_dt = "F32"
                 code_bytes, param_bytes = _quantize_2d_affine(
-                    raw, e.data.dtype, e.shape[0], e.shape[1], eff_bits, group_size
+                    raw, raw_dt, e.shape[0], e.shape[1], eff_bits, group_size
                 )
                 params_offset = _align_up(len(code_bytes), 64)
                 blob_bytes = _align_up(params_offset + len(param_bytes), APPLE_PAGE_SIZE)
@@ -1669,6 +2114,36 @@ def _write_backbone_stream(
                         blob_crc32=w.crc,
                         layout=e.layout,
                         quant_param_kind=e.quant_param_kind,
+                    )
+                )
+                cursor += blob_bytes
+            elif dequantize_quant_to_bf16 and is_mxfp_src and len(e.shape) == 2 and e.kind != TensorKind.SPARSE_TABLE:
+                f32_raw = _dequant_planned_entry_rows_f32(e, readers)
+                n_elems = e.shape[0] * e.shape[1]
+                bf16_raw = f32_to_bf16_bytes(list(struct.unpack(f"<{n_elems}f", f32_raw)))
+                blob_bytes = _align_up(len(bf16_raw), APPLE_PAGE_SIZE)
+                w = _BlobWriter(fh)
+                w.write(bf16_raw)
+                if blob_bytes > w.written:
+                    w.write(b"\x00" * (blob_bytes - w.written))
+                metas.append(
+                    PackedTensorMeta(
+                        name=e.name,
+                        kind=e.kind,
+                        dtype=DType.BF16,
+                        quant_bits=0,
+                        group_size=0,
+                        layer=e.layer,
+                        expert=e.expert,
+                        shape=e.shape,
+                        blob_offset=cursor,
+                        blob_bytes=blob_bytes,
+                        data_bytes=len(bf16_raw),
+                        params_offset=0,
+                        params_bytes=0,
+                        blob_crc32=w.crc,
+                        layout=TensorLayout.ROW_MAJOR,
+                        quant_param_kind=QuantParamKind.AFFINE_SCALE_BIAS,
                     )
                 )
                 cursor += blob_bytes
@@ -1736,7 +2211,7 @@ def _estimate_planned_wired_bytes(
             continue
         if (
             quantize_float_bits in (3, 4)
-            and e.quant_bits == 0
+            and (e.quant_bits == 0 or e.dtype in (DType.MXFP8_G32, DType.GGUF_MXFP4))
             and e.kind in quant_kinds
             and len(e.shape) == 2
             and e.shape[1] % group_size == 0
@@ -1790,6 +2265,10 @@ def convert_deepseek41_checkpoint(
     rank_dir: pathlib.Path | None = None,
     partition_strategy: str = "contiguous_by_rank",
     allow_tier_override: bool = False,
+    encoder_cold_decoder_hot: bool = False,
+    dspark_quant_profile: str = "uniform",
+    dspark_cold_experts_per_layer: int | None = None,
+    dspark_config_output: pathlib.Path | None = None,
     workers: int = 1,
 ) -> DeepSeek41ConvertReport:
     """Streaming multi-shard safetensors converter for `DeepSeek-V4.1-Flash-1017` (`pack-deepseek41`).
@@ -1839,16 +2318,16 @@ def convert_deepseek41_checkpoint(
     text_cfg = _effective_deepseek_text_config(src_config)
     top_mt = str(src_config.get("model_type", text_cfg.get("model_type", ""))).lower()
     cfg_num_experts = int(text_cfg.get("num_experts", text_cfg.get("n_routed_experts", 0)) or 0)
-    if top_mt in _DEEPSEEK41_MODEL_TYPES and cfg_num_experts >= 64:
-        total_l = int(
-            text_cfg.get(
-                "num_hidden_layers",
-                int(text_cfg.get("num_encoder_layers", 20) or 20)
-                + int(text_cfg.get("num_decoder_layers", 20) or 20),
-            )
-            or 40
+    probe_total_l = int(
+        text_cfg.get(
+            "num_hidden_layers",
+            int(text_cfg.get("num_encoder_layers", 20) or 20)
+            + int(text_cfg.get("num_decoder_layers", 20) or 20),
         )
-        enc_l, dec_l = _infer_enc_dec_layers(text_cfg, total_l)
+        or 40
+    )
+    probe_enc_l, probe_dec_l = _infer_enc_dec_layers(text_cfg, probe_total_l)
+    if top_mt in _DEEPSEEK41_MODEL_TYPES and cfg_num_experts >= 64:
         h_sz = int(text_cfg.get("hidden_size", 5120) or 5120)
         n_exp = cfg_num_experts
         moe_i = int(text_cfg.get("moe_intermediate_size", 2304) or 2304)
@@ -1859,8 +2338,8 @@ def convert_deepseek41_checkpoint(
         q_rank = int(text_cfg.get("q_lora_rank", 1280) or 1280)
         probe_cfg = DeepSeek41Config(
             model_id=model_id[:63],
-            num_encoder_layers=enc_l,
-            num_decoder_layers=dec_l,
+            num_encoder_layers=probe_enc_l,
+            num_decoder_layers=probe_dec_l,
             hidden_size=h_sz,
             vocab_size=int(text_cfg.get("vocab_size", 129280) or 129280),
             num_attention_heads=int(text_cfg.get("num_attention_heads", 64) or 64),
@@ -1882,6 +2361,9 @@ def convert_deepseek41_checkpoint(
             host_ram_gib=host_ram_gib,
             world_size=world_size,
             allow_override=allow_tier_override,
+            all_experts_cold=all_experts_cold,
+            encoder_cold_decoder_hot=encoder_cold_decoder_hot,
+            decoder_hot_fraction=0.0,
         )
 
     all_tensors = _collect_tensors(resolved.shard_paths)
@@ -1918,6 +2400,7 @@ def convert_deepseek41_checkpoint(
         backbone_tensors[raw_name] = st
 
     eff_dtype_mode = "bf16" if target_dtype == "bf16" else dtype_mode
+    dequantize_bf16 = target_dtype == "bf16"
     quantize_bits = {"q3_affine": 3, "q4_affine": 4}.get(target_dtype, 0)
     if quant_profile == "gsq-rco":
         # Pack uniform first, then delegate mixed-bit quantization to gsq_convert.
@@ -1934,6 +2417,55 @@ def convert_deepseek41_checkpoint(
         sme2_pack=sme2_pack if quantize_bits == 0 else "none",
         strip_vision=False,
     )
+
+    if encoder_cold_decoder_hot and not all_experts_cold:
+        # Step 1: tag all Causal Encoder experts (layers 0 .. enc_l-1) as cold NVMe experts.
+        for e_entry in backbone_plan:
+            if e_entry.expert != NO_EXPERT and 0 <= e_entry.layer < probe_enc_l:
+                effective_cold.add((e_entry.layer, e_entry.expert))
+        backbone_plan = plan_amf_entries(
+            backbone_tensors,
+            group_size=group_size,
+            dtype_mode=eff_dtype_mode,
+            cold_experts=effective_cold,
+            all_experts_cold=all_experts_cold,
+            tie_word_embeddings=tie,
+            exclude_tensors=exclude_tensors,
+            sme2_pack=sme2_pack if quantize_bits == 0 else "none",
+            strip_vision=False,
+        )
+        # Step 2: if hot Decoder experts still exceed target wired budget, demote tail Decoder experts to cold.
+        tot_w, non_exp_w, _ = _estimate_planned_wired_bytes(backbone_plan, quantize_bits, group_size)
+        tier_key_eff = "24gb-m4" if target_tier == "auto" and (host_ram_gib is None or host_ram_gib <= 32.0) else target_tier
+        tier_budget_b = (
+            int(host_ram_gib * 0.75 * (1024**3))
+            if host_ram_gib is not None
+            else TIER_WIRED_BUDGET_BYTES.get(tier_key_eff, TIER_WIRED_BUDGET_BYTES["24gb-m4"])
+        )
+        if non_exp_w <= tier_budget_b and tot_w > tier_budget_b:
+            dec_expert_sizes: dict[tuple[int, int], int] = {}
+            for e_entry in backbone_plan:
+                if e_entry.kind == TensorKind.HOT_EXPERT and e_entry.expert != NO_EXPERT:
+                    dec_expert_sizes[(e_entry.layer, e_entry.expert)] = (
+                        dec_expert_sizes.get((e_entry.layer, e_entry.expert), 0) + e_entry.blob_bytes
+                    )
+            cur_wired = tot_w
+            for pair in sorted(dec_expert_sizes.keys(), key=lambda p: (-p[1], p[0])):
+                if cur_wired <= tier_budget_b:
+                    break
+                effective_cold.add(pair)
+                cur_wired -= dec_expert_sizes[pair]
+            backbone_plan = plan_amf_entries(
+                backbone_tensors,
+                group_size=group_size,
+                dtype_mode=eff_dtype_mode,
+                cold_experts=effective_cold,
+                all_experts_cold=all_experts_cold,
+                tie_word_embeddings=tie,
+                exclude_tensors=exclude_tensors,
+                sme2_pack=sme2_pack if quantize_bits == 0 else "none",
+                strip_vision=False,
+            )
 
     total_wired, non_exp_wired, exp_wired = _estimate_planned_wired_bytes(backbone_plan, quantize_bits, group_size)
     tier_check = evaluate_hardware_tier(
@@ -1984,14 +2516,19 @@ def convert_deepseek41_checkpoint(
             dtype_mode=eff_dtype_mode,
         )
 
-    # 2. Pack optional DSpark head when present.
+    # 2. Pack optional DSpark head when present (M7 single-pass or real-HF 3L DSpark `mtp.0..2.*`).
     dspark_path: pathlib.Path | None = None
+    dspark_cfg_out_path: pathlib.Path | None = None
     dspark_metas: list[PackedTensorMeta] = []
     if dspark_tensors:
         eff_ds_out = (
             pathlib.Path(dspark_output) if dspark_output is not None else out_path.with_name(out_path.stem + "-dspark.amf")
         )
         remapped: dict[str, _ShardTensor] = {}
+        ds_exp_ids: set[int] = set()
+        ds_layer_ids: set[int] = set()
+        ds_exp_re = re.compile(r"\.experts\.(\d+)\.")
+        ds_mtp_l_re = re.compile(r"^mtp\.(\d+)\.")
         for raw_name, st in dspark_tensors.items():
             clean = _normalize_name(strip_dspark_prefix(raw_name))
             remapped[clean] = _ShardTensor(
@@ -2002,20 +2539,93 @@ def convert_deepseek41_checkpoint(
                 length=st.length,
                 path=st.path,
             )
+            em = ds_exp_re.search(clean)
+            if em is not None:
+                ds_exp_ids.add(int(em.group(1)))
+            lm = ds_mtp_l_re.match(clean)
+            if lm is not None:
+                ds_layer_ids.add(int(lm.group(1)))
+        ds_cold: set[tuple[int, int]] = set()
+        if dspark_cold_experts_per_layer is not None and dspark_cold_experts_per_layer > 0 and ds_exp_ids:
+            max_ds_e = max(ds_exp_ids)
+            cutoff = max_ds_e + 1 - dspark_cold_experts_per_layer
+            for l_i in ds_layer_ids or {0}:
+                for e_i in ds_exp_ids:
+                    if e_i >= cutoff:
+                        ds_cold.add((l_i, e_i))
         ds_plan = plan_amf_entries(
             remapped,
             group_size=group_size,
             dtype_mode=eff_dtype_mode,
+            cold_experts=ds_cold,
+            all_experts_cold=all_experts_cold,
             tie_word_embeddings=False,
             sme2_pack="none",
             strip_vision=False,
         )
+        ds_quant_bits = quantize_bits if (dspark_quant_profile == "uniform" and any(e.name.startswith("mtp.") for e in ds_plan)) else 0
         readers_ds = _ShardReaders()
         try:
-            dspark_metas = _write_backbone_stream(ds_plan, eff_ds_out, f"{model_id[:52]}-dspark", readers_ds)
+            dspark_metas = _write_backbone_stream(
+                ds_plan,
+                eff_ds_out,
+                f"{model_id[:52]}-dspark",
+                readers_ds,
+                quantize_float_bits=ds_quant_bits,
+                dequantize_quant_to_bf16=dequantize_bf16 and any(e.name.startswith("mtp.") for e in ds_plan),
+                group_size=group_size,
+            )
         finally:
             readers_ds.close()
+        if dspark_quant_profile == "gsq-rco" and any(m.name.startswith("mtp.") for m in dspark_metas):
+            eff_ds_bits = 3.50 if target_bits is None else float(target_bits)
+            dspark_metas = gsq_convert_with_vision(
+                eff_ds_out,
+                eff_ds_out,
+                target_bits=eff_ds_bits,
+                model_id=f"{model_id[:52]}-dspark",
+                group_size=group_size,
+                dtype_mode=eff_dtype_mode,
+                cold_experts=ds_cold,
+                all_experts_cold=all_experts_cold,
+                sme2_pack=sme2_pack,
+                lut16_sme2=lut16_sme2,
+                use_rco=use_rco,
+                workers=workers,
+                strip_vision=True,
+            )
         dspark_path = eff_ds_out
+        if (
+            dspark_config_output is not None
+            or config_output is not None
+            or dspark_output is not None
+            or any(m.name.startswith("mtp.") for m in dspark_metas)
+        ):
+            dspark_cfg_out_path = (
+                pathlib.Path(dspark_config_output)
+                if dspark_config_output is not None
+                else eff_ds_out.with_name(
+                    "dspark_config.json" if eff_ds_out.name == "dspark.amf" else f"{eff_ds_out.stem}_config.json"
+                )
+            )
+            is_3l_mtp = any(m.name.startswith("mtp.") for m in dspark_metas)
+            dspark_cfg_obj = {
+                "draft_format": "dspark_3l_mtp" if is_3l_mtp else "dspark",
+                "amf_file": dspark_path.name,
+                "num_nextn_predict_layers": int(text_cfg.get("num_nextn_predict_layers", len(ds_layer_ids) or 1) or 1),
+                "dspark_block_size": int(text_cfg.get("dspark_block_size", text_cfg.get("dspark_block_width", 5)) or 5),
+                "dspark_target_layer_ids": list(text_cfg.get("dspark_target_layer_ids", []))
+                if isinstance(text_cfg.get("dspark_target_layer_ids"), list)
+                else [],
+                "dspark_n_routed_experts": int(text_cfg.get("dspark_n_routed_experts", len(ds_exp_ids)) or 0),
+                "dspark_routed_top_k": int(text_cfg.get("dspark_routed_top_k", 3) or 3),
+                "hidden_size": int(text_cfg.get("hidden_size", 5120) or 5120),
+                "vocab_size": int(text_cfg.get("vocab_size", 129280) or 129280),
+                "tensor_count": len(dspark_metas),
+                "tensor_names_max_bytes": max((len(m.name.encode("utf-8")) for m in dspark_metas), default=0),
+            }
+            dspark_cfg_out_path.parent.mkdir(parents=True, exist_ok=True)
+            dspark_cfg_out_path.write_text(json.dumps(dspark_cfg_obj, indent=2) + "\n", encoding="utf-8")
 
     # 3. Stream backbone .amf (+ optional GSQ+RCO pass).
     readers = _ShardReaders()
@@ -2026,6 +2636,7 @@ def convert_deepseek41_checkpoint(
             model_id,
             readers,
             quantize_float_bits=quantize_bits,
+            dequantize_quant_to_bf16=dequantize_bf16,
             group_size=group_size,
             vision_block_dtype=vision_block_dtype,
         )
@@ -2101,7 +2712,11 @@ def convert_deepseek41_checkpoint(
             "per_rank_wired_bytes": tier_check.per_rank_wired_bytes,
             "per_rank_budget_bytes": tier_check.per_rank_budget_bytes,
             "fits": tier_check.fits,
+            "encoder_cold_decoder_hot": encoder_cold_decoder_hot,
+            "cold_experts_count": len(effective_cold),
         }
+        if dspark_cfg_out_path is not None and isinstance(out_cfg.get("dspark"), dict):
+            out_cfg["dspark"]["config_file"] = dspark_cfg_out_path.name
         if part_report is not None:
             out_cfg["expert_parallel"] = {
                 "world_size": part_report.world_size,
@@ -2127,6 +2742,7 @@ def convert_deepseek41_checkpoint(
         vision_amf=vision_amf_path,
         vision_metas=vision_metas,
         included_vision_tensors=included_vision,
+        dspark_config_path=dspark_cfg_out_path,
     )
 
 
@@ -2187,6 +2803,7 @@ class DeepSeek41MetadataReport:
     estimated_backbone_q4_bytes: int
     tier_admission: dict[str, dict[str, object]]
     tokenizer_present: bool
+    header_summary_verified: bool = False
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -2220,7 +2837,7 @@ class DeepSeek41MetadataReport:
             "engram_head_dim": self.engram_head_dim,
             "dspark_layers": self.dspark_layers,
             "dspark_block_size": self.dspark_block_size,
-            "dspark_n_routed_experts": self.dspark_n_routed_experts,
+            "dspark_n_routed_experts": self.dspark_n_experts if hasattr(self, "dspark_n_experts") else self.dspark_n_routed_experts,
             "quantization_config": dict(self.quantization_config),
             "kv_bytes_per_token_bf16": self.kv_bytes_per_token_bf16,
             "kv_bytes_per_token_fp4": self.kv_bytes_per_token_fp4,
@@ -2247,6 +2864,7 @@ class DeepSeek41MetadataReport:
             "estimated_backbone_q4_bytes": self.estimated_backbone_q4_bytes,
             "tier_admission": self.tier_admission,
             "tokenizer_present": self.tokenizer_present,
+            "header_summary_verified": self.header_summary_verified,
         }
 
 
@@ -2306,6 +2924,9 @@ def validate_hf_metadata_dir(
             continue
         if is_dspark_tensor(raw_name):
             dspark_cnt += 1
+            ds_clean = _normalize_name(strip_dspark_prefix(raw_name))
+            if len(ds_clean.encode("utf-8")) > 47:
+                long_names.append(f"dspark:{ds_clean}")
             continue
         norm = _strip_model_prefix(raw_name)
         backbone_cnt += 1
@@ -2415,7 +3036,7 @@ def validate_hf_metadata_dir(
             routed_expert_bytes=q3_exp,
             allow_override=True,
         )
-        tier_admission[label] = {
+        entry_adm: dict[str, object] = {
             "target_tier": chk.target_tier,
             "world_size": chk.world_size,
             "per_rank_budget_gib": round(chk.per_rank_budget_bytes / (1024**3), 2),
@@ -2423,6 +3044,47 @@ def validate_hf_metadata_dir(
             "fits_all_wired_q3": chk.fits,
             "recommendation": chk.recommendation,
         }
+        if label == "24gb-m4":
+            enc_exp_q3 = (q3_exp * enc_l) // max(1, total_layers)
+            dec_exp_q3 = max(0, q3_exp - enc_exp_q3)
+            m4_budget = chk.per_rank_budget_bytes
+            hot_budget = max(0, m4_budget - q3_non_exp)
+            dec_hot_frac = min(1.0, hot_budget / dec_exp_q3) if dec_exp_q3 > 0 else 1.0
+            fits_ecd = q3_non_exp <= m4_budget
+            entry_adm["encoder_cold_decoder_hot"] = {
+                "non_expert_q3_gib": round(q3_non_exp / (1024**3), 2),
+                "encoder_routed_cold_q3_gib": round(enc_exp_q3 / (1024**3), 2),
+                "decoder_routed_q3_gib": round(dec_exp_q3 / (1024**3), 2),
+                "decoder_hot_cache_budget_gib": round(hot_budget / (1024**3), 2),
+                "decoder_hot_expert_fraction": round(dec_hot_frac, 4),
+                "fits_encoder_cold_decoder_hot": fits_ecd,
+            }
+        tier_admission[label] = entry_adm
+
+    summary_verified = False
+    summary_path = base / "safetensors_headers_summary.json"
+    if summary_path.is_file():
+        sum_obj = json.loads(summary_path.read_text(encoding="utf-8"))
+        ratios_map = sum_obj.get("scale_weight_ratios") if isinstance(sum_obj, dict) else None
+        if isinstance(ratios_map, dict) and ratios_map:
+            for rk, rv in ratios_map.items():
+                if not isinstance(rv, dict):
+                    continue
+                w_dt = str(rv.get("weight_dtype") or "")
+                s_dt = str(rv.get("scale_dtype") or "")
+                rats = rv.get("ratios")
+                if not isinstance(rats, list) or len(rats) != 2:
+                    continue
+                if w_dt == "F8_E4M3" and s_dt == "F8_E8M0":
+                    if ".engram.embed." in rk:
+                        if rats != [1.0, 32.0]:
+                            raise ValueError(f"{rk} expected [1, 32] row-wise UE8M0 scale ratio, got {rats}")
+                    elif not (24.0 <= float(rats[0]) <= 32.0 and 24.0 <= float(rats[1]) <= 32.0):
+                        raise ValueError(f"{rk} expected [32, 32] UE8M0 FP8 block scale ratio, got {rats}")
+                elif w_dt == "I8" and s_dt == "F8_E8M0":
+                    if rats != [1.0, 16.0]:
+                        raise ValueError(f"{rk} expected [1, 16] packed UE8M0 FP4 scale ratio, got {rats}")
+            summary_verified = True
 
     raw_archs = raw_cfg.get("architectures")
     archs = tuple(str(a) for a in raw_archs) if isinstance(raw_archs, list) else ()
@@ -2480,4 +3142,5 @@ def validate_hf_metadata_dir(
         estimated_backbone_q4_bytes=q4_total,
         tier_admission=tier_admission,
         tokenizer_present=(base / "tokenizer.json").is_file(),
+        header_summary_verified=summary_verified,
     )

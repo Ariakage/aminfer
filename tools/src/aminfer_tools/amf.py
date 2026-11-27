@@ -278,6 +278,7 @@ _SAFETENSORS_DTYPE_BYTES = {
     "I8": 1,
     "F8_E4M3": 1,
     "F8_E5M2": 1,
+    "F8_E8M0": 1,
     "U16": 2,
     "I16": 2,
     "F16": 2,
@@ -754,11 +755,22 @@ def _strip_model_prefix(raw_name: str) -> str:
 
 
 _LONG_NAME_COMPACT_RULES: tuple[tuple[str, str], ...] = (
+    ("hyper_connection_mixer.", "hc_mixer."),
     (".attn_hyper_connection.", ".attn_hc."),
     (".mlp_hyper_connection.", ".mlp_hc."),
     (".input_mix_weight_down.", ".in_mix_dn."),
     (".input_mix_weight_up.", ".in_mix_up."),
     (".block_inject_weight.", ".blk_inj."),
+    (".self_attn.indexer.index_qk_proj.", ".attn.idx.qk_proj."),
+    (".self_attn.indexer.q_layernorm.", ".attn.idx.q_norm."),
+    (".self_attn.indexer.k_layernorm.", ".attn.idx.k_norm."),
+    (".ple.ple_embedding.layer_multipliers", ".ple.layer_mult"),
+    (".ple.ple_embedding.ngram_heads_offsets", ".ple.ngram_offsets"),
+    (".ple.ple_embedding.ngram_heads_vocab_sizes", ".ple.ngram_vocabs"),
+    (".ple_embedding.", "."),
+    (".ngram_heads_offsets", ".ngram_offsets"),
+    (".ngram_heads_vocab_sizes", ".ngram_vocabs"),
+    (".layer_multipliers", ".layer_mult"),
     (".compressed_indexer.", ".cidx."),
     (".head_weight_projection.", ".hw_proj."),
     (".key_gate_projection.", ".kg_proj."),
@@ -863,6 +875,8 @@ def _classify_tensor(
     all_experts_cold: bool,
 ) -> tuple[TensorKind, int, int]:
     layer_match = _LAYER_RE.search(name) or _VISION_BLOCK_RE.search(name)
+    if layer_match is None and name.startswith("mtp."):
+        layer_match = re.match(r"^mtp\.(\d+)\.", name)
     layer = int(layer_match.group(1)) if layer_match else NO_LAYER
     expert_match = _EXPERT_RE.search(name)
     expert = int(expert_match.group(1)) if expert_match else NO_EXPERT
@@ -870,13 +884,40 @@ def _classify_tensor(
     lower = name.lower()
     if _LOOP_STEP_RE.search(name) or ".loop_adapter." in lower:
         return (TensorKind.LOOP_ADAPTER, layer, NO_EXPERT)
+    _is_dense_ple = ".ple." in lower and any(
+        tok in lower
+        for tok in (
+            ".ple.conv1d",
+            ".ple.key_proj",
+            ".ple.value_proj",
+            ".ple.norm_conv",
+            ".ple.norm_key",
+            ".ple.norm_query",
+            ".ple.layer_mult",
+            ".ple.ngram_offsets",
+            ".ple.ngram_vocabs",
+            ".ple_embedding.layer_multipliers",
+            ".ple_embedding.ngram_heads_offsets",
+            ".ple_embedding.ngram_heads_vocab_sizes",
+        )
+    )
     if (
         lower.startswith(("ple.", "engram.", "sparse_table."))
-        or ".ple." in lower
+        or (".ple." in lower and not _is_dense_ple)
         or "multi_head_embedding" in lower
         or "per_layer_token_embd" in lower
         or lower.endswith(".lookup_table")
-        or (".engram." in lower and "key_projs" not in lower and "value_proj" not in lower and "norm" not in lower and "hc_scales" not in lower and "unified_pre_gamma" not in lower)
+        or (
+            ".engram." in lower
+            and "key_projs" not in lower
+            and "value_proj" not in lower
+            and "wkv" not in lower
+            and "q_weight" not in lower
+            and "k_weight" not in lower
+            and "norm" not in lower
+            and "hc_scales" not in lower
+            and "unified_pre_gamma" not in lower
+        )
     ):
         return (TensorKind.SPARSE_TABLE, layer, NO_EXPERT)
     if expert != NO_EXPERT:
@@ -1611,6 +1652,12 @@ def _slice_range(t: _ShardTensor, index: int, count: int) -> _ByteRange:
     return _ByteRange(t.path, t.offset + index * step, step, t.dtype)
 
 
+def _slice_sub_half_range(t: _ShardTensor, index: int, count: int, half_idx: int) -> _ByteRange:
+    exp_len = t.length // count
+    half_len = exp_len // 2
+    return _ByteRange(t.path, t.offset + index * exp_len + half_idx * half_len, half_len, t.dtype)
+
+
 def _full_range(t: _ShardTensor) -> _ByteRange:
     return _ByteRange(t.path, t.offset, t.length, t.dtype)
 
@@ -1739,7 +1786,7 @@ def _plan_fp8_or_mxfp8_slice(
             params_bytes_override=4,
             outer_scale_const=1.0,
         )
-    if s_tensor.dtype == "U8":
+    if s_tensor.dtype in ("U8", "F8_E8M0"):
         if k % 32 != 0:
             raise ValueError(f"MXFP8 tensor {prefix_desc} K={k} must be divisible by 32")
         tile_shape: tuple[int, int] | None = None
@@ -1884,6 +1931,9 @@ def plan_amf_entries(
     mimo_mtp_standalone: bool = False,
     mimo_dflash_mode: bool = False,
     qwen35_config: Mapping[str, Any] | None = None,
+    qwen4_config: Mapping[str, Any] | None = None,
+    qwen4_mtp_standalone: bool = False,
+    split_stacked_gate_up: bool | None = None,
     glm5_config: Mapping[str, Any] | None = None,
     glm5_mtp_standalone: bool = False,
     glm5_mtp_source_layer: int | None = None,
@@ -1994,12 +2044,22 @@ def plan_amf_entries(
             from aminfer_tools.mimo_v2 import normalize_qwen35_tensor_name
 
             nm = normalize_qwen35_tensor_name(raw_name)
+        elif qwen4_config is not None or qwen4_mtp_standalone:
+            from aminfer_tools.qwen4_exp import normalize_qwen4_tensor_name
+
+            nm = normalize_qwen4_tensor_name(raw_name, mtp_standalone=qwen4_mtp_standalone)
         else:
             return _normalize_name(raw_name)
         enc = nm.encode("utf-8")
         if len(enc) == 0 or len(enc) > 47:
             raise ValueError(f"AMF tensor name must be 1..47 UTF-8 bytes, got {len(enc)}: {nm!r}")
         return nm
+
+    eff_split_gate_up = (
+        (qwen4_config is not None or qwen4_mtp_standalone)
+        if split_stacked_gate_up is None
+        else bool(split_stacked_gate_up)
+    )
 
     def _glm5_split_specs(out_base: str, shape: Sequence[int]):
         if glm5_config is None or is_vision_tensor(out_base):
@@ -2011,14 +2071,48 @@ def plan_amf_entries(
     is_mimo_or_q35 = (
         mimo_config is not None
         or qwen35_config is not None
+        or qwen4_config is not None
         or glm5_config is not None
         or ling3_config is not None
         or mimo_dflash_mode
         or mimo_mtp_standalone
+        or qwen4_mtp_standalone
         or glm5_dflash2_mode
         or glm5_mtp_standalone
         or ling3_mtp_standalone
     )
+
+    def _qwen4_split_specs(out_base: str, n_rows: int) -> list[tuple[str, tuple[tuple[int, int], ...]]] | None:
+        if qwen4_config is None or is_vision_tensor(out_base):
+            return None
+        base = out_base[:-7] if out_base.endswith(".weight") else out_base
+        if base.endswith(".linear_attn.in_proj_qkv"):
+            lk_h = int(qwen4_config.get("linear_num_key_heads") or 16)
+            lk_d = int(qwen4_config.get("linear_key_head_dim") or 128)
+            lv_h = int(qwen4_config.get("linear_num_value_heads") or 48)
+            lv_d = int(qwen4_config.get("linear_value_head_dim") or 128)
+            kq = lk_h * lk_d
+            vd = lv_h * lv_d
+            if n_rows != 2 * kq + vd:
+                raise ValueError(f"qwen4_exp {out_base}: rows {n_rows} != 2*{kq}+{vd}")
+            pfx = base[: -len(".in_proj_qkv")]
+            return [
+                (f"{pfx}.q_proj.weight", ((0, kq),)),
+                (f"{pfx}.k_proj.weight", ((kq, kq),)),
+                (f"{pfx}.v_proj.weight", ((2 * kq, vd),)),
+            ]
+        og_type = str(qwen4_config.get("output_gate_type") or "").lower()
+        has_og = bool(qwen4_config.get("attn_output_gate", False)) or og_type == "sigmoid"
+        if base.endswith(".self_attn.q_proj") and has_og:
+            qh = int(qwen4_config.get("num_attention_heads") or 24)
+            hd = int(qwen4_config.get("head_dim") or 256)
+            if n_rows == 2 * qh * hd:
+                pfx = base[: -len(".q_proj")]
+                return [
+                    (f"{pfx}.q_proj.weight", tuple((h_i * 2 * hd, hd) for h_i in range(qh))),
+                    (f"{pfx}.q_gate_proj.weight", tuple((h_i * 2 * hd + hd, hd) for h_i in range(qh))),
+                ]
+        return None
 
     def _qwen35_split_specs(out_base: str, n_rows: int) -> list[tuple[str, tuple[tuple[int, int], ...]]] | None:
         if qwen35_config is None or is_vision_tensor(out_base):
@@ -2494,7 +2588,7 @@ def plan_amf_entries(
         if w_name in consumed:
             continue
         w = tensors[w_name]
-        if w.dtype not in ("U8", "U32", "I32", "F8_E4M3"):
+        if w.dtype not in ("U8", "I8", "U32", "I32", "F8_E4M3"):
             continue
         split = _split_quant_weight_base(w_name)
         if split is None:
@@ -2549,7 +2643,18 @@ def plan_amf_entries(
         if skip_lm_head and is_lm_head(base) and (embed_rows is None or w.shape[0] == embed_rows):
             continue
 
-        if w.dtype == "U8" and s is not None and s.dtype == "U8" and s2 is None and amax_t is None and gscale is None and len(w.shape) == 2 and len(s.shape) == 2 and w.shape[0] == s.shape[0] and w.shape[1] == 16 * s.shape[1]:
+        if (
+            w.dtype in ("U8", "I8")
+            and s is not None
+            and s.dtype in ("U8", "F8_E8M0")
+            and s2 is None
+            and amax_t is None
+            and gscale is None
+            and len(w.shape) == 2
+            and len(s.shape) == 2
+            and w.shape[0] == s.shape[0]
+            and w.shape[1] == 16 * s.shape[1]
+        ):
             k_full = w.shape[1] * 2
             norm_name = _plan_out_name(w_name if w_name.endswith(".weight") else f"{base}.weight")
             kind, layer, expert = _classify_tensor(norm_name, cold_set, all_experts_cold)
@@ -2680,6 +2785,9 @@ def plan_amf_entries(
         # w.dtype == "F8_E4M3"
         if len(w.shape) == 3:
             stacked = _resolve_stacked_expert_meta(base)
+            if stacked is None and qwen4_mtp_standalone:
+                mtp_clean = re.sub(r"^(?:model\.)?(?:language_model\.)?mtp\.", "", base)
+                stacked = _resolve_stacked_expert_meta(mtp_clean)
             if stacked is None:
                 raise ValueError(f"3D FP8/MXFP8 tensor {w_name} is not an expert stack")
             num_experts, n_r, k_c = w.shape
@@ -2696,6 +2804,40 @@ def plan_amf_entries(
             else:
                 s_slice_shape = ()
                 per_exp_scale = False
+            if eff_split_gate_up and proj in ("gate_up_proj", "w13"):
+                if n_r % 2 != 0:
+                    raise ValueError(f"3D stacked {w_name} rows {n_r} must be even to split gate_proj/up_proj")
+                half_r = n_r // 2
+                if per_exp_scale and len(s_slice_shape) == 2 and s_slice_shape[0] % 2 != 0 and s_slice_shape[0] > 1:
+                    raise ValueError(f"3D stacked scale {s.name} rows {s_slice_shape[0]} must be even to split")
+                for e in range(num_experts):
+                    ek = _expert_kind(layer, e, cold_set, all_experts_cold)
+                    for h_idx, split_proj in ((0, "gate_proj"), (1, "up_proj")):
+                        if s is None:
+                            sr = None
+                            eff_s_shp: tuple[int, ...] = ()
+                        elif per_exp_scale and len(s_slice_shape) == 2 and s_slice_shape[0] >= 2:
+                            sr = _slice_sub_half_range(s, e, num_experts, h_idx)
+                            eff_s_shp = (s_slice_shape[0] // 2, s_slice_shape[1])
+                        else:
+                            sr = _slice_range(s, e, num_experts) if per_exp_scale else _full_range(s)
+                            eff_s_shp = s_slice_shape
+                        entries.append(
+                            _plan_fp8_or_mxfp8_slice(
+                                name=f"layers.{layer}.mlp.experts.{e}.{split_proj}",
+                                kind=ek,
+                                layer=layer,
+                                expert=e,
+                                n_rows=half_r,
+                                k=k_c,
+                                w_range=_slice_sub_half_range(w, e, num_experts, h_idx),
+                                s_tensor=s,
+                                s_range=sr,
+                                s_slice_shape=eff_s_shp,
+                                prefix_desc=base,
+                            )
+                        )
+                continue
             for e in range(num_experts):
                 sr = None if s is None else (_slice_range(s, e, num_experts) if per_exp_scale else _full_range(s))
                 entries.append(
@@ -2749,6 +2891,37 @@ def plan_amf_entries(
             continue
         if skip_lm_head and is_lm_head(name) and (embed_rows is None or t.shape[0] == embed_rows):
             continue
+        if t.dtype == "I64" and norm_lenient.endswith(
+            (
+                ".ple.ple_embedding.layer_multipliers",
+                ".ple.ple_embedding.ngram_heads_offsets",
+                ".ple.ple_embedding.ngram_heads_vocab_sizes",
+                ".ple.layer_mult",
+                ".ple.ngram_offsets",
+                ".ple.ngram_vocabs",
+            )
+        ):
+            if len(t.shape) != 1 or t.shape[0] == 0:
+                raise ValueError(f"PLE I64 tensor {name!r} must be non-empty 1D, got shape {list(t.shape)}")
+            norm_name = _plan_out_name(name)
+            kind, layer, expert = _classify_tensor(norm_name, cold_set, all_experts_cold)
+            entries.append(
+                _make_entry(
+                    norm_name,
+                    kind,
+                    DType.U32,
+                    0,
+                    0,
+                    layer,
+                    expert,
+                    (t.shape[0], 2),
+                    _full_range(t),
+                    "i64_raw_u32_pair",
+                    sme2_pack="none",
+                    name_already_normalized=True,
+                )
+            )
+            continue
         if _is_d2t_name(norm_lenient) and t.dtype in ("I64", "I32"):
             if len(t.shape) != 1 or t.shape[0] == 0:
                 raise ValueError(f"EAGLE-3 d2t tensor {name!r} must be non-empty 1D, got shape {list(t.shape)}")
@@ -2786,13 +2959,42 @@ def plan_amf_entries(
                 mtp_sw_f = re.match(r"^(?:model\.)?mtp\.(\d+)\.mlp\.switch_mlp\.(gate_proj|up_proj|down_proj)\.weight$", name)
                 if mtp_sw_f is not None:
                     stacked = (0, mtp_sw_f.group(2))
+            if stacked is None and qwen4_mtp_standalone:
+                mtp_clean = re.sub(r"^(?:model\.)?(?:language_model\.)?mtp\.", "", name[: -len(".weight")])
+                stacked = _resolve_stacked_expert_meta(mtp_clean)
         elif name.endswith("_weight"):
             stacked = _resolve_stacked_expert_meta(name[: -len("_weight")])
         else:
             stacked = _resolve_stacked_expert_meta(name)
+            if stacked is None and qwen4_mtp_standalone:
+                mtp_clean = re.sub(r"^(?:model\.)?(?:language_model\.)?mtp\.", "", name)
+                stacked = _resolve_stacked_expert_meta(mtp_clean)
         if stacked is not None and len(t.shape) == 3:
             num_experts, n, k = t.shape
             layer, proj = stacked
+            if eff_split_gate_up and proj in ("gate_up_proj", "w13"):
+                if n % 2 != 0:
+                    raise ValueError(f"3D stacked {name} rows {n} must be even to split gate_proj/up_proj")
+                half_n = n // 2
+                for e in range(num_experts):
+                    ek = _expert_kind(layer, e, cold_set, all_experts_cold)
+                    for h_idx, split_proj in ((0, "gate_proj"), (1, "up_proj")):
+                        entries.append(
+                            _make_entry(
+                                f"layers.{layer}.mlp.experts.{e}.{split_proj}.weight",
+                                ek,
+                                amf_dtype,
+                                0,
+                                0,
+                                layer,
+                                e,
+                                (half_n, k),
+                                _slice_sub_half_range(t, e, num_experts, h_idx),
+                                convert,
+                                sme2_pack=sme2_pack,
+                            )
+                        )
+                continue
             for e in range(num_experts):
                 entries.append(
                     _make_entry(
@@ -2852,7 +3054,7 @@ def plan_amf_entries(
                     )
                 continue
         if len(t.shape) == 2:
-            q35_splits = _qwen35_split_specs(norm_name, t.shape[0])
+            q35_splits = _qwen35_split_specs(norm_name, t.shape[0]) or _qwen4_split_specs(norm_name, t.shape[0])
             if q35_splits is not None:
                 for split_nm, runs in q35_splits:
                     split_rows = sum(rc for _, rc in runs)
@@ -2886,13 +3088,21 @@ def plan_amf_entries(
             flat_in = eff_shape[1] * eff_shape[2] * eff_shape[3] * eff_shape[4]
             eff_shape = (eff_shape[0], flat_in)
         elif (
-            (qwen35_config is not None or glm5_config is not None or ling3_config is not None or ling3_mtp_standalone)
+            (
+                qwen35_config is not None
+                or qwen4_config is not None
+                or qwen4_mtp_standalone
+                or glm5_config is not None
+                or ling3_config is not None
+                or ling3_mtp_standalone
+            )
             and norm_name.endswith(
                 (
                     ".linear_attn.conv1d.weight",
                     ".linear_attn.q_conv1d.weight",
                     ".linear_attn.k_conv1d.weight",
                     ".linear_attn.v_conv1d.weight",
+                    ".ple.conv1d.weight",
                 )
             )
             and len(eff_shape) == 3
@@ -3502,7 +3712,7 @@ def _stream_entry(entry: _PlannedEntry, readers: _ShardReaders, w: _BlobWriter) 
         _stream_row_gathered_entry(entry, readers, w)
         return
     src = readers.get(entry.data.path)
-    if entry.data_convert is None:
+    if entry.data_convert in (None, "i64_raw_u32_pair"):
         done = 0
         while done < entry.data.length:
             take = min(_COPY_CHUNK_BYTES, entry.data.length - done)
@@ -3949,6 +4159,9 @@ def pack_amf_from_safetensors(
     mimo_mtp_standalone: bool = False,
     mimo_dflash_mode: bool = False,
     qwen35_config: Mapping[str, Any] | None = None,
+    qwen4_config: Mapping[str, Any] | None = None,
+    qwen4_mtp_standalone: bool = False,
+    split_stacked_gate_up: bool | None = None,
     glm5_config: Mapping[str, Any] | None = None,
     glm5_mtp_standalone: bool = False,
     glm5_mtp_source_layer: int | None = None,
@@ -4157,12 +4370,14 @@ def pack_amf_from_safetensors(
     eff_mimo_cfg = mimo_config
     eff_mimo_tp = 1 if mimo_qkv_tp_degree is None else mimo_qkv_tp_degree
     eff_qwen35_cfg = qwen35_config
+    eff_qwen4_cfg = qwen4_config
     eff_glm5_cfg = glm5_config
     eff_ling3_cfg = ling3_config
     cfg_probe_p = config_path or resolved.config_path
     if (
         eff_mimo_cfg is None
         and eff_qwen35_cfg is None
+        and eff_qwen4_cfg is None
         and eff_glm5_cfg is None
         and eff_ling3_cfg is None
         and cfg_probe_p is not None
@@ -4178,6 +4393,7 @@ def pack_amf_from_safetensors(
                 is_mimo_v2_config,
                 is_qwen35_config,
             )
+            from aminfer_tools.qwen4_exp import _effective_text_config, is_qwen4_config
 
             if is_glm5_config(probe_cfg_obj) and not glm5_dflash2_mode:
                 eff_glm5_cfg = probe_cfg_obj
@@ -4189,6 +4405,8 @@ def pack_amf_from_safetensors(
                     eff_mimo_tp = infer_mimo_qkv_tp_degree(probe_cfg_obj, probe_tensors)
             elif is_qwen35_config(probe_cfg_obj):
                 eff_qwen35_cfg = _effective_mimo_cfg(probe_cfg_obj)
+            elif is_qwen4_config(probe_cfg_obj):
+                eff_qwen4_cfg = _effective_text_config(probe_cfg_obj)
     tensors = probe_tensors
     plan = plan_amf_entries(
         tensors,
@@ -4208,6 +4426,9 @@ def pack_amf_from_safetensors(
         mimo_mtp_standalone=mimo_mtp_standalone,
         mimo_dflash_mode=mimo_dflash_mode,
         qwen35_config=eff_qwen35_cfg,
+        qwen4_config=eff_qwen4_cfg,
+        qwen4_mtp_standalone=qwen4_mtp_standalone,
+        split_stacked_gate_up=split_stacked_gate_up,
         glm5_config=eff_glm5_cfg,
         glm5_mtp_standalone=glm5_mtp_standalone,
         glm5_mtp_source_layer=glm5_mtp_source_layer,
@@ -6916,6 +7137,9 @@ def gsq_convert_with_vision(
     mimo_mtp_standalone: bool = False,
     mimo_dflash_mode: bool = False,
     qwen35_config: Mapping[str, Any] | None = None,
+    qwen4_config: Mapping[str, Any] | None = None,
+    qwen4_mtp_standalone: bool = False,
+    split_stacked_gate_up: bool | None = None,
     glm5_config: Mapping[str, Any] | None = None,
     glm5_mtp_standalone: bool = False,
     glm5_mtp_source_layer: int | None = None,
