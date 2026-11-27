@@ -269,14 +269,21 @@ before converter implementation:
   `MiMo-V2.6-Distill-Qwen-9B` (`qwen3_5` `4.00 bpw` `4.29 GiB` + `873 MiB` `27L`
   ViT sidecar) fully wired on `24 GB` M4 at `0` swap
   ([../benchmarks/results.md](../benchmarks/results.md#m91-mimo-v26-family-g26-asymmetric-192128-swa-d15-chained-3l-mtpdflash-and-real-distill-qwen-9b-parity)).
-- **`M9.2` — `GLM-5` (`GLM-5.2` & `5.3` `753B` `glm_moe_dsa`, `GLM-5.3-Flash` `320B` `glm5_next`):**
+- **`M9.2` — `GLM-5` (`GLM-5.2` & `5.3` `753B` `glm_moe_dsa`, `GLM-5.3-Flash` `320B` `glm5_next`) — Implemented on M4 (`22a3e7c`, `2e9ac87`, `293fe71`, `4c9f91e`, `30795a6`):**
   Reuses `G11` + `G25` `IndexCache` for `GLM-5.2/5.3` (`index_topk_freq = 4`
-  skipping `75%` of `DSA` re-indexing + `index_share_for_mtp_iteration = true`
-  zero-reindex `1L` MTP, `GSQ-RCO` `~280 GiB` single-`512 GB` Ultra fit), and
-  pairs `GLM-5.3-Flash` with `W20` `24L` ViT sidecar stripping, single-kernel
-  register-fused 20-iteration `hc_mult = 4` `mHC` Sinkhorn, `34` `fused_qkvbfg_a_proj`
-  linear-attention layers + `11` `NoPE MLA` (`qk_rope_head_dim = 0`, `index_kpool = 4`)
-  layers, and `DFlash2` (`D15`).
+  with `index_skip_topk_offset = 3`: `21/78` full vs `57/78` shared `DSA`,
+  skipping `73.1%` of `DSA` re-indexing + `index_share_for_mtp_iteration = true`
+  zero-reindex `1L` `MTP`, `GSQ-RCO` `~280 GiB` single-`512 GB` Ultra fit), and
+  pairs `GLM-5.3-Flash` with `W20` `24L` `Glm5NextVision` sidecar stripping
+  (`q_norm`/`k_norm`, global half-split 2D axial RoPE, channel-first
+  `visual.downsample`, `post_projection_norm -> GELU`, `swiglu_limit = 10.0`
+  merger), single-kernel register-fused 20-iteration `hc_mult = 4` `mHC`
+  Sinkhorn, `34` `KDA` (`-5.0 * sigmoid(...)`, `q/k/v_conv1d`, `o_norm * sigmoid(z)`)
+  layers + `11` `NoPE MLA` (`qk_rope_head_dim = 0`, `index_kpool = 4` + tail selection)
+  layers + `288E` (`swiglu_limit = 10.0`), and `DFlash2` (`D15` `DFlashGroupedConv` +
+  `CandidateSelector`, `B = 8..16`). Full `320B`/`753B` checkpoints remain gated
+  on local weight storage and `128–512 GB` hardware; see
+  [status](../status.md) and [benchmark results](../benchmarks/results.md).
 - **`M9.3` — `Ling-3.1-flash-1019` (`572B` `bailing_hybrid`) & `C27` dynamic MoE tiering:**
   Adds `63`-layer `KDA` (`Kernel Delta Attention`, `kda_lower_bound = -5.0`,
   `kda_safe_gate`, `k = 4` short conv) + `9`-layer Gated `MLA` (`g_proj`) +
