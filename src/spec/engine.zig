@@ -285,7 +285,7 @@ pub const LoadedDSparkProposer = struct {
         gm.evalLmHeadBatchF32(slot_hiddens, block_width, out_logits) catch return error.CallbackFailed;
     }
 
-    fn readOptionalConfigFileAlloc(allocator: std.mem.Allocator, amf_path: [:0]const u8) error{OutOfMemory}!?[]u8 {
+    pub fn readOptionalConfigFileAlloc(allocator: std.mem.Allocator, amf_path: [:0]const u8) error{OutOfMemory}!?[]u8 {
         const path_slice: []const u8 = amf_path;
         const slash_idx = std.mem.lastIndexOfScalar(u8, path_slice, '/');
         const dir_prefix = if (slash_idx) |idx| path_slice[0 .. idx + 1] else "";
@@ -1808,6 +1808,7 @@ pub const SpecEngine = struct {
 
     next_pos: u32,
     last_token: u32,
+    dspark_last_tap_row: u32 = 0,
     has_prefilled: bool,
     stats: SpecStats,
 
@@ -2164,6 +2165,7 @@ pub const SpecEngine = struct {
             .node_grammar_valid = @splat(true),
             .next_pos = 0,
             .last_token = 0,
+            .dspark_last_tap_row = 0,
             .has_prefilled = false,
             .stats = stats,
         };
@@ -2266,6 +2268,7 @@ pub const SpecEngine = struct {
         self.pearl_enabled = computeInitialPearlEnabled(self.config, self.small_draft, self.cost_model);
         self.next_pos = 0;
         self.last_token = 0;
+        self.dspark_last_tap_row = 0;
         self.has_prefilled = false;
         self.stats = .{};
         self.stats.pearl_enabled = self.pearl_enabled;
@@ -2310,6 +2313,13 @@ pub const SpecEngine = struct {
         return switch (self.target) {
             .qwen3 => |m| m.routerPredCalibration(),
             .graph => std.mem.zeroes(qwen3.SmeRouterCalibration),
+        };
+    }
+
+    pub fn targetFourStreamHiddenF32(self: *const SpecEngine) ?[]const f32 {
+        return switch (self.target) {
+            .qwen3 => null,
+            .graph => |g| g.lastFourStreamHiddenF32(),
         };
     }
 
@@ -2674,7 +2684,7 @@ pub const SpecEngine = struct {
         const need_top_hidden: bool = if (self.draft_head) |dh|
             (dh.config.format != .eagle3)
         else
-            false;
+            (self.dspark_proposer != null and self.dspark_proposer.?.is3L());
         const max_chunk: usize = if (self.draft_head) |dh|
             if (dh.effective_placement == .cpu_sme2)
                 @min(@as(usize, self.target.maxTreeNodes()), @as(usize, dh.max_tree_slots))
@@ -2685,9 +2695,12 @@ pub const SpecEngine = struct {
 
         var start: usize = 0;
         var first_tok: u32 = 0;
+        var last_chunk_len: u32 = 1;
+        var dspark_seeded_from_chunks = false;
         while (start < prompt_tokens.len) {
             const take: usize = @min(max_chunk, prompt_tokens.len - start);
             const is_last = (start + take == prompt_tokens.len);
+            last_chunk_len = @intCast(take);
 
             const greedy_tok = try self.target.prefillChunkWithOptions(
                 prompt_tokens[start .. start + take],
@@ -2744,6 +2757,24 @@ pub const SpecEngine = struct {
                 }
             }
 
+            if (self.dspark_proposer) |dp| {
+                if (dp.is3L() and self.target == .graph and self.target.graph.enable_feature_taps) {
+                    const g = self.target.graph;
+                    const h_u: usize = g.config.hidden_size;
+                    const aux_rows: usize = if (h_u > 0) g.accepted_aux_host.len / (3 * h_u) else 0;
+                    if (take <= aux_rows) {
+                        var taps_buf: [dspark_mod.MAX_DSPARK_TARGET_TAPS][]const f32 = undefined;
+                        for (0..take) |ti| {
+                            const n_taps = self.fillDSpark3LTapsForRow(g, @intCast(ti), &taps_buf);
+                            if (n_taps > 0) {
+                                try dp.seed3LWindow(taps_buf[0..n_taps], @intCast(start + ti));
+                                dspark_seeded_from_chunks = true;
+                            }
+                        }
+                    }
+                }
+            }
+
             start += take;
         }
 
@@ -2762,10 +2793,11 @@ pub const SpecEngine = struct {
         }
 
         // Seed real-HF 3L DSpark sliding-window KV cache from prefill target taps (0 hot-path allocs).
+        self.dspark_last_tap_row = if (last_chunk_len > 0) last_chunk_len - 1 else 0;
         if (self.dspark_proposer) |dp| {
-            if (dp.is3L() and self.target == .graph) {
+            if (dp.is3L() and self.target == .graph and !dspark_seeded_from_chunks) {
                 var taps_buf: [dspark_mod.MAX_DSPARK_TARGET_TAPS][]const f32 = undefined;
-                const n_taps = self.fillDSpark3LTaps(self.target.graph, &taps_buf);
+                const n_taps = self.fillDSpark3LTapsForRow(self.target.graph, self.dspark_last_tap_row, &taps_buf);
                 if (n_taps > 0) {
                     try dp.seed3LWindow(taps_buf[0..n_taps], @intCast(prompt_tokens.len - 1));
                 }
@@ -3147,7 +3179,7 @@ pub const SpecEngine = struct {
                         const g = self.target.graph;
                         if (dp.is3L()) {
                             var taps_buf: [dspark_mod.MAX_DSPARK_TARGET_TAPS][]const f32 = undefined;
-                            const n_taps = self.fillDSpark3LTaps(g, &taps_buf);
+                            const n_taps = self.fillDSpark3LTapsForRow(g, self.dspark_last_tap_row, &taps_buf);
                             if (n_taps > 0) {
                                 dp.set3LTargetTaps(taps_buf[0..n_taps], base_pos);
                             }
@@ -3463,6 +3495,10 @@ pub const SpecEngine = struct {
         const emitted = out_tokens[0..acc.emitted_token_count];
 
         try self.target.commitTreeKv(base_pos, self.accepted_nodes[0..acc.accepted_node_count]);
+        self.dspark_last_tap_row = if (acc.accepted_node_count > 0)
+            @as(u32, acc.accepted_node_count) - 1
+        else
+            0;
 
         for (emitted) |tok| {
             if (self.sam.remainingCapacity() > 0) {
@@ -4367,6 +4403,15 @@ pub const SpecEngine = struct {
         g: *const graph.GraphModel,
         out_taps: *[dspark_mod.MAX_DSPARK_TARGET_TAPS][]const f32,
     ) usize {
+        return self.fillDSpark3LTapsForRow(g, self.dspark_last_tap_row, out_taps);
+    }
+
+    fn fillDSpark3LTapsForRow(
+        self: *SpecEngine,
+        g: *const graph.GraphModel,
+        tap_row: u32,
+        out_taps: *[dspark_mod.MAX_DSPARK_TARGET_TAPS][]const f32,
+    ) usize {
         const h: usize = g.config.hidden_size;
         if (h == 0) return 0;
 
@@ -4377,9 +4422,12 @@ pub const SpecEngine = struct {
             out_taps[2] = df_taps[2];
             return 3;
         }
-        if (g.enable_feature_taps and self.dspark_aux_taps_scratch.len >= 3 * h) {
-            const aux_f16 = g.readAuxConcatF16(1);
-            if (aux_f16.len >= 3 * h) {
+        const total_aux_rows: usize = g.accepted_aux_host.len / (3 * h);
+        if (g.enable_feature_taps and self.dspark_aux_taps_scratch.len >= 3 * h and tap_row < total_aux_rows) {
+            const aux_all = g.readAuxConcatF16(tap_row + 1);
+            const row_off = @as(usize, tap_row) * 3 * h;
+            if (aux_all.len >= row_off + 3 * h) {
+                const aux_f16 = aux_all[row_off .. row_off + 3 * h];
                 var any_nonzero = false;
                 for (0..3 * h) |i| {
                     const v: f32 = @floatCast(aux_f16[i]);

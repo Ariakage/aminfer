@@ -104,6 +104,8 @@ const usage =
     \\                    [-h] [--json] [--models-dir <dir>]
     \\  bench-m93         run M9.3 Ling-3.1 (bailing_hybrid) W27/G28/D15/C27/W30 & W24 KL calibration suite
     \\                    [-h] [--json] [--models-dir <dir>]
+    \\  bench-m94         run M9.4 W28 real-HF header gate, Qwen3.8 & DeepSeek-V4.1 24 GB M4 parity suite
+    \\                    [-h] [--json] [--models-dir <dir>]
     \\  peer-worker       start a zero-allocation kqueue expert-parallel peer worker (M7 X1-X3)
     \\                    [-hRV] -l|--listen <ip:port> -m|--amf <path> -c|--config <path> -r|--rank N -w|--world-size N
     \\                    [--partition contiguous|round-robin] [--cluster-transport auto|tcp|rdma]
@@ -362,6 +364,12 @@ pub fn main(init: std.process.Init) !void {
             try out.writeAll(usage);
         } else {
             try runBenchM93(arena, args[2..], out);
+        }
+    } else if (args.len >= 2 and std.mem.eql(u8, args[1], "bench-m94")) {
+        if (hasHelpFlag(args[2..])) {
+            try out.writeAll(usage);
+        } else {
+            try runBenchM94(arena, args[2..], out);
         }
     } else if (args.len >= 2 and std.mem.eql(u8, args[1], "peer-worker")) {
         if (hasHelpFlag(args[2..])) {
@@ -1202,21 +1210,130 @@ fn partitionLabel(p: aminfer.expert_parallel.PartitionStrategy) []const u8 {
     };
 }
 
-fn resolveDSparkPathAlloc(
+fn resolveRelativeModelFileAlloc(
     allocator: std.mem.Allocator,
-    draft_amf_override: ?[:0]const u8,
-    config_path: []const u8,
-    gcfg: *const aminfer.graph.GraphConfig,
+    fname: []const u8,
+    config_path: ?[:0]const u8,
+    amf_path: [:0]const u8,
 ) ![:0]u8 {
-    if (draft_amf_override) |p| {
-        return std.fmt.allocPrintSentinel(allocator, "{s}", .{p}, 0);
-    }
-    const fname: []const u8 = if (gcfg.dspark_amf_file) |f| (if (f.len > 0) f else "dspark.amf") else "dspark.amf";
     if (std.fs.path.isAbsolute(fname)) {
         return std.fmt.allocPrintSentinel(allocator, "{s}", .{fname}, 0);
     }
-    const dir = std.fs.path.dirname(config_path) orelse ".";
-    return std.fmt.allocPrintSentinel(allocator, "{s}/{s}", .{ dir, fname }, 0);
+    if (config_path) |cp| {
+        const cfg_dir = std.fs.path.dirname(cp) orelse ".";
+        const cand = try std.fmt.allocPrintSentinel(allocator, "{s}/{s}", .{ cfg_dir, fname }, 0);
+        if (fileExistsPosix(cand)) return cand;
+        allocator.free(cand);
+    }
+    const amf_dir = std.fs.path.dirname(amf_path) orelse ".";
+    return std.fmt.allocPrintSentinel(allocator, "{s}/{s}", .{ amf_dir, fname }, 0);
+}
+
+const ResolvedDSparkSpec = struct {
+    amf_path: [:0]u8,
+    aux_layer_ids: ?[3]u32 = null,
+    needs_taps: bool = false,
+
+    fn deinit(self: *ResolvedDSparkSpec, allocator: std.mem.Allocator) void {
+        allocator.free(self.amf_path);
+    }
+};
+
+fn resolveDSparkSpecAlloc(
+    allocator: std.mem.Allocator,
+    draft_amf_override: ?[:0]const u8,
+    draft_config_override: ?[:0]const u8,
+    config_path: ?[:0]const u8,
+    amf_path: [:0]const u8,
+    gcfg: *const aminfer.graph.GraphConfig,
+) !ResolvedDSparkSpec {
+    const resolved_amf: [:0]u8 = if (draft_amf_override) |p|
+        try std.fmt.allocPrintSentinel(allocator, "{s}", .{p}, 0)
+    else blk: {
+        const fname: []const u8 = if (gcfg.dspark_amf_file) |f| (if (f.len > 0) f else "dspark.amf") else "dspark.amf";
+        break :blk try resolveRelativeModelFileAlloc(allocator, fname, config_path, amf_path);
+    };
+    errdefer allocator.free(resolved_amf);
+
+    var cfg_bytes_owned: ?[]u8 = null;
+    defer if (cfg_bytes_owned) |b| allocator.free(b);
+
+    if (draft_config_override) |dc_path| {
+        cfg_bytes_owned = try readFileAllocPosix(allocator, dc_path, 4 * 1024 * 1024);
+    } else if (gcfg.dspark_config_file) |dcf| {
+        if (dcf.len > 0) {
+            const p = try resolveRelativeModelFileAlloc(allocator, dcf, config_path, amf_path);
+            defer allocator.free(p);
+            if (fileExistsPosix(p)) {
+                cfg_bytes_owned = try readFileAllocPosix(allocator, p, 4 * 1024 * 1024);
+            }
+        }
+    }
+    if (cfg_bytes_owned == null) {
+        cfg_bytes_owned = try aminfer.engine.LoadedDSparkProposer.readOptionalConfigFileAlloc(allocator, resolved_amf);
+    }
+    if (cfg_bytes_owned == null) {
+        cfg_bytes_owned = readEmbeddedMetaConfigJsonAlloc(allocator, resolved_amf);
+    }
+
+    var aux_ids: ?[3]u32 = null;
+    var needs_taps = false;
+    if (cfg_bytes_owned) |cb| {
+        if (aminfer.dspark.DSpark3LConfig.fromJson(allocator, cb)) |cfg_3l| {
+            if (cfg_3l.targetLayerIdsSlice().len > 0) {
+                aux_ids = aminfer.engine.LoadedDSparkProposer.auxLayerIdsForTarget(cfg_3l, gcfg.num_hidden_layers);
+                needs_taps = true;
+            }
+        } else |_| {}
+    }
+    if (aux_ids == null and gcfg.dspark_target_layer_ids.len > 0) {
+        const max_l: u32 = if (gcfg.num_hidden_layers > 0) gcfg.num_hidden_layers - 1 else 0;
+        var out_ids: [3]u32 = .{ 0, max_l / 2, max_l };
+        for (0..@min(gcfg.dspark_target_layer_ids.len, 3)) |idx| {
+            out_ids[idx] = @min(gcfg.dspark_target_layer_ids[idx], max_l);
+        }
+        if (gcfg.dspark_target_layer_ids.len < 3) {
+            for (gcfg.dspark_target_layer_ids.len..3) |idx| {
+                out_ids[idx] = out_ids[gcfg.dspark_target_layer_ids.len - 1];
+            }
+        }
+        aux_ids = out_ids;
+        needs_taps = true;
+    }
+    if (!needs_taps and fileExistsPosix(resolved_amf)) {
+        if (aminfer.amf.AmfFile.open(allocator, resolved_amf)) |af_val| {
+            var af = af_val;
+            defer af.close(allocator);
+            if (aminfer.dspark.DSpark3LRuntime.isRealHf3LAmf(&af.parsed)) {
+                needs_taps = true;
+            }
+        } else |_| {}
+    }
+    return .{
+        .amf_path = resolved_amf,
+        .aux_layer_ids = aux_ids,
+        .needs_taps = needs_taps,
+    };
+}
+
+fn hasSiblingDSparkAmf(config_path: ?[:0]const u8, amf_path: [:0]const u8, gcfg: *const aminfer.graph.GraphConfig) bool {
+    if (gcfg.dspark_amf_file) |f| {
+        if (f.len > 0) return true;
+    }
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    if (config_path) |cp| {
+        const cfg_dir = std.fs.path.dirname(cp) orelse ".";
+        if (std.fmt.bufPrint(buf[0 .. buf.len - 1], "{s}/dspark.amf", .{cfg_dir})) |s| {
+            buf[s.len] = 0;
+            if (fileExistsPosix(buf[0..s.len :0])) return true;
+        } else |_| {}
+    }
+    const amf_dir = std.fs.path.dirname(amf_path) orelse ".";
+    if (std.fmt.bufPrint(buf[0 .. buf.len - 1], "{s}/dspark.amf", .{amf_dir})) |s| {
+        buf[s.len] = 0;
+        if (fileExistsPosix(buf[0..s.len :0])) return true;
+    } else |_| {}
+    return false;
 }
 
 fn shouldUseGraphModel(
@@ -1300,7 +1417,9 @@ fn resolveStandardDraftSpecAlloc(
     explicit_mode: ?aminfer.draft.DraftMode,
     draft_amf_override: ?[:0]const u8,
     draft_config_override: ?[:0]const u8,
-    anchor_path: []const u8,
+    config_path: ?[:0]const u8,
+    amf_path_target: [:0]const u8,
+    gcfg_opt: ?*const aminfer.graph.GraphConfig,
 ) !?ResolvedStandardDraft {
     if (explicit_mode) |em| {
         if (em != .mtp and em != .eagle3 and em != .eagle2) return null;
@@ -1308,17 +1427,36 @@ fn resolveStandardDraftSpecAlloc(
         return null;
     }
 
+    const anchor_path: []const u8 = config_path orelse amf_path_target;
     const dir = std.fs.path.dirname(anchor_path) orelse ".";
+    const target_dir = std.fs.path.dirname(amf_path_target) orelse ".";
     const stem_opt: ?[]const u8 = if (std.mem.endsWith(u8, anchor_path, ".amf"))
         anchor_path[0 .. anchor_path.len - ".amf".len]
+    else if (std.mem.endsWith(u8, amf_path_target, ".amf"))
+        amf_path_target[0 .. amf_path_target.len - ".amf".len]
     else
         null;
+
     const amf_path: [:0]u8 = if (draft_amf_override) |p|
         try std.fmt.allocPrintSentinel(allocator, "{s}", .{p}, 0)
     else if (explicit_mode == .mtp) blk: {
+        if (gcfg_opt) |gcfg| {
+            if (gcfg.mtp_amf_file) |mf| {
+                if (mf.len > 0) {
+                    const g_cand = try resolveRelativeModelFileAlloc(allocator, mf, config_path, amf_path_target);
+                    if (fileExistsPosix(g_cand)) break :blk g_cand;
+                    allocator.free(g_cand);
+                }
+            }
+        }
         const sib = try std.fmt.allocPrintSentinel(allocator, "{s}/mtp.amf", .{dir}, 0);
         if (fileExistsPosix(sib)) break :blk sib;
         allocator.free(sib);
+        if (!std.mem.eql(u8, target_dir, dir)) {
+            const sib_t = try std.fmt.allocPrintSentinel(allocator, "{s}/mtp.amf", .{target_dir}, 0);
+            if (fileExistsPosix(sib_t)) break :blk sib_t;
+            allocator.free(sib_t);
+        }
         if (stem_opt) |stem| {
             const sib_dash = try std.fmt.allocPrintSentinel(allocator, "{s}-mtp.amf", .{stem}, 0);
             if (fileExistsPosix(sib_dash)) break :blk sib_dash;
@@ -1338,22 +1476,60 @@ fn resolveStandardDraftSpecAlloc(
         cfg_bytes_owned = try readFileAllocPosix(allocator, dc_path, 4 * 1024 * 1024);
     } else if (readEmbeddedMetaConfigJsonAlloc(allocator, amf_path)) |emb| {
         cfg_bytes_owned = emb;
-    } else if (explicit_mode == .mtp) {
-        const sib_cfg = try std.fmt.allocPrintSentinel(allocator, "{s}/mtp_config.json", .{dir}, 0);
-        defer allocator.free(sib_cfg);
-        if (fileExistsPosix(sib_cfg)) {
-            cfg_bytes_owned = try readFileAllocPosix(allocator, sib_cfg, 4 * 1024 * 1024);
-        } else if (stem_opt) |stem| {
-            const stem_cfg = try std.fmt.allocPrintSentinel(allocator, "{s}-mtp_config.json", .{stem}, 0);
-            defer allocator.free(stem_cfg);
-            if (fileExistsPosix(stem_cfg)) {
-                cfg_bytes_owned = try readFileAllocPosix(allocator, stem_cfg, 4 * 1024 * 1024);
+    } else {
+        if (gcfg_opt) |gcfg| {
+            if (gcfg.mtp_config_file) |mcf| {
+                if (mcf.len > 0) {
+                    const g_cfg = try resolveRelativeModelFileAlloc(allocator, mcf, config_path, amf_path_target);
+                    defer allocator.free(g_cfg);
+                    if (fileExistsPosix(g_cfg)) {
+                        cfg_bytes_owned = try readFileAllocPosix(allocator, g_cfg, 4 * 1024 * 1024);
+                    }
+                }
+            }
+        }
+        if (cfg_bytes_owned == null and (explicit_mode == .mtp or explicit_mode == null)) {
+            const draft_dir = std.fs.path.dirname(amf_path) orelse ".";
+            const cand_dirs = [_][]const u8{ draft_dir, dir, target_dir };
+            for (cand_dirs) |cd| {
+                const sib_cfg = try std.fmt.allocPrintSentinel(allocator, "{s}/mtp_config.json", .{cd}, 0);
+                defer allocator.free(sib_cfg);
+                if (fileExistsPosix(sib_cfg)) {
+                    cfg_bytes_owned = try readFileAllocPosix(allocator, sib_cfg, 4 * 1024 * 1024);
+                    break;
+                }
+            }
+            if (cfg_bytes_owned == null and std.mem.endsWith(u8, amf_path, ".amf")) {
+                const dstem = amf_path[0 .. amf_path.len - ".amf".len];
+                const sc = try std.fmt.allocPrintSentinel(allocator, "{s}_config.json", .{dstem}, 0);
+                defer allocator.free(sc);
+                if (fileExistsPosix(sc)) {
+                    cfg_bytes_owned = try readFileAllocPosix(allocator, sc, 4 * 1024 * 1024);
+                }
+            }
+            if (cfg_bytes_owned == null) {
+                if (stem_opt) |stem| {
+                    const stem_cfg = try std.fmt.allocPrintSentinel(allocator, "{s}-mtp_config.json", .{stem}, 0);
+                    defer allocator.free(stem_cfg);
+                    if (fileExistsPosix(stem_cfg)) {
+                        cfg_bytes_owned = try readFileAllocPosix(allocator, stem_cfg, 4 * 1024 * 1024);
+                    }
+                }
             }
         }
     }
 
-    const cfg_bytes = cfg_bytes_owned orelse return error.MissingRequiredFlag;
-    var parsed_cfg = try aminfer.draft.DraftConfig.fromJson(allocator, cfg_bytes);
+    const cfg_bytes = cfg_bytes_owned orelse {
+        if (explicit_mode == null) return null;
+        return error.MissingRequiredFlag;
+    };
+    var parsed_cfg = aminfer.draft.DraftConfig.fromJson(allocator, cfg_bytes) catch |err| switch (err) {
+        error.UnsupportedFormat => {
+            if (explicit_mode == null) return null;
+            return err;
+        },
+        else => return err,
+    };
     const eff_mode: aminfer.draft.DraftMode = explicit_mode orelse parsed_cfg.format;
     parsed_cfg.format = eff_mode;
     return .{
@@ -1521,10 +1697,46 @@ fn resolveM82DraftSpecAlloc(
     return .{ .mode = mode, .amf_path = amf_path, .config_bytes = cfg_bytes };
 }
 
+fn probeShardedFilesAlloc(
+    allocator: std.mem.Allocator,
+    dirs: []const []const u8,
+    prefix: []const u8,
+    comptime total_width: usize,
+) !?[][:0]u8 {
+    for (dirs) |d| {
+        for ([_]usize{ 1, 2, 4, 8, 16 }) |total_shards| {
+            const probe_p = if (total_width == 5)
+                try std.fmt.allocPrintSentinel(allocator, "{s}/{s}-00000-of-{d:0>5}.amf", .{ d, prefix, total_shards }, 0)
+            else
+                try std.fmt.allocPrintSentinel(allocator, "{s}/{s}-00-of-{d:0>2}.amf", .{ d, prefix, total_shards }, 0);
+            const exists = fileExistsPosix(probe_p);
+            allocator.free(probe_p);
+            if (exists) {
+                const out = try allocator.alloc([:0]u8, total_shards);
+                var built: usize = 0;
+                errdefer {
+                    for (0..built) |bi| allocator.free(out[bi]);
+                    allocator.free(out);
+                }
+                for (0..total_shards) |si| {
+                    out[si] = if (total_width == 5)
+                        try std.fmt.allocPrintSentinel(allocator, "{s}/{s}-{d:0>5}-of-{d:0>5}.amf", .{ d, prefix, si, total_shards }, 0)
+                    else
+                        try std.fmt.allocPrintSentinel(allocator, "{s}/{s}-{d:0>2}-of-{d:0>2}.amf", .{ d, prefix, si, total_shards }, 0);
+                    built += 1;
+                }
+                return out;
+            }
+        }
+    }
+    return null;
+}
+
 fn resolvePlePathsAlloc(
     allocator: std.mem.Allocator,
     m6: *const M6GraphCliFlags,
-    config_path: []const u8,
+    config_path: ?[:0]const u8,
+    amf_path: [:0]const u8,
     gcfg: *const aminfer.graph.GraphConfig,
 ) ![][:0]u8 {
     if (m6.ple_amf_count > 0) {
@@ -1534,32 +1746,35 @@ fn resolvePlePathsAlloc(
         }
         return out;
     }
-    const dir = std.fs.path.dirname(config_path) orelse ".";
+    const cfg_dir = if (config_path) |cp| (std.fs.path.dirname(cp) orelse ".") else (std.fs.path.dirname(amf_path) orelse ".");
+    const amf_dir = std.fs.path.dirname(amf_path) orelse ".";
+    const one_dir = [_][]const u8{amf_dir};
+    const two_dirs = [_][]const u8{ cfg_dir, amf_dir };
+    const probe_dirs: []const []const u8 = if (std.mem.eql(u8, cfg_dir, amf_dir)) &one_dir else &two_dirs;
+
     if (gcfg.ple_shard_files.len == 0) {
         // Auto-discover `engram-00000-of-NNNNN.amf` shards for `Hy4-flash` FP8 Engram models.
         if (gcfg.m82_family.isHy4() and gcfg.m82_cfg.engram_fp8_embedding) {
-            for ([_]usize{ 1, 2, 4, 8 }) |total_shards| {
-                const probe_p = try std.fmt.allocPrintSentinel(allocator, "{s}/engram-00000-of-{d:0>5}.amf", .{ dir, total_shards }, 0);
-                const exists = fileExistsPosix(probe_p);
-                allocator.free(probe_p);
-                if (exists) {
-                    const out = try allocator.alloc([:0]u8, total_shards);
-                    for (0..total_shards) |si| {
-                        out[si] = try std.fmt.allocPrintSentinel(allocator, "{s}/engram-{d:0>5}-of-{d:0>5}.amf", .{ dir, si, total_shards }, 0);
-                    }
-                    return out;
-                }
-            }
+            if (try probeShardedFilesAlloc(allocator, probe_dirs, "engram", 5)) |found| return found;
+        }
+        // Auto-discover `ple-shard-00-of-NN.amf` / `engram-shard-00-of-NN.amf` for Qwen3.8 / DeepSeek-V4.1.
+        if (gcfg.is_qwen4_exp or gcfg.axes.memory_lookup_kind == .ple_ngram) {
+            if (try probeShardedFilesAlloc(allocator, probe_dirs, "ple-shard", 2)) |found| return found;
+        }
+        if (gcfg.is_deepseek_v41 or gcfg.axes.memory_lookup_kind == .engram) {
+            if (try probeShardedFilesAlloc(allocator, probe_dirs, "engram-shard", 2)) |found| return found;
         }
         return try allocator.alloc([:0]u8, 0);
     }
     const out = try allocator.alloc([:0]u8, gcfg.ple_shard_files.len);
+    var built: usize = 0;
+    errdefer {
+        for (0..built) |bi| allocator.free(out[bi]);
+        allocator.free(out);
+    }
     for (gcfg.ple_shard_files, 0..) |fname, idx| {
-        if (std.fs.path.isAbsolute(fname)) {
-            out[idx] = try std.fmt.allocPrintSentinel(allocator, "{s}", .{fname}, 0);
-        } else {
-            out[idx] = try std.fmt.allocPrintSentinel(allocator, "{s}/{s}", .{ dir, fname }, 0);
-        }
+        out[idx] = try resolveRelativeModelFileAlloc(allocator, fname, config_path, amf_path);
+        built += 1;
     }
     return out;
 }
@@ -2145,7 +2360,7 @@ fn runDecodeGraph(
         prompt_ids[0] = if (gcfg.bos_token_id < gcfg.vocab_size) gcfg.bos_token_id else 0;
     }
 
-    const ple_paths = try resolvePlePathsAlloc(allocator, &cli.m6, cli.config_path orelse cli.amf_path, &gcfg);
+    const ple_paths = try resolvePlePathsAlloc(allocator, &cli.m6, cli.config_path, cli.amf_path, &gcfg);
     defer freePlePaths(allocator, ple_paths);
 
     const has_vision = (cli.image_path != null or cli.vt_test_video != null);
@@ -2829,7 +3044,7 @@ fn runBenchDecode(allocator: std.mem.Allocator, raw_args: []const [:0]const u8, 
     if (shouldUseGraphModel(cfg_bytes, cli.m6, cli.m7, null)) {
         var gcfg = try aminfer.graph.GraphConfig.fromJson(allocator, cfg_bytes);
         defer gcfg.deinit(allocator);
-        const ple_paths = try resolvePlePathsAlloc(allocator, &cli.m6, cli.config_path orelse cli.amf_path, &gcfg);
+        const ple_paths = try resolvePlePathsAlloc(allocator, &cli.m6, cli.config_path, cli.amf_path, &gcfg);
         defer freePlePaths(allocator, ple_paths);
         if (!cli.m7.hasPeers() and cli.m7.effectiveTransport() == .tb5_rdma) {
             _ = try aminfer.transport.selectTransport(.tb5_rdma);
@@ -3320,13 +3535,13 @@ fn runBenchM92(allocator: std.mem.Allocator, raw_args: []const [:0]const u8, out
     if (!report.all_passed) return error.BenchmarkGateFailed;
 }
 
-const BenchM93CliArgs = struct {
+const BenchDirJsonCliArgs = struct {
     json: bool = false,
     models_dir: ?[]const u8 = null,
 };
 
-fn parseBenchM93Args(raw_args: []const [:0]const u8) !BenchM93CliArgs {
-    var parsed: BenchM93CliArgs = .{};
+fn parseBenchDirJsonArgs(raw_args: []const [:0]const u8) !BenchDirJsonCliArgs {
+    var parsed: BenchDirJsonCliArgs = .{};
     var i: usize = 0;
     while (i < raw_args.len) : (i += 1) {
         const flag = raw_args[i];
@@ -3343,9 +3558,26 @@ fn parseBenchM93Args(raw_args: []const [:0]const u8) !BenchM93CliArgs {
     return parsed;
 }
 
+const parseBenchM93Args = parseBenchDirJsonArgs;
+const parseBenchM94Args = parseBenchDirJsonArgs;
+
 fn runBenchM93(allocator: std.mem.Allocator, raw_args: []const [:0]const u8, out: *Io.Writer) !void {
     const cli = try parseBenchM93Args(raw_args);
     const report = try aminfer.bench_m93.runM93WithConfig(allocator, .{
+        .models_dir = cli.models_dir,
+    });
+    if (cli.json) {
+        try report.writeJson(out);
+    } else {
+        try report.write(out);
+    }
+    try out.flush();
+    if (!report.all_passed) return error.BenchmarkGateFailed;
+}
+
+fn runBenchM94(allocator: std.mem.Allocator, raw_args: []const [:0]const u8, out: *Io.Writer) !void {
+    const cli = try parseBenchM94Args(raw_args);
+    const report = try aminfer.bench_m94.runM94WithConfig(allocator, .{
         .models_dir = cli.models_dir,
     });
     if (cli.json) {
@@ -3993,7 +4225,9 @@ fn runSpecDecodeGraph(
             cli.draft_mode,
             cli.draft_amf_path,
             cli.draft_config_path,
-            cli.config_path orelse cli.amf_path,
+            cli.config_path,
+            cli.amf_path,
+            &gcfg,
         )
     else
         null;
@@ -4005,13 +4239,18 @@ fn runSpecDecodeGraph(
         draft_cfg_opt = sd.config;
         break :blk sd.mode;
     } else cli.draft_mode orelse blk: {
-        const has_dspark_file = if (gcfg.dspark_amf_file) |f| f.len > 0 else false;
-        if (gcfg.axes.backbone_kind == .causal_enc_dec and (cli.draft_amf_path != null or has_dspark_file)) {
+        if (gcfg.axes.backbone_kind == .causal_enc_dec and (cli.draft_amf_path != null or cli.draft_config_path != null or hasSiblingDSparkAmf(cli.config_path, cli.amf_path, &gcfg))) {
             break :blk .dspark;
         }
         if (cli.draft_amf_path == null and gcfg.axes.loop_schedule.isRecurrent()) break :blk .self_recurrent;
         break :blk .l1_only;
     };
+
+    var dspark_spec: ?ResolvedDSparkSpec = if (mode == .dspark)
+        try resolveDSparkSpecAlloc(allocator, cli.draft_amf_path, cli.draft_config_path, cli.config_path, cli.amf_path, &gcfg)
+    else
+        null;
+    defer if (dspark_spec) |*ds| ds.deinit(allocator);
 
     const resolved_std_draft_amf: ?[:0]const u8 = if (std_draft) |sd| sd.amf_path else cli.draft_amf_path;
     if (mode != .l1_only and mode != .self_recurrent and mode != .dspark and mode != .dflare and mode != .dfly2) {
@@ -4025,7 +4264,7 @@ fn runSpecDecodeGraph(
     else
         null;
 
-    const ple_paths = try resolvePlePathsAlloc(allocator, &cli.m6, cli.config_path orelse cli.amf_path, &gcfg);
+    const ple_paths = try resolvePlePathsAlloc(allocator, &cli.m6, cli.config_path, cli.amf_path, &gcfg);
     defer freePlePaths(allocator, ple_paths);
 
     const needed_seq: u32 = @intCast(prompt_ids.len + cli.max_tokens + cli.max_tree_nodes + 32);
@@ -4035,8 +4274,14 @@ fn runSpecDecodeGraph(
     else
         @as(u32, cli.max_tree_nodes);
     const budget_override = try buildBudgetOverride(cli.wired_cap_mib);
-    const aux_ids: ?[3]u32 = if (draft_cfg_opt) |dc| dc.aux_layer_ids else null;
+    const aux_ids: ?[3]u32 = if (draft_cfg_opt) |dc|
+        dc.aux_layer_ids
+    else if (dspark_spec) |ds|
+        ds.aux_layer_ids
+    else
+        null;
     const needs_taps = (mode != .l1_only and mode != .self_recurrent and mode != .dspark and mode != .dflare and mode != .dfly2);
+    const enable_feature_taps = needs_taps or (dspark_spec != null and dspark_spec.?.needs_taps);
 
     if (!cli.m7.hasPeers() and cli.m7.effectiveTransport() == .tb5_rdma) {
         _ = try aminfer.transport.selectTransport(.tb5_rdma);
@@ -4057,7 +4302,7 @@ fn runSpecDecodeGraph(
     var model = try aminfer.graph.GraphModel.loadFromFile(allocator, cli.amf_path, gcfg, .{
         .max_seq_len = max_seq_len,
         .max_tree_nodes = target_tree_cap,
-        .enable_feature_taps = needs_taps,
+        .enable_feature_taps = enable_feature_taps,
         .enable_dflare_taps = (mode == .dflare),
         .aux_layer_ids = aux_ids,
         .dflare_target_layers = explicit_dflash_taps,
@@ -4102,14 +4347,17 @@ fn runSpecDecodeGraph(
 
     var dspark_loaded: ?*aminfer.engine.LoadedDSparkProposer = null;
     defer if (dspark_loaded) |dp| dp.deinit(allocator);
-    if (mode == .dspark) {
-        const dspark_path = try resolveDSparkPathAlloc(allocator, cli.draft_amf_path, cli.config_path orelse cli.amf_path, &gcfg);
-        defer allocator.free(dspark_path);
-        dspark_loaded = try aminfer.engine.LoadedDSparkProposer.loadFromFile(
+    if (dspark_spec) |ds| {
+        dspark_loaded = try aminfer.engine.LoadedDSparkProposer.loadFromFileWithOptions(
             allocator,
             &model,
-            dspark_path,
+            ds.amf_path,
             null,
+            .{
+                .verify_crcs = cli.verify_crcs,
+                .cold_slot_pool_slots = cli.cold_slots,
+                .cold_expert_min_weight = cli.cold_expert_min_weight,
+            },
             budget_override,
         );
     }
@@ -7298,11 +7546,14 @@ fn runServeGraph(
     var tok = try aminfer.tokenizer.Tokenizer.fromHuggingFaceJson(allocator, tok_bytes);
     defer tok.deinit(allocator);
 
-    const use_spec = cli.draft_mode != null or cli.draft_amf_path != null or cli.ngram_nvme_path != null;
+    const use_spec = cli.draft_mode != null or cli.draft_amf_path != null or cli.draft_config_path != null or cli.ngram_nvme_path != null;
+    const unsupported_batch_arch = gcfg.axes.hasKda() or gcfg.axes.hasMlaDsa() or gcfg.is_qwen4_exp or
+        gcfg.axes.backbone_kind == .causal_enc_dec or
+        (gcfg.axes.hasGdn() and gcfg.axes.hasQsa() and gcfg.axes.residual_kind == .gated_4branch);
     const use_continuous = try resolveServeGraphUseContinuous(
         cli.batch_mode,
         gcfg.m82_family,
-        gcfg.axes.hasKda() or gcfg.axes.hasMlaDsa(),
+        unsupported_batch_arch,
         cli.m6.vision_sidecar_path != null,
         use_spec,
         cli.max_active_requests,
@@ -7344,7 +7595,9 @@ fn runServeGraph(
             cli.draft_mode,
             cli.draft_amf_path,
             cli.draft_config_path,
-            cli.config_path orelse cli.amf_path,
+            cli.config_path,
+            cli.amf_path,
+            &gcfg,
         )
     else
         null;
@@ -7355,7 +7608,18 @@ fn runServeGraph(
     else if (std_draft) |sd| blk: {
         draft_cfg_opt = sd.config;
         break :blk sd.mode;
-    } else (cli.draft_mode orelse .l1_only);
+    } else if (use_spec) cli.draft_mode orelse blk: {
+        if (gcfg.axes.backbone_kind == .causal_enc_dec and (cli.draft_amf_path != null or cli.draft_config_path != null or hasSiblingDSparkAmf(cli.config_path, cli.amf_path, &gcfg))) {
+            break :blk .dspark;
+        }
+        break :blk .l1_only;
+    } else .l1_only;
+
+    var dspark_spec: ?ResolvedDSparkSpec = if (use_spec and mode == .dspark)
+        try resolveDSparkSpecAlloc(allocator, cli.draft_amf_path, cli.draft_config_path, cli.config_path, cli.amf_path, &gcfg)
+    else
+        null;
+    defer if (dspark_spec) |*ds| ds.deinit(allocator);
 
     const resolved_std_draft_amf: ?[:0]const u8 = if (std_draft) |sd| sd.amf_path else cli.draft_amf_path;
     if (use_spec and mode != .l1_only and mode != .self_recurrent and mode != .dspark and mode != .dflare and mode != .dfly2) {
@@ -7369,7 +7633,7 @@ fn runServeGraph(
     else
         null;
 
-    const ple_paths = try resolvePlePathsAlloc(allocator, &cli.m6, cli.config_path orelse cli.amf_path, &gcfg);
+    const ple_paths = try resolvePlePathsAlloc(allocator, &cli.m6, cli.config_path, cli.amf_path, &gcfg);
     defer freePlePaths(allocator, ple_paths);
 
     const target_tree_cap: u32 = if (use_continuous)
@@ -7381,13 +7645,19 @@ fn runServeGraph(
     else
         @as(u32, cli.max_tree_nodes);
     const budget_override = try buildBudgetOverride(cli.wired_cap_mib);
-    const aux_ids: ?[3]u32 = if (draft_cfg_opt) |dc| dc.aux_layer_ids else null;
+    const aux_ids: ?[3]u32 = if (draft_cfg_opt) |dc|
+        dc.aux_layer_ids
+    else if (dspark_spec) |ds|
+        ds.aux_layer_ids
+    else
+        null;
     const needs_taps = use_spec and mode != .l1_only and mode != .self_recurrent and mode != .dspark and mode != .dflare and mode != .dfly2;
+    const enable_feature_taps = needs_taps or (dspark_spec != null and dspark_spec.?.needs_taps);
 
     var model = try aminfer.graph.GraphModel.loadFromFile(allocator, cli.amf_path, gcfg, .{
         .max_seq_len = max_seq_len,
         .max_tree_nodes = target_tree_cap,
-        .enable_feature_taps = needs_taps,
+        .enable_feature_taps = enable_feature_taps,
         .enable_dflare_taps = (mode == .dflare),
         .aux_layer_ids = aux_ids,
         .dflare_target_layers = explicit_dflash_taps,
@@ -7444,6 +7714,8 @@ fn runServeGraph(
     defer if (dflare_loaded) |df| df.deinit(allocator);
     var dfly2_loaded: ?*aminfer.engine.LoadedDFly2Proposer = null;
     defer if (dfly2_loaded) |df2| df2.deinit(allocator);
+    var dspark_loaded: ?*aminfer.engine.LoadedDSparkProposer = null;
+    defer if (dspark_loaded) |dp| dp.deinit(allocator);
 
     var ngram_tbl_storage: aminfer.ngram_nvme.NvmeNgramTable = undefined;
     var ngram_tbl_ptr: ?*aminfer.ngram_nvme.NvmeNgramTable = null;
@@ -7503,6 +7775,19 @@ fn runServeGraph(
                 },
             );
             draft_head_ptr = &draft_head_storage;
+        } else if (dspark_spec) |ds| {
+            dspark_loaded = try aminfer.engine.LoadedDSparkProposer.loadFromFileWithOptions(
+                allocator,
+                &model,
+                ds.amf_path,
+                null,
+                .{
+                    .verify_crcs = cli.verify_crcs,
+                    .cold_slot_pool_slots = cli.cold_slots,
+                    .cold_expert_min_weight = cli.cold_expert_min_weight,
+                },
+                budget_override,
+            );
         } else if (mode == .dflare) {
             const d_path: [:0]const u8 = if (m82_draft) |d| (d.amf_path orelse return error.MissingRequiredFlag) else (cli.draft_amf_path orelse return error.MissingRequiredFlag);
             const d_cfg: ?[]const u8 = if (m82_draft) |d| d.config_bytes else null;
@@ -7526,7 +7811,9 @@ fn runServeGraph(
             .ngram_table = ngram_tbl_ptr,
             .ngram_registry = ngram_reg_ptr,
         };
-        spec_eng_storage = if (dflare_loaded) |df|
+        spec_eng_storage = if (dspark_loaded) |dp|
+            try aminfer.engine.SpecEngine.initWithDSpark(allocator, &model, &dp.proposer, srv_spec_opts)
+        else if (dflare_loaded) |df|
             try aminfer.engine.SpecEngine.initWithDFlare(allocator, &model, df.proposer(), srv_spec_opts)
         else if (dfly2_loaded) |df2|
             try aminfer.engine.SpecEngine.initWithDFly2(allocator, &model, df2.proposer(), srv_spec_opts)
@@ -9447,7 +9734,7 @@ fn runChatGraph(
     var tok = try aminfer.tokenizer.Tokenizer.fromHuggingFaceJson(allocator, tok_bytes);
     defer tok.deinit(allocator);
 
-    const ple_paths = try resolvePlePathsAlloc(allocator, &cli.m6, cli.config_path orelse amf_path, &gcfg);
+    const ple_paths = try resolvePlePathsAlloc(allocator, &cli.m6, cli.config_path, amf_path, &gcfg);
     defer freePlePaths(allocator, ple_paths);
 
     var m82_draft = if (cli.draft_mode != null or cli.draft_amf_path != null or cli.draft_config_path != null)
@@ -9457,7 +9744,7 @@ fn runChatGraph(
     defer if (m82_draft) |*d| d.deinit(allocator);
 
     var std_draft = if (m82_draft == null and (cli.draft_mode != null or cli.draft_amf_path != null or cli.draft_config_path != null))
-        try resolveStandardDraftSpecAlloc(allocator, cli.draft_mode, cli.draft_amf_path, cli.draft_config_path, cli.config_path orelse amf_path)
+        try resolveStandardDraftSpecAlloc(allocator, cli.draft_mode, cli.draft_amf_path, cli.draft_config_path, cli.config_path, amf_path, &gcfg)
     else
         null;
     defer if (std_draft) |*sd| sd.deinit(allocator);
@@ -9466,13 +9753,30 @@ fn runChatGraph(
         d.mode
     else if (std_draft) |sd|
         sd.mode
+    else if (cli.draft_mode) |cm|
+        cm
+    else if ((cli.draft_amf_path != null or cli.draft_config_path != null) and gcfg.axes.backbone_kind == .causal_enc_dec)
+        .dspark
     else
-        cli.draft_mode;
+        null;
+
+    var dspark_spec: ?ResolvedDSparkSpec = if (chat_spec_mode == .dspark)
+        try resolveDSparkSpecAlloc(allocator, cli.draft_amf_path, cli.draft_config_path, cli.config_path, amf_path, &gcfg)
+    else
+        null;
+    defer if (dspark_spec) |*ds| ds.deinit(allocator);
+
     const chat_needs_taps = if (chat_spec_mode) |cm|
         (cm != .l1_only and cm != .self_recurrent and cm != .dspark and cm != .dflare and cm != .dfly2)
     else
         false;
-    const chat_aux_ids: ?[3]u32 = if (std_draft) |sd| sd.config.aux_layer_ids else null;
+    const chat_enable_feature_taps = chat_needs_taps or (dspark_spec != null and dspark_spec.?.needs_taps);
+    const chat_aux_ids: ?[3]u32 = if (std_draft) |sd|
+        sd.config.aux_layer_ids
+    else if (dspark_spec) |ds|
+        ds.aux_layer_ids
+    else
+        null;
     var chat_dflash_taps_buf: [aminfer.dflare_dfly.MAX_TARGET_TAPS]u16 = undefined;
     const chat_dflash_taps: ?[]const u16 = if (m82_draft) |d|
         (if (d.mode == .dflare) parseExplicitDFlashTargetLayers(allocator, d.config_bytes, &chat_dflash_taps_buf) else null)
@@ -9485,7 +9789,7 @@ fn runChatGraph(
     var model = try aminfer.graph.GraphModel.loadFromFile(allocator, amf_path, gcfg, .{
         .max_seq_len = max_seq_len,
         .max_tree_nodes = 16,
-        .enable_feature_taps = chat_needs_taps,
+        .enable_feature_taps = chat_enable_feature_taps,
         .aux_layer_ids = chat_aux_ids,
         .dflare_target_layers = chat_dflash_taps,
         .wired_budget_override = budget_override,
@@ -9537,6 +9841,8 @@ fn runChatGraph(
     defer if (dflare_loaded) |df| df.deinit(allocator);
     var dfly2_loaded: ?*aminfer.engine.LoadedDFly2Proposer = null;
     defer if (dfly2_loaded) |df2| df2.deinit(allocator);
+    var dspark_loaded: ?*aminfer.engine.LoadedDSparkProposer = null;
+    defer if (dspark_loaded) |dp| dp.deinit(allocator);
     var spec_eng_storage: aminfer.engine.SpecEngine = undefined;
     var spec_eng_ptr: ?*aminfer.engine.SpecEngine = null;
     defer if (spec_eng_ptr) |se| se.deinit(allocator);
@@ -9557,6 +9863,25 @@ fn runChatGraph(
             spec_eng_storage = try aminfer.engine.SpecEngine.initWithDFly2(allocator, &model, dfly2_loaded.?.proposer(), spec_opts);
             spec_eng_ptr = &spec_eng_storage;
         }
+    } else if (dspark_spec) |ds| {
+        dspark_loaded = try aminfer.engine.LoadedDSparkProposer.loadFromFileWithOptions(
+            allocator,
+            &model,
+            ds.amf_path,
+            null,
+            .{
+                .verify_crcs = cli.verify_crcs,
+                .cold_slot_pool_slots = cli.cold_slots,
+                .cold_expert_min_weight = cli.cold_expert_min_weight,
+            },
+            budget_override,
+        );
+        spec_eng_storage = try aminfer.engine.SpecEngine.initWithDSpark(allocator, &model, &dspark_loaded.?.proposer, .{
+            .mode = .dspark,
+            .max_tree_nodes = 16,
+            .enable_pruning = true,
+        });
+        spec_eng_ptr = &spec_eng_storage;
     } else if (std_draft) |sd| {
         draft_head_storage = try aminfer.draft.DraftHead.loadFromFileForGraph(
             allocator,
@@ -11380,4 +11705,87 @@ test "M9.3 C27 --cold-expert-min-weight and bench-m93 CLI parsers" {
     try std.testing.expectEqualStrings("/tmp/models", m93_cli.models_dir.?);
     try std.testing.expectError(error.MissingFlagValue, parseBenchM93Args(&.{"--models-dir"}));
     try std.testing.expectError(error.UnknownFlag, parseBenchM93Args(&.{"--bad"}));
+}
+
+test "M9.4 bench-m94 CLI parser and Qwen3.8/DeepSeek-V4.1 auto-discovery" {
+    const alloc = std.testing.allocator;
+    const m94_def = try parseBenchM94Args(&.{});
+    try std.testing.expect(!m94_def.json);
+    try std.testing.expect(m94_def.models_dir == null);
+    const m94_cli = try parseBenchM94Args(&.{ "--json", "--models-dir", "/tmp/m94" });
+    try std.testing.expect(m94_cli.json);
+    try std.testing.expectEqualStrings("/tmp/m94", m94_cli.models_dir.?);
+    try std.testing.expectError(error.MissingFlagValue, parseBenchM94Args(&.{"--models-dir"}));
+    try std.testing.expectError(error.UnknownFlag, parseBenchM94Args(&.{"--unknown"}));
+
+    const tmp_dir = try aminfer.graph.makeTestTempDir(alloc, "m94_cli_resolve");
+    defer {
+        aminfer.graph.removeTestDir(alloc, tmp_dir);
+        alloc.free(tmp_dir);
+    }
+    const model_p = try std.fs.path.joinZ(alloc, &.{ tmp_dir, "model.amf" });
+    defer alloc.free(model_p);
+    const mtp_p = try std.fs.path.joinZ(alloc, &.{ tmp_dir, "mtp.amf" });
+    defer alloc.free(mtp_p);
+    const mtp_cfg_p = try std.fs.path.joinZ(alloc, &.{ tmp_dir, "mtp_config.json" });
+    defer alloc.free(mtp_cfg_p);
+    const dspark_p = try std.fs.path.joinZ(alloc, &.{ tmp_dir, "dspark.amf" });
+    defer alloc.free(dspark_p);
+    const dspark_cfg_p = try std.fs.path.joinZ(alloc, &.{ tmp_dir, "dspark_config.json" });
+    defer alloc.free(dspark_cfg_p);
+    const ple0_p = try std.fs.path.joinZ(alloc, &.{ tmp_dir, "ple-shard-00-of-02.amf" });
+    defer alloc.free(ple0_p);
+    const ple1_p = try std.fs.path.joinZ(alloc, &.{ tmp_dir, "ple-shard-01-of-02.amf" });
+    defer alloc.free(ple1_p);
+
+    const writeSmall = struct {
+        fn call(path_z: [:0]const u8, body: []const u8) !void {
+            const fd = std.c.open(path_z.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
+            if (fd < 0) return error.FileCreateFailed;
+            defer _ = std.c.close(fd);
+            _ = std.c.write(fd, body.ptr, body.len);
+        }
+    }.call;
+
+    try writeSmall(model_p, "stub");
+    try writeSmall(mtp_p, "stub");
+    try writeSmall(mtp_cfg_p,
+        \\{"draft_format":"qwen4_exp_mtp","num_hidden_layers":1,"hidden_size":128,"vocab_size":512,"num_attention_heads":4,"num_key_value_heads":2,"head_dim":32,"hc_count":4,"hc_lowrank":16,"output_gate_type":"sigmoid","indexer_n_heads":2,"indexer_kv_heads":1,"indexer_head_dim":32,"num_experts":8,"num_experts_per_tok":2,"moe_intermediate_size":64,"shared_expert_intermediate_size":64}
+    );
+    try writeSmall(dspark_p, "stub");
+    try writeSmall(dspark_cfg_p,
+        \\{"draft_format":"dspark_3l_mtp","hidden_size":256,"vocab_size":2048,"dspark_target_layer_ids":[0,2,3]}
+    );
+    try writeSmall(ple0_p, "stub");
+    try writeSmall(ple1_p, "stub");
+
+    const q4_cfg_json =
+        \\{"model_type":"qwen4_exp","vocab_size":512,"hidden_size":128,"num_hidden_layers":4,"num_attention_heads":4,"num_key_value_heads":2,"head_dim":32,"linear_num_key_heads":2,"linear_num_value_heads":4,"linear_key_head_dim":32,"linear_value_head_dim":32,"num_experts":8,"num_experts_per_tok":2,"moe_intermediate_size":64,"shared_expert_intermediate_size":64,"hc_count":4,"hc_lowrank":16,"layer_types":["linear_attention","linear_attention","linear_attention","full_attention"],"mtp":{"amf_file":"mtp.amf","config_file":"mtp_config.json"}}
+    ;
+    var q4_gcfg = try aminfer.graph.GraphConfig.fromJson(alloc, q4_cfg_json);
+    defer q4_gcfg.deinit(alloc);
+
+    var resolved_mtp = (try resolveStandardDraftSpecAlloc(alloc, .mtp, null, null, null, model_p, &q4_gcfg)) orelse return error.TestUnexpectedResult;
+    defer resolved_mtp.deinit(alloc);
+    try std.testing.expectEqual(aminfer.draft.DraftMode.mtp, resolved_mtp.mode);
+    try std.testing.expectEqual(aminfer.draft.MtpArch.qwen4_exp, resolved_mtp.config.mtp_arch);
+    try std.testing.expectEqualStrings(mtp_p, resolved_mtp.amf_path);
+
+    const m6_empty: M6GraphCliFlags = .{};
+    const ple_resolved = try resolvePlePathsAlloc(alloc, &m6_empty, null, model_p, &q4_gcfg);
+    defer freePlePaths(alloc, ple_resolved);
+    try std.testing.expectEqual(@as(usize, 2), ple_resolved.len);
+    try std.testing.expectEqualStrings(ple0_p, ple_resolved[0]);
+
+    const ds_cfg_json =
+        \\{"model_type":"deepseek_v41","vocab_size":2048,"hidden_size":256,"num_hidden_layers":4,"num_encoder_layers":2,"num_decoder_layers":2,"num_attention_heads":4,"head_dim":64,"kv_lora_rank":64,"q_lora_rank":64,"qk_nope_head_dim":32,"qk_rope_head_dim":32,"v_head_dim":32,"o_lora_rank":64,"o_groups":2,"n_routed_experts":8,"n_shared_experts":1,"num_experts_per_tok":2,"moe_intermediate_size":128,"hc_mult":4,"engram_layer_ids":[1],"engram_n_heads":4,"dspark":{"amf_file":"dspark.amf","config_file":"dspark_config.json"}}
+    ;
+    var ds_gcfg = try aminfer.graph.GraphConfig.fromJson(alloc, ds_cfg_json);
+    defer ds_gcfg.deinit(alloc);
+
+    var ds_spec = try resolveDSparkSpecAlloc(alloc, null, null, null, model_p, &ds_gcfg);
+    defer ds_spec.deinit(alloc);
+    try std.testing.expect(ds_spec.needs_taps);
+    try std.testing.expectEqual([3]u32{ 0, 2, 3 }, ds_spec.aux_layer_ids.?);
+    try std.testing.expectEqualStrings(dspark_p, ds_spec.amf_path);
 }
