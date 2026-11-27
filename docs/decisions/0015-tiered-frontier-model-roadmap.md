@@ -115,15 +115,22 @@ estimates above:
   clusters.
 
 Full real-HF schema, safetensors-header pre-flight gating, and `24 GB` M4
-cold-tier parity for both models are scheduled as Milestone **`M9.4`** (`W28`),
-tracked in [../status.md](../status.md) and
-[../process.md](../process.md#milestones).
+cold-tier parity for both models are implemented in Milestone **`M9.4`**
+(`W28`; `b45e961`, `a9de5a3`, `a114561`, `f36b2f0`), tracked in
+[../status.md](../status.md),
+[../process.md](../process.md#milestones), and
+[../benchmarks/results.md](../benchmarks/results.md#m94-real-hugging-face-checkpoint-schema-w28-header-gate-and-24-gb-m4-cold-tier-parity-qwen38-flash-next-and-deepseek-v41-flash-1017).
 
 ## Open items
 
 - Resolved in M6/M7 (`C10`, `R7`, `G11`): PLE / Engram `.amf` shard layout,
   E-core prefetch batching, and FP4 (`E2M1` + `E4M3` scale) KV cache
   representation.
-- Scheduled in `M9.4` (`W28`): `Qwen3.8-Flash-Next` (`4` items) and
-  `DeepSeek-V4.1-Flash-1017` (`3` items) real Hugging Face safetensors-header
-  and `24 GB` M4 cold-tier alignment before running full published HF shards.
+- Resolved on M4 in `M9.4` (`W28`; `b45e961`, `a9de5a3`, `a114561`, `f36b2f0`):
+  `Qwen3.8-Flash-Next` (`4` items) and `DeepSeek-V4.1-Flash-1017` (`3` items)
+  real Hugging Face safetensors-header (`long_backbone_names == 0`) and `24 GB`
+  M4 cold-tier alignment verified via `bench-m94` and real-HF-aligned staged
+  bundles (`qwen4-real-hf-synth`, `qwen4-tiny-random-bf16`,
+  `deepseek41-real-hf-synth`); full `125B` / `552B + 196B` published
+  checkpoint execution remains gated on local weight storage and `128–512 GB`
+  or multi-Mac `TB5 RDMA` hardware.
