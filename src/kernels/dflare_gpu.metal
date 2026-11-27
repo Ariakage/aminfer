@@ -150,7 +150,7 @@ struct MtpGqaTreeAttnParams {
     uint sparse_k;
     uint sparse_row_stride;
     uint sparse_num_rows;
-    uint _pad0;
+    uint head_gate_mode; // 0 = none, 1 = head_wise [m, num_q_heads], 2 = element_wise [m, num_q_heads * v_head_dim]
 };
 
 struct MtpMlaPrepParams {
@@ -184,6 +184,10 @@ struct MtpMoeRouteParams {
     uint bias_dtype; // 0 = f16, 1 = bf16, 2 = f32
     uint norm_topk_prob;
     float routed_scaling_factor;
+    uint n_group;     // <= 1 disables group_limited_topk (`8` on Ling-3.1)
+    uint topk_group;  // active groups selected by top-2 sum (`4` on Ling-3.1)
+    uint _pad0;
+    uint _pad1;
 };
 
 struct MtpExpertMeta {
@@ -193,6 +197,10 @@ struct MtpExpertMeta {
     ulong gate_sb_off;
     ulong up_sb_off;
     ulong down_sb_off;
+    uint weight_dtype; // 0 = f16, 1 = bf16, 2 = q4_affine, 3 = q3_affine, 4 = q2_affine
+    uint group_size;
+    uint _pad0;
+    uint _pad1;
 };
 
 struct MtpMoeExpertParams {
@@ -380,8 +388,8 @@ static_assert(sizeof(MtpKvCommitParams) == 32, "MtpKvCommitParams size");
 static_assert(sizeof(MtpGqaTreeAttnParams) == 80, "MtpGqaTreeAttnParams size");
 static_assert(sizeof(MtpMlaPrepParams) == 48, "MtpMlaPrepParams size");
 static_assert(sizeof(MtpSwigluClampParams) == 16, "MtpSwigluClampParams size");
-static_assert(sizeof(MtpMoeRouteParams) == 32, "MtpMoeRouteParams size");
-static_assert(sizeof(MtpExpertMeta) == 48, "MtpExpertMeta size");
+static_assert(sizeof(MtpMoeRouteParams) == 48, "MtpMoeRouteParams size");
+static_assert(sizeof(MtpExpertMeta) == 64, "MtpExpertMeta size");
 static_assert(sizeof(MtpMoeExpertParams) == 32, "MtpMoeExpertParams size");
 static_assert(sizeof(DFlash2GroupedConvParams) == 32, "DFlash2GroupedConvParams size");
 static_assert(sizeof(DFlash2TopKUnaryParams) == 32, "DFlash2TopKUnaryParams size");
@@ -1988,7 +1996,8 @@ kernel void mtp_gqa_tree_verify_attn(const device half *q_f16 [[buffer(0)]],
                                      const device uchar *sink_bias_raw [[buffer(7)]],
                                      device half *out_f16 [[buffer(8)]],
                                      const device uint *sparse_indices_u32 [[buffer(9)]],
-                                     constant MtpGqaTreeAttnParams &p [[buffer(10)]],
+                                     const device half *gate_f16 [[buffer(10)]],
+                                     constant MtpGqaTreeAttnParams &p [[buffer(11)]],
                                      uint2 tg_pos [[threadgroup_position_in_grid]],
                                      uint tid [[thread_index_in_threadgroup]],
                                      uint sg_id [[simdgroup_index_in_threadgroup]],
@@ -2169,6 +2178,9 @@ kernel void mtp_gqa_tree_verify_attn(const device half *q_f16 [[buffer(0)]],
 
     const float gm = tg_m[4];
     const float inv_gl = tg_l[4];
+    const float head_gate = (p.head_gate_mode == 1u)
+        ? dflare_sigmoid(float(gate_f16[ulong(q_idx) * p.num_q_heads + qh]))
+        : 1.0f;
     for (uint d = tid; d < p.v_head_dim; d += 128u) {
         float acc = 0.0f;
         for (uint s = 0u; s < 4u; s++) {
@@ -2176,7 +2188,13 @@ kernel void mtp_gqa_tree_verify_attn(const device half *q_f16 [[buffer(0)]],
                 acc = fma(tg_acc[s][d], exp(tg_m[s] - gm), acc);
             }
         }
-        out_f16[out_off + d] = half(acc * inv_gl);
+        float out_v = acc * inv_gl;
+        if (p.head_gate_mode == 1u) {
+            out_v *= head_gate;
+        } else if (p.head_gate_mode == 2u) {
+            out_v *= dflare_sigmoid(float(gate_f16[out_off + d]));
+        }
+        out_f16[out_off + d] = half(out_v);
     }
 }
 
@@ -2306,6 +2324,8 @@ kernel void mtp_moe_route_topk_sigmoid(const device half *router_logits_f16 [[bu
     threadgroup float tg_sg_sum[4];
     threadgroup float tg_sel_v[4];
     threadgroup uint tg_sel_i[4];
+    threadgroup float tg_gscore[32];
+    threadgroup uint tg_group_mask[1];
 
     const ulong row_off = ulong(tok) * p.num_experts;
     if (p.use_sigmoid != 0u) {
@@ -2351,6 +2371,59 @@ kernel void mtp_moe_route_topk_sigmoid(const device half *router_logits_f16 [[bu
             tg_raw_w[e] = rw;
             const float b = (p.has_bias != 0u) ? mtp_load_weight_elem(bias_raw, e, p.bias_dtype) : 0.0f;
             tg_sel[e] = rw + b;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // Optional `BailingMoeV3` / DeepSeek `group_limited_topk` (`n_group=8, topk_group=4`, top-2 sum per group).
+    const bool use_groups = (p.n_group > 1u && p.topk_group > 0u && p.topk_group < p.n_group &&
+                             p.n_group <= 32u && (p.num_experts % p.n_group) == 0u);
+    if (use_groups) {
+        const uint group_size = p.num_experts / p.n_group;
+        if (tid < p.n_group) {
+            const uint g_start = tid * group_size;
+            float top1 = -INFINITY;
+            float top2 = -INFINITY;
+            for (uint off = 0u; off < group_size; off++) {
+                const float v = tg_sel[g_start + off];
+                if (v >= top1) {
+                    top2 = top1;
+                    top1 = v;
+                } else if (v > top2) {
+                    top2 = v;
+                }
+            }
+            tg_gscore[tid] = top1 + ((group_size >= 2u && isfinite(top2)) ? top2 : 0.0f);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tid == 0u) {
+            uint mask = 0u;
+            for (uint gk = 0u; gk < p.topk_group; gk++) {
+                float best_v = -INFINITY;
+                uint best_g = 0xFFFFFFFFu;
+                for (uint g = 0u; g < p.n_group; g++) {
+                    if (((mask >> g) & 1u) != 0u) {
+                        continue;
+                    }
+                    const float gs = tg_gscore[g];
+                    if (gs > best_v || (gs == best_v && g < best_g)) {
+                        best_v = gs;
+                        best_g = g;
+                    }
+                }
+                if (best_g < p.n_group) {
+                    mask |= (1u << best_g);
+                }
+            }
+            tg_group_mask[0] = mask;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        const uint allow_mask = tg_group_mask[0];
+        for (uint e = tid; e < p.num_experts; e += 128u) {
+            const uint g = e / group_size;
+            if (((allow_mask >> g) & 1u) == 0u) {
+                tg_sel[e] = -INFINITY;
+            }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
@@ -2496,10 +2569,18 @@ kernel void mtp_moe_gate_up_swiglu(const device half *x_norm_f16 [[buffer(0)]],
 
     const uint eid = expert_ids[ulong(tok) * p.top_k + k_slot];
     const MtpExpertMeta meta = expert_meta[eid];
+    if (meta.gate_off == 0xFFFFFFFFFFFFFFFFull) {
+        if (lane == 0u) {
+            act_out_f16[(ulong(tok) * p.top_k + k_slot) * p.moe_inter + row] = half(0.0f);
+        }
+        return;
+    }
     const device half *x_row = x_norm_f16 + ulong(tok) * p.hidden_size;
+    const uint exp_dt = meta.weight_dtype;
+    const uint exp_gs = (meta.group_size > 0u) ? meta.group_size : p.group_size;
 
-    float g = mtp_moe_dot_row(x_row, weights_base, meta.gate_off, meta.gate_sb_off, row, p.hidden_size, p.weight_dtype, p.group_size, lane);
-    float u = mtp_moe_dot_row(x_row, weights_base, meta.up_off, meta.up_sb_off, row, p.hidden_size, p.weight_dtype, p.group_size, lane);
+    float g = mtp_moe_dot_row(x_row, weights_base, meta.gate_off, meta.gate_sb_off, row, p.hidden_size, exp_dt, exp_gs, lane);
+    float u = mtp_moe_dot_row(x_row, weights_base, meta.up_off, meta.up_sb_off, row, p.hidden_size, exp_dt, exp_gs, lane);
     if (lane == 0u) {
         if (p.swiglu_limit > 0.0f) {
             g = min(g, p.swiglu_limit);
@@ -2535,8 +2616,13 @@ kernel void mtp_moe_down_reduce(const device half *act_f16 [[buffer(0)]],
         const uint eid = expert_ids[slot_idx];
         const float w = expert_weights[slot_idx];
         const MtpExpertMeta meta = expert_meta[eid];
+        if (meta.down_off == 0xFFFFFFFFFFFFFFFFull) {
+            continue;
+        }
+        const uint exp_dt = meta.weight_dtype;
+        const uint exp_gs = (meta.group_size > 0u) ? meta.group_size : p.group_size;
         const device half *act_row = act_f16 + slot_idx * p.moe_inter;
-        const float y_k = mtp_moe_dot_row(act_row, weights_base, meta.down_off, meta.down_sb_off, row, p.moe_inter, p.weight_dtype, p.group_size, lane);
+        const float y_k = mtp_moe_dot_row(act_row, weights_base, meta.down_off, meta.down_sb_off, row, p.moe_inter, exp_dt, exp_gs, lane);
         total = fma(w, y_k, total);
     }
     if (lane == 0u) {

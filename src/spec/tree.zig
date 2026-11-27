@@ -177,6 +177,35 @@ pub fn predictRouterTopK(
     use_sigmoid: bool,
     logits_scratch: []f32,
 ) ExpertBitset {
+    return predictRouterTopKGrouped(
+        router_bytes,
+        format,
+        hidden_f32,
+        num_experts,
+        top_k,
+        score_bias_f32,
+        use_sigmoid,
+        1,
+        1,
+        logits_scratch,
+    );
+}
+
+/// Estimates routed top-`top_k` MoE experts with optional `BailingMoeV3` / DeepSeek
+/// `group_limited_topk` (`n_group=8, topk_group=4`, top-2 sum per group + `sigmoid + bias`,
+/// up to `512` experts, zero heap allocation).
+pub fn predictRouterTopKGrouped(
+    router_bytes: []const u8,
+    format: RouterWeightFormat,
+    hidden_f32: []const f32,
+    num_experts: u32,
+    top_k: u32,
+    score_bias_f32: ?[]const f32,
+    use_sigmoid: bool,
+    n_group: u32,
+    topk_group: u32,
+    logits_scratch: []f32,
+) ExpertBitset {
     var bs = ExpertBitset.empty();
     const h: usize = hidden_f32.len;
     const n_exp: usize = @min(@as(usize, num_experts), @min(logits_scratch.len, ExpertBitset.MAX_EXPERTS));
@@ -223,6 +252,54 @@ pub fn predictRouterTopK(
         logits_scratch[e] = score;
     }
 
+    // Optional `group_limited_topk` (`n_group <= 32`, top-2 sum per group, tie-break by lower group ID).
+    const use_groups = (n_group > 1 and topk_group > 0 and topk_group < n_group and
+        n_group <= 32 and (n_exp % @as(usize, n_group)) == 0);
+    if (use_groups) {
+        const ng: usize = @intCast(n_group);
+        const group_size: usize = n_exp / ng;
+        var group_scores: [32]f32 = @splat(-std.math.inf(f32));
+        for (0..ng) |g| {
+            const g_start = g * group_size;
+            var top1: f32 = -std.math.inf(f32);
+            var top2: f32 = -std.math.inf(f32);
+            for (0..group_size) |off| {
+                const v = logits_scratch[g_start + off];
+                if (v >= top1) {
+                    top2 = top1;
+                    top1 = v;
+                } else if (v > top2) {
+                    top2 = v;
+                }
+            }
+            group_scores[g] = top1 + (if (group_size >= 2 and std.math.isFinite(top2)) top2 else 0.0);
+        }
+
+        var group_allow_mask: u32 = 0;
+        for (0..topk_group) |_| {
+            var best_g: usize = ng;
+            var best_gs: f32 = -std.math.inf(f32);
+            for (0..ng) |g| {
+                if (((group_allow_mask >> @intCast(g)) & 1) != 0) continue;
+                const gs = group_scores[g];
+                if (best_g == ng or gs > best_gs) {
+                    best_gs = gs;
+                    best_g = g;
+                }
+            }
+            if (best_g < ng) {
+                group_allow_mask |= (@as(u32, 1) << @intCast(best_g));
+            }
+        }
+
+        for (0..n_exp) |e| {
+            const g: u5 = @intCast(e / group_size);
+            if (((group_allow_mask >> g) & 1) == 0) {
+                logits_scratch[e] = -std.math.inf(f32);
+            }
+        }
+    }
+
     // Deterministic top-`eff_k` selection (tie-break by lower expert ID).
     for (0..eff_k) |_| {
         var best_e: usize = 0;
@@ -231,6 +308,7 @@ pub fn predictRouterTopK(
         for (0..n_exp) |e| {
             if (bs.contains(@intCast(e))) continue;
             const sc = logits_scratch[e];
+            if (!std.math.isFinite(sc)) continue;
             if (!found or sc > best_v) {
                 best_v = sc;
                 best_e = e;
@@ -1488,4 +1566,79 @@ test "M9.1 D15 ExpertBitset 512-expert capacity (384 Pro experts) and zero-alloc
     const bs_sig = predictRouterTopK(std.mem.sliceAsBytes(&w_f32), .f32, &hidden, n_exp, 2, &bias, true, &scratch);
     try std.testing.expectEqual(@as(u32, 2), bs_sig.count());
     try std.testing.expect(bs_sig.contains(5) and bs_sig.contains(2));
+}
+
+test "M9.3 D15 512E group_limited_topk (n_group=8, topk_group=4, top-2 sum) predictRouterTopKGrouped and D7 cold-expert pruning" {
+    // 1. Construct a 512-expert (8 groups x 64 experts) BailingMoeV3 router where:
+    //    - Group 7 has ONE strong outlier expert (e=490, score+bias ~ 1.90) and 63 weak experts (~0.05) -> top-2 sum ~ 1.95
+    //    - Groups {0, 2, 4, 6} each have TWO strong experts (~1.25 each) -> top-2 sum ~ 2.50 > 1.95
+    //    - Groups {1, 3, 5} are weak (~0.20 each) -> top-2 sum ~ 0.40
+    //    Ungrouped top-8 MUST pick e=490, while group_limited_topk (n_group=8, topk_group=4) MUST exclude
+    //    Group 7 (e=490 absent) and pick the 8 paired experts across Groups {0, 2, 4, 6} (spanning words 0..7)!
+    const n_exp: usize = 512;
+    const h: usize = 4;
+    const hidden = [_]f32{ 1.0, 0.0, 0.0, 0.0 };
+    var w_f32: [n_exp * h]f32 = @splat(0.0);
+    var bias: [n_exp]f32 = @splat(-0.45);
+    for (0..n_exp) |e| {
+        w_f32[e * h + 0] = -2.0; // sigmoid(-2) ~= 0.119
+    }
+
+    // Group 7 single outlier (e=490 -> sigmoid(2.0)+1.02 ~= 1.90, second best in group 7 ~ 0.05).
+    const outlier_e: u32 = 490;
+    w_f32[outlier_e * h + 0] = 2.0;
+    bias[outlier_e] = 1.02;
+
+    // 4 winning groups {0, 2, 4, 6}, 2 strong experts each (top-8 total across all 8 u64 words).
+    const expected_grouped = [_]u32{ 3, 45, 130, 180, 260, 315, 390, 447 };
+    for (expected_grouped) |e| {
+        w_f32[@as(usize, e) * h + 0] = 1.5; // sigmoid(1.5) ~= 0.818
+        bias[e] = 0.43; // ~ 1.248 each -> top-2 sum ~= 2.496 > 1.95
+    }
+
+    var w_f16: [n_exp * h]f16 = undefined;
+    var w_bf16: [n_exp * h]u16 = undefined;
+    for (0..n_exp * h) |i| {
+        w_f16[i] = @floatCast(w_f32[i]);
+        const bits: u32 = @bitCast(w_f32[i]);
+        w_bf16[i] = @intCast(bits >> 16);
+    }
+    var scratch: [ExpertBitset.MAX_EXPERTS]f32 = undefined;
+
+    // Ungrouped top-8 includes outlier e=490.
+    const bs_ungrouped = predictRouterTopK(std.mem.sliceAsBytes(&w_f32), .f32, &hidden, n_exp, 8, &bias, true, &scratch);
+    try std.testing.expectEqual(@as(u32, 8), bs_ungrouped.count());
+    try std.testing.expect(bs_ungrouped.contains(outlier_e));
+
+    // Grouped top-8 (n_group=8, topk_group=4) excludes e=490 and picks exact 8 experts across f32/f16/bf16.
+    const bs_g_f32 = predictRouterTopKGrouped(std.mem.sliceAsBytes(&w_f32), .f32, &hidden, n_exp, 8, &bias, true, 8, 4, &scratch);
+    const bs_g_f16 = predictRouterTopKGrouped(std.mem.sliceAsBytes(&w_f16), .f16, &hidden, n_exp, 8, &bias, true, 8, 4, &scratch);
+    const bs_g_bf16 = predictRouterTopKGrouped(std.mem.sliceAsBytes(&w_bf16), .bf16, &hidden, n_exp, 8, &bias, true, 8, 4, &scratch);
+    for ([_]ExpertBitset{ bs_g_f32, bs_g_f16, bs_g_bf16 }) |bs| {
+        try std.testing.expectEqual(@as(u32, 8), bs.count());
+        try std.testing.expect(!bs.contains(outlier_e));
+        for (expected_grouped) |e| try std.testing.expect(bs.contains(e));
+    }
+
+    // 2. Verify D7 cold-expert pruning at full 512E scale (including highest word bit 511).
+    const num_layers: u32 = 2;
+    var t = SmallTree.init(1);
+    const hot_node = t.insertChild(0, 11, 0.55, .l2) orelse unreachable;
+    const cold_node = t.insertChild(0, 22, 0.55, .l2) orelse unreachable;
+
+    var exps: [3 * num_layers]ExpertBitset = @splat(ExpertBitset.empty());
+    var cold_masks: [num_layers]ExpertBitset = @splat(ExpertBitset.empty());
+    for (0..num_layers) |l| {
+        exps[0 * num_layers + l] = bs_g_f32;
+        exps[hot_node * num_layers + l] = bs_g_f32; // shares all 8 hot grouped experts
+        exps[cold_node * num_layers + l].set(490);
+        exps[cold_node * num_layers + l].set(511);
+        for (448..512) |e| cold_masks[l].set(@intCast(e)); // Group 7 cold on NVMe
+    }
+
+    const cost = PruneCostModel.uniformBeta(80.0, 2.0, 400_000.0, 5_000_000.0, 68.0, num_layers, 512);
+    const summary = try t.pruneToOptimalSubtree(cost, &exps, &cold_masks, 16);
+    try std.testing.expectEqual(@as(u16, 2), summary.kept_nodes);
+    try std.testing.expect(t.findChild(0, 11) != null);
+    try std.testing.expectEqual(@as(?u16, null), t.findChild(0, 22));
 }

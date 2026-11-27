@@ -4163,7 +4163,7 @@ pub const SpecEngine = struct {
                         },
                     }
                 }
-                self.node_experts[ni * sampled + s] = tree_mod.predictRouterTopK(
+                self.node_experts[ni * sampled + s] = tree_mod.predictRouterTopKGrouped(
                     router_slices[s],
                     router_fmts[s],
                     emb,
@@ -4171,6 +4171,8 @@ pub const SpecEngine = struct {
                     top_k,
                     bias_opt,
                     use_sigmoid,
+                    g.config.moe_n_group,
+                    g.config.moe_topk_group,
                     self.router_logits_scratch,
                 );
             }
@@ -6778,5 +6780,338 @@ test "M9.2 D15 SpecEngine zero-reindex 1L MLA/NoPE-MLA MTP + DFlash2 (B=8, B=16,
         );
         try std.testing.expectEqual(@as(u32, 8), bs.count());
         for (hot_e) |e| try std.testing.expect(bs.contains(e));
+    }
+}
+
+test "M9.3 D15 SpecEngine Ling-3.1 bailing_hybrid Gated-MLA 1L MTP + 512E n_group=8 topk_group=4 D7 cold-expert pruning T=0 lossless" {
+    const allocator = std.testing.allocator;
+
+    // -------------------------------------------------------------------------
+    // 1. Ling-3.1 (`bailing_hybrid`) Gated-MLA (`qk=192, v=128`, head-wise `g_proj`)
+    //    + `group_limited_topk` (`n_group=8, topk_group=4`) + `swiglu_limit=10.0`
+    //    1L MTP with SpecEngine under BOTH `.gpu` and `.cpu_sme2`: 100% T=0 lossless!
+    // -------------------------------------------------------------------------
+    {
+        const tgt_cfg: qwen3.ModelConfig = .{
+            .arch = .qwen3_dense,
+            .vocab_size = 128,
+            .hidden_size = 128,
+            .num_hidden_layers = 2,
+            .num_attention_heads = 2,
+            .num_key_value_heads = 1,
+            .head_dim = 64,
+            .intermediate_size = 256,
+            .rope_theta = 10_000.0,
+            .rms_norm_eps = 1e-6,
+            .tie_word_embeddings = true,
+        };
+        const tgt_img = try draft_mod.buildSyntheticTargetBf16ForTest(allocator, tgt_cfg, 93401);
+        defer allocator.free(tgt_img);
+
+        const prompt = [_]u32{ 7, 19, 33, 51, 73, 13 };
+        const gen_steps: usize = 12;
+
+        var ref_model = try qwen3.Qwen3Model.loadFromBytes(allocator, tgt_img, tgt_cfg, .{
+            .max_seq_len = 64,
+            .max_tree_nodes = 16,
+        });
+        defer ref_model.deinit(allocator);
+        var ref_tokens: [gen_steps]u32 = undefined;
+        ref_tokens[0] = try ref_model.prefillChunk(&prompt, 0, true);
+        for (1..gen_steps) |s| {
+            ref_tokens[s] = try ref_model.stepDecode(ref_tokens[s - 1], @intCast(prompt.len + s - 1));
+        }
+
+        const ling_mtp_cfg: draft_mod.DraftConfig = .{
+            .format = .mtp,
+            .mtp_arch = .bailing_hybrid,
+            .vocab_size = 128,
+            .draft_vocab_size = 128,
+            .hidden_size = 128,
+            .target_hidden_size = 128,
+            .num_hidden_layers = 1,
+            .num_attention_heads = 4,
+            .num_key_value_heads = 4,
+            .q_lora_rank = 64,
+            .kv_lora_rank = 32,
+            .qk_nope_head_dim = 128,
+            .qk_rope_head_dim = 64,
+            .head_dim = 192,
+            .v_head_dim = 128,
+            .rope_dim = 64,
+            .rope_interleave = true,
+            .mla_gated_proj = true,
+            .mla_gate_element_wise = false,
+            .rope_theta = 6_000_000.0,
+            .num_experts = 16,
+            .num_experts_per_tok = 4,
+            .n_group = 8,
+            .topk_group = 4,
+            .moe_intermediate_size = 64,
+            .intermediate_size = 64,
+            .shared_expert_intermediate_size = 64,
+            .routed_scaling_factor = 2.5,
+            .norm_topk_prob = true,
+            .moe_scoring_sigmoid = true,
+            .swiglu_limit = 10.0,
+            .rms_norm_eps = 1e-6,
+            .share_embed_tokens = true,
+            .share_lm_head = true,
+        };
+        const mtp_img = try draft_mod.buildSyntheticDraftAmfImage(allocator, ling_mtp_cfg, 93402);
+        defer allocator.free(mtp_img);
+
+        for ([_]draft_mod.Placement{ .gpu, .cpu_sme2 }) |place| {
+            var spec_model = try qwen3.Qwen3Model.loadFromBytes(allocator, tgt_img, tgt_cfg, .{
+                .max_seq_len = 64,
+                .max_tree_nodes = 16,
+                .enable_feature_taps = true,
+            });
+            defer spec_model.deinit(allocator);
+
+            var dh = try draft_mod.DraftHead.loadFromBytes(allocator, &spec_model, mtp_img, ling_mtp_cfg, .{
+                .placement = place,
+                .max_seq_len = 64,
+                .max_tree_slots = 16,
+            });
+            defer dh.deinit(allocator, &spec_model);
+            if (place == .cpu_sme2) {
+                try std.testing.expectEqual(draft_mod.Placement.cpu_sme2, dh.effective_placement);
+            }
+
+            var eng = try SpecEngine.init(allocator, &spec_model, &dh, .{
+                .mode = .mtp,
+                .max_tree_nodes = 16,
+                .max_draft_depth = 3,
+                .branch_width = 2,
+                .top_k_per_node = 2,
+                .l1_max_draft = 0,
+                .min_frontier_prob = 0.0,
+                .enable_pruning = false,
+                .temperature = 0.0,
+            });
+            defer eng.deinit(allocator);
+
+            var spec_tokens: [gen_steps]u32 = undefined;
+            spec_tokens[0] = try eng.prefill(&prompt, null);
+            var out_len: usize = 1;
+            while (out_len < gen_steps) {
+                const rs = try eng.stepRound(null, spec_tokens[out_len..]);
+                try std.testing.expect(rs.emitted_count >= 1);
+                out_len += rs.emitted_count;
+            }
+            try std.testing.expectEqualSlices(u32, &ref_tokens, &spec_tokens);
+            if (place == .cpu_sme2) {
+                try std.testing.expectEqual(@as(u64, 0), dh.gpu_eh_proj_dispatches);
+                try std.testing.expect(dh.sme2_eval_count > 0);
+            } else {
+                try std.testing.expect(dh.gpu_eh_proj_dispatches > 0);
+            }
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // 2. Group-limited (`n_group=8, topk_group=4`, sigmoid) D7 cold-expert tree
+    //    pruning on MoE GraphModel + 100% T=0 lossless SpecEngine parity!
+    // -------------------------------------------------------------------------
+    {
+        const tmp_dir = try graph.makeTestTempDir(allocator, "m93_d15_ling3_d7");
+        defer {
+            graph.removeTestDir(allocator, tmp_dir);
+            allocator.free(tmp_dir);
+        }
+
+        var synth = try graph.buildSynthQwen4Bundle(allocator, .{
+            .num_experts = 16,
+            .top_k = 4,
+            .cold_experts_per_layer = 8,
+            .max_loops = 1,
+            .ple_num_shards = 0,
+            .include_steplora = false,
+            .tmp_dir = tmp_dir,
+        });
+        defer {
+            if (synth.amf_file_path) |p| graph.removeTestFile(p);
+            for (synth.ple_paths) |p| graph.removeTestFile(p);
+            synth.deinit(allocator);
+        }
+        synth.cfg.moe_n_group = 8;
+        synth.cfg.moe_topk_group = 4;
+        synth.cfg.moe_scoring_sigmoid = true;
+        synth.cfg.moe_routed_scaling_factor = 2.5;
+
+        const prompt = [_]u32{ 3, 9, 15, 21, 27 };
+        const gen_steps: usize = 10;
+
+        var ref_model = try graph.GraphModel.loadFromFile(allocator, synth.amf_file_path.?, synth.cfg, .{
+            .max_seq_len = 64,
+            .max_tree_nodes = 16,
+            .cold_slot_count = 16,
+            .startup_canary = false,
+        });
+        defer ref_model.deinit(allocator);
+        var ref_tokens: [gen_steps]u32 = undefined;
+        ref_tokens[0] = try ref_model.prefillChunk(&prompt, 0, true);
+        for (1..gen_steps) |s| {
+            ref_tokens[s] = try ref_model.stepDecode(ref_tokens[s - 1], @intCast(prompt.len + s - 1));
+        }
+
+        // Build a matching 1L bailing_hybrid Gated-MLA MTP head sharing GraphModel's embed/lm_head.
+        const g_h = synth.cfg.hidden_size;
+        const mtp_cfg: draft_mod.DraftConfig = .{
+            .format = .mtp,
+            .mtp_arch = .bailing_hybrid,
+            .vocab_size = synth.cfg.vocab_size,
+            .draft_vocab_size = synth.cfg.vocab_size,
+            .hidden_size = g_h,
+            .target_hidden_size = g_h,
+            .num_hidden_layers = 1,
+            .num_attention_heads = 2,
+            .num_key_value_heads = 2,
+            .q_lora_rank = 32,
+            .kv_lora_rank = 16,
+            .qk_nope_head_dim = 64,
+            .qk_rope_head_dim = 32,
+            .head_dim = 96,
+            .v_head_dim = 64,
+            .rope_dim = 32,
+            .rope_interleave = true,
+            .mla_gated_proj = true,
+            .rope_theta = 6_000_000.0,
+            .num_experts = 16,
+            .num_experts_per_tok = 4,
+            .n_group = 8,
+            .topk_group = 4,
+            .moe_intermediate_size = 32,
+            .intermediate_size = 32,
+            .shared_expert_intermediate_size = 32,
+            .routed_scaling_factor = 2.5,
+            .norm_topk_prob = true,
+            .moe_scoring_sigmoid = true,
+            .swiglu_limit = 10.0,
+            .rms_norm_eps = 1e-6,
+            .share_embed_tokens = true,
+            .share_lm_head = true,
+        };
+        const mtp_img = try draft_mod.buildSyntheticDraftAmfImage(allocator, mtp_cfg, 93501);
+        defer allocator.free(mtp_img);
+
+        for ([_]bool{ false, true }) |enable_prune| {
+            var spec_model = try graph.GraphModel.loadFromFile(allocator, synth.amf_file_path.?, synth.cfg, .{
+                .max_seq_len = 64,
+                .max_tree_nodes = 16,
+                .cold_slot_count = 16,
+                .enable_feature_taps = true,
+                .startup_canary = false,
+            });
+            defer spec_model.deinit(allocator);
+
+            var dh = try draft_mod.DraftHead.loadFromBytesForGraph(allocator, &spec_model, mtp_img, mtp_cfg, .{
+                .placement = .gpu,
+                .max_seq_len = 64,
+                .max_tree_slots = 16,
+            });
+            defer dh.deinitForGraph(allocator, &spec_model);
+
+            var eng = try SpecEngine.initWithGraph(allocator, &spec_model, &dh, .{
+                .mode = .mtp,
+                .max_tree_nodes = 16,
+                .max_draft_depth = 3,
+                .branch_width = 2,
+                .top_k_per_node = 2,
+                .l1_max_draft = 0,
+                .min_frontier_prob = 0.0,
+                .enable_pruning = enable_prune,
+                .temperature = 0.0,
+            });
+            defer eng.deinit(allocator);
+
+            if (enable_prune) {
+                eng.draft_tree.reset(prompt[0]);
+                var parent: u16 = 0;
+                for (1..12) |slot| {
+                    const tok: u32 = @intCast((slot * 5) % synth.cfg.vocab_size);
+                    parent = eng.draft_tree.insertChild(parent, tok, 0.35, .l2) orelse break;
+                }
+                const before_n = eng.draft_tree.count;
+                eng.draft_tree.fillTokenIds(eng.verify_tokens[0..before_n]);
+                const pre_pred = try eng.predictGraphMoEExpertsForTokens(&spec_model, eng.verify_tokens[0..before_n]);
+                try std.testing.expect(pre_pred.sampled > 0);
+                try std.testing.expect(pre_pred.has_cold);
+                var pre_cold: u32 = 0;
+                for (0..pre_pred.sampled) |s| {
+                    var u_bs = tree_mod.ExpertBitset.empty();
+                    for (0..before_n) |ni| {
+                        // Each node predicts top_k=4 experts under group_limited_topk (n_group=8, topk_group=4).
+                        try std.testing.expectEqual(@as(u32, 4), eng.node_experts[ni * pre_pred.sampled + s].count());
+                        u_bs = u_bs.unionWith(eng.node_experts[ni * pre_pred.sampled + s]);
+                    }
+                    pre_cold += u_bs.intersectWith(eng.cold_masks[s]).count();
+                }
+                try std.testing.expect(pre_cold > 0);
+
+                const saved_cost = eng.cost_model;
+                eng.cost_model.expert_bytes = 500_000.0;
+                eng.cost_model.cold_penalty_bytes = 10_000_000.0;
+                const ps = try eng.pruneTreeInPlace(&eng.draft_tree, 50.0, 16);
+                eng.cost_model = saved_cost;
+                try std.testing.expect(ps.kept_nodes < before_n);
+
+                eng.draft_tree.fillTokenIds(eng.verify_tokens[0..ps.kept_nodes]);
+                const post_pred = try eng.predictGraphMoEExpertsForTokens(&spec_model, eng.verify_tokens[0..ps.kept_nodes]);
+                var post_cold: u32 = 0;
+                for (0..post_pred.sampled) |s| {
+                    var u_bs = tree_mod.ExpertBitset.empty();
+                    for (0..ps.kept_nodes) |ni| u_bs = u_bs.unionWith(eng.node_experts[ni * post_pred.sampled + s]);
+                    post_cold += u_bs.intersectWith(eng.cold_masks[s]).count();
+                }
+                try std.testing.expect(post_cold < pre_cold);
+            }
+
+            var spec_tokens: [gen_steps]u32 = undefined;
+            spec_tokens[0] = try eng.prefill(&prompt, null);
+            var out_len: usize = 1;
+            while (out_len < gen_steps) {
+                const rs = try eng.stepRound(null, spec_tokens[out_len..]);
+                try std.testing.expect(rs.emitted_count >= 1);
+                out_len += rs.emitted_count;
+            }
+            try std.testing.expectEqualSlices(u32, &ref_tokens, &spec_tokens);
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // 3. Full 512E Ling-3.1 group_limited_topk (n_group=8, topk_group=4) check
+    // -------------------------------------------------------------------------
+    {
+        const ne: u32 = 512;
+        const rh: usize = 4;
+        var router_w: [ne * rh]f32 = @splat(-1.0);
+        const hidden_v = [_]f32{ 1.0, 0.0, 0.0, 0.0 };
+        var bias: [ne]f32 = @splat(-0.5);
+        var scratch: [ne]f32 = @splat(0.0);
+        // Group 7 single outlier (e=510) vs 4 winning groups {1, 3, 5, 6} with pairs.
+        router_w[510 * rh] = 3.0;
+        bias[510] = 1.1;
+        const win_e = [_]u32{ 65, 90, 195, 220, 325, 360, 390, 440 };
+        for (win_e) |e| {
+            router_w[@as(usize, e) * rh] = 2.0;
+            bias[e] = 0.5;
+        }
+        const bs = tree_mod.predictRouterTopKGrouped(
+            std.mem.sliceAsBytes(&router_w),
+            .f32,
+            &hidden_v,
+            ne,
+            8,
+            &bias,
+            true,
+            8,
+            4,
+            &scratch,
+        );
+        try std.testing.expectEqual(@as(u32, 8), bs.count());
+        try std.testing.expect(!bs.contains(510));
+        for (win_e) |e| try std.testing.expect(bs.contains(e));
     }
 }

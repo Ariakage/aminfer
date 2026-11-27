@@ -103,11 +103,13 @@ pub const MtpArch = enum {
     standard,
     glm_moe_dsa,
     glm5_next,
+    bailing_hybrid,
 
     pub fn parse(s: []const u8) ?MtpArch {
         if (std.mem.eql(u8, s, "standard")) return .standard;
-        if (std.mem.eql(u8, s, "glm_moe_dsa")) return .glm_moe_dsa;
-        if (std.mem.eql(u8, s, "glm5_next")) return .glm5_next;
+        if (std.mem.eql(u8, s, "glm_moe_dsa") or std.mem.eql(u8, s, "glm_moe_dsa_mtp")) return .glm_moe_dsa;
+        if (std.mem.eql(u8, s, "glm5_next") or std.mem.eql(u8, s, "glm5_next_mtp")) return .glm5_next;
+        if (std.mem.eql(u8, s, "bailing_hybrid") or std.mem.eql(u8, s, "bailing_hybrid_mtp") or std.mem.eql(u8, s, "bailing_moe_v3")) return .bailing_hybrid;
         return null;
     }
 };
@@ -148,15 +150,22 @@ pub const DraftConfig = struct {
     kv_lora_rank: u32 = 0,
     qk_nope_head_dim: u32 = 0,
     qk_rope_head_dim: u32 = 0,
-    /// DeepSeek/GLM interleaved RoPE pairs `(2*i, 2*i+1)` (`true` on `GLM-5.2/5.3`).
+    /// DeepSeek/GLM/Ling-3.1 interleaved RoPE pairs `(2*i, 2*i+1)` (`true` on `GLM-5.2/5.3` & `Ling-3.1`).
     rope_interleave: bool = false,
+    /// Optional Gated-MLA output gate (`Ling-3.1` `bailing_hybrid`: `g_proj [num_heads, hidden]` head-wise sigmoid gate before `o_proj`).
+    mla_gated_proj: bool = false,
+    /// `false` = `"head_wise"` (`[num_heads, hidden]`, `Ling-3.1`); `true` = `"element_wise"` (`[num_heads * v_head_dim, hidden]`).
+    mla_gate_element_wise: bool = false,
     /// Zero-reindex MTP fast path: reuse target backbone's shared sparse `topk` indices without running an MTP DSA indexer.
     index_share_for_mtp_iteration: bool = false,
     /// Sparse DSA `index_topk` cap (`2048` on `GLM-5.2/5.3` / `GLM-5.3-Flash`).
     index_topk: u32 = 0,
-    /// Optional MoE inside MTP layer (`256` on `GLM-5.2/5.3`, `288` on `GLM-5.3-Flash`; `0` => dense MLP).
+    /// Optional MoE inside MTP layer (`256` on `GLM-5.2/5.3`, `288` on `GLM-5.3-Flash`, `512` on `Ling-3.1`; `0` => dense MLP).
     num_experts: u32 = 0,
     num_experts_per_tok: u32 = 0,
+    /// Optional `BailingMoeV3` / DeepSeek `group_limited_topk` (`n_group=8, topk_group=4` top-2 sum per group on `Ling-3.1`; `1` disables).
+    n_group: u32 = 1,
+    topk_group: u32 = 1,
     moe_intermediate_size: u32 = 0,
     shared_expert_intermediate_size: u32 = 0,
     routed_scaling_factor: f32 = 1.0,
@@ -234,6 +243,11 @@ pub const DraftConfig = struct {
         return self.num_attention_heads * self.effectiveVHeadDim();
     }
 
+    pub fn mlaGateDim(self: DraftConfig) u32 {
+        if (!self.mla_gated_proj) return 0;
+        return if (self.mla_gate_element_wise) self.oInDim() else self.num_attention_heads;
+    }
+
     pub fn effectiveMlpInter(self: DraftConfig) u32 {
         if (self.isMoeMtp()) {
             return if (self.shared_expert_intermediate_size > 0) self.shared_expert_intermediate_size else self.moe_intermediate_size;
@@ -295,6 +309,14 @@ pub const DraftConfig = struct {
             if (self.num_experts > 512) return error.InvalidConfig;
             if (self.num_experts_per_tok == 0 or self.num_experts_per_tok > 16 or self.num_experts_per_tok > self.num_experts) {
                 return error.InvalidConfig;
+            }
+            if (self.n_group == 0 or self.n_group > 32) return error.InvalidConfig;
+            if (self.n_group > 1) {
+                if ((self.num_experts % self.n_group) != 0) return error.InvalidConfig;
+                if (self.topk_group == 0 or self.topk_group > self.n_group) return error.InvalidConfig;
+                if (self.num_experts_per_tok > self.topk_group * (self.num_experts / self.n_group)) {
+                    return error.InvalidConfig;
+                }
             }
             if (self.moe_intermediate_size == 0 or (self.moe_intermediate_size % 4) != 0) return error.InvalidConfig;
             if (self.shared_expert_intermediate_size > 0 and (self.shared_expert_intermediate_size % 4) != 0) return error.InvalidConfig;
@@ -391,7 +413,16 @@ pub const DraftConfig = struct {
         } else head_dim;
 
         const rope_interleave = jsonOptBool(layer_obj, "rope_interleave") orelse
-            jsonOptBool(obj, "rope_interleave") orelse (mtp_arch == .glm_moe_dsa);
+            jsonOptBool(obj, "rope_interleave") orelse (mtp_arch == .glm_moe_dsa or mtp_arch == .bailing_hybrid);
+        const gate_gran = jsonOptString(layer_obj, "gated_attention_proj_granularity_type") orelse
+            jsonOptString(obj, "gated_attention_proj_granularity_type");
+        const mla_gate_element_wise = if (gate_gran) |gg| std.mem.eql(u8, gg, "element_wise") else false;
+        const mla_gated_proj: bool = if (jsonOptBool(layer_obj, "mla_gated_proj") orelse jsonOptBool(obj, "mla_gated_proj")) |b|
+            b
+        else if (gate_gran) |gg|
+            (std.mem.eql(u8, gg, "head_wise") or std.mem.eql(u8, gg, "element_wise"))
+        else
+            (is_mla and mtp_arch == .bailing_hybrid);
         const index_share_mtp = jsonOptBool(layer_obj, "index_share_for_mtp_iteration") orelse
             jsonOptBool(obj, "index_share_for_mtp_iteration") orelse false;
         const index_topk = jsonOptU32(layer_obj, "index_topk") orelse jsonOptU32(obj, "index_topk") orelse 0;
@@ -402,16 +433,26 @@ pub const DraftConfig = struct {
             jsonOptU32(obj, "n_routed_experts") orelse 0;
         const num_experts_per_tok = jsonOptU32(layer_obj, "num_experts_per_tok") orelse
             jsonOptU32(obj, "num_experts_per_tok") orelse 0;
+        const default_n_group: u32 = if (mtp_arch == .bailing_hybrid and num_experts >= 8 and (num_experts % 8) == 0) 8 else 1;
+        const n_group = jsonOptU32(layer_obj, "n_group") orelse
+            jsonOptU32(obj, "n_group") orelse default_n_group;
+        const default_topk_group: u32 = if (n_group > 1 and mtp_arch == .bailing_hybrid) @min(@as(u32, 4), n_group) else n_group;
+        const topk_group = jsonOptU32(layer_obj, "topk_group") orelse
+            jsonOptU32(obj, "topk_group") orelse default_topk_group;
         const moe_inter = jsonOptU32(layer_obj, "moe_intermediate_size") orelse
             jsonOptU32(obj, "moe_intermediate_size") orelse 0;
         const n_shared = jsonOptU32(layer_obj, "n_shared_experts") orelse
-            jsonOptU32(obj, "n_shared_experts") orelse 0;
+            jsonOptU32(obj, "n_shared_experts") orelse
+            jsonOptU32(layer_obj, "num_shared_experts") orelse
+            jsonOptU32(obj, "num_shared_experts") orelse 0;
+        const moe_shared_inter = jsonOptU32(layer_obj, "moe_shared_expert_intermediate_size") orelse
+            jsonOptU32(obj, "moe_shared_expert_intermediate_size") orelse 0;
         const shared_inter = jsonOptU32(layer_obj, "shared_expert_intermediate_size") orelse
             jsonOptU32(obj, "shared_expert_intermediate_size") orelse
-            (if (n_shared > 0 and moe_inter > 0) n_shared * moe_inter else 0);
+            (if (moe_shared_inter > 0) moe_shared_inter * @max(n_shared, 1) else if (n_shared > 0 and moe_inter > 0) n_shared * moe_inter else 0);
         const routed_scaling = jsonOptF32(layer_obj, "routed_scaling_factor") orelse
             jsonOptF32(obj, "routed_scaling_factor") orelse
-            (if (mtp_arch == .glm_moe_dsa) @as(f32, 2.5) else @as(f32, 1.0));
+            (if (mtp_arch == .glm_moe_dsa or mtp_arch == .bailing_hybrid) @as(f32, 2.5) else @as(f32, 1.0));
         const norm_topk_prob = jsonOptBool(layer_obj, "norm_topk_prob") orelse
             jsonOptBool(obj, "norm_topk_prob") orelse true;
         const moe_sigmoid: bool = blk: {
@@ -420,11 +461,24 @@ pub const DraftConfig = struct {
                 if (std.mem.eql(u8, sf, "softmax")) break :blk false;
             }
             if (jsonOptBool(layer_obj, "moe_scoring_sigmoid") orelse jsonOptBool(obj, "moe_scoring_sigmoid")) |b| break :blk b;
-            break :blk (mtp_arch == .glm_moe_dsa or mtp_arch == .glm5_next);
+            break :blk (mtp_arch == .glm_moe_dsa or mtp_arch == .glm5_next or mtp_arch == .bailing_hybrid);
+        };
+        const swiglu_limit_from_list: ?f32 = blk: {
+            const arr_val = layer_obj.get("expert_swiglu_limit_list") orelse obj.get("expert_swiglu_limit_list") orelse break :blk null;
+            if (arr_val == .array and arr_val.array.items.len > 0) {
+                const last = arr_val.array.items[arr_val.array.items.len - 1];
+                switch (last) {
+                    .float => |fv| break :blk @floatCast(fv),
+                    .integer => |iv| break :blk @floatFromInt(iv),
+                    else => {},
+                }
+            }
+            break :blk null;
         };
         const swiglu_limit = jsonOptF32(layer_obj, "swiglu_limit") orelse
             jsonOptF32(obj, "swiglu_limit") orelse
-            (if (mtp_arch == .glm5_next) @as(f32, 10.0) else @as(f32, 0.0));
+            swiglu_limit_from_list orelse
+            (if (mtp_arch == .glm5_next or mtp_arch == .bailing_hybrid) @as(f32, 10.0) else @as(f32, 0.0));
 
         const sliding_window = jsonOptU32(layer_obj, "sliding_window") orelse
             jsonOptU32(obj, "sliding_window") orelse
@@ -444,6 +498,8 @@ pub const DraftConfig = struct {
             (if (mtp_arch == .glm_moe_dsa or mtp_arch == .glm5_next) @as(f32, 1e-5) else @as(f32, 1e-6));
         const default_theta: f32 = if (mtp_arch == .glm_moe_dsa)
             8_000_000.0
+        else if (mtp_arch == .bailing_hybrid)
+            6_000_000.0
         else if (format == .eagle3 or mtp_chained or mtp_arch == .glm5_next)
             10_000.0
         else
@@ -490,10 +546,14 @@ pub const DraftConfig = struct {
             .qk_nope_head_dim = qk_nope_head_dim,
             .qk_rope_head_dim = qk_rope_head_dim,
             .rope_interleave = rope_interleave,
+            .mla_gated_proj = mla_gated_proj,
+            .mla_gate_element_wise = mla_gate_element_wise,
             .index_share_for_mtp_iteration = index_share_mtp,
             .index_topk = index_topk,
             .num_experts = num_experts,
             .num_experts_per_tok = num_experts_per_tok,
+            .n_group = n_group,
+            .topk_group = topk_group,
             .moe_intermediate_size = moe_inter,
             .shared_expert_intermediate_size = shared_inter,
             .routed_scaling_factor = routed_scaling,
@@ -533,7 +593,7 @@ fn detectFormat(obj: std.json.ObjectMap) ?DraftMode {
     if (jsonOptString(obj, "model_type")) |s| {
         if (std.mem.eql(u8, s, "eagle3")) return .eagle3;
         if (std.mem.eql(u8, s, "eagle")) return .eagle2;
-        if (std.mem.eql(u8, s, "mtp") or std.mem.eql(u8, s, "glm_moe_dsa_mtp") or std.mem.eql(u8, s, "glm5_next_mtp")) return .mtp;
+        if (std.mem.eql(u8, s, "mtp") or std.mem.eql(u8, s, "glm_moe_dsa_mtp") or std.mem.eql(u8, s, "glm5_next_mtp") or std.mem.eql(u8, s, "bailing_hybrid_mtp")) return .mtp;
     }
     if (obj.get("architectures")) |v| {
         if (v == .array and v.array.items.len > 0) {
@@ -541,7 +601,7 @@ fn detectFormat(obj: std.json.ObjectMap) ?DraftMode {
                 const arch = v.array.items[0].string;
                 if (std.mem.indexOf(u8, arch, "Eagle3") != null) return .eagle3;
                 if (std.mem.indexOf(u8, arch, "Eagle") != null) return .eagle2;
-                if (std.mem.indexOf(u8, arch, "Mtp") != null) return .mtp;
+                if (std.mem.indexOf(u8, arch, "Mtp") != null or std.mem.indexOf(u8, arch, "MTP") != null) return .mtp;
             }
         }
     }
@@ -669,7 +729,7 @@ const MtpGqaTreeAttnParams = extern struct {
     sparse_k: u32 = 0,
     sparse_row_stride: u32 = 0,
     sparse_num_rows: u32 = 0,
-    _pad0: u32 = 0,
+    head_gate_mode: u32 = 0,
 };
 
 const MtpMlaPrepParams = extern struct {
@@ -703,6 +763,10 @@ const MtpMoeRouteParams = extern struct {
     bias_dtype: u32,
     norm_topk_prob: u32,
     routed_scaling_factor: f32,
+    n_group: u32 = 1,
+    topk_group: u32 = 1,
+    _pad0: u32 = 0,
+    _pad1: u32 = 0,
 };
 
 const MtpExpertMeta = extern struct {
@@ -712,6 +776,10 @@ const MtpExpertMeta = extern struct {
     gate_sb_off: u64,
     up_sb_off: u64,
     down_sb_off: u64,
+    weight_dtype: u32 = 0,
+    group_size: u32 = 64,
+    _pad0: u32 = 0,
+    _pad1: u32 = 0,
 };
 
 const MtpMoeExpertParams = extern struct {
@@ -731,8 +799,8 @@ comptime {
     if (@sizeOf(MtpGqaTreeAttnParams) != 80) @compileError("MtpGqaTreeAttnParams size mismatch");
     if (@sizeOf(MtpMlaPrepParams) != 48) @compileError("MtpMlaPrepParams size mismatch");
     if (@sizeOf(MtpSwigluClampParams) != 16) @compileError("MtpSwigluClampParams size mismatch");
-    if (@sizeOf(MtpMoeRouteParams) != 32) @compileError("MtpMoeRouteParams size mismatch");
-    if (@sizeOf(MtpExpertMeta) != 48) @compileError("MtpExpertMeta size mismatch");
+    if (@sizeOf(MtpMoeRouteParams) != 48) @compileError("MtpMoeRouteParams size mismatch");
+    if (@sizeOf(MtpExpertMeta) != 64) @compileError("MtpExpertMeta size mismatch");
     if (@sizeOf(MtpMoeExpertParams) != 32) @compileError("MtpMoeExpertParams size mismatch");
 }
 
@@ -794,6 +862,10 @@ const MtpMlaLayerWeights = struct {
     kv_a_proj_with_mqa: qwen3.LinearBinding,
     kv_a_layernorm: qwen3.NormBinding,
     kv_b_proj: qwen3.LinearBinding,
+    /// Optional `Ling-3.1` (`bailing_hybrid`) Gated-MLA output gate projection (`head_wise` `[num_heads, H]` or `element_wise` `[num_heads * v_head_dim, H]`).
+    g_proj: ?qwen3.LinearBinding = null,
+    /// `0` = none, `1` = head_wise, `2` = element_wise.
+    head_gate_mode: u32 = 0,
 };
 
 const MtpMoeLayerWeights = struct {
@@ -1078,6 +1150,7 @@ pub const DraftHead = struct {
     mla_kv_a_pass_bind: metal.BufferBinding = undefined,
     mla_kv_a_norm_bind: metal.BufferBinding = undefined,
     mla_kv_b_bind: metal.BufferBinding = undefined,
+    mla_gate_bind: metal.BufferBinding = undefined,
     moe_router_logits_bind: metal.BufferBinding = undefined,
     moe_expert_ids_bind: metal.BufferBinding = undefined,
     moe_expert_weights_bind: metal.BufferBinding = undefined,
@@ -1092,6 +1165,8 @@ pub const DraftHead = struct {
     /// Quantitative zero-reindex metrics (`index_share_for_mtp_iteration = true`, `0` indexer dispatches).
     zero_reindex_hits: u64 = 0,
     indexer_dispatches: u64 = 0,
+    /// Quantitative GPU `eh_proj` dispatch count (`0` when `Placement.cpu_sme2` runs `eh_proj` in L2 SME2).
+    gpu_eh_proj_dispatches: u64 = 0,
 
     // Preallocated scratch buffers & bindings (zero hot-path heap alloc)
     token_ids_host: []u32,
@@ -1254,6 +1329,7 @@ pub const DraftHead = struct {
         self.stage_tree_slots_mask = @splat(0);
         self.zero_reindex_hits = 0;
         self.indexer_dispatches = 0;
+        self.gpu_eh_proj_dispatches = 0;
         self.clearSharedSparseIndices();
     }
 
@@ -1783,6 +1859,9 @@ pub const DraftHead = struct {
 
             try self.encodeDraftLinearBatched(target, frame, mla.q_a_proj, qkv_in, self.mla_q_a_bind, m, true);
             try self.encodeDraftLinearBatched(target, frame, mla.kv_a_proj_with_mqa, qkv_in, self.mla_kv_a_bind, m, seq_b);
+            if (mla.g_proj) |gp| {
+                try self.encodeDraftLinearBatched(target, frame, gp, qkv_in, self.mla_gate_bind, m, seq_b);
+            }
 
             try target.attn_pipes.encodeRmsNorm(frame, .{
                 .x = self.mla_q_a_bind,
@@ -1875,6 +1954,7 @@ pub const DraftHead = struct {
                 .sparse_k = if (use_sparse) self.active_sparse_count else 0,
                 .sparse_row_stride = if (use_sparse) self.active_sparse_stride else 0,
                 .sparse_num_rows = if (use_sparse) self.active_sparse_rows else 0,
+                .head_gate_mode = mla.head_gate_mode,
             };
             try frame.encodeThreadgroups(
                 mp.gqa_tree_verify_attn,
@@ -1889,6 +1969,7 @@ pub const DraftHead = struct {
                     layer.sink_bias orelse dummy_b,
                     attn_slot_bind,
                     self.active_sparse_bind orelse self.shared_sparse_indices_bind,
+                    if (mla.g_proj != null) self.mla_gate_bind else dummy_b,
                 },
                 std.mem.asBytes(&gqa_p),
                 .{ self.config.num_attention_heads, m, 1 },
@@ -1981,6 +2062,7 @@ pub const DraftHead = struct {
                         layer.sink_bias orelse dummy_b,
                         attn_slot_bind,
                         self.active_sparse_bind orelse self.shared_sparse_indices_bind,
+                        dummy_b,
                     },
                     std.mem.asBytes(&gqa_p),
                     .{ self.config.num_attention_heads, m, 1 },
@@ -2112,6 +2194,8 @@ pub const DraftHead = struct {
                 .bias_dtype = moe_l.router_bias_dtype,
                 .norm_topk_prob = if (self.config.norm_topk_prob) 1 else 0,
                 .routed_scaling_factor = self.config.routed_scaling_factor,
+                .n_group = self.config.n_group,
+                .topk_group = self.config.topk_group,
             };
             try frame.encodeThreadgroups(
                 mp.moe_route_topk_sigmoid,
@@ -2168,7 +2252,7 @@ pub const DraftHead = struct {
         } else {
             try self.encodeDraftLinearBatched(target, frame, layer.gate_proj, self.x_norm_bind, self.mlp_gate_bind, m, true);
             try self.encodeDraftLinearBatched(target, frame, layer.up_proj, self.x_norm_bind, self.mlp_up_bind, m, seq_b);
-            const cnt = m * self.config.intermediate_size;
+            const cnt = m * layer.gate_proj.n;
             if (self.config.swiglu_limit > 0.0 and self.mtp_pipes != null) {
                 const mp = self.mtp_pipes.?;
                 const cp: MtpSwigluClampParams = .{ .count = cnt, .limit = self.config.swiglu_limit };
@@ -2493,6 +2577,7 @@ pub const DraftHead = struct {
                 },
                 .mtp => {
                     try self.encodeMtpStageFusion(target, &frame, sme_stage, h_in_active, m, true);
+                    self.gpu_eh_proj_dispatches += 1;
                 },
                 .l1_only, .small_draft, .self_recurrent, .dspark, .dflare, .dfly2 => unreachable,
             }
@@ -2577,6 +2662,7 @@ pub const DraftHead = struct {
                     }, true);
 
                     try self.encodeMtpStageFusion(target, &frame, stage_k, self.h_in_bind, m, true);
+                    self.gpu_eh_proj_dispatches += 1;
                     try self.encodeDraftLayerBody(target, &frame, stage_k, m, slot_start, base_pos, total_tree_nodes, commit_kv, false);
                 }
             } else {
@@ -3387,12 +3473,29 @@ fn tryInitSmeProjectionRuntime(
                     .cache_hint = .temporal,
                 };
             },
-            .q2_affine => {
-                const OpsQ2 = quant.QuantOps(.{ .bits = .q2, .group_size = 64 });
-                packed_bytes = sme.packedBlobBytes(.q2_affine, n, k) catch return null;
+            .q4_affine, .q3_affine, .q2_affine => {
+                if (blob.entry.group_size != 0 and blob.entry.group_size != sme.GROUP_SIZE) return null;
+                const panel_dt: sme.PanelDType = switch (dtype) {
+                    .q4_affine => .q4_affine,
+                    .q3_affine => .q3_affine,
+                    .q2_affine => .q2_affine,
+                    else => unreachable,
+                };
+                const q_bits: quant.QuantBits = switch (dtype) {
+                    .q4_affine => .q4,
+                    .q3_affine => .q3,
+                    .q2_affine => .q2,
+                    else => unreachable,
+                };
+                packed_bytes = sme.packedBlobBytes(panel_dt, n, k) catch return null;
                 if (packed_bytes > l2_limit) return null;
-                const groups = OpsQ2.groupsPerRow(k) catch return null;
-                const row_bytes = OpsQ2.rowWeightBytes(k) catch return null;
+                const groups = k / sme.GROUP_SIZE;
+                const grp_bytes: usize = switch (q_bits) {
+                    .q4 => 32,
+                    .q3 => 24,
+                    .q2 => 16,
+                };
+                const row_bytes = groups * grp_bytes;
                 const need_w = n * row_bytes;
                 const need_sb = n * groups * @sizeOf(quant.ScaleBias);
                 const p_off: usize = @intCast(blob.entry.params_offset);
@@ -3408,17 +3511,16 @@ fn tryInitSmeProjectionRuntime(
                     quant.ScaleBias,
                     blob.slice[p_off .. p_off + need_sb],
                 ));
-                try sme.packMlxQuantPanel64(.q2, blob.slice[0..need_w], sb, n, k, w_raw[0..packed_bytes]);
+                try sme.packMlxQuantPanel64(q_bits, blob.slice[0..need_w], sb, n, k, w_raw[0..packed_bytes]);
                 weight = .{
                     .w_packed = w_raw[0..packed_bytes],
                     .n = n,
                     .k = k,
-                    .dtype = .q2_affine,
+                    .dtype = panel_dt,
                     .param_kind = .affine_scale_bias,
                     .cache_hint = .temporal,
                 };
             },
-            else => return null,
         }
     }
     errdefer w_arena.deinit();
@@ -3775,7 +3877,7 @@ fn loadInternal(
 ) DraftLoadError!DraftHead {
     const parsed = source.parsed();
     var config = config_in;
-    if (config.format == .mtp and !config.mtp_chained) {
+    if (config.format == .mtp and !config.mtp_chained and config.num_hidden_layers > 1) {
         if (findLinearOpt(parsed, "eh_proj") == null and findLinearOpt(parsed, "layers.0.eh_proj") != null) {
             config.mtp_chained = true;
         }
@@ -3882,7 +3984,9 @@ fn loadInternal(
 
     var name_buf: [64]u8 = undefined;
     var any_layer_has_sink_bias = false;
+    var max_mla_gate_dim: u32 = config.mlaGateDim();
     var max_shared_inter: u32 = eff_mlp_inter;
+    var any_layer_is_moe = false;
     for (0..num_layers) |l| {
         if (chained_mtp) {
             const sen = parsed.find(std.fmt.bufPrint(&name_buf, "layers.{d}.enorm.weight", .{l}) catch unreachable) orelse
@@ -3943,6 +4047,17 @@ fn loadInternal(
             const kvbe = try findLinearReq(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.self_attn.kv_b_proj", .{l}) catch unreachable);
             _ = try validateLinear2D(kvbe, kvb_n, config.kv_lora_rank);
             weights_bytes += kvbe.blob_bytes;
+
+            const gp_opt = findLinearOpt(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.self_attn.g_proj", .{l}) catch unreachable);
+            if (gp_opt) |gpe| {
+                const gn = gpe.shape[0];
+                if (gn != config.num_attention_heads and gn != o_in_dim) return error.UnexpectedTensorShape;
+                _ = try validateLinear2D(gpe, gn, h);
+                weights_bytes += gpe.blob_bytes;
+                if (gn > max_mla_gate_dim) max_mla_gate_dim = gn;
+            } else if (config.mla_gated_proj) {
+                return error.MissingTensor;
+            }
         } else {
             const qe = try findLinearReq(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.self_attn.q_proj", .{l}) catch unreachable);
             _ = try validateLinear2D(qe, q_dim, qkv_in);
@@ -3983,7 +4098,10 @@ fn loadInternal(
         _ = try validateNorm1D(pln, h);
         weights_bytes += pln.blob_bytes;
 
-        if (is_moe) {
+        const layer_has_moe_gate = is_moe and (findLinearOpt(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.gate", .{l}) catch unreachable) != null or
+            findLinearOpt(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.gate_proj", .{l}) catch unreachable) == null);
+        if (layer_has_moe_gate) {
+            any_layer_is_moe = true;
             const rt = try findLinearReq(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.gate", .{l}) catch unreachable);
             _ = try validateLinear2D(rt, config.num_experts, h);
             weights_bytes += rt.blob_bytes;
@@ -4002,7 +4120,7 @@ fn loadInternal(
                 weights_bytes += sgp.blob_bytes + sup.blob_bytes + sdp.blob_bytes;
                 if (s_inter > max_shared_inter) max_shared_inter = s_inter;
             }
-            weights_bytes += amf.align64(@as(usize, config.num_experts) * @sizeOf(MtpExpertMeta)) + 64;
+            weights_bytes += amf.align64(@as(usize, config.num_experts) * @sizeOf(MtpExpertMeta)) + page.APPLE_PAGE_SIZE;
             for (0..config.num_experts) |e_idx| {
                 const eg = try findLinearReq(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.experts.{d}.gate_proj", .{ l, e_idx }) catch unreachable);
                 _ = try validateLinear2D(eg, config.moe_intermediate_size, h);
@@ -4010,20 +4128,26 @@ fn loadInternal(
                 _ = try validateLinear2D(eu, config.moe_intermediate_size, h);
                 const ed = try findLinearReq(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.experts.{d}.down_proj", .{ l, e_idx }) catch unreachable);
                 _ = try validateLinear2D(ed, h, config.moe_intermediate_size);
-                weights_bytes += eg.blob_bytes + eu.blob_bytes + ed.blob_bytes + 192;
+                weights_bytes += (try page.alignUp(@intCast(eg.blob_bytes))) +
+                    (try page.alignUp(@intCast(eu.blob_bytes))) +
+                    (try page.alignUp(@intCast(ed.blob_bytes)));
             }
         } else {
             const gp = try findLinearReq(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.gate_proj", .{l}) catch unreachable);
-            _ = try validateLinear2D(gp, config.intermediate_size, h);
+            const dense_inter = gp.shape[0];
+            if (dense_inter == 0 or (dense_inter % 4) != 0) return error.UnexpectedTensorShape;
+            if (!is_moe and dense_inter != config.intermediate_size) return error.UnexpectedTensorShape;
+            _ = try validateLinear2D(gp, dense_inter, h);
             weights_bytes += gp.blob_bytes;
 
             const up = try findLinearReq(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.up_proj", .{l}) catch unreachable);
-            _ = try validateLinear2D(up, config.intermediate_size, h);
+            _ = try validateLinear2D(up, dense_inter, h);
             weights_bytes += up.blob_bytes;
 
             const dp = try findLinearReq(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.down_proj", .{l}) catch unreachable);
-            _ = try validateLinear2D(dp, h, config.intermediate_size);
+            _ = try validateLinear2D(dp, h, dense_inter);
             weights_bytes += dp.blob_bytes;
+            if (dense_inter > max_shared_inter) max_shared_inter = dense_inter;
         }
     }
 
@@ -4061,10 +4185,11 @@ fn loadInternal(
     const mla_kv_a_bytes: usize = if (is_mla) amf.align64(m_cap * @as(usize, config.kv_lora_rank + config.qk_rope_head_dim) * @sizeOf(f16)) else 64;
     const mla_kv_pass_bytes: usize = if (is_mla) amf.align64(m_cap * @as(usize, config.kv_lora_rank) * @sizeOf(f16)) else 64;
     const mla_kv_b_bytes: usize = if (is_mla) amf.align64(m_cap * @as(usize, config.num_attention_heads) * @as(usize, config.qk_nope_head_dim + config.effectiveVHeadDim()) * @sizeOf(f16)) else 64;
-    const moe_router_bytes: usize = if (is_moe) amf.align64(m_cap * @as(usize, config.num_experts) * @sizeOf(f16)) else 64;
-    const moe_ids_bytes: usize = if (is_moe) amf.align64(m_cap * @as(usize, config.num_experts_per_tok) * @sizeOf(u32)) else 64;
-    const moe_w_bytes: usize = if (is_moe) amf.align64(m_cap * @as(usize, config.num_experts_per_tok) * @sizeOf(f32)) else 64;
-    const moe_act_bytes: usize = if (is_moe) amf.align64(m_cap * @as(usize, config.num_experts_per_tok) * @as(usize, config.moe_intermediate_size) * @sizeOf(f16)) else 64;
+    const mla_gate_bytes: usize = if (is_mla and max_mla_gate_dim > 0) amf.align64(m_cap * @as(usize, max_mla_gate_dim) * @sizeOf(f16)) else 64;
+    const moe_router_bytes: usize = if (any_layer_is_moe) amf.align64(m_cap * @as(usize, config.num_experts) * @sizeOf(f16)) else 64;
+    const moe_ids_bytes: usize = if (any_layer_is_moe) amf.align64(m_cap * @as(usize, config.num_experts_per_tok) * @sizeOf(u32)) else 64;
+    const moe_w_bytes: usize = if (any_layer_is_moe) amf.align64(m_cap * @as(usize, config.num_experts_per_tok) * @sizeOf(f32)) else 64;
+    const moe_act_bytes: usize = if (any_layer_is_moe) amf.align64(m_cap * @as(usize, config.num_experts_per_tok) * @as(usize, config.moe_intermediate_size) * @sizeOf(f16)) else 64;
     const max_sparse_indices: u32 = if (use_custom_attn) @max(if (config.index_topk > 0) @min(config.index_topk, max_seq_len) else @min(max_seq_len, 2048), 16) else 16;
     const sparse_idx_bytes: usize = amf.align64(@as(usize, max_sparse_indices) * @sizeOf(u32));
     const mlp_scratch_inter: usize = @max(@as(usize, max_shared_inter), @as(usize, eff_mlp_inter));
@@ -4087,6 +4212,7 @@ fn loadInternal(
         mla_kv_a_bytes +
         mla_kv_pass_bytes * 2 +
         mla_kv_b_bytes +
+        mla_gate_bytes +
         moe_router_bytes +
         moe_ids_bytes +
         moe_w_bytes +
@@ -4244,6 +4370,7 @@ fn loadInternal(
     const mla_kvp_raw = try scratch_arena.allocAligned(mla_kv_pass_bytes, 64);
     const mla_kvn_raw = try scratch_arena.allocAligned(mla_kv_pass_bytes, 64);
     const mla_kvb_raw = try scratch_arena.allocAligned(mla_kv_b_bytes, 64);
+    const mla_gate_raw = try scratch_arena.allocAligned(mla_gate_bytes, 64);
     const moe_rt_raw = try scratch_arena.allocAligned(moe_router_bytes, 64);
     const moe_id_raw = try scratch_arena.allocAligned(moe_ids_bytes, 64);
     const moe_w_raw = try scratch_arena.allocAligned(moe_w_bytes, 64);
@@ -4409,6 +4536,14 @@ fn loadInternal(
             const kvb_e = try findLinearReq(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.self_attn.kv_b_proj", .{l}) catch unreachable);
             const kvb_b = (try loadLinearBlobAndBindingIntoArena(source, kvb_e, kvb_n, config.kv_lora_rank, &weights_arena, weights_buf, options.verify_crcs)).binding;
 
+            var g_proj_b: ?qwen3.LinearBinding = null;
+            var head_gate_mode: u32 = 0;
+            if (findLinearOpt(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.self_attn.g_proj", .{l}) catch unreachable)) |gp_e| {
+                const gn = gp_e.shape[0];
+                g_proj_b = (try loadLinearBlobAndBindingIntoArena(source, gp_e, gn, h, &weights_arena, weights_buf, options.verify_crcs)).binding;
+                head_gate_mode = if (gn == config.num_attention_heads) 1 else 2;
+            }
+
             mla_w = .{
                 .q_a_proj = qa_b,
                 .q_a_layernorm = qan_b,
@@ -4416,6 +4551,8 @@ fn loadInternal(
                 .kv_a_proj_with_mqa = kva_b,
                 .kv_a_layernorm = kvan_b,
                 .kv_b_proj = kvb_b,
+                .g_proj = g_proj_b,
+                .head_gate_mode = head_gate_mode,
             };
             q_b = qa_b;
             k_b = kva_b;
@@ -4469,7 +4606,9 @@ fn loadInternal(
         var up_b: qwen3.LinearBinding = undefined;
         var dp_b: qwen3.LinearBinding = undefined;
         var moe_w: ?MtpMoeLayerWeights = null;
-        if (is_moe) {
+        const layer_has_moe = is_moe and (findLinearOpt(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.gate", .{l}) catch unreachable) != null or
+            findLinearOpt(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.gate_proj", .{l}) catch unreachable) == null);
+        if (layer_has_moe) {
             const rt_e = try findLinearReq(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.gate", .{l}) catch unreachable);
             const rt_b = (try loadLinearBlobAndBindingIntoArena(source, rt_e, config.num_experts, h, &weights_arena, weights_buf, options.verify_crcs)).binding;
 
@@ -4514,11 +4653,10 @@ fn loadInternal(
                     .q3_affine => 3,
                     .q2_affine => 4,
                 };
+                const e_gs: u32 = if (eg_e.group_size > 0) eg_e.group_size else 64;
                 if (e_idx == 0) {
                     exp_w_dt = dt_u32;
-                    exp_gs = if (eg_e.group_size > 0) eg_e.group_size else 64;
-                } else if (dt_u32 != exp_w_dt) {
-                    return error.UnexpectedTensorDType;
+                    exp_gs = e_gs;
                 }
                 if (eu_res.dtype != eg_res.dtype or ed_res.dtype != eg_res.dtype) return error.UnexpectedTensorDType;
 
@@ -4529,6 +4667,8 @@ fn loadInternal(
                     .gate_sb_off = if (eg_res.binding.scale_bias) |sb| sb.offset else 0,
                     .up_sb_off = if (eu_res.binding.scale_bias) |sb| sb.offset else 0,
                     .down_sb_off = if (ed_res.binding.scale_bias) |sb| sb.offset else 0,
+                    .weight_dtype = dt_u32,
+                    .group_size = e_gs,
                 };
             }
 
@@ -4549,13 +4689,14 @@ fn loadInternal(
             dp_b = rt_b;
         } else {
             const gp_e = try findLinearReq(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.gate_proj", .{l}) catch unreachable);
-            gp_b = (try loadLinearBlobAndBindingIntoArena(source, gp_e, config.intermediate_size, h, &weights_arena, weights_buf, options.verify_crcs)).binding;
+            const dense_inter = gp_e.shape[0];
+            gp_b = (try loadLinearBlobAndBindingIntoArena(source, gp_e, dense_inter, h, &weights_arena, weights_buf, options.verify_crcs)).binding;
 
             const up_e = try findLinearReq(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.up_proj", .{l}) catch unreachable);
-            up_b = (try loadLinearBlobAndBindingIntoArena(source, up_e, config.intermediate_size, h, &weights_arena, weights_buf, options.verify_crcs)).binding;
+            up_b = (try loadLinearBlobAndBindingIntoArena(source, up_e, dense_inter, h, &weights_arena, weights_buf, options.verify_crcs)).binding;
 
             const dp_e = try findLinearReq(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.down_proj", .{l}) catch unreachable);
-            dp_b = (try loadLinearBlobAndBindingIntoArena(source, dp_e, h, config.intermediate_size, &weights_arena, weights_buf, options.verify_crcs)).binding;
+            dp_b = (try loadLinearBlobAndBindingIntoArena(source, dp_e, h, dense_inter, &weights_arena, weights_buf, options.verify_crcs)).binding;
         }
 
         layers[l] = .{
@@ -4616,7 +4757,15 @@ fn loadInternal(
         (h % metal.KV_TILE_ROW_ALIGN_F16 == 0);
 
     // Prepare candidate D13 L2-resident (`<= 16 MiB`) SME2 projection for `fc` or `eh_proj`.
-    const want_sme_eval = (options.placement == .cpu_sme2 or options.placement == .auto);
+    const eh_is_sme_packed: bool = switch (config.format) {
+        .eagle3, .eagle2 => (fc_lin != null and fc_lin.?.layout == .sme2_panel64),
+        .mtp => (eh_proj_b != null and eh_proj_b.?.layout == .sme2_panel64),
+        else => false,
+    };
+    if (eh_is_sme_packed and options.placement == .gpu) {
+        return error.InvalidConfig;
+    }
+    const want_sme_eval = (options.placement == .cpu_sme2 or options.placement == .auto or eh_is_sme_packed);
     var sme_gpu_lin_opt: ?qwen3.LinearBinding = null;
     var sme_gpu_in_bind: metal.BufferBinding = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(xcat_raw.ptr) };
     var sme_gpu_out_bind: metal.BufferBinding = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(x_raw.ptr) };
@@ -4649,8 +4798,34 @@ fn loadInternal(
             .l1_only, .small_draft, .self_recurrent, .dspark, .dflare, .dfly2 => {},
         }
     }
+    if (eh_is_sme_packed and sme_proj == null) {
+        return error.InvalidConfig;
+    }
 
-    if (options.placement == .cpu_sme2) {
+    if (eh_is_sme_packed) {
+        // Pre-packed `sme2_panel64` `eh_proj`/`fc` cannot run on Metal GPU; pin directly to `.cpu_sme2`.
+        const sp = sme_proj.?;
+        const cal_m: u32 = @min(options.max_tree_slots, 4);
+        const noopGpu = struct {
+            fn run(_: *anyopaque) anyerror!void {}
+        }.run;
+        var dummy_ctx: u8 = 0;
+        const out_bytes = std.mem.sliceAsBytes(sp.cal_out_f16[0 .. @as(usize, cal_m) * sp.proj.weight.n]);
+        const sme_cal = sme.calibrateSmeVsGpuFn(
+            &sp.dispatcher,
+            &sp.proj,
+            cal_m,
+            out_bytes,
+            &dummy_ctx,
+            &noopGpu,
+            .{ .warmups = 2, .iters = 6, .out_dtype = .f16 },
+        ) catch return error.ComputeFailed;
+        gate_sme2_us = sme_cal.sme_us;
+        gate_gpu_us = 0.0;
+        sme2_proj_bytes = sp.weight_bytes;
+        wired_total_out += sp.totalWiredBytes();
+        effective_placement = .cpu_sme2;
+    } else if (options.placement == .cpu_sme2) {
         if (sme_proj) |sp| {
             const cal_m: u32 = @min(options.max_tree_slots, 4);
             const sme_cal = try calibrateD13SmeVsGpu(
@@ -4806,6 +4981,7 @@ fn loadInternal(
         .mla_kv_a_pass_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(mla_kvp_raw.ptr) },
         .mla_kv_a_norm_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(mla_kvn_raw.ptr) },
         .mla_kv_b_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(mla_kvb_raw.ptr) },
+        .mla_gate_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(mla_gate_raw.ptr) },
         .moe_router_logits_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(moe_rt_raw.ptr) },
         .moe_expert_ids_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(moe_id_raw.ptr) },
         .moe_expert_weights_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(moe_w_raw.ptr) },
@@ -5023,6 +5199,11 @@ pub fn buildSyntheticDraftAmfImage(allocator: std.mem.Allocator, cfg: DraftConfi
             const kvb_n = cfg.num_attention_heads * (cfg.qk_nope_head_dim + cfg.effectiveVHeadDim());
             try add2d(allocator, &recs, std.fmt.bufPrint(&nbuf, "layers.{d}.self_attn.kv_b_proj.weight", .{l}) catch unreachable, .dense, kvb_n, kv_lora, inv_kvl, seed + tidx);
             tidx += 1;
+            if (cfg.mla_gated_proj) {
+                const gn = cfg.mlaGateDim();
+                try add2d(allocator, &recs, std.fmt.bufPrint(&nbuf, "layers.{d}.self_attn.g_proj.weight", .{l}) catch unreachable, .dense, gn, h, inv_h, seed + tidx);
+                tidx += 1;
+            }
             try add2d(allocator, &recs, std.fmt.bufPrint(&nbuf, "layers.{d}.self_attn.o_proj.weight", .{l}) catch unreachable, .dense, h, o_in_dim, inv_o, seed + tidx);
             tidx += 1;
         } else {
@@ -6142,4 +6323,1023 @@ test "DraftHead D15 GLM-5.2/5.3 MLA and GLM-5.3-Flash NoPE-MLA zero-reindex 1L M
         try std.testing.expectEqual(@as(u64, 0), dh_gpu.zero_reindex_hits);
         try std.testing.expectEqual(@as(u64, 0), dh_gpu.indexer_dispatches);
     }
+}
+
+test "M9.3 D15 Ling-3.1 bailing_hybrid Gated-MLA 1L MTP (qk=192 v=128 head-wise g_proj, group_limited_topk, swiglu_limit=10) GPU == CPU ref parity & L2 SME2 sme2_panel64 eh_proj" {
+    const allocator = std.testing.allocator;
+
+    // 1. Parse exact Ling-3.1-flash-1019 standalone 1L MTP config.json contract.
+    const ling3_mtp_json =
+        \\{
+        \\  "model_type": "bailing_hybrid_mtp",
+        \\  "format": "mtp",
+        \\  "mtp_arch": "bailing_hybrid",
+        \\  "mtp_chained": false,
+        \\  "vocab_size": 157184,
+        \\  "hidden_size": 4096,
+        \\  "num_hidden_layers": 1,
+        \\  "num_attention_heads": 64,
+        \\  "num_key_value_heads": 64,
+        \\  "q_lora_rank": 1536,
+        \\  "kv_lora_rank": 512,
+        \\  "qk_nope_head_dim": 128,
+        \\  "qk_rope_head_dim": 64,
+        \\  "v_head_dim": 128,
+        \\  "mla_gated_proj": true,
+        \\  "gated_attention_proj_granularity_type": "head_wise",
+        \\  "mla_gate_act": "sigmoid",
+        \\  "rope_interleave": true,
+        \\  "rope_theta": 6000000.0,
+        \\  "rms_norm_eps": 1e-6,
+        \\  "n_routed_experts": 512,
+        \\  "num_experts_per_tok": 8,
+        \\  "n_shared_experts": 1,
+        \\  "n_group": 8,
+        \\  "topk_group": 4,
+        \\  "moe_intermediate_size": 1280,
+        \\  "scoring_func": "sigmoid",
+        \\  "norm_topk_prob": true,
+        \\  "routed_scaling_factor": 2.5,
+        \\  "expert_swiglu_limit_list": [0, 0, 10],
+        \\  "share_embed_tokens": true,
+        \\  "share_lm_head": true
+        \\}
+    ;
+    const cfg_ling = try DraftConfig.fromJson(allocator, ling3_mtp_json);
+    try std.testing.expectEqual(DraftMode.mtp, cfg_ling.format);
+    try std.testing.expectEqual(MtpArch.bailing_hybrid, cfg_ling.mtp_arch);
+    try std.testing.expect(!cfg_ling.mtp_chained);
+    try std.testing.expect(cfg_ling.isMlaMtp());
+    try std.testing.expect(cfg_ling.isMoeMtp());
+    try std.testing.expect(cfg_ling.mla_gated_proj);
+    try std.testing.expect(!cfg_ling.mla_gate_element_wise);
+    try std.testing.expectEqual(@as(u32, 64), cfg_ling.mlaGateDim());
+    try std.testing.expectEqual(@as(u32, 192), cfg_ling.effectiveQkHeadDim());
+    try std.testing.expectEqual(@as(u32, 128), cfg_ling.effectiveVHeadDim());
+    try std.testing.expectEqual(@as(u32, 64), cfg_ling.effectiveRopeDim());
+    try std.testing.expect(cfg_ling.rope_interleave);
+    try std.testing.expectEqual(@as(f32, 6_000_000.0), cfg_ling.rope_theta);
+    try std.testing.expectEqual(@as(u32, 512), cfg_ling.num_experts);
+    try std.testing.expectEqual(@as(u32, 8), cfg_ling.num_experts_per_tok);
+    try std.testing.expectEqual(@as(u32, 8), cfg_ling.n_group);
+    try std.testing.expectEqual(@as(u32, 4), cfg_ling.topk_group);
+    try std.testing.expectEqual(@as(u32, 1280), cfg_ling.shared_expert_intermediate_size);
+    try std.testing.expectEqual(@as(f32, 2.5), cfg_ling.routed_scaling_factor);
+    try std.testing.expectEqual(@as(f32, 10.0), cfg_ling.swiglu_limit);
+    try std.testing.expect(cfg_ling.moe_scoring_sigmoid);
+
+    // Full Ling-3.1 eh_proj [4096, 8192] fits M4 16 MiB P-cluster L2 in sme2_panel64 Q3_AFFINE & Q2_AFFINE!
+    try std.testing.expect((try sme.packedBlobBytes(.q3_affine, 4096, 8192)) <= sme.MAX_L2_DRAFT_PROJ_BYTES);
+    try std.testing.expect((try sme.packedBlobBytes(.q2_affine, 4096, 8192)) <= sme.MAX_L2_DRAFT_PROJ_BYTES);
+
+    // 2. Build compact target + exact Ling-3.1 geometry 1L MTP (`qk=192 [128+64], v=128`, head-wise `g_proj`,
+    //    `n_group=8, topk_group=4` top-2 sum per group, `swiglu_limit=10.0`, `layers.0.{enorm,hnorm,eh_proj,final_layernorm}`).
+    const tgt_cfg: qwen3.ModelConfig = .{
+        .arch = .qwen3_dense,
+        .vocab_size = 128,
+        .hidden_size = 128,
+        .num_hidden_layers = 2,
+        .num_attention_heads = 2,
+        .num_key_value_heads = 1,
+        .head_dim = 64,
+        .intermediate_size = 256,
+        .rope_theta = 10_000.0,
+        .rms_norm_eps = 1e-6,
+        .tie_word_embeddings = true,
+    };
+    const tgt_img = try buildSyntheticTargetBf16ForTest(allocator, tgt_cfg, 93015);
+    defer allocator.free(tgt_img);
+
+    var target = try qwen3.Qwen3Model.loadFromBytes(allocator, tgt_img, tgt_cfg, .{
+        .max_seq_len = 64,
+        .max_tree_nodes = 16,
+        .enable_feature_taps = true,
+    });
+    defer target.deinit(allocator);
+
+    const h: u32 = 128;
+    const nh: u32 = 4;
+    const q_lora: u32 = 64;
+    const kv_lora: u32 = 32;
+    const qk_nope: u32 = 128;
+    const qk_rope: u32 = 64;
+    const qk_hd: u32 = qk_nope + qk_rope; // 192 (exact Ling-3.1!)
+    const v_hd: u32 = 128; // exact Ling-3.1 asymmetric v_head_dim != qk_head_dim!
+    const n_exp: u32 = 16; // 8 groups x 2 experts/group
+    const top_k: u32 = 4;
+    const n_group: u32 = 8;
+    const topk_group: u32 = 4;
+    const moe_inter: u32 = 64;
+    const sh_inter: u32 = 64;
+
+    const mtp_cfg: DraftConfig = .{
+        .format = .mtp,
+        .mtp_arch = .bailing_hybrid,
+        .vocab_size = 128,
+        .draft_vocab_size = 128,
+        .hidden_size = h,
+        .target_hidden_size = h,
+        .num_hidden_layers = 1,
+        .num_attention_heads = nh,
+        .num_key_value_heads = nh,
+        .head_dim = qk_hd,
+        .v_head_dim = v_hd,
+        .q_lora_rank = q_lora,
+        .kv_lora_rank = kv_lora,
+        .qk_nope_head_dim = qk_nope,
+        .qk_rope_head_dim = qk_rope,
+        .rope_interleave = true,
+        .mla_gated_proj = true,
+        .mla_gate_element_wise = false,
+        .num_experts = n_exp,
+        .num_experts_per_tok = top_k,
+        .n_group = n_group,
+        .topk_group = topk_group,
+        .moe_intermediate_size = moe_inter,
+        .shared_expert_intermediate_size = sh_inter,
+        .routed_scaling_factor = 2.5,
+        .norm_topk_prob = true,
+        .moe_scoring_sigmoid = true,
+        .swiglu_limit = 10.0,
+        .intermediate_size = moe_inter,
+        .rms_norm_eps = 1e-6,
+        .rope_theta = 6_000_000.0,
+        .share_embed_tokens = true,
+        .share_lm_head = true,
+    };
+
+    // Helper to pack custom AMF images (supporting `layers.0.{enorm,hnorm,eh_proj,final_layernorm}`,
+    // row-major `q3_affine`, pre-packed `sme2_panel64`, and dense fallback).
+    const CustomRec = struct {
+        name: []const u8,
+        kind: amf.TensorKind,
+        dtype: amf.DType,
+        layout: amf.TensorLayout = .row_major,
+        quant_bits: u8 = 0,
+        group_size: u16 = 0,
+        shape: [4]u32,
+        rank: u8,
+        data: []u8,
+        params: []u8 = &.{},
+    };
+    const packCustomAmf = struct {
+        fn run(alloc: std.mem.Allocator, list: []const CustomRec) ![]u8 {
+            const dir_offset: usize = page.APPLE_PAGE_SIZE;
+            const dir_bytes: usize = try page.alignUp(list.len * @sizeOf(amf.TensorEntry));
+            var total_size: usize = dir_offset + dir_bytes;
+            for (list) |r| {
+                const p_off = if (r.params.len > 0) amf.align64(r.data.len) else r.data.len;
+                total_size += try page.alignUp(p_off + r.params.len);
+            }
+            const img = try alloc.alloc(u8, total_size);
+            errdefer alloc.free(img);
+            @memset(img, 0);
+            const entries = try alloc.alloc(amf.TensorEntry, list.len);
+            defer alloc.free(entries);
+            var cursor: usize = dir_offset + dir_bytes;
+            for (list, 0..) |r, i| {
+                const p_off: usize = if (r.params.len > 0) amf.align64(r.data.len) else 0;
+                const raw_len = if (r.params.len > 0) (p_off + r.params.len) else r.data.len;
+                const blob_bytes = try page.alignUp(raw_len);
+                @memcpy(img[cursor .. cursor + r.data.len], r.data);
+                if (r.params.len > 0) {
+                    @memcpy(img[cursor + p_off .. cursor + p_off + r.params.len], r.params);
+                }
+                const crc = std.hash.Crc32.hash(img[cursor .. cursor + blob_bytes]);
+                var e = amf.TensorEntry.zeroed(r.name, r.kind, r.dtype);
+                e.rank = r.rank;
+                e.shape = r.shape;
+                e.quant_bits = r.quant_bits;
+                e.group_size = r.group_size;
+                e.blob_offset = cursor;
+                e.blob_bytes = blob_bytes;
+                e.data_bytes = r.data.len;
+                e.params_offset = p_off;
+                e.params_bytes = r.params.len;
+                e.blob_crc32 = crc;
+                e.setLayoutAndParamKind(r.layout, .affine_scale_bias);
+                entries[i] = e;
+                cursor += blob_bytes;
+            }
+            const dir_slice = std.mem.sliceAsBytes(entries);
+            @memcpy(img[dir_offset .. dir_offset + dir_slice.len], dir_slice);
+            const dir_crc = std.hash.Crc32.hash(dir_slice);
+            var hdr: amf.Header = .{
+                .magic = amf.MAGIC,
+                .version = amf.FORMAT_VERSION,
+                .flags = 0,
+                .page_size = page.APPLE_PAGE_SIZE,
+                .checksum_algo = amf.CHECKSUM_CRC32_IEEE,
+                .tensor_count = @intCast(entries.len),
+                .reserved0 = 0,
+                .directory_offset = dir_offset,
+                .directory_bytes = dir_bytes,
+                .directory_crc32 = dir_crc,
+                .header_crc32 = 0,
+                .model_id = @splat(0),
+                .reserved1 = 0,
+            };
+            const mid = "ling3-mtp";
+            @memcpy(hdr.model_id[0..mid.len], mid);
+            hdr.header_crc32 = amf.computeHeaderCrc32(&hdr);
+            const hdr_bytes = std.mem.asBytes(&hdr);
+            @memcpy(img[0..hdr_bytes.len], hdr_bytes);
+            return img;
+        }
+    }.run;
+
+    const EhMode = enum { bf16, q3_row_major, q3_sme2_panel64 };
+    const buildLing3Amf = struct {
+        fn run(alloc: std.mem.Allocator, cfg: DraftConfig, eh_mode: EhMode, dense_fallback: bool, seed: u64) ![]u8 {
+            var recs: std.ArrayList(CustomRec) = .empty;
+            defer {
+                for (recs.items) |r| {
+                    alloc.free(r.name);
+                    alloc.free(r.data);
+                    if (r.params.len > 0) alloc.free(r.params);
+                }
+                recs.deinit(alloc);
+            }
+            const hh = cfg.hidden_size;
+            const qd = cfg.qDim();
+            const oin = cfg.oInDim();
+            const inv_h = 0.5 / @sqrt(@as(f32, @floatFromInt(hh)));
+            const inv_o = 0.5 / @sqrt(@as(f32, @floatFromInt(oin)));
+            const inv_ql = 0.5 / @sqrt(@as(f32, @floatFromInt(cfg.q_lora_rank)));
+            const inv_kvl = 0.5 / @sqrt(@as(f32, @floatFromInt(cfg.kv_lora_rank)));
+            var tidx: u64 = 1;
+
+            const push1d = struct {
+                fn call(a: std.mem.Allocator, list: *std.ArrayList(CustomRec), name: []const u8, dim: u32, s: u64) !void {
+                    try list.append(a, .{
+                        .name = try a.dupe(u8, name),
+                        .kind = .norm,
+                        .dtype = .bf16,
+                        .shape = .{ dim, 0, 0, 0 },
+                        .rank = 1,
+                        .data = try fillBf16(a, dim, 0.05, true, s),
+                    });
+                }
+            }.call;
+            const push2d = struct {
+                fn call(a: std.mem.Allocator, list: *std.ArrayList(CustomRec), name: []const u8, n: u32, k: u32, amp: f32, s: u64) !void {
+                    try list.append(a, .{
+                        .name = try a.dupe(u8, name),
+                        .kind = .dense,
+                        .dtype = .bf16,
+                        .shape = .{ n, k, 0, 0 },
+                        .rank = 2,
+                        .data = try fillBf16(a, @as(usize, n) * k, amp, false, s),
+                    });
+                }
+            }.call;
+
+            // Use `layers.0.{enorm,hnorm,eh_proj,final_layernorm}` naming (exact Ling-3.1 standalone mtp.amf contract!).
+            try push1d(alloc, &recs, "layers.0.enorm.weight", hh, seed + tidx);
+            tidx += 1;
+            try push1d(alloc, &recs, "layers.0.hnorm.weight", hh, seed + tidx);
+            tidx += 1;
+
+            const eh_k: u32 = 2 * hh;
+            switch (eh_mode) {
+                .bf16 => {
+                    try push2d(alloc, &recs, "layers.0.eh_proj.weight", hh, eh_k, 0.5 / @sqrt(@as(f32, @floatFromInt(eh_k))), seed + tidx);
+                },
+                .q3_row_major, .q3_sme2_panel64 => {
+                    // Deterministic Q3_AFFINE g64 weights identical between row-major and sme2_panel64!
+                    const groups: usize = eh_k / 64;
+                    const q_bytes_len: usize = @as(usize, hh) * groups * 24;
+                    const sb_count: usize = @as(usize, hh) * groups;
+                    const q_raw = try alloc.alloc(u8, q_bytes_len);
+                    errdefer alloc.free(q_raw);
+                    const sb_raw = try alloc.alloc(u8, sb_count * @sizeOf(quant.ScaleBias));
+                    errdefer alloc.free(sb_raw);
+                    const sb_slice: []quant.ScaleBias = @alignCast(std.mem.bytesAsSlice(quant.ScaleBias, sb_raw));
+                    var rng = (seed + tidx) ^ 0x9E37_79B9_7F4A_7C15;
+                    for (0..sb_count) |gi| {
+                        const su = @as(f32, @floatFromInt(nextRng(&rng) & 0xFF)) / 255.0;
+                        const s_val: f32 = 0.01 + 0.02 * su;
+                        sb_slice[gi] = .{ .scale = @floatCast(s_val), .bias = @floatCast(-3.5 * s_val) };
+                    }
+                    for (0..q_bytes_len) |bi| {
+                        q_raw[bi] = @intCast(nextRng(&rng) & 0xFF);
+                    }
+                    if (eh_mode == .q3_row_major) {
+                        try recs.append(alloc, .{
+                            .name = try alloc.dupe(u8, "layers.0.eh_proj.weight"),
+                            .kind = .dense,
+                            .dtype = .q3_affine,
+                            .layout = .row_major,
+                            .quant_bits = 3,
+                            .group_size = 64,
+                            .shape = .{ hh, eh_k, 0, 0 },
+                            .rank = 2,
+                            .data = q_raw,
+                            .params = sb_raw,
+                        });
+                    } else {
+                        defer alloc.free(q_raw);
+                        defer alloc.free(sb_raw);
+                        const packed_len = try sme.packedBlobBytes(.q3_affine, hh, eh_k);
+                        const pbuf = try alloc.alloc(u8, packed_len);
+                        errdefer alloc.free(pbuf);
+                        try sme.packMlxQuantPanel64(.q3, q_raw, sb_slice, hh, eh_k, pbuf);
+                        try recs.append(alloc, .{
+                            .name = try alloc.dupe(u8, "layers.0.eh_proj.weight"),
+                            .kind = .dense,
+                            .dtype = .q3_affine,
+                            .layout = .sme2_panel64,
+                            .quant_bits = 3,
+                            .group_size = 64,
+                            .shape = .{ hh, eh_k, 0, 0 },
+                            .rank = 2,
+                            .data = pbuf,
+                        });
+                    }
+                },
+            }
+            tidx += 1;
+
+            try push1d(alloc, &recs, "layers.0.input_layernorm.weight", hh, seed + tidx);
+            tidx += 1;
+            try push2d(alloc, &recs, "layers.0.self_attn.q_a_proj.weight", cfg.q_lora_rank, hh, inv_h, seed + tidx);
+            tidx += 1;
+            try push1d(alloc, &recs, "layers.0.self_attn.q_a_layernorm.weight", cfg.q_lora_rank, seed + tidx);
+            tidx += 1;
+            try push2d(alloc, &recs, "layers.0.self_attn.q_b_proj.weight", qd, cfg.q_lora_rank, inv_ql, seed + tidx);
+            tidx += 1;
+            try push2d(alloc, &recs, "layers.0.self_attn.kv_a_proj_with_mqa.weight", cfg.kv_lora_rank + cfg.qk_rope_head_dim, hh, inv_h, seed + tidx);
+            tidx += 1;
+            try push1d(alloc, &recs, "layers.0.self_attn.kv_a_layernorm.weight", cfg.kv_lora_rank, seed + tidx);
+            tidx += 1;
+            const kvb_n = cfg.num_attention_heads * (cfg.qk_nope_head_dim + cfg.effectiveVHeadDim());
+            try push2d(alloc, &recs, "layers.0.self_attn.kv_b_proj.weight", kvb_n, cfg.kv_lora_rank, inv_kvl, seed + tidx);
+            tidx += 1;
+            // Strong non-trivial g_proj weights so head-wise sigmoid gate strongly modulates each head!
+            try push2d(alloc, &recs, "layers.0.self_attn.g_proj.weight", cfg.num_attention_heads, hh, 0.8, seed + tidx);
+            tidx += 1;
+            try push2d(alloc, &recs, "layers.0.self_attn.o_proj.weight", hh, oin, inv_o, seed + tidx);
+            tidx += 1;
+            try push1d(alloc, &recs, "layers.0.post_attention_layernorm.weight", hh, seed + tidx);
+            tidx += 1;
+
+            if (dense_fallback) {
+                try push2d(alloc, &recs, "layers.0.mlp.gate_proj.weight", cfg.moe_intermediate_size, hh, inv_h, seed + tidx);
+                tidx += 1;
+                try push2d(alloc, &recs, "layers.0.mlp.up_proj.weight", cfg.moe_intermediate_size, hh, inv_h, seed + tidx);
+                tidx += 1;
+                try push2d(alloc, &recs, "layers.0.mlp.down_proj.weight", hh, cfg.moe_intermediate_size, 0.5 / @sqrt(@as(f32, @floatFromInt(cfg.moe_intermediate_size))), seed + tidx);
+                tidx += 1;
+            } else {
+                try push2d(alloc, &recs, "layers.0.mlp.gate.weight", cfg.num_experts, hh, inv_h * 0.25, seed + tidx);
+                tidx += 1;
+                // Craft F32 expert_bias so Group 7 has one huge outlier (e=14: +3.5, e=15: -3.5 -> sum~0.5)
+                // while Groups {0, 2, 4, 6} have paired strong biases (+1.5, +1.5 -> sum~4.0):
+                // naive top-4 WOULD pick e=14, while group_limited_topk (n_group=8, topk_group=4) MUST exclude Group 7!
+                const b_raw = try alloc.alloc(u8, @as(usize, cfg.num_experts) * @sizeOf(f32));
+                errdefer alloc.free(b_raw);
+                const b_f32: []f32 = @alignCast(std.mem.bytesAsSlice(f32, b_raw));
+                for (0..cfg.num_experts) |e| {
+                    const g = e / (cfg.num_experts / cfg.n_group);
+                    if (g == 7) {
+                        b_f32[e] = if ((e % 2) == 0) 3.5 else -3.5;
+                    } else if ((g % 2) == 0) {
+                        b_f32[e] = 1.5 + 0.02 * @as(f32, @floatFromInt(e));
+                    } else {
+                        b_f32[e] = -1.5;
+                    }
+                }
+                try recs.append(alloc, .{
+                    .name = try alloc.dupe(u8, "layers.0.mlp.gate.bias"),
+                    .kind = .norm,
+                    .dtype = .f32,
+                    .shape = .{ cfg.num_experts, 0, 0, 0 },
+                    .rank = 1,
+                    .data = b_raw,
+                });
+                tidx += 1;
+
+                // Amplify gate/up weights (amp=1.8) so swiglu_limit=10.0 actively clamps!
+                const si = cfg.shared_expert_intermediate_size;
+                const inv_si = 0.08 / @sqrt(@as(f32, @floatFromInt(si)));
+                try push2d(alloc, &recs, "layers.0.mlp.shared_experts.gate_proj.weight", si, hh, 1.8, seed + tidx);
+                tidx += 1;
+                try push2d(alloc, &recs, "layers.0.mlp.shared_experts.up_proj.weight", si, hh, 1.8, seed + tidx);
+                tidx += 1;
+                try push2d(alloc, &recs, "layers.0.mlp.shared_experts.down_proj.weight", hh, si, inv_si, seed + tidx);
+                tidx += 1;
+
+                const mi = cfg.moe_intermediate_size;
+                const inv_mi = 0.08 / @sqrt(@as(f32, @floatFromInt(mi)));
+                var nbuf: [64]u8 = undefined;
+                for (0..cfg.num_experts) |e_idx| {
+                    try push2d(alloc, &recs, std.fmt.bufPrint(&nbuf, "layers.0.mlp.experts.{d}.gate_proj.weight", .{e_idx}) catch unreachable, mi, hh, 1.8, seed + tidx);
+                    tidx += 1;
+                    try push2d(alloc, &recs, std.fmt.bufPrint(&nbuf, "layers.0.mlp.experts.{d}.up_proj.weight", .{e_idx}) catch unreachable, mi, hh, 1.8, seed + tidx);
+                    tidx += 1;
+                    try push2d(alloc, &recs, std.fmt.bufPrint(&nbuf, "layers.0.mlp.experts.{d}.down_proj.weight", .{e_idx}) catch unreachable, hh, mi, inv_mi, seed + tidx);
+                    tidx += 1;
+                }
+            }
+
+            try push1d(alloc, &recs, "layers.0.final_layernorm.weight", hh, seed + tidx);
+            return packCustomAmf(alloc, recs.items);
+        }
+    }.run;
+
+    const bf16_img = try buildLing3Amf(allocator, mtp_cfg, .bf16, false, 93101);
+    defer allocator.free(bf16_img);
+
+    var dh_gpu = try DraftHead.loadFromBytes(allocator, &target, bf16_img, mtp_cfg, .{
+        .placement = .gpu,
+        .max_seq_len = 64,
+        .max_tree_slots = 16,
+    });
+    defer dh_gpu.deinit(allocator, &target);
+    try std.testing.expect(!dh_gpu.isChainedMtp());
+    try std.testing.expect(dh_gpu.use_custom_attn);
+    try std.testing.expect(dh_gpu.layers[0].mla != null);
+    try std.testing.expect(dh_gpu.layers[0].mla.?.g_proj != null);
+    try std.testing.expectEqual(@as(u32, 1), dh_gpu.layers[0].mla.?.head_gate_mode);
+
+    // Prefill 6 tokens on target, then syncAccepted + branching 2-token tree step on GPU.
+    const prompt = [_]u32{ 5, 17, 29, 43, 61, 79 };
+    _ = try target.prefillChunk(&prompt, 0, true);
+    try dh_gpu.syncAccepted(&target, &prompt, target.accepted_top_bind, 0, 4);
+    try std.testing.expectEqual(@as(u64, 1), dh_gpu.gpu_eh_proj_dispatches);
+
+    const tree_toks = [_]u32{ dh_gpu.rootCandidates()[0].token_id, dh_gpu.rootCandidates()[1].token_id };
+    const tree_parents = [_]u32{ 0, 0 };
+    const tree_pos = [_]u32{ prompt.len, prompt.len };
+    const tree_masks = [_]u64{ 0b01, 0b10 };
+    var cands_gpu: [2 * 4]moe.TopKCandidate = undefined;
+    try dh_gpu.stepTreeBatch(&target, &tree_toks, &tree_parents, &tree_pos, &tree_masks, 0, 4, &cands_gpu);
+    try std.testing.expectEqual(@as(u64, 2), dh_gpu.gpu_eh_proj_dispatches);
+
+    // Pure-Zig FP32 CPU reference of BailingMoeV3MTPLayer.forward across prompt + 2 tree tokens.
+    var parsed_ref = try amf.Parsed.parseBytes(allocator, bf16_img);
+    defer parsed_ref.deinit(allocator);
+    const loadBf16F32 = struct {
+        fn run(a: std.mem.Allocator, p: *const amf.Parsed, raw: []const u8, name: []const u8) ![]f32 {
+            const e = p.find(name) orelse return error.MissingTensor;
+            const n_el: usize = @intCast(e.data_bytes / 2);
+            const out = try a.alloc(f32, n_el);
+            const off: usize = @intCast(e.blob_offset);
+            for (0..n_el) |i| {
+                const bits = std.mem.readInt(u16, raw[off + i * 2 ..][0..2], .little);
+                out[i] = quant.bf16ToF32(bits);
+            }
+            return out;
+        }
+    }.run;
+    const loadF32 = struct {
+        fn run(a: std.mem.Allocator, p: *const amf.Parsed, raw: []const u8, name: []const u8) ![]f32 {
+            const e = p.find(name) orelse return error.MissingTensor;
+            const n_el: usize = @intCast(e.data_bytes / 4);
+            const out = try a.alloc(f32, n_el);
+            const off: usize = @intCast(e.blob_offset);
+            for (0..n_el) |i| {
+                out[i] = @bitCast(std.mem.readInt(u32, raw[off + i * 4 ..][0..4], .little));
+            }
+            return out;
+        }
+    }.run;
+
+    const rmsNormCpu = struct {
+        fn run(x: []const f32, w: []const f32, eps: f32, out: []f32) void {
+            var ss: f32 = 0.0;
+            for (x) |v| ss += v * v;
+            const inv = 1.0 / @sqrt(ss / @as(f32, @floatFromInt(x.len)) + eps);
+            for (0..x.len) |i| out[i] = x[i] * inv * w[i];
+        }
+    }.run;
+    const matvecCpu = struct {
+        fn run(w: []const f32, x: []const f32, n_rows: usize, k_cols: usize, out: []f32) void {
+            for (0..n_rows) |r| {
+                var acc: f32 = 0.0;
+                const row = w[r * k_cols ..][0..k_cols];
+                for (0..k_cols) |c| acc += row[c] * x[c];
+                out[r] = acc;
+            }
+        }
+    }.run;
+    const sigmoidCpu = struct {
+        fn run(v: f32) f32 {
+            return 1.0 / (1.0 + @exp(-std.math.clamp(v, -80.0, 80.0)));
+        }
+    }.run;
+    const siluCpu = struct {
+        fn run(v: f32) f32 {
+            return v * sigmoidCpu(v);
+        }
+    }.run;
+    const cosSimF32 = struct {
+        fn run(a: []const f32, b: []const f32) f64 {
+            var dot: f64 = 0.0;
+            var na: f64 = 0.0;
+            var nb: f64 = 0.0;
+            for (a, b) |av, bv| {
+                dot += @as(f64, av) * @as(f64, bv);
+                na += @as(f64, av) * @as(f64, av);
+                nb += @as(f64, bv) * @as(f64, bv);
+            }
+            return dot / (@sqrt(na) * @sqrt(nb));
+        }
+    }.run;
+
+    const w_enorm = try loadBf16F32(allocator, &parsed_ref, bf16_img, "layers.0.enorm.weight");
+    defer allocator.free(w_enorm);
+    const w_hnorm = try loadBf16F32(allocator, &parsed_ref, bf16_img, "layers.0.hnorm.weight");
+    defer allocator.free(w_hnorm);
+    const w_eh = try loadBf16F32(allocator, &parsed_ref, bf16_img, "layers.0.eh_proj.weight");
+    defer allocator.free(w_eh);
+    const w_in_ln = try loadBf16F32(allocator, &parsed_ref, bf16_img, "layers.0.input_layernorm.weight");
+    defer allocator.free(w_in_ln);
+    const w_qa = try loadBf16F32(allocator, &parsed_ref, bf16_img, "layers.0.self_attn.q_a_proj.weight");
+    defer allocator.free(w_qa);
+    const w_qan = try loadBf16F32(allocator, &parsed_ref, bf16_img, "layers.0.self_attn.q_a_layernorm.weight");
+    defer allocator.free(w_qan);
+    const w_qb = try loadBf16F32(allocator, &parsed_ref, bf16_img, "layers.0.self_attn.q_b_proj.weight");
+    defer allocator.free(w_qb);
+    const w_kva = try loadBf16F32(allocator, &parsed_ref, bf16_img, "layers.0.self_attn.kv_a_proj_with_mqa.weight");
+    defer allocator.free(w_kva);
+    const w_kvan = try loadBf16F32(allocator, &parsed_ref, bf16_img, "layers.0.self_attn.kv_a_layernorm.weight");
+    defer allocator.free(w_kvan);
+    const w_kvb = try loadBf16F32(allocator, &parsed_ref, bf16_img, "layers.0.self_attn.kv_b_proj.weight");
+    defer allocator.free(w_kvb);
+    const w_gproj = try loadBf16F32(allocator, &parsed_ref, bf16_img, "layers.0.self_attn.g_proj.weight");
+    defer allocator.free(w_gproj);
+    const w_oproj = try loadBf16F32(allocator, &parsed_ref, bf16_img, "layers.0.self_attn.o_proj.weight");
+    defer allocator.free(w_oproj);
+    const w_post_ln = try loadBf16F32(allocator, &parsed_ref, bf16_img, "layers.0.post_attention_layernorm.weight");
+    defer allocator.free(w_post_ln);
+    const w_router = try loadBf16F32(allocator, &parsed_ref, bf16_img, "layers.0.mlp.gate.weight");
+    defer allocator.free(w_router);
+    const b_router = try loadF32(allocator, &parsed_ref, bf16_img, "layers.0.mlp.gate.bias");
+    defer allocator.free(b_router);
+    const w_sg = try loadBf16F32(allocator, &parsed_ref, bf16_img, "layers.0.mlp.shared_experts.gate_proj.weight");
+    defer allocator.free(w_sg);
+    const w_su = try loadBf16F32(allocator, &parsed_ref, bf16_img, "layers.0.mlp.shared_experts.up_proj.weight");
+    defer allocator.free(w_su);
+    const w_sd = try loadBf16F32(allocator, &parsed_ref, bf16_img, "layers.0.mlp.shared_experts.down_proj.weight");
+    defer allocator.free(w_sd);
+
+    var w_eg: [n_exp][]f32 = undefined;
+    var w_eu: [n_exp][]f32 = undefined;
+    var w_ed: [n_exp][]f32 = undefined;
+    var exp_loaded: usize = 0;
+    defer {
+        for (0..exp_loaded) |ei| {
+            allocator.free(w_eg[ei]);
+            allocator.free(w_eu[ei]);
+            allocator.free(w_ed[ei]);
+        }
+    }
+    var nbuf_ref: [64]u8 = undefined;
+    for (0..n_exp) |ei| {
+        w_eg[ei] = try loadBf16F32(allocator, &parsed_ref, bf16_img, std.fmt.bufPrint(&nbuf_ref, "layers.0.mlp.experts.{d}.gate_proj.weight", .{ei}) catch unreachable);
+        w_eu[ei] = try loadBf16F32(allocator, &parsed_ref, bf16_img, std.fmt.bufPrint(&nbuf_ref, "layers.0.mlp.experts.{d}.up_proj.weight", .{ei}) catch unreachable);
+        w_ed[ei] = try loadBf16F32(allocator, &parsed_ref, bf16_img, std.fmt.bufPrint(&nbuf_ref, "layers.0.mlp.experts.{d}.down_proj.weight", .{ei}) catch unreachable);
+        exp_loaded += 1;
+    }
+
+    const runCpuRef = struct {
+        fn eval(
+            tgt: *const qwen3.Qwen3Model,
+            p_toks: []const u32,
+            t_toks: []const u32,
+            use_gate: bool,
+            use_groups: bool,
+            enorm: []const f32,
+            hnorm: []const f32,
+            eh_w: []const f32,
+            in_ln: []const f32,
+            qa: []const f32,
+            qan: []const f32,
+            qb: []const f32,
+            kva: []const f32,
+            kvan: []const f32,
+            kvb: []const f32,
+            gproj: []const f32,
+            oproj: []const f32,
+            post_ln: []const f32,
+            rt_w: []const f32,
+            rt_b: []const f32,
+            sg: []const f32,
+            su: []const f32,
+            sd: []const f32,
+            eg: *const [n_exp][]f32,
+            eu: *const [n_exp][]f32,
+            ed: *const [n_exp][]f32,
+            out_root: *[h]f32,
+            out_tree0: *[h]f32,
+            out_tree1: *[h]f32,
+            clamp_hits: *usize,
+            group7_picked: *usize,
+        ) void {
+            const total_n = 8; // 6 prompt + 2 independent tree leaves attending to prompt[0..6] + self
+            var k_cache: [total_n][nh * qk_hd]f32 = undefined;
+            var v_cache: [total_n][nh * v_hd]f32 = undefined;
+            var step_out: [total_n][h]f32 = undefined;
+
+            const emb_raw = tgt.embed.weight_host;
+            for (0..total_n) |idx| {
+                const is_tree = idx >= p_toks.len;
+                const tok = if (is_tree) t_toks[idx - p_toks.len] else p_toks[idx];
+                const pos: u32 = if (is_tree) @intCast(p_toks.len) else @intCast(idx);
+                var emb_v: [h]f32 = undefined;
+                for (0..h) |d| {
+                    const bits = std.mem.readInt(u16, emb_raw[(@as(usize, tok) * h + d) * 2 ..][0..2], .little);
+                    emb_v[d] = quant.bf16ToF32(bits);
+                }
+                var h_v: [h]f32 = undefined;
+                if (is_tree) {
+                    h_v = step_out[p_toks.len - 1];
+                } else {
+                    for (0..h) |d| h_v[d] = @floatCast(tgt.accepted_top_host[idx * h + d]);
+                }
+                var e_n: [h]f32 = undefined;
+                var h_n: [h]f32 = undefined;
+                rmsNormCpu(&emb_v, enorm, 1e-6, &e_n);
+                rmsNormCpu(&h_v, hnorm, 1e-6, &h_n);
+                var cat: [2 * h]f32 = undefined;
+                @memcpy(cat[0..h], &e_n);
+                @memcpy(cat[h..], &h_n);
+                var x: [h]f32 = undefined;
+                matvecCpu(eh_w, &cat, h, 2 * h, &x);
+
+                var x_norm: [h]f32 = undefined;
+                rmsNormCpu(&x, in_ln, 1e-6, &x_norm);
+
+                // Gated MLA forward
+                var q_a: [q_lora]f32 = undefined;
+                var q_an: [q_lora]f32 = undefined;
+                var q_full: [nh * qk_hd]f32 = undefined;
+                matvecCpu(qa, &x_norm, q_lora, h, &q_a);
+                rmsNormCpu(&q_a, qan, 1e-6, &q_an);
+                matvecCpu(qb, &q_an, nh * qk_hd, q_lora, &q_full);
+
+                var kv_a: [kv_lora + qk_rope]f32 = undefined;
+                var kv_an: [kv_lora]f32 = undefined;
+                var kv_b: [nh * (qk_nope + v_hd)]f32 = undefined;
+                matvecCpu(kva, &x_norm, kv_lora + qk_rope, h, &kv_a);
+                rmsNormCpu(kv_a[0..kv_lora], kvan, 1e-6, &kv_an);
+                matvecCpu(kvb, &kv_an, nh * (qk_nope + v_hd), kv_lora, &kv_b);
+
+                var g_logits: [nh]f32 = undefined;
+                matvecCpu(gproj, &x_norm, nh, h, &g_logits);
+
+                // Split kv_b and apply interleaved RoPE (theta = 6e6) to q_rot & k_rot.
+                const half_rot = qk_rope / 2;
+                const inv_rot: f32 = 2.0 / @as(f32, @floatFromInt(qk_rope));
+                var k_rot_out: [qk_rope]f32 = undefined;
+                for (0..half_rot) |i| {
+                    const freq = 1.0 / std.math.pow(f32, 6_000_000.0, @as(f32, @floatFromInt(i)) * inv_rot);
+                    const ang = @as(f32, @floatFromInt(pos)) * freq;
+                    const c = @cos(ang);
+                    const s = @sin(ang);
+                    const k0 = kv_a[kv_lora + 2 * i];
+                    const k1 = kv_a[kv_lora + 2 * i + 1];
+                    k_rot_out[i] = k0 * c - k1 * s;
+                    k_rot_out[i + half_rot] = k1 * c + k0 * s;
+                }
+                for (0..nh) |hd_i| {
+                    const q_base = hd_i * qk_hd;
+                    const kb_base = hd_i * (qk_nope + v_hd);
+                    const v_base = hd_i * v_hd;
+                    @memcpy(k_cache[idx][q_base .. q_base + qk_nope], kv_b[kb_base .. kb_base + qk_nope]);
+                    @memcpy(k_cache[idx][q_base + qk_nope .. q_base + qk_hd], &k_rot_out);
+                    @memcpy(v_cache[idx][v_base .. v_base + v_hd], kv_b[kb_base + qk_nope .. kb_base + qk_nope + v_hd]);
+                    var q_rot_orig: [qk_rope]f32 = undefined;
+                    @memcpy(&q_rot_orig, q_full[q_base + qk_nope .. q_base + qk_hd]);
+                    for (0..half_rot) |i| {
+                        const freq = 1.0 / std.math.pow(f32, 6_000_000.0, @as(f32, @floatFromInt(i)) * inv_rot);
+                        const ang = @as(f32, @floatFromInt(pos)) * freq;
+                        const c = @cos(ang);
+                        const s = @sin(ang);
+                        const q0 = q_rot_orig[2 * i];
+                        const q1 = q_rot_orig[2 * i + 1];
+                        q_full[q_base + qk_nope + i] = q0 * c - q1 * s;
+                        q_full[q_base + qk_nope + i + half_rot] = q1 * c + q0 * s;
+                    }
+                }
+
+                // Full-causal attention (prompt attends 0..idx; tree leaves attend 0..p_toks.len + self).
+                const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(qk_hd)));
+                var attn_out: [nh * v_hd]f32 = @splat(0.0);
+                for (0..nh) |hd_i| {
+                    const q_base = hd_i * qk_hd;
+                    const v_base = hd_i * v_hd;
+                    var scores: [total_n]f32 = @splat(-std.math.inf(f32));
+                    var max_s: f32 = -std.math.inf(f32);
+                    for (0..total_n) |ki| {
+                        const allowed = if (is_tree) (ki < p_toks.len or ki == idx) else (ki <= idx);
+                        if (!allowed) continue;
+                        var dot: f32 = 0.0;
+                        for (0..qk_hd) |d| dot += q_full[q_base + d] * k_cache[ki][q_base + d];
+                        scores[ki] = dot * scale;
+                        if (scores[ki] > max_s) max_s = scores[ki];
+                    }
+                    var sum_e: f32 = 0.0;
+                    for (0..total_n) |ki| {
+                        if (std.math.isFinite(scores[ki])) {
+                            scores[ki] = @exp(scores[ki] - max_s);
+                            sum_e += scores[ki];
+                        } else {
+                            scores[ki] = 0.0;
+                        }
+                    }
+                    const head_g: f32 = if (use_gate) sigmoidCpu(g_logits[hd_i]) else 1.0;
+                    for (0..v_hd) |d| {
+                        var acc: f32 = 0.0;
+                        for (0..total_n) |ki| acc += (scores[ki] / sum_e) * v_cache[ki][v_base + d];
+                        attn_out[v_base + d] = acc * head_g;
+                    }
+                }
+
+                var o_out: [h]f32 = undefined;
+                matvecCpu(oproj, &attn_out, h, nh * v_hd, &o_out);
+                for (0..h) |d| x[d] += o_out[d];
+
+                // Post-attention norm + shared expert + 16E group_limited_topk MoE with swiglu_limit=10.0.
+                rmsNormCpu(&x, post_ln, 1e-6, &x_norm);
+                var sh_g: [sh_inter]f32 = undefined;
+                var sh_u: [sh_inter]f32 = undefined;
+                var sh_a: [sh_inter]f32 = undefined;
+                var sh_d: [h]f32 = undefined;
+                matvecCpu(sg, &x_norm, sh_inter, h, &sh_g);
+                matvecCpu(su, &x_norm, sh_inter, h, &sh_u);
+                for (0..sh_inter) |i| {
+                    if (sh_g[i] > 10.0 or @abs(sh_u[i]) > 10.0) clamp_hits.* += 1;
+                    sh_a[i] = siluCpu(@min(sh_g[i], 10.0)) * std.math.clamp(sh_u[i], -10.0, 10.0);
+                }
+                matvecCpu(sd, &sh_a, h, sh_inter, &sh_d);
+                for (0..h) |d| x[d] += sh_d[d];
+
+                var r_logits: [n_exp]f32 = undefined;
+                matvecCpu(rt_w, &x_norm, n_exp, h, &r_logits);
+                var r_raw: [n_exp]f32 = undefined;
+                var r_sel: [n_exp]f32 = undefined;
+                for (0..n_exp) |e| {
+                    r_raw[e] = sigmoidCpu(r_logits[e]);
+                    r_sel[e] = r_raw[e] + rt_b[e];
+                }
+                if (use_groups) {
+                    const gsz = n_exp / n_group;
+                    var gs: [n_group]f32 = undefined;
+                    for (0..n_group) |g| {
+                        var t1: f32 = -std.math.inf(f32);
+                        var t2: f32 = -std.math.inf(f32);
+                        for (0..gsz) |off| {
+                            const v = r_sel[g * gsz + off];
+                            if (v >= t1) {
+                                t2 = t1;
+                                t1 = v;
+                            } else if (v > t2) {
+                                t2 = v;
+                            }
+                        }
+                        gs[g] = t1 + t2;
+                    }
+                    var gmask: u32 = 0;
+                    for (0..topk_group) |_| {
+                        var bg: usize = n_group;
+                        var bv: f32 = -std.math.inf(f32);
+                        for (0..n_group) |g| {
+                            if (((gmask >> @intCast(g)) & 1) != 0) continue;
+                            if (bg == n_group or gs[g] > bv) {
+                                bv = gs[g];
+                                bg = g;
+                            }
+                        }
+                        gmask |= (@as(u32, 1) << @intCast(bg));
+                    }
+                    for (0..n_exp) |e| {
+                        if (((gmask >> @intCast(e / gsz)) & 1) == 0) r_sel[e] = -std.math.inf(f32);
+                    }
+                }
+                var top_ids: [top_k]usize = undefined;
+                var top_w: [top_k]f32 = undefined;
+                var w_sum: f32 = 0.0;
+                for (0..top_k) |ki| {
+                    var be: usize = 0;
+                    var bv: f32 = -std.math.inf(f32);
+                    for (0..n_exp) |e| {
+                        if (r_sel[e] > bv) {
+                            bv = r_sel[e];
+                            be = e;
+                        }
+                    }
+                    top_ids[ki] = be;
+                    top_w[ki] = r_raw[be];
+                    w_sum += r_raw[be];
+                    r_sel[be] = -std.math.inf(f32);
+                    if (be >= 14) group7_picked.* += 1;
+                }
+                for (0..top_k) |ki| top_w[ki] = (top_w[ki] / (w_sum + 1e-20)) * 2.5;
+                for (0..top_k) |ki| {
+                    const eid = top_ids[ki];
+                    var eg_v: [moe_inter]f32 = undefined;
+                    var eu_v: [moe_inter]f32 = undefined;
+                    var ea_v: [moe_inter]f32 = undefined;
+                    var ed_v: [h]f32 = undefined;
+                    matvecCpu(eg[eid], &x_norm, moe_inter, h, &eg_v);
+                    matvecCpu(eu[eid], &x_norm, moe_inter, h, &eu_v);
+                    for (0..moe_inter) |i| {
+                        if (eg_v[i] > 10.0 or @abs(eu_v[i]) > 10.0) clamp_hits.* += 1;
+                        ea_v[i] = siluCpu(@min(eg_v[i], 10.0)) * std.math.clamp(eu_v[i], -10.0, 10.0);
+                    }
+                    matvecCpu(ed[eid], &ea_v, h, moe_inter, &ed_v);
+                    for (0..h) |d| x[d] += top_w[ki] * ed_v[d];
+                }
+                step_out[idx] = x;
+            }
+            out_root.* = step_out[p_toks.len - 1];
+            out_tree0.* = step_out[p_toks.len];
+            out_tree1.* = step_out[p_toks.len + 1];
+        }
+    }.eval;
+
+    var ref_root: [h]f32 = undefined;
+    var ref_t0: [h]f32 = undefined;
+    var ref_t1: [h]f32 = undefined;
+    var clamp_hits: usize = 0;
+    var group7_picked: usize = 0;
+    runCpuRef(
+        &target,
+        &prompt,
+        &tree_toks,
+        true,
+        true,
+        w_enorm,
+        w_hnorm,
+        w_eh,
+        w_in_ln,
+        w_qa,
+        w_qan,
+        w_qb,
+        w_kva,
+        w_kvan,
+        w_kvb,
+        w_gproj,
+        w_oproj,
+        w_post_ln,
+        w_router,
+        b_router,
+        w_sg,
+        w_su,
+        w_sd,
+        &w_eg,
+        &w_eu,
+        &w_ed,
+        &ref_root,
+        &ref_t0,
+        &ref_t1,
+        &clamp_hits,
+        &group7_picked,
+    );
+    try std.testing.expect(clamp_hits > 0); // swiglu_limit=10.0 actively clamped!
+    try std.testing.expectEqual(@as(usize, 0), group7_picked); // group_limited_topk excluded Group 7 outlier!
+
+    var gpu_root: [h]f32 = undefined;
+    var gpu_t0: [h]f32 = undefined;
+    var gpu_t1: [h]f32 = undefined;
+    for (0..h) |d| {
+        gpu_root[d] = @floatCast(dh_gpu.hidden_pool_host[d]);
+        gpu_t0[d] = @floatCast(dh_gpu.hidden_pool_host[h + d]);
+        gpu_t1[d] = @floatCast(dh_gpu.hidden_pool_host[2 * h + d]);
+    }
+    try std.testing.expect(cosSimF32(&gpu_root, &ref_root) >= 0.9999);
+    try std.testing.expect(cosSimF32(&gpu_t0, &ref_t0) >= 0.9999);
+    try std.testing.expect(cosSimF32(&gpu_t1, &ref_t1) >= 0.9999);
+
+    // Ablation check: disabling head-wise g_proj or group_limited_topk produces a distinct output!
+    var nogate_root: [h]f32 = undefined;
+    var nogate_t0: [h]f32 = undefined;
+    var nogate_t1: [h]f32 = undefined;
+    var dummy_clamps: usize = 0;
+    var ungrouped_g7: usize = 0;
+    runCpuRef(
+        &target,
+        &prompt,
+        &tree_toks,
+        false,
+        false,
+        w_enorm,
+        w_hnorm,
+        w_eh,
+        w_in_ln,
+        w_qa,
+        w_qan,
+        w_qb,
+        w_kva,
+        w_kvan,
+        w_kvb,
+        w_gproj,
+        w_oproj,
+        w_post_ln,
+        w_router,
+        b_router,
+        w_sg,
+        w_su,
+        w_sd,
+        &w_eg,
+        &w_eu,
+        &w_ed,
+        &nogate_root,
+        &nogate_t0,
+        &nogate_t1,
+        &dummy_clamps,
+        &ungrouped_g7,
+    );
+    try std.testing.expect(ungrouped_g7 > 0);
+    try std.testing.expect(cosSimF32(&gpu_root, &nogate_root) < 0.995);
+
+    // 3. L2 SME2 `eh_proj` (`q3_affine` row-major repacked at load AND pre-packed `sme2_panel64`) vs GPU parity!
+    const q3_rm_img = try buildLing3Amf(allocator, mtp_cfg, .q3_row_major, false, 93202);
+    defer allocator.free(q3_rm_img);
+    const q3_sme_img = try buildLing3Amf(allocator, mtp_cfg, .q3_sme2_panel64, false, 93202);
+    defer allocator.free(q3_sme_img);
+
+    // Forcing `.gpu` on pre-packed `sme2_panel64` eh_proj cleanly returns InvalidConfig.
+    try std.testing.expectError(error.InvalidConfig, DraftHead.loadFromBytes(allocator, &target, q3_sme_img, mtp_cfg, .{
+        .placement = .gpu,
+        .max_seq_len = 64,
+        .max_tree_slots = 16,
+    }));
+
+    var dh_q3_gpu = try DraftHead.loadFromBytes(allocator, &target, q3_rm_img, mtp_cfg, .{
+        .placement = .gpu,
+        .max_seq_len = 64,
+        .max_tree_slots = 16,
+    });
+    defer dh_q3_gpu.deinit(allocator, &target);
+
+    var dh_q3_sme = try DraftHead.loadFromBytes(allocator, &target, q3_rm_img, mtp_cfg, .{
+        .placement = .cpu_sme2,
+        .max_seq_len = 64,
+        .max_tree_slots = 16,
+    });
+    defer dh_q3_sme.deinit(allocator, &target);
+
+    var dh_q3_packed = try DraftHead.loadFromBytes(allocator, &target, q3_sme_img, mtp_cfg, .{
+        .placement = .auto,
+        .max_seq_len = 64,
+        .max_tree_slots = 16,
+    });
+    defer dh_q3_packed.deinit(allocator, &target);
+
+    try std.testing.expectEqual(Placement.cpu_sme2, dh_q3_sme.effective_placement);
+    try std.testing.expectEqual(Placement.cpu_sme2, dh_q3_packed.effective_placement);
+    try std.testing.expect(dh_q3_sme.sme2_proj_bytes <= sme.MAX_L2_DRAFT_PROJ_BYTES);
+    try std.testing.expectEqual(dh_q3_sme.sme2_proj_bytes, dh_q3_packed.sme2_proj_bytes);
+
+    try dh_q3_gpu.syncAccepted(&target, &prompt, target.accepted_top_bind, 0, 4);
+    try dh_q3_sme.syncAccepted(&target, &prompt, target.accepted_top_bind, 0, 4);
+    try dh_q3_packed.syncAccepted(&target, &prompt, target.accepted_top_bind, 0, 4);
+
+    var c_q3_gpu: [2 * 4]moe.TopKCandidate = undefined;
+    var c_q3_sme: [2 * 4]moe.TopKCandidate = undefined;
+    var c_q3_packed: [2 * 4]moe.TopKCandidate = undefined;
+    try dh_q3_gpu.stepTreeBatch(&target, &tree_toks, &tree_parents, &tree_pos, &tree_masks, 0, 4, &c_q3_gpu);
+    try dh_q3_sme.stepTreeBatch(&target, &tree_toks, &tree_parents, &tree_pos, &tree_masks, 0, 4, &c_q3_sme);
+    try dh_q3_packed.stepTreeBatch(&target, &tree_toks, &tree_parents, &tree_pos, &tree_masks, 0, 4, &c_q3_packed);
+
+    // 0 Metal GPU dispatches for eh_proj when running on L2 SME2!
+    try std.testing.expectEqual(@as(u64, 2), dh_q3_gpu.gpu_eh_proj_dispatches);
+    try std.testing.expectEqual(@as(u64, 0), dh_q3_sme.gpu_eh_proj_dispatches);
+    try std.testing.expectEqual(@as(u64, 0), dh_q3_packed.gpu_eh_proj_dispatches);
+    try std.testing.expect(dh_q3_sme.sme2_eval_count >= 2);
+    try std.testing.expect(dh_q3_packed.sme2_eval_count >= 2);
+
+    var q3_g_all: [3 * h]f32 = undefined;
+    var q3_s_all: [3 * h]f32 = undefined;
+    var q3_p_all: [3 * h]f32 = undefined;
+    for (0..3 * h) |i| {
+        q3_g_all[i] = @floatCast(dh_q3_gpu.hidden_pool_host[i]);
+        q3_s_all[i] = @floatCast(dh_q3_sme.hidden_pool_host[i]);
+        q3_p_all[i] = @floatCast(dh_q3_packed.hidden_pool_host[i]);
+    }
+    try std.testing.expect(cosSimF32(&q3_g_all, &q3_s_all) >= 0.9999);
+    try std.testing.expect(cosSimF32(&q3_g_all, &q3_p_all) >= 0.9999);
+    try std.testing.expectEqual(dh_q3_gpu.rootCandidates()[0].token_id, dh_q3_sme.rootCandidates()[0].token_id);
+    try std.testing.expectEqual(dh_q3_gpu.rootCandidates()[0].token_id, dh_q3_packed.rootCandidates()[0].token_id);
+    try std.testing.expectEqual(c_q3_gpu[0].token_id, c_q3_packed[0].token_id);
+
+    // 4. Dense fallback for tiny synthetic bailing_hybrid MTP bundle (num_experts=512 in config, dense MLP tensors in .amf).
+    var dense_cfg = mtp_cfg;
+    dense_cfg.num_experts = 512;
+    dense_cfg.num_experts_per_tok = 8;
+    const dense_img = try buildLing3Amf(allocator, dense_cfg, .bf16, true, 93303);
+    defer allocator.free(dense_img);
+    var dh_dense = try DraftHead.loadFromBytes(allocator, &target, dense_img, dense_cfg, .{
+        .placement = .cpu_sme2,
+        .max_seq_len = 64,
+        .max_tree_slots = 16,
+    });
+    defer dh_dense.deinit(allocator, &target);
+    try std.testing.expect(dh_dense.layers[0].moe == null);
+    try dh_dense.syncAccepted(&target, &prompt, target.accepted_top_bind, 0, 4);
+    try std.testing.expectEqual(@as(u64, 0), dh_dense.gpu_eh_proj_dispatches);
+    try std.testing.expect(std.math.isFinite(dh_dense.rootCandidates()[0].prob) and dh_dense.rootCandidates()[0].prob > 0.0);
 }
