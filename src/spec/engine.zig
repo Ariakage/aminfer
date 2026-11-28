@@ -2362,7 +2362,7 @@ pub const SpecEngine = struct {
         if (self.vocab_index) |vi| {
             vi.fillAllowedTokenBitmask(self.grammar_program, st, mask_out);
         } else if (self.token_slices) |slices| {
-            grammar_mod.fillAllowedTokenBitmaskDirect(self.grammar_program, st, slices[0..v], self.eos_token_ids, mask_out);
+            grammar_mod.fillAllowedTokenBitmaskDirect(self.grammar_program, st, slices[0..@min(slices.len, v)], self.eos_token_ids, mask_out);
         } else if (self.token_bytes_fn) |get_fn| {
             const prog = self.grammar_program orelse {
                 grammar_mod.allowAllTokens(mask_out, v);
@@ -2388,6 +2388,10 @@ pub const SpecEngine = struct {
             }
         } else {
             grammar_mod.allowAllTokens(mask_out, v);
+        }
+        const rem: u5 = @intCast(v & 31);
+        if (rem != 0 and words > 0) {
+            mask_out[words - 1] &= (@as(u32, 1) << rem) - 1;
         }
         return mask_out;
     }
@@ -2928,9 +2932,32 @@ pub const SpecEngine = struct {
         var draft_accepted: u16 = 0;
         while (true) {
             const g_out = try gs.readOutput(@intCast(u));
-            const t = g_out.token_id;
+            var t = g_out.token_id;
             if (self.grammar_program != null) {
-                if (!self.advanceGrammarOnState(&self.grammar_state, t)) break;
+                const prev_state = self.grammar_state.snapshot();
+                if (!self.advanceGrammarOnState(&self.grammar_state, t)) {
+                    self.grammar_state.restore(prev_state);
+                    if (draft_accepted == 0) return error.EmptyAllowedSet;
+                    const valid_tok = self.pickFirstAllowedTokenForState(&prev_state, v_u32) orelse {
+                        return error.EmptyAllowedSet;
+                    };
+                    if (!self.advanceGrammarOnState(&self.grammar_state, valid_tok)) {
+                        self.grammar_state.restore(prev_state);
+                        return error.EmptyAllowedSet;
+                    }
+                    t = valid_tok;
+                    if (params.hasPenalties()) {
+                        self.penalty_tracker.recordToken(t);
+                    }
+                    out_tokens[draft_accepted] = t;
+                    return .{
+                        .accepted_node_count = draft_accepted + 1,
+                        .emitted_token_count = draft_accepted + 1,
+                        .draft_accepted = draft_accepted,
+                        .last_accepted_node = u,
+                        .bonus_token = t,
+                    };
+                }
             }
             if (params.hasPenalties()) {
                 self.penalty_tracker.recordToken(t);
@@ -2953,16 +2980,26 @@ pub const SpecEngine = struct {
                 .bonus_token = t,
             };
         }
-        // Fallback when token matched end-of-grammar without a child branch.
-        const last_out = try gs.readOutput(@intCast(u));
-        out_tokens[draft_accepted] = last_out.token_id;
-        return .{
-            .accepted_node_count = draft_accepted + 1,
-            .emitted_token_count = draft_accepted + 1,
-            .draft_accepted = draft_accepted,
-            .last_accepted_node = u,
-            .bonus_token = last_out.token_id,
-        };
+    }
+
+    fn pickFirstAllowedTokenForState(
+        self: *SpecEngine,
+        st: *const grammar_mod.GrammarState,
+        vocab_limit: u32,
+    ) ?u32 {
+        const mask = self.fillBitmaskForState(st);
+        for (mask, 0..) |word, w_idx| {
+            var w = word;
+            while (w != 0) {
+                const bit: u5 = @intCast(@ctz(w));
+                const tid: u32 = @intCast((w_idx << 5) + bit);
+                if (tid >= vocab_limit) return null;
+                var probe = st.snapshot();
+                if (self.advanceGrammarOnState(&probe, tid)) return tid;
+                w &= w - 1;
+            }
+        }
+        return null;
     }
 
     /// Executes one full speculative decode round with zero dynamic heap allocation:
@@ -7635,4 +7672,89 @@ test "M9.4 SpecEngine real-HF Qwen3.8-Flash-Next 1L MTP (qwen4-real-hf-synth/mtp
     try std.testing.expect(dh.sme2_eval_count > 0);
     try std.testing.expectEqual(@as(u64, 0), dh.gpu_eh_proj_dispatches);
     try std.testing.expect(dh.indexer_dispatches > 0);
+}
+
+test "F12.2 fillBitmaskForState clamps mismatched vocab and F20.1 verifyConstrainedGpuBatch restores state and rejects empty allowed set" {
+    const allocator = std.testing.allocator;
+    const tmp_dir = try graph.makeTestTempDir(allocator, "f20_1_gpu_batch");
+    defer {
+        graph.removeTestDir(allocator, tmp_dir);
+        allocator.free(tmp_dir);
+    }
+
+    var synth = try graph.buildSynthQwen4Bundle(allocator, .{
+        .num_experts = 8,
+        .top_k = 2,
+        .cold_experts_per_layer = 0,
+        .max_loops = 2,
+        .ple_num_shards = 0,
+        .include_steplora = false,
+        .tmp_dir = tmp_dir,
+    });
+    defer {
+        if (synth.amf_file_path) |p| graph.removeTestFile(p);
+        for (synth.ple_paths) |p| graph.removeTestFile(p);
+        synth.deinit(allocator);
+    }
+
+    var target = try graph.GraphModel.loadFromFile(allocator, synth.amf_file_path.?, synth.cfg, .{
+        .max_seq_len = 64,
+        .max_tree_nodes = 16,
+        .startup_canary = false,
+    });
+    defer target.deinit(allocator);
+
+    var eng = try SpecEngine.initWithGraph(allocator, &target, null, .{
+        .mode = .self_recurrent,
+        .max_tree_nodes = 16,
+        .max_draft_depth = 4,
+        .branch_width = 2,
+        .top_k_per_node = 2,
+        .enable_pruning = false,
+        .temperature = 0.0,
+        .enable_gpu_sampler = true,
+    });
+    defer eng.deinit(allocator);
+    try std.testing.expect(eng.gpu_sampler != null);
+
+    const prog_ptr = try allocator.create(grammar_mod.GrammarProgram);
+    defer allocator.destroy(prog_ptr);
+    prog_ptr.* = .{};
+    try grammar_mod.compileJsonSchema(prog_ptr, "{\"type\":\"object\"}");
+
+    // 1. F12.2: token_slices shorter than target.vocabSize() must not panic and must leave trailing words zeroed.
+    var short_slices: [8]?[]const u8 = @splat("x");
+    short_slices[0] = null;
+    short_slices[1] = "{";
+    eng.setConstraints(.{
+        .grammar_program = prog_ptr,
+        .token_slices = &short_slices,
+        .eos_token_ids = &.{0},
+        .sampling = .{ .temperature = 0.0 },
+    });
+    const st_init = prog_ptr.initialState();
+    const mask = eng.fillBitmaskForState(&st_init);
+    try std.testing.expect(grammar_mod.isTokenAllowed(mask, 1));
+    if (mask.len > 1) {
+        for (mask[1..]) |w| try std.testing.expectEqual(@as(u32, 0), w);
+    }
+
+    // 2. F20.1: when grammar_state has empty allowed set, verifyConstrainedGpuBatch restores state & returns error.EmptyAllowedSet!
+    const prompt = [_]u32{ 10, 11, 12, 13 };
+    _ = try eng.prefill(&prompt, null);
+    eng.draft_tree.reset(10);
+    const vr = try eng.target.verifyTree(&.{10}, &.{4}, &.{1}, 4);
+    _ = vr;
+    const empty_rejected: grammar_mod.GrammarState = .{ .stack_count = 0, .can_accept_eof = false, .dropped_stacks = 7 };
+    eng.grammar_state = empty_rejected;
+    eng.node_grammar_states[0] = empty_rejected;
+    eng.node_grammar_valid[0] = true;
+
+    var out_toks: [4]u32 = @splat(999);
+    try std.testing.expectError(
+        error.EmptyAllowedSet,
+        eng.verifyConstrainedGpuBatch(1, .{ .temperature = 0.0 }, null, &out_toks),
+    );
+    try std.testing.expectEqual(@as(u32, 7), eng.grammar_state.dropped_stacks);
+    try std.testing.expectEqual(@as(u32, 999), out_toks[0]);
 }

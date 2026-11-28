@@ -1782,7 +1782,8 @@ pub const DraftHead = struct {
         if (tokens.len == 0) return error.InvalidArgument;
         if (tokens.len > self.max_tree_slots) return error.BatchTooLarge;
         const m: u32 = @intCast(tokens.len);
-        if (base_pos + m > self.max_seq_len) return error.PositionOutOfRange;
+        const end_pos = std.math.add(u64, base_pos, m) catch return error.PositionOutOfRange;
+        if (end_pos > self.max_seq_len) return error.PositionOutOfRange;
         if (top_k > MAX_DRAFT_TOP_K) return error.InvalidArgument;
 
         for (tokens, 0..) |tid, i| {
@@ -4066,7 +4067,8 @@ pub const SmallDraftModel = struct {
         if (tokens.len == 0) return error.InvalidArgument;
         if (tokens.len > self.model.max_tree_nodes) return error.TreeTooLarge;
         const m: u32 = @intCast(tokens.len);
-        if (base_pos + m > self.model.max_seq_len) return error.PositionOutOfRange;
+        const end_pos = std.math.add(u64, base_pos, m) catch return error.PositionOutOfRange;
+        if (end_pos > self.model.max_seq_len) return error.PositionOutOfRange;
 
         if (top_k == 0) {
             _ = try self.model.prefillChunk(tokens, base_pos, false);
@@ -4112,9 +4114,10 @@ pub const SmallDraftModel = struct {
         while (off < tokens.len) {
             const take = @min(cap, tokens.len - off);
             const is_last = (off + take == tokens.len);
+            const cur_pos = std.math.add(u32, base_pos, @as(u32, @intCast(off))) catch return error.PositionOutOfRange;
             try self.syncAccepted(
                 tokens[off .. off + take],
-                base_pos + @as(u32, @intCast(off)),
+                cur_pos,
                 if (is_last) top_k else 0,
             );
             off += take;
@@ -7156,6 +7159,8 @@ test "D4 SmallDraftModel loads standalone Qwen3 draft, prefills, seeds L1 chain,
 
     // Invalid forward rewind must fail explicitly.
     try std.testing.expectError(error.InvalidArgument, sd.rewindKvLen(8));
+    // L9: base_pos + count overflow in u32 must fail with PositionOutOfRange, never wrap/panic.
+    try std.testing.expectError(error.PositionOutOfRange, sd.syncAccepted(&[_]u32{ 1, 2 }, std.math.maxInt(u32) - 1, 1));
 }
 
 pub fn buildSyntheticTargetBf16ForTest(allocator: std.mem.Allocator, cfg: qwen3.ModelConfig, seed: u64) ![]u8 {

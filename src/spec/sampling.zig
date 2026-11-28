@@ -100,7 +100,7 @@ pub const SamplingParams = struct {
         if (!std.math.isFinite(self.min_p) or self.min_p < 0.0 or self.min_p > 1.0) {
             return error.InvalidMinP;
         }
-        if (!std.math.isFinite(self.repetition_penalty) or !(self.repetition_penalty > 0.0)) {
+        if (!std.math.isFinite(self.repetition_penalty) or self.repetition_penalty < 1e-4) {
             return error.InvalidRepetitionPenalty;
         }
         if (!std.math.isFinite(self.presence_penalty) or !std.math.isFinite(self.frequency_penalty)) {
@@ -193,6 +193,13 @@ fn extractRandom(rng_or_random: anytype) std.Random {
     return rng_or_random.random();
 }
 
+inline fn clampFiniteLogit(v: f64) f32 {
+    const max_f32: f64 = @floatCast(std.math.floatMax(f32));
+    if (v >= max_f32) return std.math.floatMax(f32);
+    if (v <= -max_f32) return -std.math.floatMax(f32);
+    return @floatCast(v);
+}
+
 /// Applies sparse `logit_bias` and `seen_frequencies` penalties + `allowed_token_mask`
 /// into `out_logits[0..logits.len]`, returning the maximum finite modified logit.
 pub fn prepareConstrainedLogits(
@@ -242,32 +249,39 @@ pub fn prepareConstrainedLogits(
         }
         const cur = out_logits[lb.token_id];
         if (cur == -std.math.inf(f32)) continue;
-        if (lb.bias <= -100.0) {
-            // OpenAI `-100` bias convention bans the token (unless it ends up the sole fallback,
-            // `-100.0` shifts relative probability by `e^-100`).
-            out_logits[lb.token_id] = if (std.math.isInf(lb.bias)) -std.math.inf(f32) else cur + lb.bias;
+        if (std.math.isInf(lb.bias)) {
+            // Explicit `-Inf` bias bans the token.
+            out_logits[lb.token_id] = -std.math.inf(f32);
         } else {
-            out_logits[lb.token_id] = cur + lb.bias;
+            out_logits[lb.token_id] = clampFiniteLogit(@as(f64, cur) + @as(f64, lb.bias));
         }
     }
 
     // Sparse repetition, frequency, and presence penalties (`O(seen_frequencies.len)`).
     if (params.hasPenalties()) {
+        if (!std.math.isFinite(params.presence_penalty) or !std.math.isFinite(params.frequency_penalty)) {
+            return error.InvalidLogits;
+        }
+        if (!std.math.isFinite(params.repetition_penalty) or !(params.repetition_penalty > 0.0)) {
+            return error.InvalidRepetitionPenalty;
+        }
+        const rep: f64 = @as(f64, params.repetition_penalty);
         for (seen_frequencies) |entry| {
             if (entry.count == 0 or entry.token_id >= vocab_size) continue;
-            var cur = out_logits[entry.token_id];
-            if (!std.math.isFinite(cur)) continue;
+            const cur_f32 = out_logits[entry.token_id];
+            if (!std.math.isFinite(cur_f32)) continue;
 
+            var cur: f64 = @as(f64, cur_f32);
             if (params.repetition_penalty != 1.0) {
                 if (cur > 0.0) {
-                    cur /= params.repetition_penalty;
+                    cur /= rep;
                 } else {
-                    cur *= params.repetition_penalty;
+                    cur *= rep;
                 }
             }
-            const freq_term = params.frequency_penalty * @as(f32, @floatFromInt(entry.count));
-            cur -= (freq_term + params.presence_penalty);
-            out_logits[entry.token_id] = cur;
+            const freq_term = @as(f64, params.frequency_penalty) * @as(f64, @floatFromInt(entry.count));
+            cur -= (freq_term + @as(f64, params.presence_penalty));
+            out_logits[entry.token_id] = clampFiniteLogit(cur);
         }
     }
 
@@ -897,4 +911,48 @@ test "StopHoldback emits non-matching bytes with zero delay, resolves overlaps, 
     try std.testing.expectEqualStrings("ok", col.slice());
     try hold.flush(&col, Collector.emit);
     try std.testing.expectEqualStrings("ok</to", col.slice());
+}
+
+test "F20.2 Appendix A.6 repetition_penalty validation and finite logit clamping prevent NaN logprobs" {
+    // 1. Appendix A.6 repro: repetition_penalty < 1e-4 rejected explicitly by validate().
+    const bad_params = SamplingParams{
+        .temperature = 1.0,
+        .repetition_penalty = 1e-38,
+        .logprobs = true,
+    };
+    try std.testing.expectError(error.InvalidRepetitionPenalty, bad_params.validate());
+
+    var logits = [_]f32{ 4.0, 1.0, 0.5, -1.0 };
+    var work: [4]f32 = undefined;
+    var cands: [4]u32 = undefined;
+    var tracker = DefaultPenaltyTracker.init();
+    tracker.recordToken(0);
+    var prng = std.Random.DefaultPrng.init(99);
+
+    try std.testing.expectError(
+        error.InvalidRepetitionPenalty,
+        sampleToken(f32, &logits, bad_params, tracker.activeEntries(), &prng, .{
+            .logits_f32 = &work,
+            .cand_ids = &cands,
+        }),
+    );
+
+    // 2. Minimum valid repetition_penalty = 1e-4 + extreme positive logits + huge logit_bias clamp cleanly to finite f32 (never +Inf / NaN).
+    const extreme_logits = [_]f32{ 3.0e38, 1.0, 0.5, -3.0e38 };
+    const out = try sampleToken(f32, &extreme_logits, .{
+        .temperature = 1.0,
+        .repetition_penalty = 1e-4,
+        .logit_bias = &.{.{ .token_id = 0, .bias = 2.0e38 }},
+        .logprobs = true,
+        .top_logprobs = 2,
+    }, tracker.activeEntries(), &prng, .{
+        .logits_f32 = &work,
+        .cand_ids = &cands,
+    });
+    try std.testing.expect(!std.math.isNan(out.logprob));
+    try std.testing.expect(std.math.isFinite(out.logprob));
+    for (out.top_logprobs[0..out.top_logprobs_len]) |tp| {
+        try std.testing.expect(!std.math.isNan(tp.logprob));
+        try std.testing.expect(std.math.isFinite(tp.logprob));
+    }
 }

@@ -27,6 +27,7 @@ pub const MAX_TOTAL_ATTACHMENTS: usize = 256;
 pub const DEFAULT_TEXT_POOL_BYTES: usize = 512 * 1024;
 pub const DEFAULT_PROMPT_BUF_BYTES: usize = 512 * 1024;
 pub const DEFAULT_LINE_BUF_BYTES: usize = 64 * 1024;
+pub const MAX_PIPED_INPUT_BYTES: usize = 16 * 1024 * 1024;
 
 pub const Error = std.mem.Allocator.Error || vmstat.Error || prefix_cache.Error || error{
     InvalidCliArgument,
@@ -34,6 +35,7 @@ pub const Error = std.mem.Allocator.Error || vmstat.Error || prefix_cache.Error 
     HistoryFull,
     TextPoolFull,
     PromptTooLarge,
+    InputTooLarge,
     AttachmentLimitExceeded,
     EmptyAttachmentPath,
     NoTurnToRetry,
@@ -614,9 +616,18 @@ pub const ChatSession = struct {
     prompt_buf: []u8,
 
     pub fn init(allocator: std.mem.Allocator, cfg: ChatConfig) Error!ChatSession {
-        const text_pool = try allocator.alloc(u8, DEFAULT_TEXT_POOL_BYTES);
+        return initWithCapacities(allocator, cfg, DEFAULT_TEXT_POOL_BYTES, DEFAULT_PROMPT_BUF_BYTES);
+    }
+
+    pub fn initWithCapacities(
+        allocator: std.mem.Allocator,
+        cfg: ChatConfig,
+        text_pool_bytes: usize,
+        prompt_buf_bytes: usize,
+    ) Error!ChatSession {
+        const text_pool = try allocator.alloc(u8, text_pool_bytes);
         errdefer allocator.free(text_pool);
-        const prompt_buf = try allocator.alloc(u8, DEFAULT_PROMPT_BUF_BYTES);
+        const prompt_buf = try allocator.alloc(u8, prompt_buf_bytes);
 
         var session: ChatSession = .{
             .cfg = cfg,
@@ -1486,6 +1497,107 @@ pub const InteractiveLineEditor = struct {
 // Scrolling Terminal REPL & Non-Interactive `stdin` Pipe Entry Point
 // ---------------------------------------------------------------------------
 
+var g_repl_tty_fd: std.atomic.Value(std.c.fd_t) = .init(-1);
+var g_repl_out_fd: std.atomic.Value(std.c.fd_t) = .init(-1);
+var g_repl_has_termios: std.atomic.Value(u8) = .init(0);
+var g_repl_stop_signal: std.atomic.Value(c_int) = .init(0);
+var g_repl_orig_termios: std.c.termios = undefined;
+
+fn handleReplTermSignal(sig: std.c.SIG) callconv(.c) void {
+    const sig_num: c_int = @intCast(@backingInt(sig));
+    g_repl_stop_signal.store(sig_num, .release);
+    if (g_repl_has_termios.load(.acquire) != 0) {
+        const in_fd = g_repl_tty_fd.load(.monotonic);
+        if (in_fd >= 0) {
+            _ = std.c.tcsetattr(in_fd, .NOW, &g_repl_orig_termios);
+        }
+        const out_fd = g_repl_out_fd.load(.monotonic);
+        if (out_fd >= 0) {
+            const seq = "\x1b[0m\n";
+            _ = std.c.write(out_fd, seq.ptr, seq.len);
+        }
+    }
+}
+
+const ReplSignalGuard = struct {
+    installed_int: bool = false,
+    installed_term: bool = false,
+    installed_hup: bool = false,
+    old_int: std.c.Sigaction = undefined,
+    old_term: std.c.Sigaction = undefined,
+    old_hup: std.c.Sigaction = undefined,
+
+    fn installOne(sig: std.c.SIG, new_sa: *const std.c.Sigaction, old_sa: *std.c.Sigaction) bool {
+        var cur: std.c.Sigaction = undefined;
+        if (std.c.sigaction(sig, null, &cur) == 0 and cur.handler.handler == std.c.SIG.IGN) {
+            return false;
+        }
+        return std.c.sigaction(sig, new_sa, old_sa) == 0;
+    }
+
+    fn enter(in_fd: std.c.fd_t, out_fd: std.c.fd_t, orig_termios: std.c.termios) ReplSignalGuard {
+        g_repl_stop_signal.store(0, .release);
+        g_repl_orig_termios = orig_termios;
+        g_repl_tty_fd.store(in_fd, .monotonic);
+        g_repl_out_fd.store(out_fd, .monotonic);
+        g_repl_has_termios.store(1, .release);
+
+        const sa = std.c.Sigaction{
+            .handler = .{ .handler = handleReplTermSignal },
+            .mask = std.mem.zeroes(std.c.sigset_t),
+            .flags = 0,
+        };
+        var g: ReplSignalGuard = .{};
+        g.installed_int = installOne(std.c.SIG.INT, &sa, &g.old_int);
+        g.installed_term = installOne(std.c.SIG.TERM, &sa, &g.old_term);
+        g.installed_hup = installOne(std.c.SIG.HUP, &sa, &g.old_hup);
+        return g;
+    }
+
+    fn leave(self: *ReplSignalGuard) void {
+        if (self.installed_int) _ = std.c.sigaction(std.c.SIG.INT, &self.old_int, null);
+        if (self.installed_term) _ = std.c.sigaction(std.c.SIG.TERM, &self.old_term, null);
+        if (self.installed_hup) _ = std.c.sigaction(std.c.SIG.HUP, &self.old_hup, null);
+        g_repl_has_termios.store(0, .release);
+        g_repl_tty_fd.store(-1, .monotonic);
+        g_repl_out_fd.store(-1, .monotonic);
+    }
+};
+
+fn readPipedStdinAlloc(
+    allocator: std.mem.Allocator,
+    in_fd: std.c.fd_t,
+    max_bytes: usize,
+) Error![]u8 {
+    var list: std.ArrayList(u8) = .empty;
+    errdefer list.deinit(allocator);
+
+    var chunk: [16384]u8 = undefined;
+    while (true) {
+        if (list.items.len >= max_bytes) {
+            var probe: [1]u8 = undefined;
+            const rc = std.c.read(in_fd, &probe, 1);
+            if (rc < 0) {
+                if (std.c.errno(rc) == .INTR) continue;
+                return error.ReadFailed;
+            }
+            if (rc == 0) break;
+            return error.InputTooLarge;
+        }
+        const avail = max_bytes - list.items.len;
+        const want = @min(chunk.len, avail);
+        const rc = std.c.read(in_fd, &chunk, want);
+        if (rc < 0) {
+            if (std.c.errno(rc) == .INTR) continue;
+            return error.ReadFailed;
+        }
+        if (rc == 0) break;
+        const got: usize = @intCast(rc);
+        try list.appendSlice(allocator, chunk[0..got]);
+    }
+    return list.toOwnedSlice(allocator);
+}
+
 /// Runs `aminfer chat` over `in_fd`, `out_fd`, and `err_fd`:
 /// - When `in_fd` is a TTY (`is_interactive == true`), runs the plain scrolling
 ///   line-REPL (`> ` prompt, slash commands, dimmed `<think>`, 1-line summary).
@@ -1511,33 +1623,31 @@ pub fn runReplOrPipe(
         }
     }
 
-    var session = try ChatSession.init(allocator, effective_cfg);
-    defer session.deinit(allocator);
-
     const out_fd_val = out_fd;
     const err_fd_val = err_fd;
     const out_sink = ByteSink.fromFd(&out_fd_val);
     const err_sink = ByteSink.fromFd(&err_fd_val);
 
-    const line_buf = try allocator.alloc(u8, DEFAULT_LINE_BUF_BYTES);
-    defer allocator.free(line_buf);
-
     if (!is_interactive) {
-        // Non-interactive `stdin` pipe mode: read entire stdin up to EOF.
-        var total: usize = 0;
-        while (total < line_buf.len) {
-            const rc = std.c.read(in_fd, line_buf[total..].ptr, line_buf.len - total);
-            if (rc < 0) {
-                if (std.c.errno(rc) == .INTR) continue;
-                return error.ReadFailed;
-            }
-            if (rc == 0) break;
-            total += @intCast(rc);
-        }
-        const piped = line_buf[0..total];
+        // Non-interactive `stdin` pipe mode: read entire stdin dynamically up to `MAX_PIPED_INPUT_BYTES`.
+        const piped = try readPipedStdinAlloc(allocator, in_fd, MAX_PIPED_INPUT_BYTES);
+        defer allocator.free(piped);
+
+        const extra_pad: usize = 64 * 1024;
+        const pool_cap = @max(DEFAULT_TEXT_POOL_BYTES, piped.len + extra_pad);
+        const prompt_cap = @max(DEFAULT_PROMPT_BUF_BYTES, piped.len + extra_pad);
+        var session = try ChatSession.initWithCapacities(allocator, effective_cfg, pool_cap, prompt_cap);
+        defer session.deinit(allocator);
+
         try runPipedInput(&session, piped, runner, out_sink, err_sink);
         return;
     }
+
+    var session = try ChatSession.init(allocator, effective_cfg);
+    defer session.deinit(allocator);
+
+    const line_buf = try allocator.alloc(u8, DEFAULT_LINE_BUF_BYTES);
+    defer allocator.free(line_buf);
 
     // Plain scrolling terminal line-REPL (zero alternate screen!).
     const prompt_str = if (effective_cfg.use_color) "\x1b[1;36m>\x1b[0m " else "> ";
@@ -1562,14 +1672,21 @@ pub fn runReplOrPipe(
 
             if (std.c.tcsetattr(in_fd, .NOW, &edit_termios) == 0) {
                 defer _ = std.c.tcsetattr(in_fd, .NOW, &orig_termios);
+                var sig_guard = ReplSignalGuard.enter(in_fd, out_fd, orig_termios);
+                defer sig_guard.leave();
+
                 var editor: InteractiveLineEditor = .{ .line_buf = line_buf };
                 var read_buf: [256]u8 = undefined;
 
                 try out_sink.writeAll(prompt_str);
                 while (true) {
+                    if (g_repl_stop_signal.load(.acquire) != 0) return;
                     const rc = std.c.read(in_fd, read_buf[0..].ptr, read_buf.len);
                     if (rc < 0) {
-                        if (std.c.errno(rc) == .INTR) continue;
+                        if (std.c.errno(rc) == .INTR) {
+                            if (g_repl_stop_signal.load(.acquire) != 0) return;
+                            continue;
+                        }
                         return error.ReadFailed;
                     }
                     if (rc == 0) {
@@ -2383,4 +2500,71 @@ test "M9.5 chat_repl parses /lora commands and dispatches onLoraCommandFn" {
     try std.testing.expectEqual(LineOutcome.continued, try sess.handleInteractiveLine("/lora off", runner, out_b.sink(), info_b.sink()));
     try std.testing.expectEqualStrings("[LoRA disabled (base model)]\n", info_b.written());
     try std.testing.expectEqualStrings("base", mock.active);
+}
+
+test "F25 piped stdin reads > 64 KiB dynamically without truncation and rejects > max_bytes with InputTooLarge" {
+    const gpa = std.testing.allocator;
+
+    // 1. 96 KiB piped input (> DEFAULT_LINE_BUF_BYTES = 64 KiB) delivered across pipe without truncation!
+    var in_pipe: [2]std.c.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.pipe(&in_pipe));
+    defer _ = std.c.close(in_pipe[0]);
+    var out_pipe: [2]std.c.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.pipe(&out_pipe));
+    defer _ = std.c.close(out_pipe[0]);
+    var err_pipe: [2]std.c.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.pipe(&err_pipe));
+    defer _ = std.c.close(err_pipe[0]);
+
+    const big_len: usize = 96 * 1024;
+    const payload = try gpa.alloc(u8, big_len);
+    defer gpa.free(payload);
+    @memset(payload, 'A');
+    payload[big_len - 1] = 'Z';
+
+    const Writer = struct {
+        fd: std.c.fd_t,
+        data: []const u8,
+        fn run(w: @This()) void {
+            var off: usize = 0;
+            while (off < w.data.len) {
+                const rc = std.c.write(w.fd, w.data[off..].ptr, w.data.len - off);
+                if (rc <= 0) break;
+                off += @intCast(rc);
+            }
+            _ = std.c.close(w.fd);
+        }
+    };
+    const wt = try std.Thread.spawn(.{}, Writer.run, .{Writer{ .fd = in_pipe[1], .data = payload }});
+
+    const CapRunner = struct {
+        seen_len: usize = 0,
+        last_byte: u8 = 0,
+        fn runTurn(ctx: *anyopaque, req: *const TurnRequest, stream: *TurnStream) Error!TurnStats {
+            const s: *@This() = @ptrCast(@alignCast(ctx));
+            s.seen_len = req.user_message.len;
+            s.last_byte = req.user_message[req.user_message.len - 1];
+            try stream.emitText("ok");
+            return .{ .prompt_tokens = 1, .generated_tokens = 1, .prefix_hit_tokens = 0, .ttft_ns = 1, .total_ns = 2 };
+        }
+    };
+    var cap_r: CapRunner = .{};
+    var cfg = try ChatConfig.parseArgs(&.{});
+    cfg.show_stats = false;
+    try runReplOrPipe(gpa, cfg, .{ .ctx = &cap_r, .runTurnFn = CapRunner.runTurn }, in_pipe[0], out_pipe[1], err_pipe[1], false);
+    wt.join();
+    _ = std.c.close(out_pipe[1]);
+    _ = std.c.close(err_pipe[1]);
+
+    try std.testing.expectEqual(big_len, cap_r.seen_len);
+    try std.testing.expectEqual(@as(u8, 'Z'), cap_r.last_byte);
+
+    // 2. readPipedStdinAlloc returns error.InputTooLarge when input exceeds explicit bound.
+    var over_pipe: [2]std.c.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.pipe(&over_pipe));
+    defer _ = std.c.close(over_pipe[0]);
+    const tiny = "123456789";
+    _ = std.c.write(over_pipe[1], tiny.ptr, tiny.len);
+    _ = std.c.close(over_pipe[1]);
+    try std.testing.expectError(error.InputTooLarge, readPipedStdinAlloc(gpa, over_pipe[0], 8));
 }

@@ -160,10 +160,14 @@ pub fn clearBitmask(mask: []u32, vocab_size: usize) void {
 }
 
 pub fn allowAllTokens(mask: []u32, vocab_size: usize) void {
-    const words = bitmaskWordCount(vocab_size);
-    if (words == 0 or mask.len < words) return;
+    @memset(mask, 0);
+    if (mask.len == 0 or vocab_size == 0) return;
+    const max_mask_bits = std.math.mul(usize, mask.len, 32) catch std.math.maxInt(usize);
+    const eff_vocab = @min(vocab_size, max_mask_bits);
+    const words = bitmaskWordCount(eff_vocab);
+    if (words == 0) return;
     @memset(mask[0..words], std.math.maxInt(u32));
-    const rem: u5 = @intCast(vocab_size & 31);
+    const rem: u5 = @intCast(eff_vocab & 31);
     if (rem != 0) {
         mask[words - 1] = (@as(u32, 1) << rem) - 1;
     }
@@ -229,6 +233,7 @@ pub const GrammarState = struct {
     can_accept_eof: bool = false,
     has_plain_ascii_self_loop: bool = false,
     allowed_bytes: ByteSet = ByteSet.empty,
+    dropped_stacks: u32 = 0,
 
     pub inline fn snapshot(self: *const GrammarState) GrammarState {
         return self.*;
@@ -372,7 +377,10 @@ pub const GrammarProgram = struct {
         for (out.stacks[0..out.stack_count]) |*existing| {
             if (existing.eql(st)) return;
         }
-        if (out.stack_count >= MAX_ACTIVE_STACKS) return;
+        if (out.stack_count >= MAX_ACTIVE_STACKS) {
+            out.dropped_stacks +|= 1;
+            return;
+        }
 
         const dst = &out.stacks[out.stack_count];
         dst.depth = st.depth;
@@ -500,6 +508,7 @@ pub const GrammarProgram = struct {
         }
 
         if (next_state.isRejected()) return false;
+        next_state.dropped_stacks +|= state.dropped_stacks;
         state.* = next_state;
         return true;
     }
@@ -772,19 +781,22 @@ pub const VocabIndex = struct {
         state: *const GrammarState,
         out_mask: []u32,
     ) void {
+        @memset(out_mask, 0);
         const words = bitmaskWordCount(self.vocab_size);
-        std.debug.assert(out_mask.len >= words);
+        const active_words = @min(words, out_mask.len);
+        if (active_words == 0) return;
+
+        const max_mask_bits = std.math.mul(usize, out_mask.len, 32) catch std.math.maxInt(usize);
+        const target_vocab_bits = @min(self.vocab_size, max_mask_bits);
 
         const program = program_opt orelse {
-            allowAllTokens(out_mask, self.vocab_size);
+            allowAllTokens(out_mask, target_vocab_bits);
             return;
         };
 
-        @memset(out_mask[0..words], 0);
-
         if (state.can_accept_eof) {
             for (self.eos_tokens[0..self.eos_count]) |eid| {
-                setTokenAllowed(out_mask, eid);
+                if (eid < target_vocab_bits) setTokenAllowed(out_mask, eid);
             }
         }
         if (state.stack_count == 0 or self.nodes.len == 0) return;
@@ -792,7 +804,7 @@ pub const VocabIndex = struct {
         // Fast-path bulk OR when root state has a plain-ASCII-string self-loop.
         const root_plain_loop = state.has_plain_ascii_self_loop;
         if (root_plain_loop) {
-            for (0..words) |w| {
+            for (0..active_words) |w| {
                 out_mask[w] |= self.ascii_string_safe_mask[w];
             }
         }
@@ -836,7 +848,7 @@ pub const VocabIndex = struct {
             if (child_node.token_count > 0) {
                 const tids = self.node_tokens[child_node.first_token .. child_node.first_token + child_node.token_count];
                 for (tids) |tid| {
-                    setTokenAllowed(out_mask, tid);
+                    if (tid < target_vocab_bits) setTokenAllowed(out_mask, tid);
                 }
             }
 
@@ -861,24 +873,25 @@ pub fn fillAllowedTokenBitmaskDirect(
     eos_token_ids: []const u32,
     out_mask: []u32,
 ) void {
+    @memset(out_mask, 0);
     const vocab_size = token_slices.len;
-    const words = bitmaskWordCount(vocab_size);
-    std.debug.assert(out_mask.len >= words);
+    const max_mask_bits = std.math.mul(usize, out_mask.len, 32) catch std.math.maxInt(usize);
+    const target_vocab_bits = @min(vocab_size, max_mask_bits);
+    if (target_vocab_bits == 0) return;
 
     const program = program_opt orelse {
-        allowAllTokens(out_mask, vocab_size);
+        allowAllTokens(out_mask, target_vocab_bits);
         return;
     };
 
-    @memset(out_mask[0..words], 0);
     if (state.can_accept_eof) {
         for (eos_token_ids) |eid| {
-            if (eid < vocab_size) setTokenAllowed(out_mask, eid);
+            if (eid < target_vocab_bits) setTokenAllowed(out_mask, eid);
         }
     }
     if (state.stack_count == 0) return;
 
-    for (token_slices, 0..) |maybe_tok, idx| {
+    for (token_slices[0..target_vocab_bits], 0..) |maybe_tok, idx| {
         const raw = maybe_tok orelse continue;
         if (raw.len == 0) continue;
         if (!state.allowed_bytes.contains(raw[0])) continue;
@@ -3202,4 +3215,98 @@ test "C22 VocabIndex 248,077-token bitmask (Qwen3.8 scale), O(1) branch snapshot
 
     malloc_zone_statistics(null, &m_after);
     try std.testing.expectEqual(m_before.size_allocated, m_after.size_allocated);
+}
+
+test "F12.2 Appendix A.3 VocabIndex.fillAllowedTokenBitmask zeros trailing words and clamps oversized vi.vocab_size safely" {
+    const gpa = std.testing.allocator;
+    var prog: GrammarProgram = undefined;
+    try compileJsonSchema(&prog, "{\"type\":\"object\"}");
+
+    // 1. Appendix A.3: vi.vocab_size = 32 (1 word), out_mask covers 64 tokens (2 words).
+    var slices32: [32]?[]const u8 = @splat("x");
+    slices32[0] = "{";
+    var vi32 = try VocabIndex.initFromSlices(gpa, &slices32, &.{});
+    defer vi32.deinit(gpa);
+
+    var mask64: [2]u32 = .{ 0xFFFF_FFFF, 0xFFFF_FFFF };
+    var st = prog.initialState();
+    vi32.fillAllowedTokenBitmask(&prog, &st, &mask64);
+    try std.testing.expectEqual(@as(u32, 0x0000_0001), mask64[0]);
+    try std.testing.expectEqual(@as(u32, 0), mask64[1]);
+
+    // Also when program == null: trailing word for padded OOV tokens must stay 0!
+    @memset(&mask64, 0xFFFF_FFFF);
+    vi32.fillAllowedTokenBitmask(null, &st, &mask64);
+    try std.testing.expectEqual(@as(u32, 0xFFFF_FFFF), mask64[0]);
+    try std.testing.expectEqual(@as(u32, 0), mask64[1]);
+
+    // 2. vi.vocab_size = 96 (3 words) with out_mask covering 64 tokens (2 words): no panic, no OOB write!
+    var slices96: [96]?[]const u8 = @splat("x");
+    slices96[0] = "{";
+    slices96[80] = "{";
+    var vi96 = try VocabIndex.initFromSlices(gpa, &slices96, &.{});
+    defer vi96.deinit(gpa);
+
+    @memset(&mask64, 0xFFFF_FFFF);
+    vi96.fillAllowedTokenBitmask(&prog, &st, &mask64);
+    try std.testing.expect(isTokenAllowed(&mask64, 0));
+    try std.testing.expect(!isTokenAllowed(&mask64, 1));
+
+    @memset(&mask64, 0);
+    vi96.fillAllowedTokenBitmask(null, &st, &mask64);
+    try std.testing.expectEqual(@as(u32, 0xFFFF_FFFF), mask64[0]);
+    try std.testing.expectEqual(@as(u32, 0xFFFF_FFFF), mask64[1]);
+
+    // 3. Direct bitmask helper matches both 32-into-64 and 96-into-64 safely.
+    @memset(&mask64, 0xFFFF_FFFF);
+    fillAllowedTokenBitmaskDirect(&prog, &st, &slices32, &.{}, &mask64);
+    try std.testing.expectEqual(@as(u32, 0x0000_0001), mask64[0]);
+    try std.testing.expectEqual(@as(u32, 0), mask64[1]);
+
+    @memset(&mask64, 0xFFFF_FFFF);
+    fillAllowedTokenBitmaskDirect(&prog, &st, &slices96, &.{}, &mask64);
+    try std.testing.expect(isTokenAllowed(&mask64, 0));
+}
+
+test "F12.1 VocabIndex.initFromTokenizer indexes sparse token IDs >= tokenCount" {
+    const gpa = std.testing.allocator;
+    const MockTok = struct {
+        pub fn vocabSize(_: *const @This()) usize {
+            return 27;
+        }
+        pub fn isSpecialToken(_: *const @This(), id: u32) bool {
+            return id == 25;
+        }
+        pub fn tokenBytes(_: *const @This(), id: u32) error{UnknownTokenId}![]const u8 {
+            return switch (id) {
+                0 => "{",
+                26 => "}",
+                else => error.UnknownTokenId,
+            };
+        }
+    };
+    const tok = MockTok{};
+    var vi = try VocabIndex.initFromTokenizer(gpa, &tok, &.{25});
+    defer vi.deinit(gpa);
+
+    try std.testing.expectEqual(@as(usize, 27), vi.vocab_size);
+    var prog: GrammarProgram = undefined;
+    try compileJsonSchema(&prog, "{\"type\":\"object\"}");
+    var st = prog.initialState();
+    try std.testing.expect(vi.advanceToken(&prog, &st, &tok, 0));
+    var mask: [1]u32 = .{0};
+    vi.fillAllowedTokenBitmask(&prog, &st, &mask);
+    try std.testing.expect(isTokenAllowed(&mask, 26));
+}
+
+test "N3 GrammarState records dropped_stacks when ambiguous branches exceed MAX_ACTIVE_STACKS" {
+    var prog: GrammarProgram = undefined;
+    // 20 ambiguous branches matching 'a' exceed MAX_ACTIVE_STACKS = 16 at initialState.
+    const gbnf =
+        \\root ::= "a" | "a" "b" | "a" "c" | "a" "d" | "a" "e" | "a" "f" | "a" "g" | "a" "h" | "a" "i" | "a" "j" | "a" "k" | "a" "l" | "a" "m" | "a" "n" | "a" "o" | "a" "p" | "a" "q" | "a" "r" | "a" "s" | "a" "t"
+    ;
+    try compileGbnf(&prog, gbnf);
+    const st = prog.initialState();
+    try std.testing.expectEqual(@as(u8, MAX_ACTIVE_STACKS), st.stack_count);
+    try std.testing.expect(st.dropped_stacks > 0);
 }

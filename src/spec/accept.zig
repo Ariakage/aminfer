@@ -489,12 +489,16 @@ pub const GrammarTreeAdapter = struct {
             grammar.fillAllowedTokenBitmaskDirect(
                 self.program,
                 self.state,
-                slices[0..vocab_size],
+                slices[0..@min(slices.len, vocab_size)],
                 self.eos_token_ids,
                 mask_out,
             );
         } else {
             grammar.allowAllTokens(mask_out, vocab_size);
+        }
+        const rem: u5 = @intCast(vocab_size & 31);
+        if (rem != 0 and words > 0) {
+            mask_out[words - 1] &= (@as(u32, 1) << rem) - 1;
         }
         return mask_out;
     }
@@ -748,7 +752,8 @@ pub fn verifyConstrained(
         const residual = scratch.logits_f32[0..vocab_size];
         const max_l = try sampling.prepareConstrainedLogits(LogitT, row_logits, step_params, seen, residual);
         const inv_t: f64 = 1.0 / @as(f64, step_params.temperature);
-        const max_f64: f64 = @as(f64, max_l);
+        const max_f32: f64 = @floatCast(std.math.floatMax(f32));
+        const max_f64: f64 = std.math.clamp(@as(f64, max_l), -max_f32, max_f32);
 
         // Build target distribution `p_target` applying `top_k`, `min_p`, `top_p`, and `allowed_token_mask`.
         var max_exp: f64 = 0.0;
@@ -756,11 +761,12 @@ pub fn verifyConstrained(
         for (0..vocab_size) |idx| {
             const l = residual[idx];
             if (l == max_l) argmax_id = idx;
-            if (l == -std.math.inf(f32)) {
+            if (l == -std.math.inf(f32) or !std.math.isFinite(l)) {
                 residual[idx] = 0.0;
                 continue;
             }
-            const shifted = (@as(f64, l) - max_f64) * inv_t;
+            const clamped_l = std.math.clamp(@as(f64, l), -max_f32, max_f32);
+            const shifted = (clamped_l - max_f64) * inv_t;
             const e: f64 = if (shifted < -80.0) 0.0 else @exp(shifted);
             residual[idx] = @floatCast(e);
             if (e > max_exp) max_exp = e;
@@ -1599,4 +1605,84 @@ test "C22 speculative tree branch propagation and verifyConstrained enforce json
     const emp4 = @as(f64, @floatFromInt(counts[4])) / @as(f64, rounds);
     const tvd = 0.5 * (@abs(emp3 - p3_exact) + @abs(emp4 - p4_exact));
     try std.testing.expect(tvd < 0.015);
+}
+
+test "F12.2 GrammarTreeAdapter.fillBitmask clamps mismatched token_slices and F20.2 verifyConstrained handles extreme logits without NaN" {
+    var prog: grammar.GrammarProgram = undefined;
+    try grammar.compileJsonSchema(&prog, "{\"type\":\"object\"}");
+    var st = prog.initialState();
+
+    // 1. slices.len = 32 < vocab_size = 64 AND slices.len = 96 > vocab_size = 64
+    var slices32: [32]?[]const u8 = @splat("x");
+    slices32[0] = "{";
+    var slices96: [96]?[]const u8 = @splat("x");
+    slices96[0] = "{";
+    var mask_scratch: [4]u32 = .{ 0xFFFF_FFFF, 0xFFFF_FFFF, 0xFFFF_FFFF, 0xFFFF_FFFF };
+
+    const ga32 = GrammarTreeAdapter{
+        .program = &prog,
+        .state = &st,
+        .token_slices = &slices32,
+        .mask_scratch = &mask_scratch,
+    };
+    const m64_from_32 = try ga32.fillBitmask(64);
+    try std.testing.expectEqual(@as(usize, 2), m64_from_32.len);
+    try std.testing.expectEqual(@as(u32, 0x0000_0001), m64_from_32[0]);
+    try std.testing.expectEqual(@as(u32, 0), m64_from_32[1]);
+
+    const ga96 = GrammarTreeAdapter{
+        .program = &prog,
+        .state = &st,
+        .token_slices = &slices96,
+        .mask_scratch = &mask_scratch,
+    };
+    const m50_from_96 = try ga96.fillBitmask(50);
+    try std.testing.expectEqual(@as(usize, 2), m50_from_96.len);
+    try std.testing.expectEqual(@as(u32, 0x0000_0001), m50_from_96[0]);
+    try std.testing.expectEqual(@as(u32, 0), m50_from_96[1]);
+
+    // 2. Huge logits + bias + small repetition_penalty = 1e-4 must not produce spurious EmptyAllowedSet!
+    var tree = tree_mod.DraftTree(16).init(0);
+    _ = tree.insertChild(0, 0, 0.9, .l2).?;
+    slices32[1] = "}";
+    const target_logits = [_]f32{
+        3.0e38, 1.0,    0.5, -1.0,
+        1.0,    3.0e38, 0.5, -1.0,
+    };
+    var pt = sampling.DefaultPenaltyTracker.init();
+    pt.recordToken(0);
+    var work_logits: [4]f32 = undefined;
+    var cand_ids: [4]u32 = undefined;
+    var out_nodes: [4]u16 = undefined;
+    var out_toks: [4]u32 = undefined;
+    var prng = std.Random.DefaultPrng.init(123);
+
+    var st2 = prog.initialState();
+    const ga_tiny = GrammarTreeAdapter{
+        .program = &prog,
+        .state = &st2,
+        .token_slices = slices32[0..4],
+        .mask_scratch = &mask_scratch,
+    };
+    const res = try verifyConstrained(
+        16,
+        f32,
+        &tree,
+        &target_logits,
+        4,
+        null,
+        .{
+            .temperature = 1.0,
+            .repetition_penalty = 1e-4,
+            .logit_bias = &.{.{ .token_id = 0, .bias = 2.0e38 }},
+        },
+        &pt,
+        ga_tiny,
+        prng.random(),
+        .{ .logits_f32 = &work_logits, .cand_ids = &cand_ids },
+        &out_nodes,
+        &out_toks,
+    );
+    try std.testing.expect(res.emitted_token_count >= 1);
+    try std.testing.expectEqual(@as(u32, 0), out_toks[0]);
 }

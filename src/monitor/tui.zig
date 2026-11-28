@@ -418,51 +418,156 @@ pub const ServerTelemetry = struct {
     }
 };
 
-fn findJsonValueAfterKey(json: []const u8, key: []const u8) ?[]const u8 {
-    var search_pos: usize = 0;
-    while (search_pos + key.len + 2 < json.len) {
-        const quote_idx = std.mem.indexOfScalarPos(u8, json, search_pos, '"') orelse return null;
-        if (quote_idx + 1 + key.len >= json.len) return null;
-        const candidate = json[quote_idx + 1 .. quote_idx + 1 + key.len];
-        const close_quote_pos = quote_idx + 1 + key.len;
-        if (std.mem.eql(u8, candidate, key) and json[close_quote_pos] == '"') {
-            const after = std.mem.trimStart(u8, json[close_quote_pos + 1 ..], " \t\r\n");
-            if (after.len > 0 and after[0] == ':') {
-                return std.mem.trimStart(u8, after[1..], " \t\r\n");
-            }
+fn isControlCodepoint(cp: u21) bool {
+    return cp < 0x20 or cp == 0x7F or (cp >= 0x80 and cp <= 0x9F);
+}
+
+/// Strips C0 (`< 0x20`), DEL (`0x7F`), and C1 (`U+0080..U+009F`) control characters
+/// plus invalid UTF-8 bytes from untrusted `/health` strings while preserving valid UTF-8.
+pub fn sanitizeDisplayString(input: []const u8, out_buf: []u8) []const u8 {
+    var out_len: usize = 0;
+    var i: usize = 0;
+    while (i < input.len) {
+        const seq_len = std.unicode.utf8ByteSequenceLength(input[i]) catch {
+            i += 1;
+            continue;
+        };
+        if (i + seq_len > input.len) break;
+        const cp = std.unicode.utf8Decode(input[i .. i + seq_len]) catch {
+            i += 1;
+            continue;
+        };
+        if (!isControlCodepoint(cp)) {
+            if (out_len + seq_len > out_buf.len) break;
+            @memcpy(out_buf[out_len .. out_len + seq_len], input[i .. i + seq_len]);
+            out_len += seq_len;
         }
-        search_pos = quote_idx + 1;
+        i += seq_len;
+    }
+    return out_buf[0..out_len];
+}
+
+fn findJsonValueAfterKey(json: []const u8, key: []const u8) ?[]const u8 {
+    var i: usize = 0;
+    while (i < json.len and std.ascii.isWhitespace(json[i])) : (i += 1) {}
+    if (i >= json.len or json[i] != '{') return null;
+    i += 1;
+    var depth: usize = 1;
+    var expecting_key = true;
+    while (i < json.len) {
+        while (i < json.len and std.ascii.isWhitespace(json[i])) : (i += 1) {}
+        if (i >= json.len) return null;
+        const c = json[i];
+        if (c == '{' or c == '[') {
+            depth += 1;
+            i += 1;
+            expecting_key = (c == '{');
+            continue;
+        }
+        if (c == '}' or c == ']') {
+            depth -= 1;
+            i += 1;
+            if (depth == 0) return null;
+            expecting_key = false;
+            continue;
+        }
+        if (c == ',') {
+            i += 1;
+            expecting_key = (depth == 1);
+            continue;
+        }
+        if (c == ':') {
+            i += 1;
+            expecting_key = false;
+            continue;
+        }
+        if (c == '"') {
+            const str_start = i + 1;
+            i += 1;
+            var has_escape = false;
+            while (i < json.len) : (i += 1) {
+                if (json[i] == '\\') {
+                    has_escape = true;
+                    i += 1;
+                    if (i >= json.len) return null;
+                    continue;
+                }
+                if (json[i] == '"') break;
+            }
+            if (i >= json.len) return null;
+            const str_end = i;
+            i += 1;
+            if (depth == 1 and expecting_key and !has_escape) {
+                const candidate = json[str_start..str_end];
+                var j = i;
+                while (j < json.len and std.ascii.isWhitespace(json[j])) : (j += 1) {}
+                if (j < json.len and json[j] == ':') {
+                    if (std.mem.eql(u8, candidate, key)) {
+                        return std.mem.trimStart(u8, json[j + 1 ..], " \t\r\n");
+                    }
+                    expecting_key = false;
+                }
+            }
+            continue;
+        }
+        i += 1;
     }
     return null;
+}
+
+fn parseHex4(s: []const u8) ?u16 {
+    if (s.len < 4) return null;
+    return std.fmt.parseInt(u16, s[0..4], 16) catch null;
 }
 
 fn extractJsonString(json: []const u8, key: []const u8, out_buf: []u8) ?[]const u8 {
     const val = findJsonValueAfterKey(json, key) orelse return null;
     if (val.len == 0 or val[0] != '"') return null;
+    var raw_buf: [512]u8 = undefined;
+    var raw_len: usize = 0;
     var i: usize = 1;
-    var out_len: usize = 0;
     while (i < val.len) : (i += 1) {
         const c = val[i];
         if (c == '"') {
-            return out_buf[0..out_len];
+            return sanitizeDisplayString(raw_buf[0..raw_len], out_buf);
         }
-        var decoded: u8 = c;
         if (c == '\\') {
             i += 1;
             if (i >= val.len) return null;
-            decoded = switch (val[i]) {
+            if (val[i] == 'u') {
+                if (i + 4 >= val.len) return null;
+                const cp16 = parseHex4(val[i + 1 .. i + 5]) orelse return null;
+                i += 4;
+                if (isControlCodepoint(@as(u21, cp16))) continue;
+                var ubuf: [4]u8 = undefined;
+                if (std.unicode.utf8Encode(@as(u21, cp16), &ubuf)) |n| {
+                    if (raw_len + n <= raw_buf.len) {
+                        @memcpy(raw_buf[raw_len .. raw_len + n], ubuf[0..n]);
+                        raw_len += n;
+                    }
+                } else |_| {}
+                continue;
+            }
+            const decoded: u8 = switch (val[i]) {
                 '"' => '"',
                 '\\' => '\\',
                 '/' => '/',
                 'n' => '\n',
                 'r' => '\r',
                 't' => '\t',
+                'b' => 0x08,
+                'f' => 0x0c,
                 else => val[i],
             };
+            if (raw_len < raw_buf.len) {
+                raw_buf[raw_len] = decoded;
+                raw_len += 1;
+            }
+            continue;
         }
-        if (out_len < out_buf.len) {
-            out_buf[out_len] = decoded;
-            out_len += 1;
+        if (raw_len < raw_buf.len) {
+            raw_buf[raw_len] = c;
+            raw_len += 1;
         }
     }
     return null;
@@ -672,8 +777,9 @@ pub const Canvas = struct {
     }
 
     pub fn putChar(self: *Canvas, x: u16, y: u16, cp: u21, style: Style) void {
+        const safe_cp: u21 = if (isControlCodepoint(cp)) ' ' else cp;
         self.putCell(x, y, .{
-            .codepoint = cp,
+            .codepoint = safe_cp,
             .fg = style.fg,
             .bg = style.bg,
             .bold = style.bold,
@@ -703,6 +809,10 @@ pub const Canvas = struct {
             };
             if (i + seq_len > text.len) break;
             const cp = std.unicode.utf8Decode(text[i .. i + seq_len]) catch '?';
+            if (isControlCodepoint(cp)) {
+                i += seq_len;
+                continue;
+            }
             self.putChar(cx, y, cp, style);
             cx += 1;
             i += seq_len;
@@ -1883,6 +1993,76 @@ pub fn runCli(allocator: std.mem.Allocator, args: []const []const u8) Error!void
     return run(allocator, cfg, 0, 1);
 }
 
+var g_tui_in_fd: std.atomic.Value(std.c.fd_t) = .init(-1);
+var g_tui_out_fd: std.atomic.Value(std.c.fd_t) = .init(-1);
+var g_tui_has_termios: std.atomic.Value(u8) = .init(0);
+var g_tui_stop_signal: std.atomic.Value(c_int) = .init(0);
+var g_tui_saved_termios: std.c.termios = undefined;
+
+fn handleMonitorTermSignal(sig: std.c.SIG) callconv(.c) void {
+    const sig_num: c_int = @intCast(@backingInt(sig));
+    g_tui_stop_signal.store(sig_num, .release);
+    if (g_tui_has_termios.load(.acquire) != 0) {
+        const in_fd = g_tui_in_fd.load(.monotonic);
+        if (in_fd >= 0) {
+            _ = std.c.tcsetattr(in_fd, .NOW, &g_tui_saved_termios);
+        }
+    }
+    const out_fd = g_tui_out_fd.load(.monotonic);
+    if (out_fd >= 0) {
+        const seq = "\x1b[0m\x1b[?25h\x1b[?1049l";
+        _ = std.c.write(out_fd, seq.ptr, seq.len);
+    }
+}
+
+const MonitorSignalGuard = struct {
+    installed_int: bool = false,
+    installed_term: bool = false,
+    installed_hup: bool = false,
+    old_int: std.c.Sigaction = undefined,
+    old_term: std.c.Sigaction = undefined,
+    old_hup: std.c.Sigaction = undefined,
+
+    fn installOne(sig: std.c.SIG, new_sa: *const std.c.Sigaction, old_sa: *std.c.Sigaction) bool {
+        var cur: std.c.Sigaction = undefined;
+        if (std.c.sigaction(sig, null, &cur) == 0 and cur.handler.handler == std.c.SIG.IGN) {
+            return false;
+        }
+        return std.c.sigaction(sig, new_sa, old_sa) == 0;
+    }
+
+    fn enter(in_fd: std.c.fd_t, out_fd: std.c.fd_t) MonitorSignalGuard {
+        g_tui_stop_signal.store(0, .release);
+        g_tui_in_fd.store(in_fd, .monotonic);
+        g_tui_out_fd.store(out_fd, .monotonic);
+        if (std.c.tcgetattr(in_fd, &g_tui_saved_termios) == 0) {
+            g_tui_has_termios.store(1, .release);
+        } else {
+            g_tui_has_termios.store(0, .release);
+        }
+
+        const sa = std.c.Sigaction{
+            .handler = .{ .handler = handleMonitorTermSignal },
+            .mask = std.mem.zeroes(std.c.sigset_t),
+            .flags = 0,
+        };
+        var g: MonitorSignalGuard = .{};
+        g.installed_int = installOne(std.c.SIG.INT, &sa, &g.old_int);
+        g.installed_term = installOne(std.c.SIG.TERM, &sa, &g.old_term);
+        g.installed_hup = installOne(std.c.SIG.HUP, &sa, &g.old_hup);
+        return g;
+    }
+
+    fn leave(self: *MonitorSignalGuard) void {
+        if (self.installed_int) _ = std.c.sigaction(std.c.SIG.INT, &self.old_int, null);
+        if (self.installed_term) _ = std.c.sigaction(std.c.SIG.TERM, &self.old_term, null);
+        if (self.installed_hup) _ = std.c.sigaction(std.c.SIG.HUP, &self.old_hup, null);
+        g_tui_has_termios.store(0, .release);
+        g_tui_in_fd.store(-1, .monotonic);
+        g_tui_out_fd.store(-1, .monotonic);
+    }
+};
+
 fn restoreTerminalBestEffort(out_fd: std.c.fd_t) void {
     const seq = "\x1b[0m\x1b[?25h\x1b[?1049l";
     var off: usize = 0;
@@ -1968,6 +2148,9 @@ pub fn run(
     }
     try setTimerMs(kq_fd, state.interval_ms);
 
+    var sig_guard = MonitorSignalGuard.enter(in_fd, out_fd);
+    defer sig_guard.leave();
+
     var raw_guard = try telemetry.TtyRawGuard.enter(in_fd);
     defer raw_guard.leave();
 
@@ -1993,11 +2176,16 @@ pub fn run(
     var key_buf: [64]u8 = undefined;
 
     while (true) {
+        if (g_tui_stop_signal.load(.acquire) != 0) return;
         const nev_rc = std.c.kevent64(kq_fd, &empty_ev, 0, &evs, evs.len, std.c.KEVENT.FLAG.NONE, null);
         if (nev_rc < 0) {
-            if (std.c.errno(nev_rc) == .INTR) continue;
+            if (std.c.errno(nev_rc) == .INTR) {
+                if (g_tui_stop_signal.load(.acquire) != 0) return;
+                continue;
+            }
             return error.KqueueFailed;
         }
+        if (g_tui_stop_signal.load(.acquire) != 0) return;
         const nev: usize = @intCast(nev_rc);
         var need_redraw = false;
         var need_sample = false;
@@ -2217,4 +2405,29 @@ test "pollServerHealth parses live loopback HTTP /health JSON without heap alloc
     try std.testing.expectEqual(@as(u32, 2), srv.active_requests);
     try std.testing.expectApproxEqAbs(@as(f64, 142.5), srv.tok_per_s, 0.01);
     try std.testing.expectEqual(@as(u64, 512), srv.prefix_hit_tokens);
+}
+
+test "F25 ServerTelemetry.parseHealthJson and Canvas strip ANSI/OSC/C1 escapes while preserving valid UTF-8" {
+    const gpa = std.testing.allocator;
+    const malicious =
+        "{\"note\":\"\\\"model\\\":\\\"spoofed\\\"\",\"status\":\"ok\",\"model\":\"\x1b[2J\x1b]0;pwned\x07Qwen3.8-\xe4\xb8\xad\xe6\x96\x87\xc2\x9b31m\",\"active_ngram_pack\":\"\x1b[31mrepo\x7f\",\"cluster_mode\":\"\\u001b[1msolo\xc2\x9b2J\"}";
+    const srv = ServerTelemetry.parseHealthJson(malicious, "127.0.0.1:8080");
+    try std.testing.expect(srv.online);
+    try std.testing.expectEqualStrings("[2J]0;pwnedQwen3.8-中文31m", srv.model());
+    try std.testing.expectEqualStrings("[31mrepo", srv.activeNgramPack());
+    try std.testing.expectEqualStrings("[1msolo2J", srv.clusterMode());
+    try std.testing.expect(std.mem.indexOfScalar(u8, srv.model(), 0x1b) == null);
+    try std.testing.expect(std.mem.indexOfScalar(u8, srv.activeNgramPack(), 0x7f) == null);
+
+    // Canvas.putTextClipped also filters C0/DEL/C1 control codepoints cleanly.
+    var canvas = try Canvas.init(gpa, 40, 10);
+    defer canvas.deinit(gpa);
+    const mon_cfg = try MonitorConfig.parseArgs(&.{});
+    const state = try MonitorState.init(mon_cfg);
+    const pal = &state.palette;
+    canvas.clear(pal.main_fg, pal.main_bg);
+    const end_x = canvas.putTextClipped(0, 0, 40, "A\x1b\x7f\xc2\x9bB", .{ .fg = pal.main_fg, .bg = pal.main_bg });
+    try std.testing.expectEqual(@as(u16, 2), end_x);
+    try std.testing.expectEqual(@as(u21, 'A'), canvas.back[0].codepoint);
+    try std.testing.expectEqual(@as(u21, 'B'), canvas.back[1].codepoint);
 }

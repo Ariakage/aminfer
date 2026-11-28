@@ -29,6 +29,7 @@ pub const FLAG_HAS_TABLE_CRC32: u32 = 1 << 0;
 
 pub const MAX_CTX_LEN: usize = 4;
 pub const MAX_CONT_LEN: usize = 8;
+pub const MAX_CONT_TOKENS: usize = MAX_CONT_LEN;
 pub const SLOTS_PER_BUCKET: usize = page.APPLE_PAGE_SIZE / @sizeOf(NgramSlot);
 
 /// Maximum simultaneously registered domain `.ang` corpus packs (`C14`).
@@ -140,6 +141,17 @@ pub fn computeHeaderCrc32(hdr: *const Header) u32 {
     var copy = hdr.*;
     copy.header_crc32 = 0;
     return std.hash.Crc32.hash(std.mem.asBytes(&copy));
+}
+
+inline fn validateSlotContinuation(slot: *const NgramSlot, vocab_size: u32) ?usize {
+    if (slot.cont_len == 0 or slot.cont_len > MAX_CONT_TOKENS) return null;
+    const clen: usize = @min(@as(usize, slot.cont_len), MAX_CONT_TOKENS);
+    if (vocab_size > 0) {
+        for (slot.cont_tokens[0..clen]) |tok| {
+            if (tok >= vocab_size) return null;
+        }
+    }
+    return clen;
 }
 
 pub inline fn f32ToF16Bits(v: f32) u16 {
@@ -531,31 +543,51 @@ pub const NvmeNgramTable = struct {
         self.stats.bytes_read += bytes_read;
     }
 
+    fn applyCompletionsAll(self: *NvmeNgramTable, comps: []const aio.Completion) QueryError!void {
+        var first_err: ?QueryError = null;
+        for (comps) |c| {
+            self.applyCompletion(c) catch |err| {
+                if (first_err == null) first_err = err;
+            };
+        }
+        if (first_err) |err| return err;
+    }
+
     /// Reaps any already-completed background prefetches without blocking.
     pub fn reapPrefetches(self: *NvmeNgramTable) QueryError!usize {
         if (self.async_reader.inflightCount() == 0) return 0;
         var comps: [16]aio.Completion = undefined;
         var total: usize = 0;
+        var first_err: ?QueryError = null;
         while (self.async_reader.inflightCount() > 0) {
-            const got = try self.async_reader.poll(&comps);
+            const got = self.async_reader.poll(&comps) catch |err| {
+                if (first_err == null) first_err = err;
+                break;
+            };
             if (got == 0) break;
-            for (comps[0..got]) |c| {
-                try self.applyCompletion(c);
-            }
+            self.applyCompletionsAll(comps[0..got]) catch |err| {
+                if (first_err == null) first_err = err;
+            };
             total += got;
         }
+        if (first_err) |err| return err;
         return total;
     }
 
     fn drainPrefetches(self: *NvmeNgramTable) QueryError!void {
         var comps: [16]aio.Completion = undefined;
+        var first_err: ?QueryError = null;
         while (self.async_reader.inflightCount() > 0) {
-            const got = try self.async_reader.wait(&comps, self.timeout_ms);
-            if (got == 0) return error.Timeout;
-            for (comps[0..got]) |c| {
-                try self.applyCompletion(c);
-            }
+            const got = self.async_reader.wait(&comps, self.timeout_ms) catch |err| {
+                if (first_err == null) first_err = err;
+                break;
+            };
+            if (got == 0) return first_err orelse error.Timeout;
+            self.applyCompletionsAll(comps[0..got]) catch |err| {
+                if (first_err == null) first_err = err;
+            };
         }
+        if (first_err) |err| return err;
     }
 
     fn waitForInflightSlot(self: *NvmeNgramTable, target_slot: usize) QueryError!void {
@@ -563,9 +595,7 @@ pub const NvmeNgramTable = struct {
         while (self.slots[target_slot].state == .inflight) {
             const got = try self.async_reader.wait(&comps, self.timeout_ms);
             if (got == 0) return error.Timeout;
-            for (comps[0..got]) |c| {
-                try self.applyCompletion(c);
-            }
+            try self.applyCompletionsAll(comps[0..got]);
         }
     }
 
@@ -634,9 +664,7 @@ pub const NvmeNgramTable = struct {
             var comps: [16]aio.Completion = undefined;
             const got = try self.async_reader.wait(&comps, self.timeout_ms);
             if (got == 0) return error.Timeout;
-            for (comps[0..got]) |c| {
-                try self.applyCompletion(c);
-            }
+            try self.applyCompletionsAll(comps[0..got]);
             victim_opt = self.pickVictimSlot();
         }
         const victim = victim_opt.?;
@@ -693,7 +721,8 @@ pub const NvmeNgramTable = struct {
             for (page_slots) |*slot| {
                 if (slot.isEmpty()) break;
                 if (slot.matchesContext(h, ctx)) {
-                    const n: usize = @min(@as(usize, slot.cont_len), out_cont.len);
+                    const valid_len = validateSlotContinuation(slot, self.header.vocab_size) orelse continue;
+                    const n: usize = @min(out_cont.len, valid_len);
                     @memcpy(out_cont[0..n], slot.cont_tokens[0..n]);
                     const is_seed = ctx_len >= sam_mod.SEED_MIN_MATCH_LEN;
                     self.stats.hits += 1;
@@ -1203,7 +1232,8 @@ pub const DomainNgramRegistry = struct {
 
         const verify_crc = verify_table_crc orelse self.verify_table_crc_default;
         var opened = try self.openAndValidateFileLocked(new_path, verify_crc);
-        errdefer opened.file.close();
+        var close_new_on_err = true;
+        errdefer if (close_new_on_err) opened.file.close();
 
         const new_gen = self.next_generation.fetchAdd(1, .acq_rel);
         pack.banks[new_bank] = .{
@@ -1213,6 +1243,8 @@ pub const DomainNgramRegistry = struct {
             .generation = new_gen,
             .pins = .init(0),
         };
+        // Ownership of `opened.file` transferred to `pack.banks[new_bank]` before publication.
+        close_new_on_err = false;
 
         // Atomic generation-guarded descriptor bank publication.
         const prev_swap = pack.swap_gen.load(.acquire);
@@ -1223,14 +1255,18 @@ pub const DomainNgramRegistry = struct {
 
         // Drain all in-flight queries and async prefetches pinned to `old_bank`
         // BEFORE closing `old_bank.file`.
+        var drain_err: ?QueryError = null;
         while (pack.banks[old_bank].pins.load(.acquire) > 0) {
-            try self.reapPendingForDrain();
+            self.reapPendingForDrain() catch |err| {
+                if (drain_err == null) drain_err = err;
+            };
             std.atomic.spinLoopHint();
         }
         if (pack.banks[old_bank].file.fd >= 0) {
             pack.banks[old_bank].file.close();
         }
         pack.banks[old_bank] = .{};
+        if (drain_err) |err| return err;
 
         return new_gen;
     }
@@ -1707,7 +1743,8 @@ pub const DomainNgramRegistry = struct {
             for (page_slots) |*slot| {
                 if (slot.isEmpty()) break;
                 if (slot.matchesContext(h, ctx)) {
-                    const n: usize = @min(@as(usize, slot.cont_len), out_cont.len);
+                    const valid_len = validateSlotContinuation(slot, pinned.desc.header.vocab_size) orelse continue;
+                    const n: usize = @min(out_cont.len, valid_len);
                     @memcpy(out_cont[0..n], slot.cont_tokens[0..n]);
                     const is_seed = ctx_len >= sam_mod.SEED_MIN_MATCH_LEN;
                     _ = self.packs[pinned.pack_idx].stats.hits.fetchAdd(1, .monotonic);
@@ -2311,4 +2348,124 @@ test "DomainNgramRegistry atomic hot-swap (swapDomainPack) under concurrent mult
     try std.testing.expectEqual(@as(usize, 1), reg.snapshotPacks(&infos));
     try std.testing.expectEqual(@as(u64, 17), infos[0].swaps);
     try std.testing.expectEqualStrings("hot-v2", infos[0].corpusIdSlice());
+}
+
+test "F15.3 swapDomainPack preserves live new_bank fd on drain error, F19.1 skips corrupt slots, F19.3 applies all batch completions" {
+    const gpa = std.testing.allocator;
+
+    // 1. F19.1: corrupt slot with cont_len > MAX_CONT_LEN and OOB cont_tokens >= vocab_size are skipped cleanly.
+    var p_corrupt_buf: [256]u8 = undefined;
+    const p_corrupt = try testTmpAngPath(&p_corrupt_buf, "aminfer-test-f19-corrupt.ang");
+    defer _ = std.c.unlink(p_corrupt.ptr);
+
+    const ctx = [_]u32{ 1, 2, 3, 4 };
+    const entries = [_]BuildEntry{
+        .{ .ctx = &ctx, .cont = &[_]u32{ 5, 6 }, .hit_count = 100, .step_prob = 0.9 },
+        .{ .ctx = &ctx, .cont = &[_]u32{ 7, 8 }, .hit_count = 50, .step_prob = 0.8 },
+    };
+    var img = try buildTableBytes(gpa, &entries, .{
+        .num_buckets = 1,
+        .vocab_size = 100,
+        .include_table_crc = false,
+    });
+    defer gpa.free(img);
+
+    // Corrupt slot 0 in bucket page 0: set cont_len = 25 (> MAX_CONT_LEN=8), and slot 1 cont_tokens[0] = 999 (>= vocab_size=100).
+    const slots: []NgramSlot = @alignCast(std.mem.bytesAsSlice(NgramSlot, img[page.APPLE_PAGE_SIZE .. 2 * page.APPLE_PAGE_SIZE]));
+    slots[0].cont_len = 25;
+    slots[1].cont_tokens[0] = 999;
+
+    {
+        const fd = std.c.open(p_corrupt.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
+        try std.testing.expect(fd >= 0);
+        defer _ = std.c.close(fd);
+        var woff: usize = 0;
+        while (woff < img.len) {
+            const rc = std.c.write(fd, img[woff..].ptr, img.len - woff);
+            try std.testing.expect(rc > 0);
+            woff += @intCast(rc);
+        }
+    }
+
+    var tbl = try NvmeNgramTable.open(gpa, p_corrupt, .{
+        .cache_pages = 4,
+        .max_inflight = 2,
+        .verify_table_crc = false,
+    });
+    defer tbl.deinit(gpa);
+
+    var out_cont: [16]u32 = undefined;
+    const qres = try tbl.query(&ctx, &out_cont);
+    try std.testing.expectEqual(@as(u32, 0), qres.draft_len);
+
+    // 2. F19.3: applyCompletionsAll updates ALL completions in a batch even when comps[0] fails.
+    tbl.slots[0] = .{ .state = .inflight, .bucket_idx = 0, .last_used_tick = 1 };
+    tbl.slots[1] = .{ .state = .inflight, .bucket_idx = 0, .last_used_tick = 2 };
+    const comps = [_]aio.Completion{
+        .{ .user_data = 0, .bytes_read = 0, .err_code = 5, .short_read = false },
+        .{ .user_data = 1, .bytes_read = page.APPLE_PAGE_SIZE, .err_code = 0, .short_read = false },
+    };
+    try std.testing.expectError(error.ReadFailed, tbl.applyCompletionsAll(&comps));
+    try std.testing.expectEqual(NvmeNgramTable.SlotState.empty, tbl.slots[0].state);
+    try std.testing.expectEqual(NvmeNgramTable.SlotState.ready, tbl.slots[1].state);
+
+    // 3. F15.3: DomainNgramRegistry.swapDomainPack keeps new_bank.file.fd open if drain hits an AIO error.
+    var p1_buf: [256]u8 = undefined;
+    var p2_buf: [256]u8 = undefined;
+    const p1 = try testTmpAngPath(&p1_buf, "aminfer-test-f15-v1.ang");
+    const p2 = try testTmpAngPath(&p2_buf, "aminfer-test-f15-v2.ang");
+    defer _ = std.c.unlink(p1.ptr);
+    defer _ = std.c.unlink(p2.ptr);
+
+    try writeTableFile(gpa, p1, &[_]BuildEntry{.{ .ctx = &ctx, .cont = &[_]u32{ 11, 12 } }}, .{
+        .num_buckets = 2,
+        .vocab_size = 100,
+        .corpus_id = "v1",
+        .include_table_crc = true,
+    });
+    try writeTableFile(gpa, p2, &[_]BuildEntry{.{ .ctx = &ctx, .cont = &[_]u32{ 21, 22 } }}, .{
+        .num_buckets = 2,
+        .vocab_size = 100,
+        .corpus_id = "v2",
+        .include_table_crc = true,
+    });
+
+    var reg = try DomainNgramRegistry.init(gpa, .{
+        .cache_pages = 4,
+        .max_inflight = 2,
+        .io_backend = .kqueue_aio,
+        .verify_table_crc = true,
+    });
+    defer reg.deinit(gpa);
+    const pidx = try reg.registerPack("live", p1, true);
+
+    // Simulate an in-flight short-read prefetch pinned to old bank 0 by queueing a past-EOF AIO read on p1's fd!
+    const short_fd = std.c.open(p1.ptr, .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+    try std.testing.expect(short_fd >= 0);
+    defer _ = std.c.close(short_fd);
+    _ = reg.packs[pidx].banks[0].pins.fetchAdd(1, .acq_rel);
+    reg.cache_slots[0] = .{
+        .state = .inflight,
+        .pack_idx = @intCast(pidx),
+        .bank_idx = 0,
+        .desc_gen = reg.packs[pidx].banks[0].generation,
+        .bucket_idx = 0,
+        .last_used_tick = 1,
+        .readers = 0,
+    };
+    try reg.async_reader.submit(.{
+        .fd = short_fd,
+        .offset = 16 * page.APPLE_PAGE_SIZE,
+        .dst = reg.pageSlice(0),
+        .user_data = 0,
+    });
+
+    const swap_res = reg.swapDomainPack("live", p2, true);
+    try std.testing.expectError(error.ShortRead, swap_res);
+    // New live bank MUST still have a valid open fd and serve v2 queries cleanly!
+    const live_bank = reg.packs[pidx].active_bank.load(.acquire);
+    try std.testing.expect(reg.packs[pidx].banks[live_bank].file.fd >= 0);
+    try std.testing.expectEqual(@as(std.c.fd_t, -1), reg.packs[pidx].banks[1 - live_bank].file.fd);
+    const after_q = try reg.queryDomain("live", &ctx, &out_cont);
+    try std.testing.expectEqualSlices(u32, &[_]u32{ 21, 22 }, out_cont[0..after_q.draft_len]);
 }
