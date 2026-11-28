@@ -222,7 +222,11 @@ pub const ModelConfig = struct {
         if ((self.num_attention_heads % self.num_key_value_heads) != 0) return error.InvalidConfig;
         if ((self.qDim() % align_req) != 0) return error.InvalidConfig;
         if ((self.kvDim() % align_req) != 0) return error.InvalidConfig;
-        if (self.rms_norm_eps <= 0.0 or self.rope_theta <= 0.0) return error.InvalidConfig;
+        if (!std.math.isFinite(self.rms_norm_eps) or self.rms_norm_eps <= 0.0 or
+            !std.math.isFinite(self.rope_theta) or self.rope_theta <= 0.0)
+        {
+            return error.InvalidConfig;
+        }
 
         switch (self.arch) {
             .qwen3_moe => {
@@ -2961,7 +2965,7 @@ pub const Qwen3Model = struct {
         if (self.max_tree_nodes <= 1) return error.TreeNotEnabled;
         if (accepted_nodes.len == 0 or accepted_nodes.len > self.max_tree_nodes) return error.InvalidArgument;
         const accepted_count: u32 = @intCast(accepted_nodes.len);
-        if (base_pos + accepted_count > self.max_seq_len) return error.PositionOutOfRange;
+        if (@as(u64, base_pos) + accepted_count > self.max_seq_len) return error.PositionOutOfRange;
 
         for (accepted_nodes, 0..) |node_idx, i| {
             if (node_idx >= self.max_tree_nodes) return error.InvalidArgument;
@@ -3067,7 +3071,7 @@ pub const Qwen3Model = struct {
     ) StepError!u32 {
         const m: u32 = @intCast(tokens.len);
         if (m == 0 or m > self.wide_prefill_max_tokens) return error.InvalidArgument;
-        if (start_pos + m > self.max_seq_len) return error.PositionOutOfRange;
+        if (@as(u64, start_pos) + m > self.max_seq_len) return error.PositionOutOfRange;
         for (tokens) |tid| {
             if (tid >= self.config.vocab_size) return error.TokenOutOfRange;
         }
@@ -3981,6 +3985,10 @@ pub const Qwen3Model = struct {
         opts: PrefillChunkOptions,
     ) StepError!u32 {
         if (tokens.len == 0) return error.TreeTooLarge;
+        if (@as(u64, start_pos) + tokens.len > self.max_seq_len) return error.PositionOutOfRange;
+        for (tokens) |tid| {
+            if (tid >= self.config.vocab_size) return error.TokenOutOfRange;
+        }
         if (self.usesWideGpuPrefill()) {
             const cap: usize = self.prefillChunkCap();
             var off: usize = 0;
@@ -3988,9 +3996,10 @@ pub const Qwen3Model = struct {
             while (off < tokens.len) {
                 const take: usize = @min(cap, tokens.len - off);
                 const is_last = (off + take == tokens.len);
+                const chunk_start: u32 = std.math.add(u32, start_pos, @as(u32, @intCast(off))) catch return error.PositionOutOfRange;
                 last_tok = try self.prefillWideChunk(
                     tokens[off .. off + take],
-                    start_pos + @as(u32, @intCast(off)),
+                    chunk_start,
                     is_last,
                     opts.compute_logits and is_last,
                     opts.preserve_all_top_hidden,
@@ -4006,11 +4015,13 @@ pub const Qwen3Model = struct {
         var masks: [attention.MAX_TREE_NODES]u64 = undefined;
         var accepted: [attention.MAX_TREE_NODES]u16 = undefined;
         for (0..m) |i| {
-            positions[i] = start_pos + @as(u32, @intCast(i));
+            positions[i] = std.math.add(u32, start_pos, @as(u32, @intCast(i))) catch return error.PositionOutOfRange;
             masks[i] = if (i == 63) ~@as(u64, 0) else (@as(u64, 1) << @as(u6, @intCast(i + 1))) - 1;
             accepted[i] = @intCast(i);
         }
         if (self.has_pure_cpu_sme2_dense) {
+            const m_u32: u32 = @intCast(m);
+            try self.retireBeforeCommitRange(start_pos, m_u32);
             const cands = try self.stepDraftTreeBatchSme2(
                 tokens,
                 positions[0..m],
@@ -4021,6 +4032,8 @@ pub const Qwen3Model = struct {
                 true,
                 true,
             );
+            self.seq_len = @max(self.seq_len, start_pos + m_u32);
+            try self.retireExcessCompletedChunks();
             return if (opts.compute_logits) cands[0].token_id else 0;
         }
         const vr = try self.verifyTree(tokens, positions[0..m], masks[0..m], start_pos, opts.compute_logits);
@@ -6213,14 +6226,18 @@ pub const Qwen3Model = struct {
         }, a_u16, packed_w, aux_f32, out_bytes, m_u, n_u, k_u);
     }
 
-    fn cpuEmbedLookup(self: *Qwen3Model, token_ids: []const u32) void {
+    fn cpuEmbedLookup(self: *Qwen3Model, token_ids: []const u32) StepError!void {
         const h: usize = self.config.hidden_size;
+        const vocab_limit: u32 = @min(self.config.vocab_size, self.embed.n);
+        for (token_ids) |tid| {
+            if (tid >= vocab_limit) return error.TokenOutOfRange;
+        }
         const w_bytes = self.embed.weight_host;
         const emb_amf = self.embed.effectiveAmfDType();
         if (dequant.usesQuantFormats(emb_amf, self.embed.group_size)) {
-            const qf_dt = quant_formats.DType.fromAmf(emb_amf) orelse unreachable;
+            const qf_dt = quant_formats.DType.fromAmf(emb_amf) orelse return error.InvalidArgument;
             const p_bytes: []const u8 = self.embed.scale_bias_host orelse &.{};
-            const tmp_f32 = self.embed_dequant_f32.?;
+            const tmp_f32 = self.embed_dequant_f32 orelse return error.InvalidArgument;
             for (token_ids, 0..) |tid, r| {
                 quant_formats.dequantRowCpuRef(
                     qf_dt,
@@ -6231,7 +6248,7 @@ pub const Qwen3Model = struct {
                     self.embed.n,
                     h,
                     tmp_f32,
-                ) catch unreachable;
+                ) catch return error.InvalidArgument;
                 const row_dst = self.x_host[r * h ..][0..h];
                 for (0..h) |c| row_dst[c] = @floatCast(tmp_f32[c]);
             }
@@ -6822,6 +6839,16 @@ pub const Qwen3Model = struct {
         logits_last_row_only: bool,
         commit_kv: bool,
     ) StepError![]const moe.TopKCandidate {
+        if (token_ids.len == 0 or positions.len != token_ids.len or slot_ancestor_masks.len != token_ids.len) {
+            return error.InvalidArgument;
+        }
+        if (@as(u64, slot_start) + token_ids.len > self.max_tree_nodes) return error.TreeTooLarge;
+        if (commit_kv and @as(u64, kv_base_pos) + token_ids.len > self.max_seq_len) return error.PositionOutOfRange;
+        if (kv_base_pos > self.max_seq_len) return error.PositionOutOfRange;
+        for (token_ids, positions) |tid, p| {
+            if (tid >= self.config.vocab_size) return error.TokenOutOfRange;
+            if (p >= self.max_seq_len) return error.PositionOutOfRange;
+        }
         const srt = self.sme_rt.?;
         const m: u32 = @intCast(token_ids.len);
         const m_u: usize = m;
@@ -6835,7 +6862,7 @@ pub const Qwen3Model = struct {
         const active_chunks: usize = if (kv_base_pos > 0) (kv_base_pos + self.chunk_tokens - 1) / self.chunk_tokens else 0;
         if (active_chunks > 64) return error.PositionOutOfRange;
 
-        self.cpuEmbedLookup(token_ids);
+        try self.cpuEmbedLookup(token_ids);
 
         const attn_scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(hd)));
         const scratch_bytes = self.scratch_arena.bytes();
@@ -6965,6 +6992,9 @@ pub const Qwen3Model = struct {
                 while (off < m_u) {
                     const pos0 = @as(usize, kv_base_pos) + off;
                     const ci = pos0 / ct;
+                    if (ci < self.num_retired_chunks or ci - self.num_retired_chunks >= self.active_kv_chunks) {
+                        return error.PositionOutOfRange;
+                    }
                     const s_in_c = pos0 % ct;
                     const take = @min(m_u - off, ct - s_in_c);
                     const pair = self.kvTileAt(l, ci);
@@ -10657,6 +10687,10 @@ const BatchSlotState = struct {
     prompt_tokens: []u32 = &.{},
     /// Active `W19` LoRA adapter slot bound to this request slot (`lora.NO_ADAPTER` for base).
     lora_slot: u32 = lora.NO_ADAPTER,
+    /// Monotonic generation tag paired with `lora_slot` to prevent ABA aliasing (`F22.1`).
+    lora_generation: u64 = 0,
+    /// True iff this batch slot currently holds a pin refcount in `LoraRegistry` (`F22.1`).
+    lora_pinned: bool = false,
 };
 
 /// Preallocated zero-allocation continuous-batching (`C14`), shared `PrefixCache` (`R8`),
@@ -10723,6 +10757,10 @@ pub const Qwen3BatchRuntime = struct {
     kv_retire_events: u64 = 0,
     decode_batch_steps: u64 = 0,
     decode_batch_tokens: u64 = 0,
+    teardown_recovery_errors: u64 = 0,
+    last_teardown_error: ?anyerror = null,
+    prefix_cow_errors: u64 = 0,
+    last_prefix_cow_error: ?anyerror = null,
     /// Optional non-owning `W19` multi-LoRA registry shared across concurrent batch slots.
     lora_registry: ?*lora.LoraRegistry = null,
 
@@ -11093,30 +11131,89 @@ pub const Qwen3BatchRuntime = struct {
         };
     }
 
-    pub fn attachLoraRegistry(self: *Qwen3BatchRuntime, registry: ?*lora.LoraRegistry) void {
-        self.lora_registry = registry;
-        if (registry == null) {
-            for (self.slots) |*slot| slot.lora_slot = lora.NO_ADAPTER;
+    fn unpinSlotLora(self: *Qwen3BatchRuntime, slot: *BatchSlotState) void {
+        if (slot.lora_pinned) {
+            if (self.lora_registry) |reg| {
+                reg.unpinSlot(.{
+                    .slot_id = slot.lora_slot,
+                    .generation = slot.lora_generation,
+                }) catch |err| {
+                    self.teardown_recovery_errors += 1;
+                    self.last_teardown_error = err;
+                };
+            }
+            slot.lora_pinned = false;
         }
+        slot.lora_slot = lora.NO_ADAPTER;
+        slot.lora_generation = 0;
+    }
+
+    fn resolveValidatedSlotLora(
+        self: *const Qwen3BatchRuntime,
+        reg: *const lora.LoraRegistry,
+        slot: *const BatchSlotState,
+    ) error{InvalidState}!u32 {
+        _ = self;
+        if (slot.lora_slot == lora.NO_ADAPTER) return lora.NO_ADAPTER;
+        if (slot.lora_pinned or slot.lora_generation != 0) {
+            if (!reg.isHandleValid(.{
+                .slot_id = slot.lora_slot,
+                .generation = slot.lora_generation,
+            })) {
+                return error.InvalidState;
+            }
+        }
+        return slot.lora_slot;
+    }
+
+    pub fn attachLoraRegistry(self: *Qwen3BatchRuntime, registry: ?*lora.LoraRegistry) void {
+        for (self.slots) |*slot| self.unpinSlotLora(slot);
+        self.lora_registry = registry;
     }
 
     pub fn setSlotLora(self: *Qwen3BatchRuntime, slot_id: u32, lora_slot: u32) void {
         if (slot_id >= self.max_slots) return;
-        self.slots[slot_id].lora_slot = lora_slot;
+        const slot = &self.slots[slot_id];
+        self.unpinSlotLora(slot);
+        if (lora_slot == lora.NO_ADAPTER) return;
+        if (self.lora_registry) |reg| {
+            const handle = reg.pinSlot(lora_slot) catch |err| {
+                self.teardown_recovery_errors += 1;
+                self.last_teardown_error = err;
+                return;
+            };
+            slot.lora_slot = handle.slot_id;
+            slot.lora_generation = handle.generation;
+            slot.lora_pinned = true;
+        } else {
+            slot.lora_slot = lora_slot;
+            slot.lora_generation = 0;
+            slot.lora_pinned = false;
+        }
     }
 
     pub fn setSlotModelSelector(self: *Qwen3BatchRuntime, slot_id: u32, model_selector: []const u8) lora.LoraError!void {
         if (slot_id >= self.max_slots) return error.InvalidConfig;
+        const slot = &self.slots[slot_id];
         const sel = lora.parseModelSelector(model_selector);
         if (sel.adapter == null) {
-            self.slots[slot_id].lora_slot = lora.NO_ADAPTER;
+            self.unpinSlotLora(slot);
             return;
         }
         const reg = self.lora_registry orelse return error.AdapterNotFound;
-        self.slots[slot_id].lora_slot = (try reg.resolveModelSelector(model_selector)) orelse lora.NO_ADAPTER;
+        const resolved = (try reg.resolveModelSelector(model_selector)) orelse {
+            self.unpinSlotLora(slot);
+            return;
+        };
+        const handle = try reg.pinSlot(resolved);
+        self.unpinSlotLora(slot);
+        slot.lora_slot = handle.slot_id;
+        slot.lora_generation = handle.generation;
+        slot.lora_pinned = true;
     }
 
     pub fn deinit(self: *Qwen3BatchRuntime, allocator: std.mem.Allocator) void {
+        for (self.slots) |*slot| self.unpinSlotLora(slot);
         allocator.free(self.p_res);
         allocator.free(self.scratch_evicted_handles);
         allocator.free(self.scratch_handles);
@@ -11268,7 +11365,10 @@ pub const Qwen3BatchRuntime = struct {
         } else if (self.retired_pool) |*rpool| {
             for (handles) |h| {
                 if (h.storage == .retired_q8) {
-                    rpool.releaseSlot(h.pool_slot_id) catch unreachable;
+                    rpool.releaseSlot(h.pool_slot_id) catch |err| {
+                        self.teardown_recovery_errors += 1;
+                        self.last_teardown_error = err;
+                    };
                 }
             }
         }
@@ -11319,11 +11419,16 @@ pub const Qwen3BatchRuntime = struct {
         var frame = self.model.compute.beginFrame(self.model.timeout_ms) catch return false;
         var acquired: usize = 0;
         for (0..num_layers) |l| {
-            const dst_slot = rpool.acquireSlot() catch {
+            const dst_slot = rpool.acquireSlot() catch |err| {
                 frame.abort();
+                self.teardown_recovery_errors += 1;
+                self.last_teardown_error = err;
                 for (0..acquired) |li| {
                     const rids = self.slotRetiredIdsSlice(li, slot_id);
-                    rpool.releaseSlot(rids[c]) catch unreachable;
+                    rpool.releaseSlot(rids[c]) catch |rerr| {
+                        self.teardown_recovery_errors += 1;
+                        self.last_teardown_error = rerr;
+                    };
                 }
                 return false;
             };
@@ -11337,17 +11442,37 @@ pub const Qwen3BatchRuntime = struct {
                 .pool = rpool,
                 .pool_buf = self.batch_buf,
                 .dst_slot = dst_slot,
-            }, false) catch {
+            }, false) catch |err| {
                 frame.abort();
+                self.teardown_recovery_errors += 1;
+                self.last_teardown_error = err;
                 for (0..acquired) |li| {
                     const rids_undo = self.slotRetiredIdsSlice(li, slot_id);
-                    rpool.releaseSlot(rids_undo[c]) catch unreachable;
+                    rpool.releaseSlot(rids_undo[c]) catch |rerr| {
+                        self.teardown_recovery_errors += 1;
+                        self.last_teardown_error = rerr;
+                    };
                 }
                 return false;
             };
         }
-        const sig = frame.commit() catch return false;
-        self.model.compute.wait(sig, self.model.timeout_ms) catch return false;
+        const sig = frame.commit() catch |err| {
+            self.teardown_recovery_errors += 1;
+            self.last_teardown_error = err;
+            for (0..acquired) |li| {
+                const rids_undo = self.slotRetiredIdsSlice(li, slot_id);
+                rpool.releaseSlot(rids_undo[c]) catch |rerr| {
+                    self.teardown_recovery_errors += 1;
+                    self.last_teardown_error = rerr;
+                };
+            }
+            return false;
+        };
+        self.model.compute.wait(sig, self.model.timeout_ms) catch |err| {
+            self.teardown_recovery_errors += 1;
+            self.last_teardown_error = err;
+            return false;
+        };
 
         slot.retired_is_shared[c] = false;
         slot.chunk_group_ids[c] = NONE_GROUP;
@@ -11403,12 +11528,14 @@ pub const Qwen3BatchRuntime = struct {
         src_group: u32,
         dst_group: u32,
         valid_tokens: u32,
-    ) bool {
-        var frame = self.model.compute.beginFrame(self.model.timeout_ms) catch return false;
+    ) metal.Error!void {
+        var frame = try self.model.compute.beginFrame(self.model.timeout_ms);
+        var frame_active = true;
+        errdefer if (frame_active) frame.abort();
         for (0..self.model.layers.len) |l| {
             const src_pair = self.poolTilePair(src_group, l);
             const dst_pair = self.poolTilePair(dst_group, l);
-            prefix_cache_mod.PrefixCache.encodeTailCowCopy(
+            try prefix_cache_mod.PrefixCache.encodeTailCowCopy(
                 self.model.attn_pipes,
                 &frame,
                 src_pair.k,
@@ -11420,15 +11547,12 @@ pub const Qwen3BatchRuntime = struct {
                 self.model.chunk_tokens,
                 valid_tokens,
                 false,
-            ) catch {
-                frame.abort();
-                return false;
-            };
+            );
         }
-        const sig = frame.commit() catch return false;
-        self.model.compute.wait(sig, self.model.timeout_ms) catch return false;
+        const sig = try frame.commit();
+        frame_active = false;
+        try self.model.compute.wait(sig, self.model.timeout_ms);
         self.prefix_cow_copies += 1;
-        return true;
     }
 
     fn resetSlotState(self: *Qwen3BatchRuntime, slot_id: u32) void {
@@ -11436,7 +11560,10 @@ pub const Qwen3BatchRuntime = struct {
         const slot = &self.slots[slot_id];
         if (self.prefix_cache) |*pc| {
             for (slot.pinned_full_ids[0..slot.pinned_full_count]) |eid| {
-                pc.unpin(eid) catch unreachable;
+                pc.unpin(eid) catch |err| {
+                    self.teardown_recovery_errors += 1;
+                    self.last_teardown_error = err;
+                };
             }
         }
         slot.pinned_full_count = 0;
@@ -11454,7 +11581,10 @@ pub const Qwen3BatchRuntime = struct {
                 if (!slot.retired_is_shared[rc]) {
                     for (0..self.model.layers.len) |l| {
                         const rids = self.slotRetiredIdsSlice(l, slot_id);
-                        rpool.releaseSlot(rids[rc]) catch unreachable;
+                        rpool.releaseSlot(rids[rc]) catch |err| {
+                            self.teardown_recovery_errors += 1;
+                            self.last_teardown_error = err;
+                        };
                     }
                 }
                 slot.retired_is_shared[rc] = false;
@@ -11465,7 +11595,7 @@ pub const Qwen3BatchRuntime = struct {
         slot.matched_prefix_tokens = 0;
         slot.prefix_cached_full_chunks = 0;
         slot.last_cached_parent_id = prefix_cache_mod.NONE_ID;
-        slot.lora_slot = lora.NO_ADAPTER;
+        self.unpinSlotLora(slot);
         slot.in_use = false;
         self.syncSlotActiveTables(slot_id);
     }
@@ -11486,6 +11616,11 @@ pub const Qwen3BatchRuntime = struct {
         if (prompt_tokens.len <= 1 or prompt_tokens.len > self.model.max_seq_len) {
             return .{ .matched_tokens = 0, .prefix_handle = handle };
         }
+        for (prompt_tokens) |tid| {
+            if (tid >= self.model.config.vocab_size) {
+                return .{ .matched_tokens = 0, .prefix_handle = handle };
+            }
+        }
 
         const cap_full: usize = @min(self.max_chunks, self.active_per_slot);
         var match = pc.matchAndPin(prompt_tokens, slot.pinned_full_ids[0..cap_full], .{
@@ -11501,8 +11636,13 @@ pub const Qwen3BatchRuntime = struct {
         // Bind matched full blocks (`0` copy!).
         for (0..match.full_block_count) |ci| {
             const eid = slot.pinned_full_ids[ci];
-            const h0 = pc.entryHandle(eid, 0) catch {
-                pc.releaseMatch(&match, slot.pinned_full_ids[0..match.full_block_count]) catch unreachable;
+            const h0 = pc.entryHandle(eid, 0) catch |err| {
+                self.teardown_recovery_errors += 1;
+                self.last_teardown_error = err;
+                pc.releaseMatch(&match, slot.pinned_full_ids[0..match.full_block_count]) catch |rerr| {
+                    self.teardown_recovery_errors += 1;
+                    self.last_teardown_error = rerr;
+                };
                 self.resetSlotState(slot_id);
                 slot.in_use = true;
                 return .{ .matched_tokens = 0, .prefix_handle = handle };
@@ -11529,8 +11669,14 @@ pub const Qwen3BatchRuntime = struct {
                 @intCast(l),
                 self.slotRetiredIdsSlice(l, slot_id),
                 self.slotKvTilesSlice(l, slot_id),
-            ) catch {
-                pc.releaseMatch(&match, slot.pinned_full_ids[0..match.full_block_count]) catch unreachable;
+            ) catch |err| {
+                self.teardown_recovery_errors += 1;
+                self.last_teardown_error = err;
+                pc.releaseMatch(&match, slot.pinned_full_ids[0..match.full_block_count]) catch |rerr| {
+                    self.teardown_recovery_errors += 1;
+                    self.last_teardown_error = rerr;
+                };
+                slot.pinned_full_count = 0;
                 self.resetSlotState(slot_id);
                 slot.in_use = true;
                 return .{ .matched_tokens = 0, .prefix_handle = handle };
@@ -11546,7 +11692,7 @@ pub const Qwen3BatchRuntime = struct {
                 tail_c < slot.num_retired_chunks + self.active_per_slot)
             {
                 if (self.acquireChunkGroup()) |dst_g| {
-                    if (self.copyTailGroupGpu(tail_src_handle.?.pool_slot_id, dst_g, match.tail_tokens)) {
+                    if (self.copyTailGroupGpu(tail_src_handle.?.pool_slot_id, dst_g, match.tail_tokens)) |_| {
                         slot.chunk_group_ids[tail_c] = dst_g;
                         slot.chunk_is_shared[tail_c] = false;
                         const a_idx: usize = tail_c - slot.num_retired_chunks;
@@ -11555,12 +11701,17 @@ pub const Qwen3BatchRuntime = struct {
                             self.slotKvTilesSlice(l, slot_id)[a_idx] = attention.KvTilePair.fromTiles(pair.k, pair.v, .rgba16f);
                         }
                         final_matched += match.tail_tokens;
-                    } else {
+                    } else |err| {
+                        self.prefix_cow_errors += 1;
+                        self.last_prefix_cow_error = err;
                         self.releaseChunkGroup(dst_g);
                     }
                 }
             }
-            pc.releaseTailPin(&match) catch unreachable;
+            pc.releaseTailPin(&match) catch |err| {
+                self.teardown_recovery_errors += 1;
+                self.last_teardown_error = err;
+            };
         }
 
         @memcpy(slot.prompt_tokens[0..final_matched], prompt_tokens[0..final_matched]);
@@ -11621,7 +11772,10 @@ pub const Qwen3BatchRuntime = struct {
                             self.slotKvTilesSlice(l, slot_id)[a_idx] = h_l.toTilePair();
                         }
                     } else {
-                        pc.unpin(ins.entry_id) catch unreachable;
+                        pc.unpin(ins.entry_id) catch |err| {
+                            self.teardown_recovery_errors += 1;
+                            self.last_teardown_error = err;
+                        };
                         break;
                     }
                 }
@@ -11643,7 +11797,7 @@ pub const Qwen3BatchRuntime = struct {
                 !slot.chunk_is_shared[tail_c] and slot.chunk_group_ids[tail_c] != NONE_GROUP)
             {
                 if (self.acquireChunkGroup()) |snap_g| {
-                    if (self.copyTailGroupGpu(slot.chunk_group_ids[tail_c], snap_g, tail_len)) {
+                    if (self.copyTailGroupGpu(slot.chunk_group_ids[tail_c], snap_g, tail_len)) |_| {
                         for (0..num_layers) |l| {
                             const pair = self.poolTilePair(snap_g, l);
                             self.scratch_handles[l] = prefix_cache_mod.KvBlockHandle.activeFromTiles(pair.k, pair.v, snap_g);
@@ -11682,7 +11836,9 @@ pub const Qwen3BatchRuntime = struct {
                         } else |_| {
                             self.releaseChunkGroup(snap_g);
                         }
-                    } else {
+                    } else |err| {
+                        self.prefix_cow_errors += 1;
+                        self.last_prefix_cow_error = err;
                         self.releaseChunkGroup(snap_g);
                     }
                 }
@@ -11700,6 +11856,11 @@ pub const Qwen3BatchRuntime = struct {
     ) StepError!u32 {
         const m: u32 = @intCast(tokens.len);
         const model = self.model;
+        if (m == 0) return error.InvalidArgument;
+        if (@as(u64, base_pos) + m > model.max_seq_len) return error.PositionOutOfRange;
+        for (tokens) |tid| {
+            if (tid >= model.config.vocab_size) return error.TokenOutOfRange;
+        }
         const slot = &self.slots[slot_id];
         const h = model.config.hidden_size;
         const kv_dim = model.config.num_key_value_heads * model.config.head_dim;
@@ -11712,8 +11873,9 @@ pub const Qwen3BatchRuntime = struct {
         }
 
         if (self.lora_registry) |reg| {
-            if (reg.activeAdapterCount() > 0 and slot.lora_slot != lora.NO_ADAPTER) {
-                return self.runPrefillWideChunkWithLora(reg, slot_id, slot.lora_slot, tokens, base_pos, is_final_chunk, compute_logits);
+            const lslot = self.resolveValidatedSlotLora(reg, slot) catch return error.InvalidArgument;
+            if (reg.activeAdapterCount() > 0 and lslot != lora.NO_ADAPTER) {
+                return self.runPrefillWideChunkWithLora(reg, slot_id, lslot, tokens, base_pos, is_final_chunk, compute_logits);
             }
         }
 
@@ -12267,6 +12429,11 @@ pub const Qwen3BatchRuntime = struct {
     ) StepError!u32 {
         const m: u32 = @intCast(tokens.len);
         const model = self.model;
+        if (m == 0) return error.InvalidArgument;
+        if (@as(u64, base_pos) + m > model.max_seq_len) return error.PositionOutOfRange;
+        for (tokens) |tid| {
+            if (tid >= model.config.vocab_size) return error.TokenOutOfRange;
+        }
         const slot = &self.slots[slot_id];
         const h = model.config.hidden_size;
 
@@ -12576,7 +12743,10 @@ pub const Qwen3BatchRuntime = struct {
 
     pub fn prefillSlot(self: *Qwen3BatchRuntime, chunk: *const batch_sched.PrefillChunkView) batch_sched.BackendError!batch_sched.PrefillResult {
         if (chunk.slot_id >= self.max_slots or chunk.tokens.len == 0) return error.InvalidState;
-        if (chunk.start_pos + chunk.tokens.len > self.model.max_seq_len) return error.PrefillFailed;
+        if (@as(u64, chunk.start_pos) + chunk.tokens.len > self.model.max_seq_len) return error.PrefillFailed;
+        for (chunk.tokens) |tid| {
+            if (tid >= self.model.config.vocab_size) return error.PrefillFailed;
+        }
         const slot = &self.slots[chunk.slot_id];
         if (!slot.in_use) {
             self.resetSlotState(chunk.slot_id);
@@ -12693,18 +12863,16 @@ pub const Qwen3BatchRuntime = struct {
         // when `active_adapters == 0` or no active slot in this batch selects a LoRA,
         // the base `stepDecodeBatch` loop executes with ZERO extra branches.
         if (self.lora_registry) |reg| {
-            if (reg.activeAdapterCount() > 0) {
-                var batch_lora: [batch_sched.MAX_BATCH_SLOTS]u32 = @splat(lora.NO_ADAPTER);
-                var any_lora = false;
-                for (0..b_usize) |bi| {
-                    const sid: u32 = view.slot_ids[bi];
-                    const lslot = self.slots[sid].lora_slot;
-                    batch_lora[bi] = lslot;
-                    if (lslot != lora.NO_ADAPTER) any_lora = true;
-                }
-                if (any_lora) {
-                    return self.stepDecodeBatchWithLora(reg, view, batch_lora[0..b_usize], max_seq, out_next_tokens);
-                }
+            var batch_lora: [batch_sched.MAX_BATCH_SLOTS]u32 = @splat(lora.NO_ADAPTER);
+            var any_lora = false;
+            for (0..b_usize) |bi| {
+                const sid: u32 = view.slot_ids[bi];
+                const lslot = try self.resolveValidatedSlotLora(reg, &self.slots[sid]);
+                batch_lora[bi] = lslot;
+                if (lslot != lora.NO_ADAPTER) any_lora = true;
+            }
+            if (any_lora and reg.activeAdapterCount() > 0) {
+                return self.stepDecodeBatchWithLora(reg, view, batch_lora[0..b_usize], max_seq, out_next_tokens);
             }
         }
 
@@ -16611,4 +16779,99 @@ test "M8.15 W8 enable_router_trace captures exact per-layer GPU top-K routing wi
         }
         tok = traced_next;
     }
+}
+
+test "F12.3 F14 L6 F22 Qwen3Model rejects NaN config, OOB token IDs, u32 position wrap, and pins batch LoRA" {
+    const gpa = std.testing.allocator;
+    const base_cfg: ModelConfig = .{
+        .arch = .qwen3_dense,
+        .quant_bits = .q4,
+        .vocab_size = 64,
+        .hidden_size = 64,
+        .num_hidden_layers = 1,
+        .num_attention_heads = 1,
+        .num_key_value_heads = 1,
+        .head_dim = 64,
+        .intermediate_size = 64,
+        .max_position_embeddings = 128,
+    };
+    try base_cfg.validate();
+
+    // L6: reject NaN and non-positive `rms_norm_eps` / `rope_theta`.
+    var nan_eps = base_cfg;
+    nan_eps.rms_norm_eps = std.math.nan(f32);
+    try std.testing.expectError(error.InvalidConfig, nan_eps.validate());
+    var nan_theta = base_cfg;
+    nan_theta.rope_theta = std.math.nan(f32);
+    try std.testing.expectError(error.InvalidConfig, nan_theta.validate());
+    var neg_eps = base_cfg;
+    neg_eps.rms_norm_eps = 0.0;
+    try std.testing.expectError(error.InvalidConfig, neg_eps.validate());
+
+    const img = try buildSyntheticAmfImage(gpa, base_cfg, true, 0xF141_2026);
+    defer gpa.free(img);
+
+    var model = try Qwen3Model.loadFromBytes(gpa, img, base_cfg, .{
+        .max_seq_len = 64,
+        .chunk_tokens = 32,
+        .max_tree_nodes = 8,
+    });
+    defer model.deinit(gpa);
+
+    // F12.3 & F14: reject OOB token IDs across prefill/decode and u32 position overflow (L9).
+    try std.testing.expectError(error.TokenOutOfRange, model.prefillChunkWithOptions(&.{base_cfg.vocab_size}, 0, .{}));
+    try std.testing.expectError(error.TokenOutOfRange, model.stepDecode(base_cfg.vocab_size, 0));
+    try std.testing.expectError(error.PositionOutOfRange, model.commitTreeKv(std.math.maxInt(u32), &.{0}));
+
+    // F12.3 & F22.1: batch prefill rejects OOB token IDs and batch slot pins LoRA against unload.
+    var reg = try lora.LoraRegistry.init(.{
+        .pool_bytes = 2 * 1024 * 1024,
+        .allocator = gpa,
+        .base_shape = model.baseLoraShape(),
+    });
+    defer reg.deinit(gpa);
+    var a_f32: [4 * 64]f32 = @splat(0.01);
+    var b_f32: [64 * 4]f32 = @splat(0.01);
+    const lspec = [_]lora.SyntheticLoraSpec{.{
+        .layer = 0,
+        .target = .q_proj,
+        .n = 64,
+        .k = 64,
+        .rank = 4,
+        .a_f32 = &a_f32,
+        .b_f32 = &b_f32,
+    }};
+    const lbytes = try lora.buildSyntheticAmloraBytes(gpa, "pin-test", 4, 4.0, &lspec);
+    defer gpa.free(lbytes);
+    const lslot = try reg.loadAdapterFromBytes(gpa, "pin-test", lbytes);
+
+    var batch_rt = try Qwen3BatchRuntime.init(gpa, &model, .{
+        .max_slots = 2,
+        .prefix_cache_chunks = 4,
+    });
+    defer batch_rt.deinit(gpa);
+    batch_rt.attachLoraRegistry(&reg);
+
+    var rng0 = try rng_mod.RequestRng.init(42);
+    const bad_toks = [_]u32{base_cfg.vocab_size};
+    try std.testing.expectError(error.PrefillFailed, batch_rt.prefillSlot(&.{
+        .slot_id = 0,
+        .request_id = 1,
+        .user_tag = 0,
+        .tokens = &bad_toks,
+        .start_pos = 0,
+        .total_prompt_len = 1,
+        .is_final_chunk = true,
+        .prefix_handle = 1,
+        .temperature = 0.0,
+        .rng = &rng0,
+        .ngram_domain = "",
+    }));
+
+    batch_rt.setSlotLora(0, lslot);
+    try std.testing.expectEqual(@as(u32, 1), reg.slotPinCount(lslot));
+    try std.testing.expectError(error.AdapterInUse, reg.unloadAdapter(gpa, "pin-test"));
+    batch_rt.setSlotLora(0, lora.NO_ADAPTER);
+    try std.testing.expectEqual(@as(u32, 0), reg.slotPinCount(lslot));
+    try reg.unloadAdapter(gpa, "pin-test");
 }

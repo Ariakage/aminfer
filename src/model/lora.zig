@@ -36,9 +36,24 @@ pub const MAX_ADAPTERS: usize = 16;
 pub const MAX_ADAPTER_NAME_LEN: usize = 64;
 pub const MAX_LORA_RANK: u32 = sme.MAX_STEP_LORA_RANK; // 64
 pub const MAX_LORA_BATCH_ROWS: usize = sme.MAX_STEP_LORA_M; // 64
+/// Maximum output dimension `n` supported by stack-buffered quantized-B CPU single-row
+/// evaluation when no external `f32` scratch slice is supplied (`F22.2`).
+pub const MAX_LORA_OUT_DIM: usize = 32768;
 
 /// Sentinel indicating no active LoRA adapter (base model only).
 pub const NO_ADAPTER: u32 = std.math.maxInt(u32);
+
+/// ABA-safe pinned adapter reference carrying `(slot_id, generation)` (`F22.1`).
+pub const AdapterHandle = struct {
+    slot_id: u32 = NO_ADAPTER,
+    generation: u64 = 0,
+
+    pub const NONE: AdapterHandle = .{ .slot_id = NO_ADAPTER, .generation = 0 };
+
+    pub inline fn isActive(self: AdapterHandle) bool {
+        return self.slot_id != NO_ADAPTER;
+    }
+};
 
 pub const TargetProjection = enum(u8) {
     q_proj = 0,
@@ -291,7 +306,11 @@ pub const LoraError = amf.ParseError || amf.IoError || page.WiredRegion.InitErro
     PoolOutOfSpace,
     RegistryFull,
     DuplicateAdapterName,
+    DuplicateTargetProjection,
     AdapterNotFound,
+    AdapterInUse,
+    AdapterGenerationMismatch,
+    UnbalancedUnpin,
     InvalidAdapterName,
     InvalidAdapterConfig,
     UnsupportedRank,
@@ -601,20 +620,35 @@ pub const LoraLinearPair = struct {
         z_u16_scratch: []u16,
         dispatcher: ?*sme.SmeDispatcher,
     ) sme.Error!void {
+        return self.applySingleRowF16WithOutScratch(x_row, y_row, z_scratch, z_u16_scratch, dispatcher, null);
+    }
+
+    pub fn applySingleRowF16WithOutScratch(
+        self: *const LoraLinearPair,
+        x_row: []const f16,
+        y_row: []f16,
+        z_scratch: []f32,
+        z_u16_scratch: []u16,
+        dispatcher: ?*sme.SmeDispatcher,
+        y_f32_scratch: ?[]f32,
+    ) sme.Error!void {
         const dora_scale: ?[]const f32 = if (self.use_dora) self.dora_row_scale_f32 else null;
         const r: usize = self.rank;
         const n: usize = self.n;
         const k: usize = self.k;
         if (self.scale == 0.0) {
             if (dora_scale) |ds| {
-                std.debug.assert(y_row.len >= n and ds.len >= n);
+                if (y_row.len < n or ds.len < n) return error.BufferTooSmall;
                 for (0..n) |o| {
                     y_row[o] = @floatCast(@as(f32, @floatCast(y_row[o])) * ds[o]);
                 }
             }
             return;
         }
-        std.debug.assert(x_row.len >= k and y_row.len >= n and z_scratch.len >= r);
+        if (x_row.len < k or y_row.len < n or z_scratch.len < r) return error.BufferTooSmall;
+        if (dora_scale) |ds| {
+            if (ds.len < n) return error.BufferTooSmall;
+        }
 
         switch (self.layout) {
             .row_major => {
@@ -665,22 +699,15 @@ pub const LoraLinearPair = struct {
                         }
                         @memset(z_u16_scratch[r..sme.GROUP_SIZE], 0);
                         if (adp.b_weight.dtype.isQuantized()) {
-                            if (n > 8192) return error.BufferTooSmall;
-                            var y_f32_tmp: [8192]f32 = undefined;
-                            try sme.evalSmeLinear(
-                                dispatcher.?,
+                            try evalQuantizedBSingleRow(
                                 adp.b_weight,
                                 z_u16_scratch[0..sme.GROUP_SIZE],
-                                null,
-                                std.mem.sliceAsBytes(y_f32_tmp[0..n]),
-                                1,
-                                .{ .cache_hint = .temporal, .epilogue = .none, .out_dtype = .f32 },
+                                y_row,
+                                dora_scale,
+                                n,
+                                dispatcher.?,
+                                y_f32_scratch,
                             );
-                            for (0..n) |o| {
-                                var val = @as(f32, @floatCast(y_row[o])) + y_f32_tmp[o];
-                                if (dora_scale) |ds| val *= ds[o];
-                                y_row[o] = @floatCast(val);
-                            }
                             return;
                         }
                         self.addPanel64BToF16Row(z_u16_scratch[0..sme.GROUP_SIZE], y_row);
@@ -689,7 +716,7 @@ pub const LoraLinearPair = struct {
                 }
                 if (self.sme_adapter) |adp| {
                     if (adp.a_weight.dtype.isQuantized() or adp.b_weight.dtype.isQuantized() or self.weight_dtype == .q2_affine) {
-                        if (n > 8192 or z_u16_scratch.len < sme.GROUP_SIZE) return error.BufferTooSmall;
+                        if (z_u16_scratch.len < sme.GROUP_SIZE) return error.BufferTooSmall;
                         const x_u16: []const u16 = @ptrCast(x_row[0..k]);
                         sme.matmulPanel64ScalarRange(
                             adp.a_weight.dtype,
@@ -711,33 +738,72 @@ pub const LoraLinearPair = struct {
                             z_u16_scratch[j] = quant.f32ToFloatBits(.f16, z_scratch[j] * self.scale);
                         }
                         @memset(z_u16_scratch[r..sme.GROUP_SIZE], 0);
-                        var y_f32_tmp: [8192]f32 = undefined;
-                        sme.matmulPanel64ScalarRange(
-                            adp.b_weight.dtype,
-                            adp.b_weight.param_kind,
-                            .none,
-                            .f32,
+                        try evalQuantizedBSingleRow(
+                            adp.b_weight,
                             z_u16_scratch[0..sme.GROUP_SIZE],
-                            adp.b_weight.w_packed,
-                            null,
-                            std.mem.sliceAsBytes(y_f32_tmp[0..n]),
-                            0,
-                            1,
-                            0,
-                            sme.panelCount(n),
+                            y_row,
+                            dora_scale,
                             n,
-                            sme.GROUP_SIZE,
+                            null,
+                            y_f32_scratch,
                         );
-                        for (0..n) |o| {
-                            var val = @as(f32, @floatCast(y_row[o])) + y_f32_tmp[o];
-                            if (dora_scale) |ds| val *= ds[o];
-                            y_row[o] = @floatCast(val);
-                        }
                         return;
                     }
                 }
                 self.applyPanel64ScalarF16(x_row, y_row, z_scratch);
             },
+        }
+    }
+
+    noinline fn evalQuantizedBSingleRow(
+        b_weight: sme.SmeLinearWeight,
+        z_u16: []const u16,
+        y_row: []f16,
+        dora_scale: ?[]const f32,
+        n: usize,
+        dispatcher: ?*sme.SmeDispatcher,
+        y_f32_scratch: ?[]f32,
+    ) sme.Error!void {
+        var stack_tmp: [MAX_LORA_OUT_DIM]f32 = undefined;
+        const y_f32: []f32 = blk: {
+            if (y_f32_scratch) |sc| {
+                if (sc.len >= n) break :blk sc[0..n];
+            }
+            if (n > MAX_LORA_OUT_DIM) return error.BufferTooSmall;
+            break :blk stack_tmp[0..n];
+        };
+        if (dispatcher) |disp| {
+            try sme.evalSmeLinear(
+                disp,
+                b_weight,
+                z_u16,
+                null,
+                std.mem.sliceAsBytes(y_f32),
+                1,
+                .{ .cache_hint = .temporal, .epilogue = .none, .out_dtype = .f32 },
+            );
+        } else {
+            sme.matmulPanel64ScalarRange(
+                b_weight.dtype,
+                b_weight.param_kind,
+                .none,
+                .f32,
+                z_u16,
+                b_weight.w_packed,
+                null,
+                std.mem.sliceAsBytes(y_f32),
+                0,
+                1,
+                0,
+                sme.panelCount(n),
+                n,
+                sme.GROUP_SIZE,
+            );
+        }
+        for (0..n) |o| {
+            var val = @as(f32, @floatCast(y_row[o])) + y_f32[o];
+            if (dora_scale) |ds| val *= ds[o];
+            y_row[o] = @floatCast(val);
         }
     }
 
@@ -865,6 +931,8 @@ pub const LayerAdapters = struct {
 
 pub const LoadedAdapter = struct {
     in_use: bool = false,
+    generation: u64 = 0,
+    pin_count: u32 = 0,
     name: [MAX_ADAPTER_NAME_LEN]u8 = @splat(0),
     name_len: u8 = 0,
     rank: u32 = 0,
@@ -946,6 +1014,7 @@ pub const LoraRegistry = struct {
     sme_scratch: ?sme.StepLoraScratch,
     delta_f32_region: ?page.WiredRegion,
     slots: [MAX_ADAPTERS]LoadedAdapter,
+    slot_generations: [MAX_ADAPTERS]u64,
     active_count: u32,
     total_loads: u64,
     total_unloads: u64,
@@ -1011,6 +1080,7 @@ pub const LoraRegistry = struct {
             .sme_scratch = sme_scratch,
             .delta_f32_region = delta_region,
             .slots = @splat(.{}),
+            .slot_generations = @splat(0),
             .active_count = 0,
             .total_loads = 0,
             .total_unloads = 0,
@@ -1154,6 +1224,53 @@ pub const LoraRegistry = struct {
         return &self.slots[slot_id];
     }
 
+    /// Returns the monotonic generation counter of an active slot (`null` if unloaded).
+    pub fn slotGeneration(self: *const LoraRegistry, slot_id: u32) ?u64 {
+        const adp = self.adapterAt(slot_id) orelse return null;
+        return adp.generation;
+    }
+
+    /// Returns the active request pin refcount of an adapter slot (`0` if unloaded).
+    pub fn slotPinCount(self: *const LoraRegistry, slot_id: u32) u32 {
+        const adp = self.adapterAt(slot_id) orelse return 0;
+        return adp.pin_count;
+    }
+
+    /// Pins an active adapter slot for an in-flight request, returning its ABA-safe
+    /// `(slot_id, generation)` handle. While `pin_count > 0`, `unloadAdapter` /
+    /// `unloadSlot` returns `error.AdapterInUse` (`F22.1`).
+    pub fn pinSlot(self: *LoraRegistry, slot_id: u32) LoraError!AdapterHandle {
+        if (slot_id >= MAX_ADAPTERS or !self.slots[slot_id].in_use) return error.AdapterNotFound;
+        const next_pin = std.math.add(u32, self.slots[slot_id].pin_count, 1) catch return error.AdapterInUse;
+        self.slots[slot_id].pin_count = next_pin;
+        return .{
+            .slot_id = slot_id,
+            .generation = self.slots[slot_id].generation,
+        };
+    }
+
+    /// Releases a previously pinned `(slot_id, generation)` handle (`F22.1`).
+    pub fn unpinSlot(self: *LoraRegistry, handle: AdapterHandle) LoraError!void {
+        if (!handle.isActive()) return;
+        if (handle.slot_id >= MAX_ADAPTERS or !self.slots[handle.slot_id].in_use) {
+            return error.AdapterNotFound;
+        }
+        if (self.slots[handle.slot_id].generation != handle.generation) {
+            return error.AdapterGenerationMismatch;
+        }
+        if (self.slots[handle.slot_id].pin_count == 0) {
+            return error.UnbalancedUnpin;
+        }
+        self.slots[handle.slot_id].pin_count -= 1;
+    }
+
+    /// Returns `true` iff `handle` still refers to the same loaded adapter generation.
+    pub inline fn isHandleValid(self: *const LoraRegistry, handle: AdapterHandle) bool {
+        if (!handle.isActive() or handle.slot_id >= MAX_ADAPTERS) return false;
+        const slot = &self.slots[handle.slot_id];
+        return slot.in_use and slot.generation == handle.generation;
+    }
+
     /// Hot-loads an `.amlora` (`.amf`-based) bundle from disk (`F_NOCACHE`) into
     /// the preallocated wired L2 pool under `name`. Returns the assigned slot ID.
     pub fn loadAdapterFromFile(
@@ -1182,6 +1299,7 @@ pub const LoraRegistry = struct {
 
     /// Hot-unloads adapter `name`, immediately returning all of its wired 16 KiB
     /// pages back to the preallocated pool without touching base weights.
+    /// Refuses with `error.AdapterInUse` while pinned by any active request (`F22.1`).
     pub fn unloadAdapter(self: *LoraRegistry, allocator: std.mem.Allocator, name: []const u8) LoraError!void {
         const slot_id = self.findSlotByName(name) orelse return error.AdapterNotFound;
         try self.unloadSlot(allocator, slot_id);
@@ -1189,6 +1307,7 @@ pub const LoraRegistry = struct {
 
     pub fn unloadSlot(self: *LoraRegistry, allocator: std.mem.Allocator, slot_id: u32) LoraError!void {
         if (slot_id >= MAX_ADAPTERS or !self.slots[slot_id].in_use) return error.AdapterNotFound;
+        if (self.slots[slot_id].pin_count > 0) return error.AdapterInUse;
         const owner: u8 = @intCast(slot_id);
         for (0..self.total_pages) |p| {
             if (self.page_owner[p] == owner) {
@@ -1255,7 +1374,13 @@ pub const LoraRegistry = struct {
 
         const k: usize = pair.k;
         const n: usize = pair.n;
+        const req_x = std.math.mul(usize, num_rows, k) catch return error.BufferTooSmall;
+        const req_y = std.math.mul(usize, num_rows, n) catch return error.BufferTooSmall;
+        if (x_f16.len < req_x or y_f16.len < req_y) return error.BufferTooSmall;
         const dora_scale: ?[]const f32 = if (pair.use_dora) pair.dora_row_scale_f32 else null;
+        if (dora_scale) |ds| {
+            if (ds.len < n) return error.BufferTooSmall;
+        }
         if (pair.scale != 0.0 and pair.layout == .sme2_panel64 and pair.sme_adapter != null and
             self.sme_dispatcher != null and self.sme_scratch != null and self.delta_f32_region != null)
         {
@@ -1305,13 +1430,18 @@ pub const LoraRegistry = struct {
             }
         }
 
+        const out_scratch: ?[]f32 = if (self.delta_f32_region) |dr|
+            @alignCast(std.mem.bytesAsSlice(f32, dr.bytes))
+        else
+            null;
         for (0..num_rows) |row| {
-            try pair.applySingleRowF16(
+            try pair.applySingleRowF16WithOutScratch(
                 x_f16[row * k ..][0..k],
                 y_f16[row * n ..][0..n],
                 &self.z_f32_scratch,
                 &self.z_u16_scratch,
                 self.sme_dispatcher,
+                out_scratch,
             );
         }
     }
@@ -1350,7 +1480,7 @@ pub const LoraRegistry = struct {
             }
             if (!pair.use_dora and pair.scale != 0.0 and pair.layout == .sme2_panel64 and pair.sme_adapter != null and
                 self.sme_dispatcher != null and self.sme_scratch != null and self.delta_f32_region != null and
-                !pair.sme_adapter.?.a_weight.dtype.activationIsBf16() and hoisted_count < MAX_ADAPTERS)
+                !pair.sme_adapter.?.a_weight.dtype.activationIsBf16() and pair.k == k and pair.n == n and hoisted_count < MAX_ADAPTERS)
             {
                 hoisted[hoisted_count] = pair.sme_adapter.?.withAlpha(pair.scale);
                 hoisted_count += 1;
@@ -1361,6 +1491,9 @@ pub const LoraRegistry = struct {
         }
 
         if (hoisted_count > 0) {
+            const req_x = std.math.mul(usize, num_rows, k) catch return error.BufferTooSmall;
+            const req_y = std.math.mul(usize, num_rows, n) catch return error.BufferTooSmall;
+            if (x_f16.len < req_x or y_f16.len < req_y) return error.BufferTooSmall;
             const delta_all: []f32 = @alignCast(std.mem.bytesAsSlice(f32, self.delta_f32_region.?.bytes));
             const cap_rows: usize = @min(MAX_LORA_BATCH_ROWS, delta_all.len / n);
             if (cap_rows == 0) return error.BufferTooSmall;
@@ -1408,6 +1541,10 @@ pub const LoraRegistry = struct {
         x_f16: []const f16,
         y_f16: []f16,
     ) sme.Error!void {
+        const out_scratch: ?[]f32 = if (self.delta_f32_region) |dr|
+            @alignCast(std.mem.bytesAsSlice(f32, dr.bytes))
+        else
+            null;
         for (batch_lora_slots, 0..) |sid, row| {
             if (sid == NO_ADAPTER) continue;
             const adp = self.adapterAt(sid) orelse continue;
@@ -1415,12 +1552,18 @@ pub const LoraRegistry = struct {
             const pair = la.projections[@backingInt(target)] orelse continue;
             const k: usize = pair.k;
             const n: usize = pair.n;
-            try pair.applySingleRowF16(
-                x_f16[row * k ..][0..k],
-                y_f16[row * n ..][0..n],
+            const x_off = std.math.mul(usize, row, k) catch return error.BufferTooSmall;
+            const x_end = std.math.add(usize, x_off, k) catch return error.BufferTooSmall;
+            const y_off = std.math.mul(usize, row, n) catch return error.BufferTooSmall;
+            const y_end = std.math.add(usize, y_off, n) catch return error.BufferTooSmall;
+            if (x_end > x_f16.len or y_end > y_f16.len) return error.BufferTooSmall;
+            try pair.applySingleRowF16WithOutScratch(
+                x_f16[x_off..x_end],
+                y_f16[y_off..y_end],
                 &self.z_f32_scratch,
                 &self.z_u16_scratch,
                 self.sme_dispatcher,
+                out_scratch,
             );
         }
     }
@@ -1555,37 +1698,17 @@ pub const LoraRegistry = struct {
         parsed: *const amf.Parsed,
         info: ParsedLoraTensorName,
         role: LoraTensorRole,
-    ) ?*const amf.TensorEntry {
-        var name_buf: [64]u8 = undefined;
-        const suffixes: []const []const u8 = switch (role) {
-            .lora_a => &.{"lora_a"},
-            .lora_b => &.{"lora_b"},
-            .dora_mag => &.{ "dora_mag", "lora_mag", "lora_magnitude_vector" },
-        };
-        // Fast O(1)-ish exact lookup trying source mod_path first, then canonical suffix.
-        for (suffixes) |sfx| {
-            if (std.fmt.bufPrint(&name_buf, "layers.{d}.{s}.{s}", .{ info.layer, info.mod_path, sfx })) |nm| {
-                if (nm.len < 48) {
-                    if (parsed.find(nm)) |e| return e;
-                }
-            } else |_| {}
-            if (!std.mem.eql(u8, info.mod_path, info.target.suffix())) {
-                if (std.fmt.bufPrint(&name_buf, "layers.{d}.{s}.{s}", .{ info.layer, info.target.suffix(), sfx })) |nm| {
-                    if (nm.len < 48) {
-                        if (parsed.find(nm)) |e| return e;
-                    }
-                } else |_| {}
-            }
-        }
-        // Fallback scan matching any alias resolving to the same `(layer, target, role)`.
+    ) LoraError!?*const amf.TensorEntry {
+        var matched: ?*const amf.TensorEntry = null;
         for (parsed.entries) |*e| {
             if (amf.isMetaEntry(e)) continue;
             const parsed_e = parseLoraTensorName(e.nameSlice()) orelse continue;
             if (parsed_e.layer == info.layer and parsed_e.target == info.target and parsed_e.role == role) {
-                return e;
+                if (matched != null) return error.DuplicateTargetProjection;
+                matched = e;
             }
         }
-        return null;
+        return matched;
     }
 
     fn doraWiredBytes(n: usize) LoraError!usize {
@@ -1627,7 +1750,8 @@ pub const LoraRegistry = struct {
         errdefer allocator.free(layers);
         @memset(layers, .{});
 
-        // Pre-check total wired pages required (including DoRA wired vectors) before mutating pool state.
+        // Pre-check total wired pages required (including DoRA wired vectors) and reject duplicate
+        // `(layer, target)` aliases before mutating pool state (`F22.2`).
         var needed_pages: usize = 0;
         var found_any_pair = false;
         for (parsed.entries) |*e| {
@@ -1636,18 +1760,22 @@ pub const LoraRegistry = struct {
             const info = parseLoraTensorName(e.nameSlice()) orelse continue;
             if (info.layer >= self.base_shape.num_layers) return error.LayerOutOfRange;
             if (info.role != .lora_a) continue;
-            const b_entry = findPairedEntry(parsed, info, .lora_b) orelse return error.MissingPairedTensor;
+            const t_bit = info.target.bit();
+            if ((layers[info.layer].target_mask & t_bit) != 0) return error.DuplicateTargetProjection;
+            layers[info.layer].target_mask |= t_bit;
+            const b_entry = (try findPairedEntry(parsed, info, .lora_b)) orelse return error.MissingPairedTensor;
             if ((try b_entry.tensorKind()) != .loop_adapter) return error.InvalidTensorKind;
             if (b_entry.rank != 2 or b_entry.shape[0] == 0) return error.DimensionMismatch;
 
             needed_pages += @intCast(e.blob_bytes / page.APPLE_PAGE_SIZE);
             needed_pages += @intCast(b_entry.blob_bytes / page.APPLE_PAGE_SIZE);
-            if (findPairedEntry(parsed, info, .dora_mag)) |mag_entry| {
+            if (try findPairedEntry(parsed, info, .dora_mag)) |mag_entry| {
                 if ((try mag_entry.tensorKind()) != .loop_adapter) return error.InvalidTensorKind;
                 const d_bytes = try doraWiredBytes(b_entry.shape[0]);
                 needed_pages += d_bytes / page.APPLE_PAGE_SIZE;
             }
         }
+        for (layers) |*la| la.target_mask = 0;
         if (needed_pages == 0) return error.MissingPairedTensor;
         if (self.used_pages + needed_pages > self.total_pages) return error.PoolOutOfSpace;
 
@@ -1666,7 +1794,10 @@ pub const LoraRegistry = struct {
             const info = parseLoraTensorName(a_entry.nameSlice()) orelse continue;
             if (info.role != .lora_a) continue;
 
-            const b_entry = findPairedEntry(parsed, info, .lora_b) orelse return error.MissingPairedTensor;
+            const t_idx: usize = @backingInt(info.target);
+            if (layers[info.layer].projections[t_idx] != null) return error.DuplicateTargetProjection;
+
+            const b_entry = (try findPairedEntry(parsed, info, .lora_b)) orelse return error.MissingPairedTensor;
             if ((try b_entry.tensorKind()) != .loop_adapter) return error.InvalidTensorKind;
 
             const a_dt = try a_entry.dataType();
@@ -1735,7 +1866,7 @@ pub const LoraRegistry = struct {
             var pair_use_dora = false;
             var dora_mag_slice: ?[]f32 = null;
             var dora_scale_slice: ?[]f32 = null;
-            if (findPairedEntry(parsed, info, .dora_mag)) |mag_entry| {
+            if (try findPairedEntry(parsed, info, .dora_mag)) |mag_entry| {
                 if ((try mag_entry.tensorKind()) != .loop_adapter) return error.InvalidTensorKind;
                 if (mag_entry.rank != 1 or mag_entry.shape[0] != n) return error.DimensionMismatch;
                 if ((try mag_entry.tensorLayout()) != .row_major) return error.InvalidTensorLayout;
@@ -1787,7 +1918,6 @@ pub const LoraRegistry = struct {
                 );
             }
 
-            const t_idx: usize = @backingInt(info.target);
             layers[info.layer].projections[t_idx] = .{
                 .rank = rank,
                 .n = n,
@@ -1811,8 +1941,16 @@ pub const LoraRegistry = struct {
 
         if (!found_any_pair) return error.MissingPairedTensor;
 
+        const next_gen: u64 = if (self.slot_generations[slot_id] == std.math.maxInt(u64))
+            1
+        else
+            self.slot_generations[slot_id] + 1;
+        self.slot_generations[slot_id] = next_gen;
+
         var slot: LoadedAdapter = .{
             .in_use = true,
+            .generation = next_gen,
+            .pin_count = 0,
             .name = @splat(0),
             .name_len = @intCast(name.len),
             .rank = inferred_rank,
@@ -2774,4 +2912,101 @@ test "W30 universal projections, Inkling-2 aliases, 32 MiB R9 pool, and exact Do
     try reg.unloadAdapter(gpa, "ink-dora");
     try std.testing.expectEqual(@as(usize, 0), reg.stats().pool_used_bytes);
     try std.testing.expectEqual(@as(u32, 0), reg.activeAdapterCount());
+}
+
+test "F22 LoraRegistry pins block unload with AdapterInUse, increment generation against ABA, reject duplicate target aliases, and bounds-check CPU fallback" {
+    const gpa = std.testing.allocator;
+    const base_shape: BaseModelShape = .{
+        .num_layers = 1,
+        .hidden_size = 64,
+        .q_dim = 64,
+        .kv_dim = 64,
+        .intermediate_size = 64,
+    };
+    var reg = try LoraRegistry.init(.{
+        .pool_bytes = 2 * 1024 * 1024,
+        .allocator = gpa,
+        .base_shape = base_shape,
+    });
+    defer reg.deinit(gpa);
+
+    var a_f32: [4 * 64]f32 = @splat(0.05);
+    var b_f32: [64 * 4]f32 = @splat(0.02);
+    const spec_a = [_]SyntheticLoraSpec{.{
+        .layer = 0,
+        .target = .q_proj,
+        .n = 64,
+        .k = 64,
+        .rank = 4,
+        .a_f32 = &a_f32,
+        .b_f32 = &b_f32,
+    }};
+    const bytes_a = try buildSyntheticAmloraBytes(gpa, "adp-a", 4, 4.0, &spec_a);
+    defer gpa.free(bytes_a);
+
+    const slot_a = try reg.loadAdapterFromBytes(gpa, "adp-a", bytes_a);
+    const gen1 = reg.slotGeneration(slot_a) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(gen1 >= 1);
+
+    // Pinning prevents hot-unload while in flight (`F22.1`).
+    const h1 = try reg.pinSlot(slot_a);
+    try std.testing.expectEqual(slot_a, h1.slot_id);
+    try std.testing.expectEqual(gen1, h1.generation);
+    try std.testing.expectEqual(@as(u32, 1), reg.slotPinCount(slot_a));
+    try std.testing.expect(reg.isHandleValid(h1));
+    try std.testing.expectError(error.AdapterInUse, reg.unloadAdapter(gpa, "adp-a"));
+    try std.testing.expectError(error.AdapterInUse, reg.unloadSlot(gpa, slot_a));
+
+    // CPU fallback bounds checks (`F22.2`).
+    var x_short: [32]f16 = @splat(0);
+    var y_ok: [64]f16 = @splat(0);
+    var x_ok: [64]f16 = @splat(0);
+    var y_short: [32]f16 = @splat(0);
+    try std.testing.expectError(error.BufferTooSmall, reg.applySingleAdapterProjectionF16(slot_a, 0, .q_proj, &x_short, &y_ok, 1));
+    try std.testing.expectError(error.BufferTooSmall, reg.applySingleAdapterProjectionF16(slot_a, 0, .q_proj, &x_ok, &y_short, 1));
+    try std.testing.expectError(error.BufferTooSmall, reg.applyBatchProjectionF16(&.{slot_a}, 0, .q_proj, &x_short, &y_ok));
+    try std.testing.expectError(error.BufferTooSmall, reg.applyBatchProjectionF16(&.{slot_a}, 0, .q_proj, &x_ok, &y_short));
+
+    // Unpin, unload, reload into the same slot -> generation must strictly increase so stale `h1` is invalid.
+    try reg.unpinSlot(h1);
+    try std.testing.expectEqual(@as(u32, 0), reg.slotPinCount(slot_a));
+    try reg.unloadAdapter(gpa, "adp-a");
+    try std.testing.expect(!reg.isHandleValid(h1));
+
+    const slot_b = try reg.loadAdapterFromBytes(gpa, "adp-b", bytes_a);
+    try std.testing.expectEqual(slot_a, slot_b);
+    const gen2 = reg.slotGeneration(slot_b) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(gen2 > gen1);
+    try std.testing.expect(!reg.isHandleValid(h1));
+    try std.testing.expectError(error.AdapterGenerationMismatch, reg.unpinSlot(h1));
+    try reg.unloadAdapter(gpa, "adp-b");
+    try std.testing.expectEqual(@as(usize, 0), reg.stats().pool_used_bytes);
+
+    // Duplicate `(layer, target)` aliases in one `.amlora` must be rejected with zero page leaks (`F22.2`).
+    const dup_specs = [_]SyntheticLoraSpec{
+        .{
+            .layer = 0,
+            .target = .q_proj,
+            .n = 64,
+            .k = 64,
+            .rank = 4,
+            .a_f32 = &a_f32,
+            .b_f32 = &b_f32,
+            .custom_suffix = "self_attn.q_proj",
+        },
+        .{
+            .layer = 0,
+            .target = .q_proj,
+            .n = 64,
+            .k = 64,
+            .rank = 4,
+            .a_f32 = &a_f32,
+            .b_f32 = &b_f32,
+            .custom_suffix = "attn.wq",
+        },
+    };
+    const dup_bytes = try buildSyntheticAmloraBytes(gpa, "dup-q", 4, 4.0, &dup_specs);
+    defer gpa.free(dup_bytes);
+    try std.testing.expectError(error.DuplicateTargetProjection, reg.loadAdapterFromBytes(gpa, "dup-q", dup_bytes));
+    try std.testing.expectEqual(@as(usize, 0), reg.stats().pool_used_bytes);
 }

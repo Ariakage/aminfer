@@ -1285,6 +1285,7 @@ const Hy4LayerWeights = struct {
     is_swa: bool = false,
     indexer: ?Hy4IndexerWeights = null,
     k_fine_cache_off: u64 = 0, // `[max_seq_len, idx_d]` f16 for `.full` sparse layers
+    tree_k_fine_off: u64 = 0, // `[max_tree_nodes, idx_d]` f16 uncommitted tree scratch (`F20.3`)
 
     // MLA KV cache in M82 arena
     kv_latent_off: u64, // `[max_seq_len, kv_lora_rank]` f16
@@ -1351,6 +1352,7 @@ pub const M82Runtime = struct {
     buf: metal.Buffer,
     max_seq_len: u32,
     max_tree_nodes: u32,
+    last_verified_nodes: u32 = 0,
     effective_steps: u32,
     use_sme2_controllers: bool = false,
     enable_router_trace: bool = false,
@@ -1663,6 +1665,7 @@ pub const M82Runtime = struct {
 
     pub fn resetKvCache(self: *M82Runtime) void {
         self.sconv_pos = 0;
+        self.last_verified_nodes = 0;
         if (self.sconv_h_ring) |*r| @memset(r.bytes(), 0);
         if (self.sconv_kv_ring) |*r| @memset(r.bytes(), 0);
         if (self.attn_res_ring) |*r| {
@@ -1929,8 +1932,20 @@ pub const M82Runtime = struct {
         vis_local_start: u32,
         vis_count: u32,
     ) graph.GraphStepError!qwen3.VerifyTreeResult {
-        if (self.family.isInkling2()) {
-            return self.forwardInkling2(
+        if (token_ids.len == 0 or positions.len != token_ids.len or ancestor_masks.len != token_ids.len) {
+            return error.InvalidTree;
+        }
+        if (token_ids.len > self.max_tree_nodes) {
+            return error.TreeTooLarge;
+        }
+        if (commit_state and @as(u64, base_pos) + token_ids.len > self.max_seq_len) {
+            return error.SequenceFull;
+        }
+        for (token_ids) |tid| {
+            if (tid >= model.config.vocab_size) return error.TokenOutOfRange;
+        }
+        const res = if (self.family.isInkling2())
+            try self.forwardInkling2(
                 model,
                 token_ids,
                 positions,
@@ -1943,21 +1958,23 @@ pub const M82Runtime = struct {
                 vis_src_row_off,
                 vis_local_start,
                 vis_count,
+            )
+        else
+            try self.forwardHy4(
+                model,
+                token_ids,
+                positions,
+                ancestor_masks,
+                base_pos,
+                compute_logits,
+                commit_state,
+                vis_override_src,
+                vis_src_row_off,
+                vis_local_start,
+                vis_count,
             );
-        }
-        return self.forwardHy4(
-            model,
-            token_ids,
-            positions,
-            ancestor_masks,
-            base_pos,
-            compute_logits,
-            commit_state,
-            vis_override_src,
-            vis_src_row_off,
-            vis_local_start,
-            vis_count,
-        );
+        self.last_verified_nodes = if (!commit_state) @intCast(token_ids.len) else 0;
+        return res;
     }
 
     // ------------------------------------------------------------------------
@@ -3558,10 +3575,10 @@ pub const M82Runtime = struct {
         // covers 100% of prefill, single-step decode, and DFly2 linear blocks, giving exact bit-identical
         // `causal_q_start_pos = base_pos` indexer + sparse-MLA attention across every node `0..m-1`.
         var is_linear_chain = commit_state;
-        if (!commit_state and (base_pos + m) <= self.max_seq_len) {
+        if (!commit_state and @as(u64, base_pos) + m <= self.max_seq_len) {
             is_linear_chain = true;
             for (0..m) |ni| {
-                const exp_mask: u64 = (@as(u64, 1) << @intCast(ni + 1)) - 1;
+                const exp_mask: u64 = hy4LinearAncestorMask(ni);
                 if (positions[ni] != base_pos + @as(u32, @intCast(ni)) or ancestor_masks[ni] != exp_mask) {
                     is_linear_chain = false;
                     break;
@@ -3746,7 +3763,9 @@ pub const M82Runtime = struct {
                     try model.encodeLinearBatched(f, hwp, model.x_norm_bind, self.bindAt(self.hy4_hw_idx_off), m, false);
                 }
                 if (is_linear_chain) {
-                    // Write `k_fine` at `base_pos..base_pos+m` (uncommitted tail is safe when `!commit_state`).
+                    // Write `k_fine` at `base_pos..base_pos+m` (and stage into dedicated
+                    // `tree_k_fine_off` when `!commit_state` so `commitTreeKv` reads uncommitted
+                    // keys solely from tree scratch without ever contaminating `k_fine_cache`, `F20.3`).
                     try model.moe_pipes.encodeCopyStrided(f, .{
                         .src = self.bindAt(self.hy4_k_idx_off),
                         .dst = self.bindAt(layer.k_fine_cache_off + @as(u64, base_pos) * idx_d * 2),
@@ -3755,6 +3774,16 @@ pub const M82Runtime = struct {
                         .src_stride = idx_d,
                         .dst_stride = idx_d,
                     }, true);
+                    if (!commit_state) {
+                        try model.moe_pipes.encodeCopyStrided(f, .{
+                            .src = self.bindAt(self.hy4_k_idx_off),
+                            .dst = self.bindAt(layer.tree_k_fine_off),
+                            .num_rows = m,
+                            .copy_cols = idx_d,
+                            .src_stride = idx_d,
+                            .dst_stride = idx_d,
+                        }, false);
+                    }
 
                     const disp = try self.pipes.encodeHy4IndexLayer(f, .{
                         .mode = .full,
@@ -3780,6 +3809,9 @@ pub const M82Runtime = struct {
                     try flushFrame(model, frame_opt);
                     const k_idx_src = self.sliceF16(self.hy4_k_idx_off, @as(usize, m) * idx_d);
                     const k_fine_dst = self.sliceF16(layer.k_fine_cache_off, @as(usize, self.max_seq_len) * idx_d);
+                    const tree_k_fine_dst = self.sliceF16(layer.tree_k_fine_off, @as(usize, self.max_tree_nodes) * idx_d);
+                    // Stage ALL uncommitted tree node `k_fine` vectors into dedicated tree scratch (`F20.3`).
+                    @memcpy(tree_k_fine_dst[0 .. @as(usize, m) * idx_d], k_idx_src);
                     const cand_k: usize = idx_pool.spec.candidate_topk;
                     var rev: usize = m;
                     while (rev > 0) {
@@ -3815,13 +3847,6 @@ pub const M82Runtime = struct {
                                 idx_pool.selected_tokens[0..cand_k],
                             );
                             idx_pool.selected_counts[ni] = idx_pool.selected_counts[0];
-                        }
-                    }
-                    // Restore tree node `k_fine` rows at `base_pos..base_pos+m` for `commitTreeKv` compaction.
-                    for (0..m) |ni| {
-                        const pos = base_pos + @as(u32, @intCast(ni));
-                        if (pos < self.max_seq_len) {
-                            @memcpy(k_fine_dst[@as(usize, pos) * idx_d ..][0..idx_d], k_idx_src[ni * idx_d ..][0..idx_d]);
                         }
                     }
                 }
@@ -4372,6 +4397,12 @@ pub const M82Runtime = struct {
         idx_pool.selected_counts[b] = tc;
     }
 
+    /// Returns the expected causal linear-chain ancestor bitmask for tree node `ni`,
+    /// guarding the `ni == 63` (`u6` shift width) boundary (`F14`).
+    pub inline fn hy4LinearAncestorMask(ni: usize) u64 {
+        return if (ni >= 63) ~@as(u64, 0) else (@as(u64, 1) << @intCast(ni + 1)) - 1;
+    }
+
     pub fn commitTreeKv(
         self: *M82Runtime,
         model: *graph.GraphModel,
@@ -4379,6 +4410,13 @@ pub const M82Runtime = struct {
         accepted_nodes: []const u16,
     ) graph.GraphStepError!void {
         if (accepted_nodes.len == 0) return;
+        if (accepted_nodes.len > self.max_tree_nodes) return error.InvalidTree;
+        if (@as(u64, base_pos) + accepted_nodes.len > self.max_seq_len) return error.SequenceFull;
+        for (accepted_nodes) |nid| {
+            if (nid >= self.max_tree_nodes or nid >= self.last_verified_nodes) {
+                return error.NodeOutOfRange;
+            }
+        }
         const k_len: u32 = @intCast(accepted_nodes.len);
         const cfg = &model.config;
 
@@ -4475,16 +4513,15 @@ pub const M82Runtime = struct {
                         @memcpy(dst_r[@as(usize, pos) * qk_rope ..][0..qk_rope], src_r[@as(usize, nid) * qk_rope ..][0..qk_rope]);
                     }
                 }
-                // Compact `k_fine` cache when tree nodes were non-contiguous.
+                // Copy ONLY accepted nodes from dedicated uncommitted `tree_k_fine_off`
+                // scratch into `k_fine_cache_off` (`F20.3`) so rejected branches never contaminate it.
                 if (layer.indexer_mode == .full and layer.indexer != null and !layer.is_swa) {
+                    const tree_kf = self.sliceF16(layer.tree_k_fine_off, @as(usize, self.max_tree_nodes) * idx_d);
                     const kf = self.sliceF16(layer.k_fine_cache_off, @as(usize, self.max_seq_len) * idx_d);
                     for (accepted_nodes, 0..) |nid, idx| {
-                        if (nid != idx) {
-                            const src_pos = base_pos + @as(u32, nid);
-                            const dst_pos = base_pos + @as(u32, @intCast(idx));
-                            if (src_pos < self.max_seq_len and dst_pos < self.max_seq_len) {
-                                @memcpy(kf[@as(usize, dst_pos) * idx_d ..][0..idx_d], kf[@as(usize, src_pos) * idx_d ..][0..idx_d]);
-                            }
+                        const dst_pos = @as(u64, base_pos) + idx;
+                        if (dst_pos < self.max_seq_len) {
+                            @memcpy(kf[@as(usize, @intCast(dst_pos)) * idx_d ..][0..idx_d], tree_kf[@as(usize, nid) * idx_d ..][0..idx_d]);
                         }
                     }
                 }
@@ -4496,6 +4533,7 @@ pub const M82Runtime = struct {
             }
             self.refreshDFly2TargetKvViews(cfg, base_pos + k_len);
         }
+        self.last_verified_nodes = 0;
     }
 
     // ------------------------------------------------------------------------
@@ -4929,10 +4967,11 @@ fn computeArenaBytes(
             bytes += amf.align64(n_q * kv_rank * qk_nope * 2);
             bytes += amf.align64(n_q * v_dim * kv_rank * 2);
             bytes += amf.align64(n_q * 4) + amf.align64(num_exp * 4) + 512;
-            const is_full_sparse = (l < m82c.indexer_modes.len and m82c.indexer_modes[l] == .full) and
+            const is_full_sparse = (l >= m82c.indexer_modes.len or m82c.indexer_modes[l] == .full) and
                 !(l < m82c.is_swa_layer.len and m82c.is_swa_layer[l]);
             if (is_full_sparse) {
                 bytes += amf.align64(max_seq * idx_d * 2);
+                bytes += amf.align64(max_m * idx_d * 2);
             }
         }
     }
@@ -5518,6 +5557,7 @@ fn loadHy4(
         const is_swa: bool = (l < m82c.is_swa_layer.len and m82c.is_swa_layer[l]);
         var indexer: ?Hy4IndexerWeights = null;
         var k_fine_off: u64 = 0;
+        var tree_k_fine_off: u64 = 0;
         if (!is_swa and idx_mode == .full) {
             var nb_cidx: [96]u8 = undefined;
             var nb_std: [96]u8 = undefined;
@@ -5538,6 +5578,7 @@ fn loadHy4(
                     .is_compressed = true,
                 };
                 k_fine_off = try allocArenaOff(&rt.arena, @as(usize, max_seq) * idx_d * 2);
+                tree_k_fine_off = try allocArenaOff(&rt.arena, @as(usize, max_m) * idx_d * 2);
             } else if (findLinearEntry(ctx.source, std_q) != null) {
                 const q_p = try bindLinearCtx(ctx, std_q, idx_h * idx_d, q_rank);
                 const wk_p = try bindLinearCtx(ctx, std.fmt.bufPrint(&nb, "layers.{d}.self_attn.indexer.wk", .{l}) catch unreachable, idx_d, h);
@@ -5553,6 +5594,7 @@ fn loadHy4(
                     .is_compressed = false,
                 };
                 k_fine_off = try allocArenaOff(&rt.arena, @as(usize, max_seq) * idx_d * 2);
+                tree_k_fine_off = try allocArenaOff(&rt.arena, @as(usize, max_m) * idx_d * 2);
             }
         }
 
@@ -5604,6 +5646,7 @@ fn loadHy4(
             .is_swa = is_swa,
             .indexer = indexer,
             .k_fine_cache_off = k_fine_off,
+            .tree_k_fine_off = tree_k_fine_off,
             .kv_latent_off = kv_lat_off,
             .kv_rope_off = kv_rope_off,
             .tree_kv_latent_off = tree_lat_off,
@@ -6807,4 +6850,11 @@ fn jsonF32(obj: std.json.ObjectMap, key: []const u8) ?f32 {
         .integer => |i| @floatFromInt(i),
         else => null,
     };
+}
+
+test "F14 hy4LinearAncestorMask handles ni == 63 without u6 shift overflow" {
+    try std.testing.expectEqual(@as(u64, 0b1), M82Runtime.hy4LinearAncestorMask(0));
+    try std.testing.expectEqual(@as(u64, 0b11), M82Runtime.hy4LinearAncestorMask(1));
+    try std.testing.expectEqual((@as(u64, 1) << 63) - 1, M82Runtime.hy4LinearAncestorMask(62));
+    try std.testing.expectEqual(~@as(u64, 0), M82Runtime.hy4LinearAncestorMask(63));
 }

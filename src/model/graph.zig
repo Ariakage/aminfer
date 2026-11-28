@@ -824,6 +824,11 @@ pub const GraphConfig = struct {
 
     pub fn validate(self: GraphConfig) ConfigError!void {
         if (self.vocab_size == 0 or self.hidden_size == 0 or self.num_hidden_layers == 0) return error.InvalidConfig;
+        if (!std.math.isFinite(self.rms_norm_eps) or self.rms_norm_eps <= 0.0 or
+            !std.math.isFinite(self.rope_theta) or self.rope_theta <= 0.0)
+        {
+            return error.InvalidConfig;
+        }
         if (self.m82_family != .none) {
             if (self.m82_family.isInkling2()) {
                 if (self.num_attention_heads == 0 or self.num_key_value_heads == 0 or self.head_dim == 0) return error.InvalidConfig;
@@ -1647,8 +1652,14 @@ pub const GraphConfig = struct {
         var gsize: u16 = 64;
         if (root.get("quantization") orelse obj.get("quantization")) |qv| {
             if (qv == .object) {
-                if (jsonU32(qv.object, "bits")) |b| qbits = @intCast(b);
-                if (jsonU32(qv.object, "group_size")) |g| gsize = @intCast(g);
+                if (jsonU32(qv.object, "bits")) |b| {
+                    if (b == 0 or b > std.math.maxInt(u8)) return error.InvalidConfig;
+                    qbits = @intCast(b);
+                }
+                if (jsonU32(qv.object, "group_size")) |g| {
+                    if (g == 0 or g > std.math.maxInt(u16)) return error.InvalidConfig;
+                    gsize = @intCast(g);
+                }
             }
         }
 
@@ -2171,6 +2182,8 @@ pub const GraphStepError = error{
     TokenOutOfRange,
     TreeNotEnabled,
     TreeTooLarge,
+    InvalidTree,
+    NodeOutOfRange,
     InvalidBatchSize,
     InvalidLoopStep,
     Overflow,
@@ -3023,6 +3036,10 @@ pub const GraphModel = struct {
 
     // M7.8 Native Full Vision Tower (`W20`, `G22`, `C16`/`D5`, ADR-0023 §5)
     vision_state: GraphVisionState = .{},
+    /// Reusable multimodal prefill scratch cache (`F21.2`, `F15.4`: zero steady-state alloc/mlock).
+    mm_scratch: MultimodalScratchCache = .{},
+    gpu_timeout_drain_failures: u64 = 0,
+    last_gpu_drain_error: ?anyerror = null,
 
     // M8.1 Multi-format Quantization (`G23`), Activation Quantization (`G24`), and ChatTemplate (`W24`)
     qf_pipes: ?quant_formats.QuantFormatPipelines = null,
@@ -3200,7 +3217,7 @@ pub const GraphModel = struct {
     pub fn attachLoraRegistry(
         self: *GraphModel,
         reg: ?*lora.LoraRegistry,
-    ) (lora_gpu.WorkspaceInitError || metal.Error)!void {
+    ) (lora_gpu.WorkspaceInitError || metal.Error || error{DimensionMismatch})!void {
         if (reg == null) {
             if (self.lora_ws) |*ws| {
                 ws.deinit(self.compute);
@@ -3211,6 +3228,7 @@ pub const GraphModel = struct {
             return;
         }
         const r = reg.?;
+        try self.validateLoraAdapters(r);
         if (self.lora_registry == r) {
             if (self.lora_ws) |*ws| {
                 const ps = r.poolSlice();
@@ -3226,8 +3244,9 @@ pub const GraphModel = struct {
         if (self.lora_pipes == null) {
             self.lora_pipes = try lora_gpu.GpuLoraPipelines.init(self.device, self.library);
         }
+        const lora_max_rows: u32 = @max(@as(u32, 64), @max(self.max_tree_nodes, self.wide_prefill_max_tokens));
         self.lora_ws = try lora_gpu.GpuLoraWorkspace.init(self.device, self.compute, r, .{
-            .max_rows = 64,
+            .max_rows = lora_max_rows,
             .desc_staging_bytes_per_frame = 512 * 1024,
             .row_slots_per_frame = 16384,
             .frames_in_flight = metal.MAX_FRAMES_IN_FLIGHT,
@@ -3464,6 +3483,33 @@ pub const GraphModel = struct {
         };
     }
 
+    /// Validates every loaded adapter projection in `reg` against this model's
+    /// base `LinearBinding` `(n, k)` geometry (`F22.2`).
+    pub fn validateLoraAdapters(
+        self: *const GraphModel,
+        reg: *const lora.LoraRegistry,
+    ) error{DimensionMismatch}!void {
+        if (reg.activeAdapterCount() == 0) return;
+        for (0..lora.MAX_ADAPTERS) |slot_usize| {
+            const slot_id: u32 = @intCast(slot_usize);
+            const adp = reg.adapterAt(slot_id) orelse continue;
+            for (0..adp.layers.len) |l| {
+                const mask = adp.layers[l].target_mask;
+                if (mask == 0) continue;
+                for (0..lora.TargetProjection.COUNT) |ti| {
+                    const target: lora.TargetProjection = @fromBackingInt(@intCast(ti));
+                    if ((mask & target.bit()) == 0) continue;
+                    const pair = reg.pairAt(slot_id, l, target) orelse continue;
+                    if (self.findBaseLinearBinding(l, target)) |lin| {
+                        if (lin.n != pair.n or lin.k != pair.k) return error.DimensionMismatch;
+                    } else if (pair.use_dora) {
+                        return error.DimensionMismatch;
+                    }
+                }
+            }
+        }
+    }
+
     /// One-time load/bind-time calibration of exact PEFT DoRA row scales
     /// `gamma_i = m_i / sqrt(||W_0[i] + s * (B @ A)[i]||_2^2 + 1e-12)` across all
     /// DoRA-enabled adapter pairs loaded in `self.lora_registry` (`0` hot-path cost).
@@ -3473,6 +3519,7 @@ pub const GraphModel = struct {
     ) (lora.LoraError || quant_ref.Error || error{OutOfMemory})!void {
         const reg = self.lora_registry orelse return;
         if (reg.activeAdapterCount() == 0) return;
+        try self.validateLoraAdapters(reg);
 
         var row_buf: []f32 = &.{};
         defer if (row_buf.len > 0) allocator.free(row_buf);
@@ -3491,8 +3538,8 @@ pub const GraphModel = struct {
                     const pair = reg.pairAtMut(slot_id, l, target) orelse continue;
                     if (!pair.use_dora or pair.dora_mag_f32 == null or pair.dora_row_scale_f32 == null) continue;
 
-                    const lin = self.findBaseLinearBinding(l, target) orelse continue;
-                    if (lin.n != pair.n or lin.k != pair.k or lin.weight_host.len == 0) continue;
+                    const lin = self.findBaseLinearBinding(l, target) orelse return error.DimensionMismatch;
+                    if (lin.n != pair.n or lin.k != pair.k or lin.weight_host.len == 0) return error.DimensionMismatch;
 
                     const eff_dt = lin.effectiveAmfDType();
                     var params_slice: []const u8 = lin.scale_bias_host orelse &.{};
@@ -3656,6 +3703,7 @@ pub const GraphModel = struct {
         }
         self.lora_registry = null;
         self.active_lora_slot = lora.NO_ADAPTER;
+        self.mm_scratch.deinit(self.compute);
         self.vision_state.deinit(allocator, self.compute);
         if (self.adapter_rt) |art| {
             art.deinit(allocator);
@@ -4107,10 +4155,12 @@ pub const GraphModel = struct {
             self.x_norm_host[i] = @floatCast(slot_hiddens[i]);
         }
         var frame = try self.compute.beginFrame(self.timeout_ms);
-        errdefer frame.abort();
+        var frame_active = true;
+        errdefer if (frame_active) frame.abort();
         try self.encodeLinearBatched(&frame, self.lm_head, self.x_norm_bind, self.logits_bind, w, false);
         const sig = try frame.commit();
-        try self.compute.wait(sig, self.timeout_ms);
+        frame_active = false;
+        try self.waitWithTimeoutDrain(sig);
         for (0..@as(usize, w) * v) |i| {
             out_logits[i] = @floatCast(self.logits_host[i]);
         }
@@ -4802,6 +4852,274 @@ pub const GraphModel = struct {
         });
     }
 
+    const WIDE_FRAME_DISPATCH_FLUSH_LIMIT: u32 = metal.UNIFORM_SLOTS_PER_FRAME - 128;
+
+    const MultimodalScratchCache = struct {
+        full_toks: []u32 = &.{},
+        mrope_planar: []u32 = &.{},
+        all_pos3d: []hybrid.Pos3D = &.{},
+
+        stage_arena: ?arena_mod.WiredArena = null,
+        stage_buf: ?metal.Buffer = null,
+        stage_bytes: usize = 0,
+
+        fallback_ingress: ?vision_mod.VisionIngress = null,
+        fallback_ingress_resident: bool = false,
+        fallback_max_tokens: u32 = 0,
+        fallback_max_patch_dim: u32 = 0,
+        fallback_max_mrope_tokens: u32 = 0,
+
+        proj_arena: ?arena_mod.WiredArena = null,
+        proj_buf: ?metal.Buffer = null,
+        proj_token_in_dim: u32 = 0,
+        proj_bytes: usize = 0,
+        teardown_errors: u64 = 0,
+        last_teardown_error: ?anyerror = null,
+
+        fn ensureHostBuffers(self: *MultimodalScratchCache, capacity_tokens: u32) error{ OutOfMemory, Overflow }!void {
+            const cap: usize = capacity_tokens;
+            if (self.full_toks.len >= cap and self.all_pos3d.len >= cap and self.mrope_planar.len >= cap * 3) {
+                return;
+            }
+            const alloc = std.heap.page_allocator;
+            const planar_cap = std.math.mul(usize, cap, 3) catch return error.Overflow;
+            const new_toks = try alloc.alloc(u32, cap);
+            errdefer alloc.free(new_toks);
+            const new_planar = try alloc.alloc(u32, planar_cap);
+            errdefer alloc.free(new_planar);
+            const new_pos3d = try alloc.alloc(hybrid.Pos3D, cap);
+            errdefer alloc.free(new_pos3d);
+
+            if (self.full_toks.len > 0) alloc.free(self.full_toks);
+            if (self.mrope_planar.len > 0) alloc.free(self.mrope_planar);
+            if (self.all_pos3d.len > 0) alloc.free(self.all_pos3d);
+            self.full_toks = new_toks;
+            self.mrope_planar = new_planar;
+            self.all_pos3d = new_pos3d;
+        }
+
+        const FallbackHandles = struct {
+            ingress: *vision_mod.VisionIngress,
+            proj_buf: metal.Buffer,
+        };
+
+        fn ensureStageBuffer(
+            self: *MultimodalScratchCache,
+            device: metal.Device,
+            compute: metal.Compute,
+            needed_bytes: usize,
+            wired_budget: budget_mod.Budget,
+        ) (arena_mod.WiredArena.InitError || metal.Error || error{ MisalignedAddress, MisalignedLength, Overflow })!metal.BufferBinding {
+            const aligned_bytes = try page.alignUp(needed_bytes);
+            if (self.stage_buf != null and self.stage_bytes >= aligned_bytes) {
+                return .{ .buffer = self.stage_buf.?, .offset = 0 };
+            }
+            var sa = try arena_mod.WiredArena.init(aligned_bytes, wired_budget);
+            errdefer sa.deinit();
+            const sb = try metal.Buffer.wrap(device, sa.bytes());
+            errdefer sb.close();
+            try compute.makeResident(&.{sb});
+
+            if (self.stage_buf) |old_b| {
+                compute.removeResident(&.{old_b}) catch |err| {
+                    self.teardown_errors += 1;
+                    self.last_teardown_error = err;
+                };
+                old_b.close();
+            }
+            if (self.stage_arena) |*old_a| old_a.deinit();
+            self.stage_arena = sa;
+            self.stage_buf = sb;
+            self.stage_bytes = aligned_bytes;
+            return .{ .buffer = sb, .offset = 0 };
+        }
+
+        fn ensureFallbackIngressAndProj(
+            self: *MultimodalScratchCache,
+            device: metal.Device,
+            library: metal.Library,
+            compute: metal.Compute,
+            hidden_size: u32,
+            total_vis_tokens: u32,
+            token_in_dim: u32,
+            total_tokens: u32,
+            wired_budget: budget_mod.Budget,
+        ) (vision_mod.VisionIngress.InitError || arena_mod.WiredArena.InitError || metal.Error || error{ MisalignedAddress, MisalignedLength, Overflow })!FallbackHandles {
+            const need_ingress = self.fallback_ingress == null or
+                self.fallback_max_tokens < total_vis_tokens or
+                self.fallback_max_patch_dim < token_in_dim or
+                self.fallback_max_mrope_tokens < total_tokens;
+            if (need_ingress) {
+                const new_max_toks = @max(self.fallback_max_tokens, total_vis_tokens);
+                const new_max_patch = @max(self.fallback_max_patch_dim, token_in_dim);
+                const new_max_mrope = @max(self.fallback_max_mrope_tokens, total_tokens);
+                var ing = try vision_mod.VisionIngress.init(device, library, wired_budget, .{
+                    .max_tokens = new_max_toks,
+                    .max_patch_dim = new_max_patch,
+                    .max_hidden_size = hidden_size,
+                    .max_mrope_tokens = new_max_mrope,
+                });
+                errdefer ing.deinit();
+                try compute.makeResident(&.{ing.buffer()});
+
+                if (self.fallback_ingress) |*old_ing| {
+                    if (self.fallback_ingress_resident) {
+                        compute.removeResident(&.{old_ing.buffer()}) catch |err| {
+                            self.teardown_errors += 1;
+                            self.last_teardown_error = err;
+                        };
+                    }
+                    old_ing.deinit();
+                }
+                self.fallback_ingress = ing;
+                self.fallback_ingress_resident = true;
+                self.fallback_max_tokens = new_max_toks;
+                self.fallback_max_patch_dim = new_max_patch;
+                self.fallback_max_mrope_tokens = new_max_mrope;
+            }
+
+            const proj_elems = std.math.mul(usize, hidden_size, token_in_dim) catch return error.Overflow;
+            const proj_bytes = try page.alignUp(proj_elems * @sizeOf(f16));
+            const need_proj_alloc = self.proj_buf == null or self.proj_bytes < proj_bytes;
+            const need_proj_fill = need_proj_alloc or self.proj_token_in_dim != token_in_dim;
+            if (need_proj_alloc) {
+                var pa = try arena_mod.WiredArena.init(proj_bytes, wired_budget);
+                errdefer pa.deinit();
+                const pb = try metal.Buffer.wrap(device, pa.bytes());
+                errdefer pb.close();
+                try compute.makeResident(&.{pb});
+
+                if (self.proj_buf) |old_pb| {
+                    compute.removeResident(&.{old_pb}) catch |err| {
+                        self.teardown_errors += 1;
+                        self.last_teardown_error = err;
+                    };
+                    old_pb.close();
+                }
+                if (self.proj_arena) |*old_pa| old_pa.deinit();
+                self.proj_arena = pa;
+                self.proj_buf = pb;
+                self.proj_bytes = proj_bytes;
+            }
+            if (need_proj_fill) {
+                const proj_f16: []f16 = @alignCast(std.mem.bytesAsSlice(f16, self.proj_arena.?.bytes()[0 .. proj_elems * @sizeOf(f16)]));
+                const inv_scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(token_in_dim)));
+                for (proj_f16, 0..) |*w, idx| {
+                    const h_mix = (@as(u64, idx) *% 0x9e3779b97f4a7c15) ^ 0x517cc1b727220a95;
+                    const unit: f32 = (@as(f32, @floatFromInt(h_mix & 0xFFFF)) / 32767.5) - 1.0;
+                    w.* = @floatCast(unit * inv_scale * 0.25);
+                }
+                self.proj_token_in_dim = token_in_dim;
+            }
+            return .{
+                .ingress = &(self.fallback_ingress.?),
+                .proj_buf = self.proj_buf.?,
+            };
+        }
+
+        fn deinit(self: *MultimodalScratchCache, compute: metal.Compute) void {
+            const alloc = std.heap.page_allocator;
+            if (self.full_toks.len > 0) alloc.free(self.full_toks);
+            if (self.mrope_planar.len > 0) alloc.free(self.mrope_planar);
+            if (self.all_pos3d.len > 0) alloc.free(self.all_pos3d);
+            self.full_toks = &.{};
+            self.mrope_planar = &.{};
+            self.all_pos3d = &.{};
+
+            if (self.stage_buf) |b| {
+                compute.removeResident(&.{b}) catch |err| {
+                    self.teardown_errors += 1;
+                    self.last_teardown_error = err;
+                };
+                b.close();
+                self.stage_buf = null;
+            }
+            if (self.stage_arena) |*a| {
+                a.deinit();
+                self.stage_arena = null;
+            }
+            self.stage_bytes = 0;
+
+            if (self.proj_buf) |b| {
+                compute.removeResident(&.{b}) catch |err| {
+                    self.teardown_errors += 1;
+                    self.last_teardown_error = err;
+                };
+                b.close();
+                self.proj_buf = null;
+            }
+            if (self.proj_arena) |*a| {
+                a.deinit();
+                self.proj_arena = null;
+            }
+            self.proj_bytes = 0;
+            self.proj_token_in_dim = 0;
+
+            if (self.fallback_ingress) |*ing| {
+                if (self.fallback_ingress_resident) {
+                    compute.removeResident(&.{ing.buffer()}) catch |err| {
+                        self.teardown_errors += 1;
+                        self.last_teardown_error = err;
+                    };
+                }
+                ing.deinit();
+                self.fallback_ingress = null;
+                self.fallback_ingress_resident = false;
+            }
+            self.fallback_max_tokens = 0;
+            self.fallback_max_patch_dim = 0;
+            self.fallback_max_mrope_tokens = 0;
+        }
+    };
+
+    fn waitWithTimeoutDrain(self: *GraphModel, sig: u64) metal.Error!void {
+        self.compute.wait(sig, self.timeout_ms) catch |err| {
+            if (err == error.Timeout) {
+                const drain_ms: u64 = @max(self.timeout_ms, 5_000);
+                self.compute.wait(sig, drain_ms) catch |drain_err| {
+                    self.gpu_timeout_drain_failures += 1;
+                    self.last_gpu_drain_error = drain_err;
+                };
+            }
+            return err;
+        };
+    }
+
+    fn estimateWideLayerDispatches(self: *const GraphModel, l: usize, m: u32) u32 {
+        var est: u32 = 48;
+        if (self.hasActiveLora()) {
+            if (self.lora_registry) |reg| {
+                if (reg.adapterAt(self.active_lora_slot)) |adp| {
+                    if (adp.layerAdapters(l)) |la| {
+                        const targets: u32 = @popCount(la.target_mask);
+                        const ws_rows: u32 = if (self.lora_ws) |ws| @max(ws.max_rows, 1) else 64;
+                        const chunks: u32 = (m + ws_rows - 1) / ws_rows;
+                        est += targets * chunks * 2;
+                    }
+                }
+            }
+        }
+        return est;
+    }
+
+    fn maybeFlushWideFrame(
+        self: *GraphModel,
+        frame: *metal.Compute.Frame,
+        frame_active: *bool,
+        est_dispatches: *u32,
+        next_layer_est: u32,
+    ) GraphStepError!void {
+        if (est_dispatches.* > 0 and est_dispatches.* + next_layer_est >= WIDE_FRAME_DISPATCH_FLUSH_LIMIT) {
+            const flush_sig = try frame.commit();
+            frame_active.* = false;
+            try self.waitWithTimeoutDrain(flush_sig);
+            frame.* = try self.compute.beginFrame(self.timeout_ms);
+            frame_active.* = true;
+            self.beginLoraFrame(frame.slot);
+            est_dispatches.* = 0;
+        }
+    }
+
     pub fn prefillChunkWithOptions(
         self: *GraphModel,
         tokens: []const u32,
@@ -4809,7 +5127,7 @@ pub const GraphModel = struct {
         opts: qwen3.PrefillChunkOptions,
     ) GraphStepError!u32 {
         if (tokens.len == 0) return error.InvalidBatchSize;
-        if (start_pos + tokens.len > self.max_seq_len) return error.SequenceFull;
+        if (@as(u64, start_pos) + tokens.len > self.max_seq_len) return error.SequenceFull;
         for (tokens) |tid| {
             if (tid >= self.config.vocab_size) return error.TokenOutOfRange;
         }
@@ -5033,7 +5351,10 @@ pub const GraphModel = struct {
     ) GraphStepError!u32 {
         const m: u32 = @intCast(tokens.len);
         if (m == 0 or m > self.wide_prefill_max_tokens) return error.InvalidBatchSize;
-        if (base_pos + m > self.max_seq_len) return error.SequenceFull;
+        if (@as(u64, base_pos) + m > self.max_seq_len) return error.SequenceFull;
+        for (tokens) |tid| {
+            if (tid >= self.config.vocab_size) return error.TokenOutOfRange;
+        }
         try self.retireBeforeCommitRange(base_pos, m);
 
         const is_ced = self.config.isCausalEncDec();
@@ -5067,8 +5388,10 @@ pub const GraphModel = struct {
         self.ds_active_multimodal = false;
 
         var frame = try self.compute.beginFrame(self.timeout_ms);
-        errdefer frame.abort();
+        var frame_active = true;
+        errdefer if (frame_active) frame.abort();
         self.beginLoraFrame(frame.slot);
+        var frame_est_dispatches: u32 = 8;
 
         try self.encodeEmbedLookupUnified(&frame, .{
             .weight = self.embed.weight,
@@ -5097,11 +5420,15 @@ pub const GraphModel = struct {
 
         // Prelude layers `[0 .. core_start)`.
         for (0..core_start) |l| {
+            const layer_est = self.estimateWideLayerDispatches(l, m);
+            try self.maybeFlushWideFrame(&frame, &frame_active, &frame_est_dispatches, layer_est);
             try self.execLayerWide(&frame, l, tokens, base_pos, m, 0, R, true, false, false);
+            frame_est_dispatches += layer_est;
         }
 
         // Save `x_init` after Prelude when `R > 1 and ls.inject_x_init`.
         if (R > 1 and ls.inject_x_init) {
+            try self.maybeFlushWideFrame(&frame, &frame_active, &frame_est_dispatches, 8);
             if (self.wp_gr_arena) |*gr| {
                 try self.hybrid_pipes.encodeGrCollapse(&frame, .{
                     .stream = gr.binding(self.scratch_buf),
@@ -5123,6 +5450,7 @@ pub const GraphModel = struct {
                     .dst_stride = h,
                 }, true);
             }
+            frame_est_dispatches += 4;
         }
 
         // Core recurrent block `[core_start .. core_end) x R`.
@@ -5131,6 +5459,7 @@ pub const GraphModel = struct {
         while (r < R) : (r += 1) {
             self.loop_stats.total_loop_steps += 1;
             if (r >= 1 and ls.inject_x_init) {
+                try self.maybeFlushWideFrame(&frame, &frame_active, &frame_est_dispatches, 8);
                 if (self.wp_gr_arena) |*gr| {
                     try self.hybrid_pipes.encodeBlendF16(&frame, .{
                         .dst = gr.binding(self.scratch_buf),
@@ -5158,9 +5487,12 @@ pub const GraphModel = struct {
                         .b = 0.5,
                     }, true);
                 }
+                frame_est_dispatches += 4;
             }
             const is_final_pass = (r == R - 1);
             for (core_start..core_end) |l| {
+                const layer_est = self.estimateWideLayerDispatches(l, m);
+                try self.maybeFlushWideFrame(&frame, &frame_active, &frame_est_dispatches, layer_est);
                 const is_terminal_exec = (!has_coda) and is_final_pass and (l == last_l);
                 try self.execLayerWide(
                     &frame,
@@ -5174,11 +5506,14 @@ pub const GraphModel = struct {
                     is_terminal_exec and prune_non_final_last,
                     is_terminal_exec and prune_final_last_to_m1,
                 );
+                frame_est_dispatches += layer_est;
             }
         }
 
         // Coda layers `[core_end .. active_end_layer)`.
         for (core_end..active_end_layer) |l| {
+            const layer_est = self.estimateWideLayerDispatches(l, m);
+            try self.maybeFlushWideFrame(&frame, &frame_active, &frame_est_dispatches, layer_est);
             const is_terminal_exec = (l == last_l);
             try self.execLayerWide(
                 &frame,
@@ -5192,7 +5527,10 @@ pub const GraphModel = struct {
                 is_terminal_exec and prune_non_final_last,
                 is_terminal_exec and prune_final_last_to_m1,
             );
+            frame_est_dispatches += layer_est;
         }
+
+        try self.maybeFlushWideFrame(&frame, &frame_active, &frame_est_dispatches, 16);
 
         if (!prune_non_final_last) {
             if (self.has_qwen4_hc) {
@@ -5244,7 +5582,8 @@ pub const GraphModel = struct {
 
         if (is_ced) {
             const sig = try frame.commit();
-            try self.compute.wait(sig, self.timeout_ms);
+            frame_active = false;
+            try self.waitWithTimeoutDrain(sig);
             if (self.ced_bridge != null) {
                 try self.projectCedEncoderToDecoderKv(base_pos, m, true);
                 for (0..m) |i| {
@@ -5262,8 +5601,10 @@ pub const GraphModel = struct {
             // decoder layers `[N_enc .. N_total)` in a second wide pass to populate decoder KV caches.
             self.updateCedEncoderSummaryNoBridge(base_pos, m, true);
             var dec_frame = try self.compute.beginFrame(self.timeout_ms);
-            errdefer dec_frame.abort();
+            var dec_frame_active = true;
+            errdefer if (dec_frame_active) dec_frame.abort();
             self.beginLoraFrame(dec_frame.slot);
+            var dec_est_dispatches: u32 = 8;
             try self.encodeEmbedLookupUnified(&dec_frame, .{
                 .weight = self.embed.weight,
                 .scale_bias = self.embed.scale_bias,
@@ -5278,8 +5619,12 @@ pub const GraphModel = struct {
                 try self.encodeDsMhcInitIfNeeded(&dec_frame, true, m, false);
             }
             for (self.config.num_encoder_layers..self.config.num_hidden_layers) |dl| {
+                const layer_est = self.estimateWideLayerDispatches(dl, m);
+                try self.maybeFlushWideFrame(&dec_frame, &dec_frame_active, &dec_est_dispatches, layer_est);
                 try self.execLayerWide(&dec_frame, dl, tokens, base_pos, m, 0, 1, true, false, false);
+                dec_est_dispatches += layer_est;
             }
+            try self.maybeFlushWideFrame(&dec_frame, &dec_frame_active, &dec_est_dispatches, 16);
             if (self.wp_mhc_arena) |*mhc| {
                 try self.encodeMhcCollapseAny(&dec_frame, mhc.binding(self.scratch_buf), self.wp_x_bind, true, m, true);
             }
@@ -5310,7 +5655,8 @@ pub const GraphModel = struct {
                 dec_logits_rows = 1;
             }
             const dec_sig = try dec_frame.commit();
-            try self.compute.wait(dec_sig, self.timeout_ms);
+            dec_frame_active = false;
+            try self.waitWithTimeoutDrain(dec_sig);
             for (0..m) |i| {
                 self.token_history[base_pos + @as(u32, @intCast(i))] = tokens[i];
             }
@@ -5388,7 +5734,8 @@ pub const GraphModel = struct {
         }
 
         const sig = try frame.commit();
-        try self.compute.wait(sig, self.timeout_ms);
+        frame_active = false;
+        try self.waitWithTimeoutDrain(sig);
 
         if (self.has_qwen4_hc and self.last_four_stream_hidden_host.len == 4 * @as(usize, h)) {
             const st_last = self.wp_qwen4_hc_scratch.stream_host[@as(usize, m - 1) * 4 * h ..][0 .. 4 * h];
@@ -7326,16 +7673,20 @@ pub const GraphModel = struct {
     pub fn commitTreeKv(self: *GraphModel, base_pos: u32, accepted_nodes: []const u16) GraphStepError!void {
         if (accepted_nodes.len == 0) return;
         if (accepted_nodes.len > self.max_tree_nodes) return error.TreeTooLarge;
-        if (base_pos + accepted_nodes.len > self.max_seq_len) return error.SequenceFull;
+        if (@as(u64, base_pos) + accepted_nodes.len > self.max_seq_len) return error.SequenceFull;
+        for (accepted_nodes) |nid| {
+            if (nid >= self.max_tree_nodes or nid >= self.last_verified_nodes) {
+                return error.NodeOutOfRange;
+            }
+        }
         if (self.m82) |rt| {
             try rt.commitTreeKv(self, base_pos, accepted_nodes);
             for (accepted_nodes, 0..) |nid, i| {
-                if (nid < self.last_verified_nodes) {
-                    self.token_history[base_pos + @as(u32, @intCast(i))] = self.last_verified_tokens[nid];
-                }
+                self.token_history[base_pos + @as(u32, @intCast(i))] = self.last_verified_tokens[nid];
             }
             self.seq_len = base_pos + @as(u32, @intCast(accepted_nodes.len));
             self.mrope_next_pos = self.seq_len;
+            self.last_verified_nodes = 0;
             return;
         }
         try self.retireBeforeCommitRange(base_pos, @intCast(accepted_nodes.len));
@@ -7606,6 +7957,7 @@ pub const GraphModel = struct {
         }
         self.seq_len = base_pos + @as(u32, @intCast(accepted_nodes.len));
         self.mrope_next_pos = self.seq_len;
+        self.last_verified_nodes = 0;
         if (self.last_dsa_valid and accepted_nodes.len > 0) {
             const last_acc: u32 = accepted_nodes[accepted_nodes.len - 1];
             const max_row: u32 = if (self.last_dsa_num_rows > 0) self.last_dsa_num_rows - 1 else 0;
@@ -7722,11 +8074,18 @@ pub const GraphModel = struct {
         const total_vis_tokens = std.math.mul(u32, tube_count, tokens_per_tube) catch return error.Overflow;
         const token_in_dim = try geom.tokenInDim();
 
-        const prefix_u32: u32 = @intCast(prefix_tokens.len);
-        const suffix_u32: u32 = @intCast(suffix_tokens.len);
-        const total_tokens = prefix_u32 + total_vis_tokens + suffix_u32;
+        const prefix_u32: u32 = std.math.cast(u32, prefix_tokens.len) orelse return error.SequenceFull;
+        const suffix_u32: u32 = std.math.cast(u32, suffix_tokens.len) orelse return error.SequenceFull;
+        const pre_vis = std.math.add(u32, prefix_u32, total_vis_tokens) catch return error.SequenceFull;
+        const total_tokens = std.math.add(u32, pre_vis, suffix_u32) catch return error.SequenceFull;
         if (total_tokens == 0) return error.InvalidBatchSize;
         if (total_tokens > self.max_seq_len) return error.SequenceFull;
+        for (prefix_tokens) |tid| {
+            if (tid >= self.config.vocab_size) return error.TokenOutOfRange;
+        }
+        for (suffix_tokens) |tid| {
+            if (tid >= self.config.vocab_size) return error.TokenOutOfRange;
+        }
 
         const grid: vision_mod.VisionGridSpec = .{
             .grid_t = tube_count,
@@ -7734,47 +8093,47 @@ pub const GraphModel = struct {
             .grid_w = geom.mergedW(),
         };
 
-        const facts = try sysinfo.Facts.read();
-        const dev_info = try self.device.info();
-        const wired_budget = opts.budget_override orelse budget_mod.Budget.fromHost(facts, dev_info, .{});
-
-        // Preallocate `VisionIngress` workspace + deterministic wired projection matrix `[H, token_in_dim] f16`.
-        var ingress = try vision_mod.VisionIngress.init(self.device, self.library, wired_budget, .{
-            .max_tokens = total_vis_tokens,
-            .max_patch_dim = token_in_dim,
-            .max_hidden_size = self.config.hidden_size,
-            .max_mrope_tokens = total_tokens,
-        });
-        defer ingress.deinit();
-
-        const proj_elems = std.math.mul(usize, self.config.hidden_size, token_in_dim) catch return error.Overflow;
-        const proj_bytes = try page.alignUp(proj_elems * @sizeOf(f16));
-        var proj_arena = try arena_mod.WiredArena.init(proj_bytes, wired_budget);
-        defer proj_arena.deinit();
-        const proj_f16: []f16 = @alignCast(std.mem.bytesAsSlice(f16, proj_arena.bytes()[0 .. proj_elems * @sizeOf(f16)]));
-        const inv_scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(token_in_dim)));
-        for (proj_f16, 0..) |*w, idx| {
-            const h_mix = (@as(u64, idx) *% 0x9e3779b97f4a7c15) ^ 0x517cc1b727220a95;
-            const unit: f32 = (@as(f32, @floatFromInt(h_mix & 0xFFFF)) / 32767.5) - 1.0;
-            w.* = @floatCast(unit * inv_scale * 0.25);
-        }
-        const proj_buf = try metal.Buffer.wrap(self.device, proj_arena.bytes());
-        defer proj_buf.close();
-
-        try self.compute.makeResident(&.{ ingress.buffer(), proj_buf });
-        defer self.compute.removeResident(&.{ ingress.buffer(), proj_buf }) catch |err| {
-            std.debug.panic("removeResident(vision_ingress) failed: {}", .{err});
+        // Lazily initialize reusable `VisionIngress` + wired projection matrix once on `GraphModel`
+        // so steady-state multimodal requests perform 0 `mmap`/`mlock`/residency churn (`F21.2`, `F15.4`).
+        const need_fallback_init = self.mm_scratch.fallback_ingress == null or
+            self.mm_scratch.fallback_max_tokens < total_vis_tokens or
+            self.mm_scratch.fallback_max_patch_dim < token_in_dim or
+            self.mm_scratch.fallback_max_mrope_tokens < total_tokens or
+            self.mm_scratch.proj_buf == null or
+            self.mm_scratch.proj_token_in_dim != token_in_dim;
+        const fallback_res: MultimodalScratchCache.FallbackHandles = if (need_fallback_init) blk: {
+            const facts = try sysinfo.Facts.read();
+            const dev_info = try self.device.info();
+            const wired_budget = opts.budget_override orelse budget_mod.Budget.fromHost(facts, dev_info, .{});
+            break :blk try self.mm_scratch.ensureFallbackIngressAndProj(
+                self.device,
+                self.library,
+                self.compute,
+                self.config.hidden_size,
+                total_vis_tokens,
+                token_in_dim,
+                total_tokens,
+                wired_budget,
+            );
+        } else .{
+            .ingress = &(self.mm_scratch.fallback_ingress.?),
+            .proj_buf = self.mm_scratch.proj_buf.?,
         };
+        const ingress = fallback_res.ingress;
+        const proj_buf = fallback_res.proj_buf;
+
         try self.compute.makeVisionFramesResident(frames);
         defer self.compute.removeVisionFramesResident(frames) catch |err| {
-            std.debug.panic("removeVisionFramesResident failed: {}", .{err});
+            self.mm_scratch.teardown_errors += 1;
+            self.mm_scratch.last_teardown_error = err;
         };
 
         // 1. Run zero-copy Metal 4 patchify + 2x2 merge + linear embed directly from IOSurface textures.
         const vis_t0 = try vmstat.nowNs();
         {
             var vframe = try self.compute.beginFrame(self.timeout_ms);
-            errdefer vframe.abort();
+            var vframe_active = true;
+            errdefer if (vframe_active) vframe.abort();
             var tube: u32 = 0;
             while (tube < tube_count) : (tube += 1) {
                 const f0_idx: usize = @as(usize, tube) * eff_t_patch;
@@ -7820,7 +8179,8 @@ pub const GraphModel = struct {
                 }
             }
             const vsig = try vframe.commit();
-            try self.compute.wait(vsig, self.timeout_ms);
+            vframe_active = false;
+            try self.waitWithTimeoutDrain(vsig);
         }
         const vis_t1 = try vmstat.nowNs();
         const vision_encode_us: f64 = @as(f64, @floatFromInt(vis_t1 - vis_t0)) / 1000.0;
@@ -7871,12 +8231,15 @@ pub const GraphModel = struct {
         vision_tower_active: bool,
         vision_placement: vision_mod.VisionPlacement,
     ) MultimodalPrefillError!MultimodalPrefillResult {
-        const prefix_u32: u32 = @intCast(prefix_tokens.len);
-        const suffix_u32: u32 = @intCast(suffix_tokens.len);
-        const total_tokens = prefix_u32 + total_vis_tokens + suffix_u32;
+        _ = allocator;
+        const prefix_u32: u32 = std.math.cast(u32, prefix_tokens.len) orelse return error.SequenceFull;
+        const suffix_u32: u32 = std.math.cast(u32, suffix_tokens.len) orelse return error.SequenceFull;
+        const pre_vis = std.math.add(u32, prefix_u32, total_vis_tokens) catch return error.SequenceFull;
+        const total_tokens = std.math.add(u32, pre_vis, suffix_u32) catch return error.SequenceFull;
+        if (total_tokens > self.max_seq_len) return error.SequenceFull;
 
-        const full_toks = try allocator.alloc(u32, total_tokens);
-        defer allocator.free(full_toks);
+        try self.mm_scratch.ensureHostBuffers(@max(total_tokens, self.max_seq_len));
+        const full_toks = self.mm_scratch.full_toks[0..total_tokens];
         @memcpy(full_toks[0..prefix_u32], prefix_tokens);
         @memset(full_toks[prefix_u32 .. prefix_u32 + total_vis_tokens], 0);
         @memcpy(full_toks[prefix_u32 + total_vis_tokens .. total_tokens], suffix_tokens);
@@ -8035,11 +8398,18 @@ pub const GraphModel = struct {
             anyres_plan_opt = plan;
         }
 
-        const prefix_u32: u32 = @intCast(prefix_tokens.len);
-        const suffix_u32: u32 = @intCast(suffix_tokens.len);
-        const total_tokens = prefix_u32 + total_vis_tokens + suffix_u32;
+        const prefix_u32: u32 = std.math.cast(u32, prefix_tokens.len) orelse return error.SequenceFull;
+        const suffix_u32: u32 = std.math.cast(u32, suffix_tokens.len) orelse return error.SequenceFull;
+        const pre_vis = std.math.add(u32, prefix_u32, total_vis_tokens) catch return error.SequenceFull;
+        const total_tokens = std.math.add(u32, pre_vis, suffix_u32) catch return error.SequenceFull;
         if (total_tokens == 0) return error.InvalidBatchSize;
         if (total_tokens > self.max_seq_len) return error.SequenceFull;
+        for (prefix_tokens) |tid| {
+            if (tid >= self.config.vocab_size) return error.TokenOutOfRange;
+        }
+        for (suffix_tokens) |tid| {
+            if (tid >= self.config.vocab_size) return error.TokenOutOfRange;
+        }
 
         // Populate 2D-RoPE coordinates & tile/image-isolated bidirectional window bounds in aliased scratch.
         const coords_sl = sc.coordsSlice();
@@ -8072,38 +8442,30 @@ pub const GraphModel = struct {
         }
 
         // If `sc.lm_embeds_off` aliases `tr_arena` `[0 .. tr_scratch_bytes)`, stage emitted embeddings
-        // on the GPU before `runForwardInternal` reuses `tr_arena` across prefill chunks (`0` CPU memcpy).
+        // into the reusable `mm_scratch.stage_buf` so steady-state calls perform 0 `mmap`/`mlock` (`F21.2`, `F15.4`).
         const need_stage = (sc.lm_embeds_off < self.vision_state.tr_scratch_bytes);
-        var stage_arena_opt: ?arena_mod.WiredArena = null;
-        var stage_buf_opt: ?metal.Buffer = null;
-        defer {
-            if (stage_buf_opt) |b| {
-                self.compute.removeResident(&.{b}) catch |err| {
-                    std.debug.panic("removeResident(vision_stage) failed: {}", .{err});
-                };
-                b.close();
-            }
-            if (stage_arena_opt) |*sa| sa.deinit();
-        }
         var vis_embeds_bind = sc.lmEmbedsBinding();
         if (need_stage) {
-            const facts = try sysinfo.Facts.read();
-            const dev_info = try self.device.info();
-            const wired_budget = opts.budget_override orelse budget_mod.Budget.fromHost(facts, dev_info, .{});
-            const stage_bytes = try page.alignUp(@as(usize, total_vis_tokens) * self.config.hidden_size * @sizeOf(f16));
-            var sa = try arena_mod.WiredArena.init(stage_bytes, wired_budget);
-            errdefer sa.deinit();
-            const sb = try metal.Buffer.wrap(self.device, sa.bytes());
-            errdefer sb.close();
-            try self.compute.makeResident(&.{sb});
-            stage_arena_opt = sa;
-            stage_buf_opt = sb;
-            vis_embeds_bind = .{ .buffer = sb, .offset = 0 };
+            const stage_bytes_raw = std.math.mul(usize, total_vis_tokens, @as(usize, self.config.hidden_size) * @sizeOf(f16)) catch return error.Overflow;
+            if (self.mm_scratch.stage_buf != null and self.mm_scratch.stage_bytes >= stage_bytes_raw) {
+                vis_embeds_bind = .{ .buffer = self.mm_scratch.stage_buf.?, .offset = 0 };
+            } else {
+                const facts = try sysinfo.Facts.read();
+                const dev_info = try self.device.info();
+                const wired_budget = opts.budget_override orelse budget_mod.Budget.fromHost(facts, dev_info, .{});
+                vis_embeds_bind = try self.mm_scratch.ensureStageBuffer(
+                    self.device,
+                    self.compute,
+                    stage_bytes_raw,
+                    wired_budget,
+                );
+            }
         }
 
         try self.compute.makeVisionFramesResident(frames);
         defer self.compute.removeVisionFramesResident(frames) catch |err| {
-            std.debug.panic("removeVisionFramesResident failed: {}", .{err});
+            self.mm_scratch.teardown_errors += 1;
+            self.mm_scratch.last_teardown_error = err;
         };
 
         const vis_t0 = try vmstat.nowNs();
@@ -8115,7 +8477,8 @@ pub const GraphModel = struct {
             total_vis_tokens == total_patches);
         {
             var vframe = try self.compute.beginFrame(self.timeout_ms);
-            errdefer vframe.abort();
+            var vframe_active = true;
+            errdefer if (vframe_active) vframe.abort();
 
             var first_dispatch = true;
             if (ink_plan_opt) |ink_plan| {
@@ -8235,7 +8598,8 @@ pub const GraphModel = struct {
 
             if (use_ane_offload) {
                 const vsig = try vframe.commit();
-                try self.compute.wait(vsig, self.timeout_ms);
+                vframe_active = false;
+                try self.waitWithTimeoutDrain(vsig);
             } else {
                 const emitted = if (ink_plan_opt) |ink_plan|
                     try rt.encodeTowerForwardWithPreNorm(
@@ -8275,7 +8639,8 @@ pub const GraphModel = struct {
                     }, true);
                 }
                 const vsig = try vframe.commit();
-                try self.compute.wait(vsig, self.timeout_ms);
+                vframe_active = false;
+                try self.waitWithTimeoutDrain(vsig);
             }
         }
         if (use_ane_offload) {
@@ -8299,8 +8664,8 @@ pub const GraphModel = struct {
             {
                 var out_lock = try offload.out_frame.lockPlane(0, true);
                 errdefer out_lock.release();
-                const dst_embeds: []f16 = if (stage_arena_opt) |*sa|
-                    @alignCast(std.mem.bytesAsSlice(f16, sa.bytes()))
+                const dst_embeds: []f16 = if (need_stage and self.mm_scratch.stage_arena != null)
+                    @alignCast(std.mem.bytesAsSlice(f16, self.mm_scratch.stage_arena.?.bytes()))
                 else
                     sc.lmEmbedsF16();
                 const lm_h: usize = self.config.hidden_size;
@@ -8322,10 +8687,9 @@ pub const GraphModel = struct {
             .grid_w = ink_plan.merged_w,
             .temporal_stride = 1,
         } else anyres_plan_opt.?.toVisionGridSpec(tube_count, 1);
-        const mrope_planar = try allocator.alloc(u32, @as(usize, total_tokens) * 3);
-        defer allocator.free(mrope_planar);
-        const all_pos3d = try allocator.alloc(hybrid.Pos3D, total_tokens);
-        defer allocator.free(all_pos3d);
+        try self.mm_scratch.ensureHostBuffers(@max(total_tokens, self.max_seq_len));
+        const mrope_planar = self.mm_scratch.mrope_planar[0 .. @as(usize, total_tokens) * 3];
+        const all_pos3d = self.mm_scratch.all_pos3d[0..total_tokens];
         const mrope_res = try vision_mod.buildMultimodalMropePositions(prefix_u32, grid, suffix_u32, mrope_planar);
         try vision_mod.packMropePlanarToPos3D(mrope_planar, mrope_res.total_tokens, all_pos3d);
 
@@ -10961,8 +11325,9 @@ pub const GraphModel = struct {
 
     fn flushAndReopenWideFrame(self: *GraphModel, frame: *metal.Compute.Frame) GraphStepError!void {
         const sig = try frame.commit();
-        try self.compute.wait(sig, self.timeout_ms);
+        try self.waitWithTimeoutDrain(sig);
         frame.* = try self.compute.beginFrame(self.timeout_ms);
+        self.beginLoraFrame(frame.slot);
     }
 
     fn encodeMhcInitStreams(
@@ -13725,7 +14090,7 @@ pub const GraphModel = struct {
         }
 
         const sig = try frame.commit();
-        try self.compute.wait(sig, self.timeout_ms);
+        try self.waitWithTimeoutDrain(sig);
 
         // Update chunk-invariant running mean `ced_encoder_summary_host` over `[0 .. new_prefix_len)`.
         if (self.ced_encoder_sum_host.len == h and self.ced_encoder_summary_host.len == h) {
@@ -14217,10 +14582,12 @@ pub const GraphModel = struct {
 
     fn commitFeatureTaps(self: *GraphModel, accepted_nodes: []const u16) GraphStepError!void {
         var frame = try self.compute.beginFrame(self.timeout_ms);
-        errdefer frame.abort();
+        var frame_active = true;
+        errdefer if (frame_active) frame.abort();
         try self.encodeCommitFeatureTaps(&frame, accepted_nodes, false);
         const sig = try frame.commit();
-        try self.compute.wait(sig, self.timeout_ms);
+        frame_active = false;
+        try self.waitWithTimeoutDrain(sig);
     }
 
     fn encodeCommitFeatureTaps(
@@ -19337,6 +19704,8 @@ const GraphBatchSlotState = struct {
     pinned_full_ids: []u32 = &.{},
     prompt_tokens: []u32 = &.{},
     lora_slot: u32 = lora.NO_ADAPTER,
+    lora_generation: u64 = 0,
+    lora_pinned: bool = false,
 };
 
 /// Preallocated zero-allocation continuous-batching (`C14`) & shared `PrefixCache` +
@@ -19418,6 +19787,8 @@ pub const GraphBatchRuntime = struct {
     gdn_snapshot_clones: u64 = 0,
     decode_batch_steps: u64 = 0,
     decode_batch_tokens: u64 = 0,
+    teardown_recovery_errors: u64 = 0,
+    last_teardown_error: ?anyerror = null,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -19965,6 +20336,7 @@ pub const GraphBatchRuntime = struct {
     }
 
     pub fn deinit(self: *GraphBatchRuntime, allocator: std.mem.Allocator) void {
+        for (self.slots) |*slot| self.unpinSlotLora(slot);
         if (self.slot_mla_swa.len > 0) allocator.free(self.slot_mla_swa);
         if (self.slot_csa2_sum.len > 0) allocator.free(self.slot_csa2_sum);
         if (self.slot_mla_kv.len > 0) allocator.free(self.slot_mla_kv);
@@ -20036,42 +20408,108 @@ pub const GraphBatchRuntime = struct {
         };
     }
 
+    fn unpinSlotLora(self: *GraphBatchRuntime, slot: *GraphBatchSlotState) void {
+        if (slot.lora_pinned) {
+            if (self.model.lora_registry) |reg| {
+                reg.unpinSlot(.{
+                    .slot_id = slot.lora_slot,
+                    .generation = slot.lora_generation,
+                }) catch |err| {
+                    self.teardown_recovery_errors += 1;
+                    self.last_teardown_error = err;
+                };
+            }
+            slot.lora_pinned = false;
+        }
+        slot.lora_slot = lora.NO_ADAPTER;
+        slot.lora_generation = 0;
+    }
+
+    fn resolveValidatedSlotLora(
+        self: *const GraphBatchRuntime,
+        slot: *const GraphBatchSlotState,
+    ) error{InvalidState}!u32 {
+        if (slot.lora_slot == lora.NO_ADAPTER) return lora.NO_ADAPTER;
+        if (slot.lora_pinned or slot.lora_generation != 0) {
+            const reg = self.model.lora_registry orelse return error.InvalidState;
+            if (!reg.isHandleValid(.{
+                .slot_id = slot.lora_slot,
+                .generation = slot.lora_generation,
+            })) {
+                return error.InvalidState;
+            }
+        }
+        return slot.lora_slot;
+    }
+
     pub fn setSlotLora(self: *GraphBatchRuntime, slot_id: u32, lora_slot: u32) void {
         if (slot_id >= self.max_slots) return;
-        self.slots[slot_id].lora_slot = lora_slot;
+        const slot = &self.slots[slot_id];
+        self.unpinSlotLora(slot);
+        if (lora_slot == lora.NO_ADAPTER) return;
+        if (self.model.lora_registry) |reg| {
+            const handle = reg.pinSlot(lora_slot) catch |err| {
+                self.teardown_recovery_errors += 1;
+                self.last_teardown_error = err;
+                return;
+            };
+            slot.lora_slot = handle.slot_id;
+            slot.lora_generation = handle.generation;
+            slot.lora_pinned = true;
+        } else {
+            slot.lora_slot = lora_slot;
+            slot.lora_generation = 0;
+            slot.lora_pinned = false;
+        }
     }
 
     pub fn setSlotLoraAdapter(self: *GraphBatchRuntime, slot_id: u32, name: ?[]const u8) lora.LoraError!void {
         if (slot_id >= self.max_slots) return;
+        const slot = &self.slots[slot_id];
         const raw = name orelse {
-            self.slots[slot_id].lora_slot = lora.NO_ADAPTER;
+            self.unpinSlotLora(slot);
             return;
         };
         if (raw.len == 0) {
-            self.slots[slot_id].lora_slot = lora.NO_ADAPTER;
+            self.unpinSlotLora(slot);
             return;
         }
         const reg = self.model.lora_registry orelse return error.AdapterNotFound;
-        if (reg.findSlotByName(raw)) |sid| {
-            self.slots[slot_id].lora_slot = sid;
+        const sid_opt: ?u32 = if (reg.findSlotByName(raw)) |sid|
+            sid
+        else if (std.mem.indexOfScalar(u8, raw, ':') != null)
+            try reg.resolveModelSelector(raw)
+        else
+            return error.AdapterNotFound;
+        const sid = sid_opt orelse {
+            self.unpinSlotLora(slot);
             return;
-        }
-        if (std.mem.indexOfScalar(u8, raw, ':') != null) {
-            self.slots[slot_id].lora_slot = (try reg.resolveModelSelector(raw)) orelse lora.NO_ADAPTER;
-            return;
-        }
-        return error.AdapterNotFound;
+        };
+        const handle = try reg.pinSlot(sid);
+        self.unpinSlotLora(slot);
+        slot.lora_slot = handle.slot_id;
+        slot.lora_generation = handle.generation;
+        slot.lora_pinned = true;
     }
 
     pub fn selectSlotModelAdapter(self: *GraphBatchRuntime, slot_id: u32, model_selector: []const u8) lora.LoraError!void {
         if (slot_id >= self.max_slots) return;
+        const slot = &self.slots[slot_id];
         const sel = lora.parseModelSelector(model_selector);
         if (sel.adapter == null) {
-            self.slots[slot_id].lora_slot = lora.NO_ADAPTER;
+            self.unpinSlotLora(slot);
             return;
         }
         const reg = self.model.lora_registry orelse return error.AdapterNotFound;
-        self.slots[slot_id].lora_slot = (try reg.resolveModelSelector(model_selector)) orelse lora.NO_ADAPTER;
+        const sid = (try reg.resolveModelSelector(model_selector)) orelse {
+            self.unpinSlotLora(slot);
+            return;
+        };
+        const handle = try reg.pinSlot(sid);
+        self.unpinSlotLora(slot);
+        slot.lora_slot = handle.slot_id;
+        slot.lora_generation = handle.generation;
+        slot.lora_pinned = true;
     }
 
     fn poolTilePair(self: *const GraphBatchRuntime, group_id: u32, kv_idx: u32) struct { k: metal.KvTile, v: metal.KvTile } {
@@ -20166,15 +20604,21 @@ pub const GraphBatchRuntime = struct {
         self.pool_free_top += 1;
     }
 
+    fn releaseGdnSnapshotSafe(self: *GraphBatchRuntime, snap_id: u32) void {
+        if (snap_id == prefix_cache_mod.NO_SNAPSHOT) return;
+        if (self.gdn_snapshot_pool) |*sp| {
+            sp.releaseSlot(snap_id) catch |err| {
+                self.teardown_recovery_errors += 1;
+                self.last_teardown_error = err;
+            };
+        }
+    }
+
     fn reclaimEvicted(self: *GraphBatchRuntime, ev: prefix_cache_mod.EvictedEntry, handles: []const prefix_cache_mod.KvBlockHandle) void {
         if (self.num_kv_layers > 0 and handles.len > 0 and handles[0].storage == .active_tile and handles[0].pool_slot_id < self.pool_chunk_groups) {
             self.releaseChunkGroup(handles[0].pool_slot_id);
         }
-        if (ev.gdn_snapshot_id != prefix_cache_mod.NO_SNAPSHOT) {
-            if (self.gdn_snapshot_pool) |*sp| {
-                sp.releaseSlot(ev.gdn_snapshot_id) catch unreachable;
-            }
-        }
+        self.releaseGdnSnapshotSafe(ev.gdn_snapshot_id);
     }
 
     fn acquireChunkGroup(self: *GraphBatchRuntime) ?u32 {
@@ -20349,7 +20793,10 @@ pub const GraphBatchRuntime = struct {
         const slot = &self.slots[slot_id];
         if (self.prefix_cache) |*pc| {
             for (slot.pinned_full_ids[0..slot.pinned_full_count]) |eid| {
-                pc.unpin(eid) catch unreachable;
+                pc.unpin(eid) catch |err| {
+                    self.teardown_recovery_errors += 1;
+                    self.last_teardown_error = err;
+                };
             }
         }
         slot.pinned_full_count = 0;
@@ -20397,6 +20844,11 @@ pub const GraphBatchRuntime = struct {
         if (prompt_tokens.len <= 1 or prompt_tokens.len > self.model.max_seq_len) {
             return .{ .matched_tokens = 0, .prefix_handle = handle };
         }
+        for (prompt_tokens) |tid| {
+            if (tid >= self.model.config.vocab_size) {
+                return .{ .matched_tokens = 0, .prefix_handle = handle };
+            }
+        }
 
         const require_gdn = (self.num_gdn_layers > 0);
         var match = pc.matchAndPin(prompt_tokens, slot.pinned_full_ids[0..self.max_chunks], .{
@@ -20413,8 +20865,13 @@ pub const GraphBatchRuntime = struct {
         if (self.num_kv_layers > 0) {
             for (0..match.full_block_count) |ci| {
                 const eid = slot.pinned_full_ids[ci];
-                const h0 = pc.entryHandle(eid, 0) catch {
-                    pc.releaseMatch(&match, slot.pinned_full_ids[0..match.full_block_count]) catch unreachable;
+                const h0 = pc.entryHandle(eid, 0) catch |err| {
+                    self.teardown_recovery_errors += 1;
+                    self.last_teardown_error = err;
+                    pc.releaseMatch(&match, slot.pinned_full_ids[0..match.full_block_count]) catch |rerr| {
+                        self.teardown_recovery_errors += 1;
+                        self.last_teardown_error = rerr;
+                    };
                     self.resetSlotState(slot_id);
                     slot.in_use = true;
                     return .{ .matched_tokens = 0, .prefix_handle = handle };
@@ -20422,7 +20879,17 @@ pub const GraphBatchRuntime = struct {
                 slot.chunk_group_ids[ci] = h0.pool_slot_id;
                 slot.chunk_is_shared[ci] = true;
                 for (0..self.num_kv_layers) |ki| {
-                    const hl = pc.entryHandle(eid, @intCast(ki)) catch unreachable;
+                    const hl = pc.entryHandle(eid, @intCast(ki)) catch |err| {
+                        self.teardown_recovery_errors += 1;
+                        self.last_teardown_error = err;
+                        pc.releaseMatch(&match, slot.pinned_full_ids[0..match.full_block_count]) catch |rerr| {
+                            self.teardown_recovery_errors += 1;
+                            self.last_teardown_error = rerr;
+                        };
+                        self.resetSlotState(slot_id);
+                        slot.in_use = true;
+                        return .{ .matched_tokens = 0, .prefix_handle = handle };
+                    };
                     self.slotKvTilesSlice(@intCast(ki), slot_id)[ci] = hl.toTilePair();
                 }
             }
@@ -20435,10 +20902,20 @@ pub const GraphBatchRuntime = struct {
             prefix_cache_mod.NONE_ID;
 
         var final_matched = match.full_block_count * self.kv_chunk_tokens;
-        var effective_snap = if (match.full_block_count > 0)
-            (pc.entryInfo(slot.pinned_full_ids[match.full_block_count - 1]) catch unreachable).gdn_snapshot_id
-        else
-            prefix_cache_mod.NO_SNAPSHOT;
+        var effective_snap = if (match.full_block_count > 0) blk_snap: {
+            const info = pc.entryInfo(slot.pinned_full_ids[match.full_block_count - 1]) catch |err| {
+                self.teardown_recovery_errors += 1;
+                self.last_teardown_error = err;
+                pc.releaseTailPin(&match) catch |terr| {
+                    self.teardown_recovery_errors += 1;
+                    self.last_teardown_error = terr;
+                };
+                self.resetSlotState(slot_id);
+                slot.in_use = true;
+                return .{ .matched_tokens = 0, .prefix_handle = handle };
+            };
+            break :blk_snap info.gdn_snapshot_id;
+        } else prefix_cache_mod.NO_SNAPSHOT;
 
         if (match.tail_tokens > 0 and match.tail_entry_id != prefix_cache_mod.NONE_ID) {
             if (self.num_kv_layers == 0) {
@@ -20464,7 +20941,10 @@ pub const GraphBatchRuntime = struct {
                     }
                 }
             }
-            pc.releaseTailPin(&match) catch unreachable;
+            pc.releaseTailPin(&match) catch |err| {
+                self.teardown_recovery_errors += 1;
+                self.last_teardown_error = err;
+            };
         }
 
         // Restore GDN recurrent state + conv1d history snapshot on GPU (`ami_gdn_clone_state`).
@@ -20519,7 +20999,7 @@ pub const GraphBatchRuntime = struct {
                             if (self.saveOrRestoreGdnSnapshotGpu(slot_id, sid, false)) {
                                 snap_id = sid;
                             } else {
-                                self.gdn_snapshot_pool.?.releaseSlot(sid) catch unreachable;
+                                self.releaseGdnSnapshotSafe(sid);
                             }
                         }
                     }
@@ -20532,7 +21012,7 @@ pub const GraphBatchRuntime = struct {
                 const gid = slot.chunk_group_ids[c];
                 if (self.num_kv_layers > 0) {
                     if (gid == GRAPH_NONE_GROUP) {
-                        if (snap_id != prefix_cache_mod.NO_SNAPSHOT) self.gdn_snapshot_pool.?.releaseSlot(snap_id) catch unreachable;
+                        self.releaseGdnSnapshotSafe(snap_id);
                         break;
                     }
                     for (0..self.num_kv_layers) |ki| {
@@ -20555,12 +21035,12 @@ pub const GraphBatchRuntime = struct {
                         .pin_on_insert = true,
                     },
                 ) catch {
-                    if (snap_id != prefix_cache_mod.NO_SNAPSHOT) self.gdn_snapshot_pool.?.releaseSlot(snap_id) catch unreachable;
+                    self.releaseGdnSnapshotSafe(snap_id);
                     break;
                 };
                 if (ins.evicted) |ev| self.reclaimEvicted(ev, self.scratch_evicted_handles);
                 if (ins.already_existed) {
-                    if (snap_id != prefix_cache_mod.NO_SNAPSHOT) self.gdn_snapshot_pool.?.releaseSlot(snap_id) catch unreachable;
+                    self.releaseGdnSnapshotSafe(snap_id);
                     if (self.num_kv_layers > 0) {
                         const eh0 = pc.entryHandle(ins.entry_id, 0) catch break;
                         self.releaseChunkGroup(gid);
@@ -20592,7 +21072,7 @@ pub const GraphBatchRuntime = struct {
                         if (self.saveOrRestoreGdnSnapshotGpu(slot_id, sid, false)) {
                             snap_id = sid;
                         } else {
-                            self.gdn_snapshot_pool.?.releaseSlot(sid) catch unreachable;
+                            self.releaseGdnSnapshotSafe(sid);
                             return;
                         }
                     } else return;
@@ -20601,16 +21081,16 @@ pub const GraphBatchRuntime = struct {
                 if (self.num_kv_layers > 0) {
                     const src_g = slot.chunk_group_ids[tail_c];
                     if (src_g == GRAPH_NONE_GROUP) {
-                        if (snap_id != prefix_cache_mod.NO_SNAPSHOT) self.gdn_snapshot_pool.?.releaseSlot(snap_id) catch unreachable;
+                        self.releaseGdnSnapshotSafe(snap_id);
                         return;
                     }
                     snap_g = self.acquireChunkGroup() orelse {
-                        if (snap_id != prefix_cache_mod.NO_SNAPSHOT) self.gdn_snapshot_pool.?.releaseSlot(snap_id) catch unreachable;
+                        self.releaseGdnSnapshotSafe(snap_id);
                         return;
                     };
                     if (!self.copyTailGroupGpu(src_g, snap_g, tail_len)) {
                         self.releaseChunkGroup(snap_g);
-                        if (snap_id != prefix_cache_mod.NO_SNAPSHOT) self.gdn_snapshot_pool.?.releaseSlot(snap_id) catch unreachable;
+                        self.releaseGdnSnapshotSafe(snap_id);
                         return;
                     }
                     for (0..self.num_kv_layers) |ki| {
@@ -20651,11 +21131,11 @@ pub const GraphBatchRuntime = struct {
                     if (ins.evicted) |ev| self.reclaimEvicted(ev, self.scratch_evicted_handles);
                     if (ins.already_existed) {
                         self.releaseChunkGroup(snap_g);
-                        if (snap_id != prefix_cache_mod.NO_SNAPSHOT) self.gdn_snapshot_pool.?.releaseSlot(snap_id) catch unreachable;
+                        self.releaseGdnSnapshotSafe(snap_id);
                     }
                 } else |_| {
                     self.releaseChunkGroup(snap_g);
-                    if (snap_id != prefix_cache_mod.NO_SNAPSHOT) self.gdn_snapshot_pool.?.releaseSlot(snap_id) catch unreachable;
+                    self.releaseGdnSnapshotSafe(snap_id);
                 }
             }
         }
@@ -20672,6 +21152,11 @@ pub const GraphBatchRuntime = struct {
         const model = self.model;
         const slot = &self.slots[slot_id];
         const m: u32 = @intCast(tokens.len);
+        if (m == 0) return error.InvalidBatchSize;
+        if (@as(u64, base_pos) + m > model.max_seq_len) return error.SequenceFull;
+        for (tokens) |tid| {
+            if (tid >= model.config.vocab_size) return error.TokenOutOfRange;
+        }
         const h = model.config.hidden_size;
         const w_stride = model.wide_prefill_max_tokens;
         const kv_len_after: u32 = base_pos + m;
@@ -21727,6 +22212,11 @@ pub const GraphBatchRuntime = struct {
         const model = self.model;
         const slot = &self.slots[slot_id];
         const m: u32 = @intCast(tokens.len);
+        if (m == 0) return error.InvalidBatchSize;
+        if (@as(u64, base_pos) + m > model.max_seq_len) return error.SequenceFull;
+        for (tokens) |tid| {
+            if (tid >= model.config.vocab_size) return error.TokenOutOfRange;
+        }
         const h = model.config.hidden_size;
 
         var acc_nodes: [hybrid.MAX_TREE_NODES]u16 = undefined;
@@ -22463,14 +22953,18 @@ pub const GraphBatchRuntime = struct {
 
     pub fn prefillSlot(self: *GraphBatchRuntime, chunk: *const batch_sched.PrefillChunkView) batch_sched.BackendError!batch_sched.PrefillResult {
         if (chunk.slot_id >= self.max_slots or chunk.tokens.len == 0) return error.InvalidState;
-        if (chunk.start_pos + chunk.tokens.len > self.model.max_seq_len) return error.PrefillFailed;
+        if (@as(u64, chunk.start_pos) + chunk.tokens.len > self.model.max_seq_len) return error.PrefillFailed;
+        for (chunk.tokens) |tid| {
+            if (tid >= self.model.config.vocab_size) return error.PrefillFailed;
+        }
         const slot = &self.slots[chunk.slot_id];
         if (!slot.in_use) {
             self.resetSlotState(chunk.slot_id);
             slot.in_use = true;
         }
+        const validated_lora = try self.resolveValidatedSlotLora(slot);
         const saved_lora_slot = self.model.active_lora_slot;
-        self.model.active_lora_slot = slot.lora_slot;
+        self.model.active_lora_slot = validated_lora;
         defer self.model.active_lora_slot = saved_lora_slot;
         @memcpy(slot.prompt_tokens[chunk.start_pos .. chunk.start_pos + chunk.tokens.len], chunk.tokens);
 
@@ -22608,8 +23102,9 @@ pub const GraphBatchRuntime = struct {
                     return error.DecodeFailed;
                 }
                 const slot = &self.slots[sid];
+                const validated_lora = try self.resolveValidatedSlotLora(slot);
                 const saved_lora = model.active_lora_slot;
-                model.active_lora_slot = slot.lora_slot;
+                model.active_lora_slot = validated_lora;
                 defer model.active_lora_slot = saved_lora;
                 model.mla_kv_buf = self.batch_buf;
                 model.mla_kv_arena = self.slot_mla_kv[sid];
@@ -22653,7 +23148,7 @@ pub const GraphBatchRuntime = struct {
             model.pos3d_host[bi] = hybrid.Pos3D.text(pos);
             model.ancestor_masks_host[bi] = 1;
             self.gdn_slot_ids_host[bi] = sid;
-            const lslot = self.slots[sid].lora_slot;
+            const lslot = try self.resolveValidatedSlotLora(&self.slots[sid]);
             batch_lora_slots[bi] = lslot;
             if (can_run_batch_lora and lslot != lora.NO_ADAPTER) any_batch_lora = true;
             max_seq = @max(max_seq, pos + 1);
@@ -23243,7 +23738,7 @@ pub const GraphBatchRuntime = struct {
         _ = prefix_handle;
         const self: *GraphBatchRuntime = @ptrCast(@alignCast(ctx));
         if (slot_id < self.max_slots) {
-            self.slots[slot_id].lora_slot = lora.NO_ADAPTER;
+            self.unpinSlotLora(&self.slots[slot_id]);
         }
         self.resetSlotState(slot_id);
     }
@@ -30976,4 +31471,124 @@ test "M9.4 DeepSeek-V4.1 in-memory real-HF layout (24x4H mHC Sinkhorn-20 handoff
     try std.testing.expect(m94CosineSimF16(m_a.readLogitsF16()[0..vocab], m_b.readLogitsF16()[0..vocab]) >= 0.999);
     try std.testing.expectEqual(@as(u64, 0), m_a.m7Stats().encoder_layer_dispatches_decode);
     try std.testing.expectEqual(@as(u64, 0), m_b.m7Stats().encoder_layer_dispatches_decode);
+}
+
+test "L6 F12.3 F14 F22 GraphConfig rejects bits 256 and NaN params, GraphModel rejects OOB commitTreeKv nid and mismatched LoRA dims" {
+    const allocator = std.testing.allocator;
+
+    // L6: JSON quantization `bits: 256` and `group_size: 70000` must return `error.InvalidConfig` instead of `@intCast` panic.
+    const bad_bits_json =
+        \\{
+        \\  "model_type": "qwen3",
+        \\  "vocab_size": 64,
+        \\  "hidden_size": 64,
+        \\  "num_hidden_layers": 1,
+        \\  "num_attention_heads": 2,
+        \\  "num_key_value_heads": 2,
+        \\  "head_dim": 32,
+        \\  "intermediate_size": 64,
+        \\  "quantization": { "bits": 256, "group_size": 64 }
+        \\}
+    ;
+    try std.testing.expectError(error.InvalidConfig, GraphConfig.fromJson(allocator, bad_bits_json));
+
+    const bad_gs_json =
+        \\{
+        \\  "model_type": "qwen3",
+        \\  "vocab_size": 64,
+        \\  "hidden_size": 64,
+        \\  "num_hidden_layers": 1,
+        \\  "num_attention_heads": 2,
+        \\  "num_key_value_heads": 2,
+        \\  "head_dim": 32,
+        \\  "intermediate_size": 64,
+        \\  "quantization": { "bits": 4, "group_size": 70000 }
+        \\}
+    ;
+    try std.testing.expectError(error.InvalidConfig, GraphConfig.fromJson(allocator, bad_gs_json));
+
+    // L6: `GraphConfig.validate` must reject NaN / non-positive `rms_norm_eps` and `rope_theta`.
+    var bundle = try buildSynthLoopDenseTestBundle(allocator, .single_pass, 1, false, false);
+    defer bundle.deinit(allocator);
+    try bundle.cfg.validate();
+
+    var bad_eps = bundle.cfg;
+    bad_eps.rms_norm_eps = std.math.nan(f32);
+    try std.testing.expectError(error.InvalidConfig, bad_eps.validate());
+    var bad_theta = bundle.cfg;
+    bad_theta.rope_theta = std.math.nan(f32);
+    try std.testing.expectError(error.InvalidConfig, bad_theta.validate());
+    var zero_theta = bundle.cfg;
+    zero_theta.rope_theta = 0.0;
+    try std.testing.expectError(error.InvalidConfig, zero_theta.validate());
+
+    // F14 & L9: `GraphModel.commitTreeKv` rejects OOB `nid >= last_verified_nodes` and `u32` wraparound.
+    var model = try GraphModel.loadFromBytes(allocator, bundle.amf_bytes, bundle.cfg, .{
+        .max_seq_len = 64,
+        .max_tree_nodes = 8,
+    });
+    defer model.deinit(allocator);
+
+    _ = try model.verifyTree(&.{ 1, 2 }, &.{ 0, 1 }, &.{ 0b01, 0b11 }, 0);
+    try std.testing.expectError(error.NodeOutOfRange, model.commitTreeKv(0, &.{2}));
+    try std.testing.expectError(error.NodeOutOfRange, model.commitTreeKv(0, &.{99}));
+    try std.testing.expectError(error.SequenceFull, model.commitTreeKv(std.math.maxInt(u32), &.{0}));
+    try model.commitTreeKv(0, &.{ 0, 1 });
+
+    // F12.3: `GraphBatchRuntime.prefillSlot` rejects OOB token IDs.
+    var batch_rt = try GraphBatchRuntime.init(allocator, &model, .{
+        .max_slots = 2,
+        .prefix_cache_chunks = 4,
+    });
+    defer batch_rt.deinit(allocator);
+    var rng0 = try rng_mod.RequestRng.init(77);
+    const bad_toks = [_]u32{bundle.cfg.vocab_size};
+    try std.testing.expectError(error.PrefillFailed, batch_rt.prefillSlot(&.{
+        .slot_id = 0,
+        .request_id = 1,
+        .user_tag = 0,
+        .tokens = &bad_toks,
+        .start_pos = 0,
+        .total_prompt_len = 1,
+        .is_final_chunk = true,
+        .prefix_handle = 1,
+        .temperature = 0.0,
+        .rng = &rng0,
+        .ngram_domain = "",
+    }));
+
+    // F22.2: mismatched `(n, k)` LoRA dimensions must fail in `attachLoraRegistry` & `calibrateLoraDora`.
+    var reg = try lora.LoraRegistry.init(.{
+        .pool_bytes = 2 * 1024 * 1024,
+        .allocator = allocator,
+        .base_shape = model.baseModelShape(),
+    });
+    defer reg.deinit(allocator);
+    const bad_n: u32 = bundle.cfg.qDim() + 16;
+    const h: u32 = bundle.cfg.hidden_size;
+    const a_f32 = try allocator.alloc(f32, 4 * @as(usize, h));
+    defer allocator.free(a_f32);
+    @memset(a_f32, 0.01);
+    const b_f32 = try allocator.alloc(f32, @as(usize, bad_n) * 4);
+    defer allocator.free(b_f32);
+    @memset(b_f32, 0.01);
+    const bad_spec = [_]lora.SyntheticLoraSpec{.{
+        .layer = 0,
+        .target = .q_proj,
+        .n = bad_n,
+        .k = h,
+        .rank = 4,
+        .a_f32 = a_f32,
+        .b_f32 = b_f32,
+    }};
+    const bad_amlora = try lora.buildSyntheticAmloraBytes(allocator, "bad-dims", 4, 4.0, &bad_spec);
+    defer allocator.free(bad_amlora);
+
+    try model.attachLoraRegistry(&reg);
+    defer model.attachLoraRegistry(null) catch |err| {
+        std.debug.panic("attachLoraRegistry(null) failed in F22 test defer: {}", .{err});
+    };
+    _ = try reg.loadAdapterFromBytes(allocator, "bad-dims", bad_amlora);
+    try std.testing.expectError(error.DimensionMismatch, model.calibrateLoraDora(allocator));
+    try std.testing.expectError(error.DimensionMismatch, model.attachLoraRegistry(&reg));
 }
