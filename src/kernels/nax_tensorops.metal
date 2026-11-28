@@ -379,11 +379,26 @@ static inline void nax_dequant_stage_tile(const device T *x,
 
             if (gk_base + 32u <= p.k) {
                 if (QUANT_BITS == 4u) {
-                    const device uint *wp = (const device uint *)(qweight + row_off + (gk_base >> 1));
-                    for (uint c = 0u; c < 4u; c++) {
-                        const uint w = wp[c];
-                        for (uint j = 0u; j < 8u; j++) {
-                            dst[c * 8u + j] = T(fma(float((w >> (j * 4u)) & 0xFu), scale, bias));
+                    const ulong byte_off = row_off + (gk_base >> 1);
+                    if ((byte_off & 3ul) == 0ul) {
+                        const device uint *wp = (const device uint *)(qweight + byte_off);
+                        for (uint c = 0u; c < 4u; c++) {
+                            const uint w = wp[c];
+                            for (uint j = 0u; j < 8u; j++) {
+                                dst[c * 8u + j] = T(fma(float((w >> (j * 4u)) & 0xFu), scale, bias));
+                            }
+                        }
+                    } else {
+                        const device uchar *bp = qweight + byte_off;
+                        for (uint c = 0u; c < 4u; c++) {
+                            const uint base_b = c * 4u;
+                            const uint w = uint(bp[base_b + 0u]) |
+                                           (uint(bp[base_b + 1u]) << 8) |
+                                           (uint(bp[base_b + 2u]) << 16) |
+                                           (uint(bp[base_b + 3u]) << 24);
+                            for (uint j = 0u; j < 8u; j++) {
+                                dst[c * 8u + j] = T(fma(float((w >> (j * 4u)) & 0xFu), scale, bias));
+                            }
                         }
                     }
                 } else if (QUANT_BITS == 3u) {
@@ -398,11 +413,23 @@ static inline void nax_dequant_stage_tile(const device T *x,
                         }
                     }
                 } else if (QUANT_BITS == 2u) {
-                    const device ushort *wp = (const device ushort *)(qweight + row_off + (gk_base >> 2));
-                    for (uint c = 0u; c < 4u; c++) {
-                        const uint w = uint(wp[c]);
-                        for (uint j = 0u; j < 8u; j++) {
-                            dst[c * 8u + j] = T(fma(float((w >> (j * 2u)) & 0x3u), scale, bias));
+                    const ulong byte_off = row_off + (gk_base >> 2);
+                    if ((byte_off & 1ul) == 0ul) {
+                        const device ushort *wp = (const device ushort *)(qweight + byte_off);
+                        for (uint c = 0u; c < 4u; c++) {
+                            const uint w = uint(wp[c]);
+                            for (uint j = 0u; j < 8u; j++) {
+                                dst[c * 8u + j] = T(fma(float((w >> (j * 2u)) & 0x3u), scale, bias));
+                            }
+                        }
+                    } else {
+                        const device uchar *bp = qweight + byte_off;
+                        for (uint c = 0u; c < 4u; c++) {
+                            const uint base_b = c * 2u;
+                            const uint w = uint(bp[base_b + 0u]) | (uint(bp[base_b + 1u]) << 8);
+                            for (uint j = 0u; j < 8u; j++) {
+                                dst[c * 8u + j] = T(fma(float((w >> (j * 2u)) & 0x3u), scale, bias));
+                            }
                         }
                     }
                 } else {

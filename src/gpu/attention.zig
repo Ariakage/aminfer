@@ -4096,10 +4096,12 @@ const AneStreamWorker = struct {
     stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     completed: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     failed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    last_error: ?anyerror = null,
 
     fn run(self: *AneStreamWorker) void {
         while (!self.stop.load(.acquire)) {
-            _ = self.model.predict(self.plan) catch {
+            _ = self.model.predict(self.plan) catch |err| {
+                self.last_error = err;
                 self.failed.store(true, .release);
                 self.started.store(1, .release);
                 return;

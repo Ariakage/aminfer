@@ -2800,45 +2800,48 @@ kernel void ami_act_quant_emulate_f16(const device half *x_in [[buffer(0)]],
 
     if (QF_ACT_QUANT_MODE == QF_ACT_MXFP8_G32) {
         // Dispatch grid.x = ceil((K / 32) / 4), tg = {128, 1, 1}.
+        // Participate unconditionally in `simd_max` with neutral 0.0f for tail lanes (`K % 32 != 0`).
         const uint g = tg_pos.x * 4u + sg_id;
         const uint col = g * 32u + lane;
-        if (col >= p.k) {
-            return;
-        }
-        const float v = float(x_in[row_off + col]);
+        const bool in_bounds = (col < p.k);
+        const float v = in_bounds ? float(x_in[row_off + col]) : 0.0f;
         const float amax = simd_max(fabs(v));
-        float out_v = 0.0f;
-        if (amax > 0.0f) {
-            const float scale = qf_ue8m0_to_f32(qf_mxfp8_ue8m0_from_amax(amax));
-            const uchar q = qf_f32_to_e4m3(v / scale);
-            out_v = qf_e4m3_to_f32(q) * scale;
+        if (in_bounds) {
+            float out_v = 0.0f;
+            if (amax > 0.0f) {
+                const float scale = qf_ue8m0_to_f32(qf_mxfp8_ue8m0_from_amax(amax));
+                const uchar q = qf_f32_to_e4m3(v / scale);
+                out_v = qf_e4m3_to_f32(q) * scale;
+            }
+            x_out[row_off + col] = half(out_v);
         }
-        x_out[row_off + col] = half(out_v);
         return;
     }
 
     if (QF_ACT_QUANT_MODE == QF_ACT_FP8_G128) {
-        // Dispatch grid.x = K / 128, tg = {128, 1, 1}.
+        // Dispatch grid.x = ceil(K / 128), tg = {128, 1, 1}.
+        // Participate unconditionally in `simd_max` and `threadgroup_barrier` with neutral 0.0f
+        // so tail groups (`K % 128 != 0`) never diverge before the barrier.
         threadgroup float sg_max_buf[4];
         const uint col = tg_pos.x * 128u + tid;
-        if (col >= p.k) {
-            return;
-        }
-        const float v = float(x_in[row_off + col]);
+        const bool in_bounds = (col < p.k);
+        const float v = in_bounds ? float(x_in[row_off + col]) : 0.0f;
         const float sm = simd_max(fabs(v));
         if (lane == 0u) {
             sg_max_buf[sg_id] = sm;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        const float amax = fmax(fmax(sg_max_buf[0], sg_max_buf[1]),
-                                fmax(sg_max_buf[2], sg_max_buf[3]));
-        float out_v = 0.0f;
-        if (amax > 0.0f) {
-            const float scale = amax / 448.0f;
-            const uchar q = qf_f32_to_e4m3(v / scale);
-            out_v = qf_e4m3_to_f32(q) * scale;
+        if (in_bounds) {
+            const float amax = fmax(fmax(sg_max_buf[0], sg_max_buf[1]),
+                                    fmax(sg_max_buf[2], sg_max_buf[3]));
+            float out_v = 0.0f;
+            if (amax > 0.0f) {
+                const float scale = amax / 448.0f;
+                const uchar q = qf_f32_to_e4m3(v / scale);
+                out_v = qf_e4m3_to_f32(q) * scale;
+            }
+            x_out[row_off + col] = half(out_v);
         }
-        x_out[row_off + col] = half(out_v);
         return;
     }
 

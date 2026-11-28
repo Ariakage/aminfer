@@ -156,6 +156,14 @@ pub const PanelDType = enum(u8) {
         };
     }
 
+    pub fn supportsQuantParamKind(self: PanelDType, pk: QuantParamKind) bool {
+        return switch (pk) {
+            .affine_scale_bias => true,
+            .lut16_codebook => self.hasAffineBias(),
+            .lut4_codebook => self == .q2_affine,
+        };
+    }
+
     pub fn activationIsBf16(self: PanelDType) bool {
         return self == .bf16;
     }
@@ -2883,6 +2891,7 @@ pub const SmeDispatcher = struct {
             const w = op.weight;
             if (op.m == 0 or w.n == 0 or w.k == 0) return error.ZeroDimension;
             if ((w.k % GROUP_SIZE) != 0) return error.UnalignedK;
+            if (!w.dtype.supportsQuantParamKind(w.param_kind)) return error.InvalidArgument;
             const w_need = try packedBlobBytes(w.dtype, w.n, w.k);
             const mk = std.math.mul(usize, op.m, w.k) catch return error.Overflow;
             const mn = std.math.mul(usize, op.m, w.n) catch return error.Overflow;
@@ -2969,7 +2978,20 @@ pub const SmeDispatcher = struct {
                     .m32 => @min(rem, 32),
                 };
 
-                if (task_count == MAX_HOISTED_BATCH_OPS) {
+                const a_strip_bytes = std.mem.sliceAsBytes(op.a_u16[m_cur * w.k ..][0 .. strip_rows * w.k]);
+                const a_begin = @intFromPtr(a_strip_bytes.ptr);
+                const a_end = a_begin + a_strip_bytes.len;
+                var aliases_pending_out = false;
+                for (args_buf[0..task_count]) |prev| {
+                    const out_begin = @intFromPtr(prev.out_ptr);
+                    const out_end = out_begin + @as(usize, prev.m_rows) * prev.out_row_stride_bytes;
+                    if (a_begin < out_end and out_begin < a_end) {
+                        aliases_pending_out = true;
+                        break;
+                    }
+                }
+
+                if (aliases_pending_out or task_count == MAX_HOISTED_BATCH_OPS) {
                     ami_sme2_exec_batch(&task_buf, task_count);
                     task_count = 0;
                     a_pack_used = 0;
@@ -3243,7 +3265,7 @@ pub const SmeLinearWeight = struct {
         const amf_dt = try entry.dataType();
         const dt = try panelDTypeFromAmf(amf_dt);
         const pk = quantParamKindFromAmf(try entry.quantParamKind());
-        if (!dt.isQuantized() and pk != .affine_scale_bias) {
+        if (!dt.supportsQuantParamKind(pk)) {
             return error.InvalidQuantParamKind;
         }
 
@@ -7454,4 +7476,205 @@ test "C25 GGUF Q2_0, TQ1_0, TQ2_0, IQ2_XXS SME2 microkernels, hoisted batch, and
             evaluateC13BusGate(caps, m4_chip, 8 * 1024 * 1024, true, 1.12, 0),
         );
     }
+}
+
+test "F22.3: evalLinearBatchHoisted flushes dependent aliased input-output ops to match scalar fallback bit-for-bit" {
+    const gpa = std.testing.allocator;
+    var disp = try SmeDispatcher.init(gpa, .{ .total_threads = 2 });
+    defer disp.deinit();
+    const caps = disp.caps;
+
+    const k: usize = 64;
+    const mid_n: usize = 64;
+    const out_n: usize = 32;
+
+    // Layer 0: f16 weight [mid_n, k] -> f16 output written into `mid_u16`.
+    const w0_f32 = try gpa.alloc(f32, mid_n * k);
+    defer gpa.free(w0_f32);
+    for (w0_f32, 0..) |*v, idx| {
+        const s: i32 = @intCast((idx * 13 + 7) % 19);
+        v.* = @as(f32, @floatFromInt(s - 9)) * 0.04;
+    }
+    const w0_blob = try gpa.alloc(u8, try packedBlobBytes(.f16, mid_n, k));
+    defer gpa.free(w0_blob);
+    try packDenseFromF32Panel64(.f16, w0_f32, mid_n, k, w0_blob);
+    const w0: SmeLinearWeight = .{
+        .dtype = .f16,
+        .param_kind = .affine_scale_bias,
+        .cache_hint = .temporal,
+        .n = mid_n,
+        .k = k,
+        .w_packed = w0_blob,
+    };
+
+    // Layer 1: q4_affine weight [out_n, mid_n] consuming `mid_u16` (exercises both
+    // `computeGroupActivationSums` in `.m1_4` and `packActivationStrip` in `.m5_16`/`.m32`!).
+    const w1_codes = try gpa.alloc(u8, out_n * mid_n);
+    defer gpa.free(w1_codes);
+    const w1_sb = try gpa.alloc(quant.ScaleBias, out_n * (mid_n / GROUP_SIZE));
+    defer gpa.free(w1_sb);
+    for (w1_codes, 0..) |*c, idx| c.* = @intCast((idx * 5 + 3) & 0x0F);
+    for (w1_sb, 0..) |*sb, idx| {
+        sb.* = .{
+            .scale = @floatCast(0.02 + 0.003 * @as(f32, @floatFromInt(idx % 7))),
+            .bias = @floatCast(-0.15 + 0.01 * @as(f32, @floatFromInt(idx % 5))),
+        };
+    }
+    const w1_blob = try gpa.alloc(u8, try packedBlobBytes(.q4_affine, out_n, mid_n));
+    defer gpa.free(w1_blob);
+    try packQuantAffinePanel64(.q4_affine, w1_codes, w1_sb, out_n, mid_n, w1_blob);
+    const w1: SmeLinearWeight = .{
+        .dtype = .q4_affine,
+        .param_kind = .affine_scale_bias,
+        .cache_hint = .temporal,
+        .n = out_n,
+        .k = mid_n,
+        .w_packed = w1_blob,
+    };
+
+    const m_cases = [_]usize{ 1, 8, 33 };
+    for (m_cases) |m| {
+        const a_u16 = try gpa.alloc(u16, m * k);
+        defer gpa.free(a_u16);
+        for (a_u16, 0..) |*v, idx| {
+            const s: i32 = @intCast((idx * 11 + m * 3) % 17);
+            v.* = quant.f32ToFloatBits(.f16, @as(f32, @floatFromInt(s - 8)) * 0.125);
+        }
+
+        const mid_sme = try gpa.alloc(u16, m * mid_n);
+        defer gpa.free(mid_sme);
+        const mid_seq = try gpa.alloc(u16, m * mid_n);
+        defer gpa.free(mid_seq);
+        const mid_fb = try gpa.alloc(u16, m * mid_n);
+        defer gpa.free(mid_fb);
+        const out_sme = try gpa.alloc(f32, m * out_n);
+        defer gpa.free(out_sme);
+        const out_seq = try gpa.alloc(f32, m * out_n);
+        defer gpa.free(out_seq);
+        const out_fb = try gpa.alloc(f32, m * out_n);
+        defer gpa.free(out_fb);
+
+        // Seed `mid` with large non-zero sentinel values so stale pre-packing would diverge hugely.
+        const sentinel_f16 = quant.f32ToFloatBits(.f16, 128.0);
+        @memset(mid_sme, sentinel_f16);
+        @memset(mid_seq, sentinel_f16);
+        @memset(mid_fb, sentinel_f16);
+        @memset(out_sme, 0.0);
+        @memset(out_seq, 0.0);
+        @memset(out_fb, 0.0);
+
+        const active_be: ExecutionBackend = if (caps.supportsSme2()) .sme2 else .scalar_fallback;
+
+        const ops_fb = [_]BatchLinearOp{
+            .{ .weight = w0, .a_u16 = a_u16, .out_bytes = std.mem.sliceAsBytes(mid_fb), .out_dtype = .f16, .m = m },
+            .{ .weight = w1, .a_u16 = mid_fb, .out_bytes = std.mem.sliceAsBytes(out_fb), .out_dtype = .f32, .m = m },
+        };
+        try disp.evalLinearBatchHoisted(&ops_fb, .scalar_fallback);
+
+        // Separate sequential execution on the active backend (ground-truth bit-exact reference).
+        try disp.evalLinearBatchHoisted(&.{
+            .{ .weight = w0, .a_u16 = a_u16, .out_bytes = std.mem.sliceAsBytes(mid_seq), .out_dtype = .f16, .m = m },
+        }, active_be);
+        try disp.evalLinearBatchHoisted(&.{
+            .{ .weight = w1, .a_u16 = mid_seq, .out_bytes = std.mem.sliceAsBytes(out_seq), .out_dtype = .f32, .m = m },
+        }, active_be);
+
+        const ops_sme = [_]BatchLinearOp{
+            .{ .weight = w0, .a_u16 = a_u16, .out_bytes = std.mem.sliceAsBytes(mid_sme), .out_dtype = .f16, .m = m },
+            .{ .weight = w1, .a_u16 = mid_sme, .out_bytes = std.mem.sliceAsBytes(out_sme), .out_dtype = .f32, .m = m },
+        };
+        try disp.evalLinearBatchHoisted(&ops_sme, active_be);
+
+        try std.testing.expectEqualSlices(u16, mid_seq, mid_sme);
+        try std.testing.expectEqualSlices(f32, out_seq, out_sme);
+        for (0..m * out_n) |idx| {
+            try std.testing.expectApproxEqAbs(out_fb[idx], out_sme[idx], 1e-3);
+        }
+    }
+}
+
+test "F22.3: SmeLinearWeight.fromAmfEntry rejects invalid dtype and QuantParamKind combinations" {
+    const gpa = std.testing.allocator;
+    const n: usize = 16;
+    const k: usize = 64;
+
+    const makeEntryRawPk = struct {
+        fn call(amf_dt: amf.DType, raw_pk: u8, data_bytes: usize) amf.TensorEntry {
+            var e: amf.TensorEntry = std.mem.zeroes(amf.TensorEntry);
+            e.kind = @backingInt(amf.TensorKind.dense);
+            e.dtype = @backingInt(amf_dt);
+            e.rank = 2;
+            e.shape = .{ @intCast(n), @intCast(k), 0, 0 };
+            e.data_bytes = data_bytes;
+            e.blob_bytes = data_bytes;
+            e.reserved0 = @as(u16, @backingInt(amf.TensorLayout.sme2_panel64)) | (@as(u16, raw_pk) << 8);
+            return e;
+        }
+    }.call;
+
+    // Direct capability matrix checks: lut4_codebook is strictly 2-bit (`q2_affine`) only.
+    try std.testing.expect(!PanelDType.q4_affine.supportsQuantParamKind(.lut4_codebook));
+    try std.testing.expect(!PanelDType.q3_affine.supportsQuantParamKind(.lut4_codebook));
+    try std.testing.expect(PanelDType.q2_affine.supportsQuantParamKind(.lut4_codebook));
+    try std.testing.expect(PanelDType.q4_affine.supportsQuantParamKind(.lut16_codebook));
+    try std.testing.expect(PanelDType.q3_affine.supportsQuantParamKind(.lut16_codebook));
+    try std.testing.expect(PanelDType.q2_affine.supportsQuantParamKind(.lut16_codebook));
+    try std.testing.expect(!PanelDType.f16.supportsQuantParamKind(.lut16_codebook));
+    try std.testing.expect(!PanelDType.nvfp4_g16.supportsQuantParamKind(.lut16_codebook));
+
+    // Invalid: q4_affine + lut4_codebook (raw_pk = 2) rejected by `fromAmfEntry` AND `evalLinearBatchHoisted`.
+    const q4_bytes = try packedBlobBytes(.q4_affine, n, k);
+    const q4_blob = try gpa.alloc(u8, q4_bytes);
+    defer gpa.free(q4_blob);
+    @memset(q4_blob, 0);
+    const e_q4_lut4 = makeEntryRawPk(.q4_affine, @backingInt(QuantParamKind.lut4_codebook), q4_bytes);
+    try std.testing.expectError(error.InvalidQuantParamKind, SmeLinearWeight.fromAmfEntry(&e_q4_lut4, q4_blob, null));
+
+    var disp = try SmeDispatcher.init(gpa, .{ .total_threads = 1 });
+    defer disp.deinit();
+    var a_u16: [64]u16 = @splat(0);
+    var out_f32: [16]f32 = @splat(0.0);
+    const bad_ops = [_]BatchLinearOp{.{
+        .weight = .{
+            .dtype = .q4_affine,
+            .param_kind = .lut4_codebook,
+            .cache_hint = .temporal,
+            .n = n,
+            .k = k,
+            .w_packed = q4_blob,
+        },
+        .a_u16 = &a_u16,
+        .out_bytes = std.mem.sliceAsBytes(&out_f32),
+        .out_dtype = .f32,
+        .m = 1,
+    }};
+    try std.testing.expectError(error.InvalidArgument, disp.evalLinearBatchHoisted(&bad_ops, .scalar_fallback));
+
+    // Valid: q4_affine + lut16_codebook
+    const e_q4_lut16 = makeEntryRawPk(.q4_affine, @backingInt(amf.QuantParamKind.lut16_codebook), q4_bytes);
+    const w_q4_lut16 = try SmeLinearWeight.fromAmfEntry(&e_q4_lut16, q4_blob, null);
+    try std.testing.expectEqual(QuantParamKind.lut16_codebook, w_q4_lut16.param_kind);
+
+    // Invalid: q3_affine + lut4_codebook
+    const q3_bytes = try packedBlobBytes(.q3_affine, n, k);
+    const q3_blob = try gpa.alloc(u8, q3_bytes);
+    defer gpa.free(q3_blob);
+    @memset(q3_blob, 0);
+    const e_q3_lut4 = makeEntryRawPk(.q3_affine, @backingInt(QuantParamKind.lut4_codebook), q3_bytes);
+    try std.testing.expectError(error.InvalidQuantParamKind, SmeLinearWeight.fromAmfEntry(&e_q3_lut4, q3_blob, null));
+
+    // Invalid: dense f16 + lut16_codebook, and non-affine nvfp4_g16 + lut16_codebook
+    const f16_bytes = try packedBlobBytes(.f16, n, k);
+    const f16_blob = try gpa.alloc(u8, f16_bytes);
+    defer gpa.free(f16_blob);
+    @memset(f16_blob, 0);
+    const e_f16_lut16 = makeEntryRawPk(.f16, @backingInt(amf.QuantParamKind.lut16_codebook), f16_bytes);
+    try std.testing.expectError(error.InvalidQuantParamKind, SmeLinearWeight.fromAmfEntry(&e_f16_lut16, f16_blob, null));
+
+    const nvfp4_bytes = try packedBlobBytes(.nvfp4_g16, n, k);
+    const nvfp4_blob = try gpa.alloc(u8, nvfp4_bytes);
+    defer gpa.free(nvfp4_blob);
+    @memset(nvfp4_blob, 0);
+    const e_nvfp4_lut16 = makeEntryRawPk(.nvfp4_g16, @backingInt(amf.QuantParamKind.lut16_codebook), nvfp4_bytes);
+    try std.testing.expectError(error.InvalidQuantParamKind, SmeLinearWeight.fromAmfEntry(&e_nvfp4_lut16, nvfp4_blob, null));
 }

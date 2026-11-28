@@ -1080,8 +1080,10 @@ fn packMatrixIntoArena(
     };
 }
 
-/// Packs FP32 `[n, k]` row-major weights directly into Q4 `sme2_panel64` layout
-/// panel-by-panel using strictly fixed stack buffers (`0` heap allocations).
+/// Packs FP32 `[n, k]` row-major weights directly into canonical Q4 `sme2_panel64`
+/// layout (`640 B/group`: 64 B duplicated `f16` scales + 64 B duplicated `f16` biases
+/// + 512 B packed 4-bit nibbles, matching `sme.packQuantAffinePanel64`) panel-by-panel
+/// using strictly fixed stack buffers (`0` heap allocations).
 fn packF32AsQ4Panel64NoHeap(
     w_f32: []const f32,
     n: usize,
@@ -1089,9 +1091,18 @@ fn packF32AsQ4Panel64NoHeap(
     groups: usize,
     dst: []u8,
 ) Error!void {
+    comptime {
+        if (GATE_RANK != sme.GROUP_SIZE) @compileError("GATE_RANK must equal sme.GROUP_SIZE");
+        if (sme.groupBytes(.q4_affine) != sme.QUANT_HEADER_BYTES + 32 * sme.PANEL_COLS) {
+            @compileError("q4_affine panel64 group stride mismatch");
+        }
+    }
     const panel_cols = sme.PANEL_COLS; // 16
-    const panels = (n + panel_cols - 1) / panel_cols;
-    const grp_bytes: usize = 64 + 32 * panel_cols; // 576 B per group per panel
+    const panels = sme.panelCount(n);
+    const grp_bytes: usize = sme.groupBytes(.q4_affine); // 640 B = 128 B header + 512 B codes
+    const pg = std.math.mul(usize, panels, groups) catch return error.Overflow;
+    const total_bytes = std.math.mul(usize, pg, grp_bytes) catch return error.Overflow;
+    if (dst.len < total_bytes) return error.BufferTooSmall;
 
     var out_off: usize = 0;
     for (0..panels) |p| {
@@ -1123,11 +1134,15 @@ fn packF32AsQ4Panel64NoHeap(
                         }
                     }
                 }
-                std.mem.writeInt(u16, grp_slice[c * 4 + 0 ..][0..2], @bitCast(sb.scale), .little);
-                std.mem.writeInt(u16, grp_slice[c * 4 + 2 ..][0..2], @bitCast(sb.bias), .little);
+                const s_bits: u16 = @bitCast(sb.scale);
+                const b_bits: u16 = @bitCast(sb.bias);
+                std.mem.writeInt(u16, grp_slice[c * 4 + 0 ..][0..2], s_bits, .little);
+                std.mem.writeInt(u16, grp_slice[c * 4 + 2 ..][0..2], s_bits, .little);
+                std.mem.writeInt(u16, grp_slice[64 + c * 4 + 0 ..][0..2], b_bits, .little);
+                std.mem.writeInt(u16, grp_slice[64 + c * 4 + 2 ..][0..2], b_bits, .little);
             }
 
-            const code_dst = grp_slice[64..];
+            const code_dst = grp_slice[sme.QUANT_HEADER_BYTES..];
             for (0..32) |kp| {
                 const k0 = 2 * kp;
                 const k1 = k0 + 1;
@@ -1139,6 +1154,9 @@ fn packF32AsQ4Panel64NoHeap(
             }
             out_off += grp_bytes;
         }
+    }
+    if (out_off < dst.len) {
+        @memset(dst[out_off..], 0);
     }
 }
 
@@ -1792,5 +1810,132 @@ test "C26 Inkling2LoopController loadFromAmfLayer loads sme2_panel64 blobs from 
     try stepBranchFp32Reference(&h_in, &h_in, &s_prev, &down_f32, &forget_f32, &gain_f32, null, null, null, .tanh, cfg.rms_eps, 1, h, sd, &s_ref);
     for (0..sd) |d| {
         try std.testing.expectApproxEqAbs(s_ref[d], s_got[d], 2e-3);
+    }
+}
+
+test "F11: dense_f32 -> q4_affine packF32AsQ4Panel64NoHeap matches 640B canonical layout and FP32 parity" {
+    const gpa = std.testing.allocator;
+
+    // 1. Direct binary layout & zero-tail check on non-multiple-of-16 `n` (`n = 21, k = 128`)
+    //    into a poisoned buffer (`0xAA`) so any unwritten header/padding byte fails immediately.
+    {
+        const n_odd: usize = 21;
+        const k_odd: usize = 128;
+        const groups = k_odd / GATE_RANK;
+        const w_f32 = try gpa.alloc(f32, n_odd * k_odd);
+        defer gpa.free(w_f32);
+        fillDeterministicMatrix(w_f32, 313, 0.35);
+
+        const blob_bytes = try sme.packedBlobBytes(.q4_affine, n_odd, k_odd);
+        try std.testing.expectEqual(sme.panelCount(n_odd) * groups * 640, blob_bytes);
+
+        const got_blob = try gpa.alloc(u8, blob_bytes + 64);
+        defer gpa.free(got_blob);
+        @memset(got_blob, 0xAA);
+        try packF32AsQ4Panel64NoHeap(w_f32, n_odd, k_odd, groups, got_blob);
+
+        // Verify tail bytes beyond packed payload are strictly zeroed.
+        for (got_blob[blob_bytes..]) |b| {
+            try std.testing.expectEqual(@as(u8, 0), b);
+        }
+
+        // Compare byte-for-byte against canonical `quantizeF32ToQ4Affine + sme.packQuantAffinePanel64`.
+        const ref_codes = try gpa.alloc(u8, n_odd * k_odd);
+        defer gpa.free(ref_codes);
+        const ref_sb = try gpa.alloc(quant.ScaleBias, n_odd * groups);
+        defer gpa.free(ref_sb);
+        try quantizeF32ToQ4Affine(w_f32, n_odd, k_odd, ref_codes, ref_sb);
+
+        const ref_blob = try gpa.alloc(u8, blob_bytes);
+        defer gpa.free(ref_blob);
+        @memset(ref_blob, 0x55);
+        try sme.packQuantAffinePanel64(.q4_affine, ref_codes, ref_sb, n_odd, k_odd, ref_blob);
+        try std.testing.expectEqualSlices(u8, ref_blob, got_blob[0..blob_bytes]);
+    }
+
+    // 2. End-to-end `Inkling2LoopController` initialized from `.dense_f32` -> `.q4_affine`
+    //    verifying numerical parity against FP32 reference across native SME2 and scalar fallback.
+    {
+        const h: usize = 128;
+        const sd: usize = 64;
+        const r: usize = GATE_RANK;
+
+        var disp = try sme.SmeDispatcher.init(gpa, .{ .total_threads = 2 });
+        defer disp.deinit();
+
+        var cfg = ControllerConfig.uniform(@intCast(h), @intCast(sd), .q4_affine, .silu, 4);
+        cfg.budget_override = testBudget(4 * 1024 * 1024);
+
+        const down_f32 = try gpa.alloc(f32, r * h);
+        defer gpa.free(down_f32);
+        const forget_f32 = try gpa.alloc(f32, sd * r);
+        defer gpa.free(forget_f32);
+        const gain_f32 = try gpa.alloc(f32, sd * r);
+        defer gpa.free(gain_f32);
+        fillDeterministicMatrix(down_f32, 611, 0.25);
+        fillDeterministicMatrix(forget_f32, 612, 0.25);
+        fillDeterministicMatrix(gain_f32, 613, 0.25);
+
+        const branch_in: BranchWeightInput = .{
+            .down_weight = .{ .dense_f32 = down_f32 },
+            .forget_weight = .{ .dense_f32 = forget_f32 },
+            .gain_weight = .{ .dense_f32 = gain_f32 },
+        };
+
+        var ctrl = try Inkling2LoopController.init(cfg, .{ branch_in, branch_in, branch_in, branch_in });
+        defer ctrl.deinit();
+
+        // Build dequantized Q4 reference weights to check exact SME2 vs reference parity,
+        // plus raw FP32 reference to bound quantization error.
+        const down_codes = try gpa.alloc(u8, r * h);
+        defer gpa.free(down_codes);
+        const down_sb = try gpa.alloc(quant.ScaleBias, r * (h / GATE_RANK));
+        defer gpa.free(down_sb);
+        try quantizeF32ToQ4Affine(down_f32, r, h, down_codes, down_sb);
+        const down_deq = try gpa.alloc(f32, r * h);
+        defer gpa.free(down_deq);
+        try dequantizeQ4AffineToF32(down_codes, down_sb, r, h, down_deq);
+
+        const fg_codes = try gpa.alloc(u8, sd * r);
+        defer gpa.free(fg_codes);
+        const fg_sb = try gpa.alloc(quant.ScaleBias, sd);
+        defer gpa.free(fg_sb);
+        try quantizeF32ToQ4Affine(forget_f32, sd, r, fg_codes, fg_sb);
+        const forget_deq = try gpa.alloc(f32, sd * r);
+        defer gpa.free(forget_deq);
+        try dequantizeQ4AffineToF32(fg_codes, fg_sb, sd, r, forget_deq);
+
+        const gg_codes = try gpa.alloc(u8, sd * r);
+        defer gpa.free(gg_codes);
+        const gg_sb = try gpa.alloc(quant.ScaleBias, sd);
+        defer gpa.free(gg_sb);
+        try quantizeF32ToQ4Affine(gain_f32, sd, r, gg_codes, gg_sb);
+        const gain_deq = try gpa.alloc(f32, sd * r);
+        defer gpa.free(gain_deq);
+        try dequantizeQ4AffineToF32(gg_codes, gg_sb, sd, r, gain_deq);
+
+        const m: usize = 3;
+        var h_in: [m * h]f32 = undefined;
+        var val_x: [m * sd]f32 = undefined;
+        var s_prev: [m * sd]f32 = undefined;
+        var s_got: [m * sd]f32 = undefined;
+        var s_fb: [m * sd]f32 = undefined;
+        var s_qref: [m * sd]f32 = undefined;
+        var s_fref: [m * sd]f32 = undefined;
+        fillDeterministicMatrix(&h_in, 701, 0.5);
+        fillDeterministicMatrix(&val_x, 702, 0.5);
+        fillDeterministicMatrix(&s_prev, 703, 0.5);
+
+        try ctrl.stepBranchWithValue(&disp, .attn, &h_in, &val_x, &s_prev, &s_got, m, null);
+        try ctrl.stepBranchWithValue(&disp, .attn, &h_in, &val_x, &s_prev, &s_fb, m, .scalar_fallback);
+        try stepBranchFp32Reference(&h_in, &val_x, &s_prev, down_deq, forget_deq, gain_deq, null, null, null, .silu, cfg.rms_eps, m, h, sd, &s_qref);
+        try stepBranchFp32Reference(&h_in, &val_x, &s_prev, down_f32, forget_f32, gain_f32, null, null, null, .silu, cfg.rms_eps, m, h, sd, &s_fref);
+
+        for (0..m * sd) |idx| {
+            try std.testing.expect(std.math.isFinite(s_got[idx]));
+            try std.testing.expectApproxEqAbs(s_qref[idx], s_got[idx], 2e-3);
+            try std.testing.expectApproxEqAbs(s_fb[idx], s_got[idx], 1e-4);
+            try std.testing.expectApproxEqAbs(s_fref[idx], s_got[idx], 0.15);
+        }
     }
 }

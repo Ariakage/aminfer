@@ -103,7 +103,7 @@ pub const GpuLoraWorkspaceConfig = struct {
     /// Preallocated descriptor staging capacity per in-flight frame slot (bytes, 64B aligned).
     desc_staging_bytes_per_frame: usize = 256 * 1024,
     /// Preallocated per-row slot-ID staging capacity per in-flight frame slot (`u32` elements).
-    row_slots_per_frame: u32 = 16384,
+    row_slots_per_frame: u32 = 32768,
     /// Number of disjoint staging rings matching `metal.Compute` frames-in-flight (`1..MAX_FRAMES_IN_FLIGHT`).
     frames_in_flight: u32 = 2,
     /// Optional `R9` wired budget checking workspace scratch memory.
@@ -128,6 +128,8 @@ pub const GpuLoraWorkspace = struct {
     row_slots_base_off: [metal.MAX_FRAMES_IN_FLIGHT]u64,
     row_slots_cap: u32,
     row_slots_cursor: [metal.MAX_FRAMES_IN_FLIGHT]u32,
+    last_row_slots_off: [metal.MAX_FRAMES_IN_FLIGHT]u64 = @splat(0),
+    last_row_slots_len: [metal.MAX_FRAMES_IN_FLIGHT]u32 = @splat(0),
 
     pub fn init(
         device: metal.Device,
@@ -229,6 +231,8 @@ pub const GpuLoraWorkspace = struct {
         const fi: usize = frame_slot % self.frames_in_flight;
         self.desc_cursor[fi] = 0;
         self.row_slots_cursor[fi] = 0;
+        self.last_row_slots_off[fi] = 0;
+        self.last_row_slots_len[fi] = 0;
     }
 
     fn verifyPoolPointer(self: *const GpuLoraWorkspace, ptr: [*]const u8, len: usize) EncodeError!u64 {
@@ -261,14 +265,30 @@ pub const GpuLoraWorkspace = struct {
         slots: []const u32,
     ) EncodeError!metal.BufferBinding {
         const fi: usize = frame_slot % self.frames_in_flight;
+        if (slots.len > std.math.maxInt(u32)) return error.Overflow;
         const count_u32: u32 = @intCast(slots.len);
+        const raw_bytes = slots.len * @sizeOf(u32);
+        const src_bytes = std.mem.sliceAsBytes(slots);
+
+        // Deduplicate identical consecutive `batch_lora_slots` across layers/projections
+        // in the same frame so 40 layers x 7 projections x 64 batch slots stages once.
+        if (count_u32 > 0 and self.last_row_slots_len[fi] == count_u32) {
+            const prev_off: usize = @intCast(self.last_row_slots_off[fi]);
+            const prev_bytes = self.arena.bytes()[prev_off .. prev_off + raw_bytes];
+            if (std.mem.eql(u8, prev_bytes, src_bytes)) {
+                return .{ .buffer = self.scratch_buf, .offset = self.last_row_slots_off[fi] };
+            }
+        }
+
         const aligned_count: u32 = std.mem.alignForward(u32, count_u32, 16);
         const cur = self.row_slots_cursor[fi];
         if (@as(u64, cur) + aligned_count > self.row_slots_cap) return error.StagingExhausted;
         const abs_off: usize = @intCast(self.row_slots_base_off[fi] + @as(u64, cur) * @sizeOf(u32));
-        const dst_bytes = self.arena.bytes()[abs_off .. abs_off + slots.len * @sizeOf(u32)];
-        @memcpy(dst_bytes, std.mem.sliceAsBytes(slots));
+        const dst_bytes = self.arena.bytes()[abs_off .. abs_off + raw_bytes];
+        @memcpy(dst_bytes, src_bytes);
         self.row_slots_cursor[fi] = cur + aligned_count;
+        self.last_row_slots_off[fi] = @intCast(abs_off);
+        self.last_row_slots_len[fi] = count_u32;
         return .{ .buffer = self.scratch_buf, .offset = @intCast(abs_off) };
     }
 
@@ -1034,4 +1054,70 @@ test "gpu.lora_gpu. exact DoRA equivalence, heterogeneous C14 batching, zero-flu
     try compute.wait(sig3, 5_000);
     refDoraMergedRow(x_f32[0..k], w0, a1_q, b1_q, mag1, 0.0, n, k, r1, &ref_row);
     for (0..n) |i| try std.testing.expectApproxEqAbs(ref_row[i], y0_f32[i], 1e-3);
+}
+
+test "F21.1: stageRowSlots deduplicates identical batch_lora_slots across 40 layers x 7 projections x 64 batch slots" {
+    const gpa = std.testing.allocator;
+    const device = try metal.Device.open();
+    defer device.close();
+    var compute = try metal.Compute.initWithFrames(device, 2);
+    defer compute.close();
+
+    var reg = try lora.LoraRegistry.init(.{
+        .pool_bytes = 256 * 1024,
+        .allocator = gpa,
+        .base_shape = .{ .num_layers = 40, .hidden_size = 128, .flexible_dims = true },
+    });
+    defer reg.deinit(gpa);
+
+    // Explicitly test with `row_slots_per_frame = 16384` (which previously overflowed at
+    // 40 * 7 * 64 = 17,920 > 16,384 with `error.StagingExhausted`).
+    var ws = try GpuLoraWorkspace.init(device, compute, &reg, .{
+        .max_rows = 64,
+        .row_slots_per_frame = 16384,
+        .frames_in_flight = 2,
+    });
+    defer ws.deinit(compute);
+
+    ws.beginFrame(0);
+    var batch_slots: [64]u32 = undefined;
+    for (&batch_slots, 0..) |*s, idx| {
+        s.* = if ((idx % 5) == 0) lora.NO_ADAPTER else @intCast(idx % 4);
+    }
+
+    const first_bind = try ws.stageRowSlots(0, &batch_slots);
+    try std.testing.expectEqual(@as(u32, 64), ws.row_slots_cursor[0]);
+
+    // Simulate 40 layers x 7 projections (280 total calls in one frame) with identical slots.
+    for (0..40) |_| {
+        for (0..7) |_| {
+            const b = try ws.stageRowSlots(0, &batch_slots);
+            try std.testing.expectEqual(first_bind.offset, b.offset);
+        }
+    }
+    try std.testing.expectEqual(@as(u32, 64), ws.row_slots_cursor[0]);
+
+    // Changing any slot content must allocate a fresh non-overlapping offset so prior dispatches
+    // in the same frame are never clobbered.
+    batch_slots[17] = 7;
+    const mutated_bind = try ws.stageRowSlots(0, &batch_slots);
+    try std.testing.expect(mutated_bind.offset != first_bind.offset);
+    try std.testing.expectEqual(@as(u32, 128), ws.row_slots_cursor[0]);
+
+    // Confirm first staged copy still holds the original slot value at index 17.
+    const orig_off: usize = @intCast(first_bind.offset);
+    const orig_u32: []const u32 = @alignCast(std.mem.bytesAsSlice(u32, ws.arena.bytes()[orig_off .. orig_off + 64 * @sizeOf(u32)]));
+    try std.testing.expectEqual(@as(u32, 17 % 4), orig_u32[17]);
+
+    // Subsequent calls with the updated slice deduplicate against the new copy.
+    const mutated_again = try ws.stageRowSlots(0, &batch_slots);
+    try std.testing.expectEqual(mutated_bind.offset, mutated_again.offset);
+    try std.testing.expectEqual(@as(u32, 128), ws.row_slots_cursor[0]);
+
+    // `beginFrame` resets cursor and dedup cache cleanly.
+    ws.beginFrame(0);
+    try std.testing.expectEqual(@as(u32, 0), ws.row_slots_cursor[0]);
+    const fresh_bind = try ws.stageRowSlots(0, &batch_slots);
+    try std.testing.expectEqual(first_bind.offset, fresh_bind.offset);
+    try std.testing.expectEqual(@as(u32, 64), ws.row_slots_cursor[0]);
 }

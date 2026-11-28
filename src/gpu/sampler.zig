@@ -52,6 +52,9 @@ pub const NUM_RADIX_BUCKETS: usize = 1024;
 pub const MAX_BATCH_SLOTS: u32 = 64;
 /// Capacity of parallel boundary-refinement candidate buffer per row.
 pub const CUT_CAND_CAP: usize = 2048;
+/// Default number of rotating `RowSampleConfig` ring slots in `GpuSamplerWorkspace`
+/// so back-to-back or multi-frame `encodeSampleBatch` calls never clobber in-flight configs.
+pub const DEFAULT_ROW_CFG_RING_SLOTS: u32 = 64;
 
 const EMPTY_ID: u32 = 0xFFFF_FFFF;
 
@@ -384,12 +387,15 @@ pub const SamplerSpec = struct {
     max_batch_slots: u32 = 1,
     enable_bitmask: bool = true,
     enable_overrides: bool = true,
+    /// Number of rotating `RowSampleConfig` ring slots for safe back-to-back / multi-frame encoding.
+    row_cfg_ring_slots: u32 = DEFAULT_ROW_CFG_RING_SLOTS,
 };
 
 fn validateSpec(spec: SamplerSpec) Error!void {
     if (spec.max_vocab_size == 0) return error.EmptyVocab;
     if (spec.max_vocab_size > MAX_VOCAB_SIZE) return error.VocabTooLarge;
     if (spec.max_batch_slots == 0 or spec.max_batch_slots > MAX_BATCH_SLOTS) return error.BatchTooLarge;
+    if (spec.row_cfg_ring_slots == 0) return error.SlotOutOfRange;
 }
 
 pub const GpuSamplerWorkspace = struct {
@@ -397,6 +403,11 @@ pub const GpuSamplerWorkspace = struct {
     bitmask_stride_u32: u32,
 
     row_cfgs_off: u64,
+    row_cfgs_base_off: u64,
+    row_cfg_ring_slots: u32,
+    row_cfg_ring_stride_bytes: u64,
+    row_cfg_ring_stride_elems: usize,
+    row_cfg_ring_cursor: u32 = 0,
     bitmasks_off: u64,
     bias_tables_off: u64,
     bias_keys_off: u64,
@@ -414,6 +425,7 @@ pub const GpuSamplerWorkspace = struct {
     outputs_off: u64,
 
     row_cfgs: []RowSampleConfig,
+    row_cfgs_ring: []RowSampleConfig,
     bitmasks: []u32,
     bias_tables: []GpuBiasEntry,
     bias_keys: []u32,
@@ -428,11 +440,14 @@ pub const GpuSamplerWorkspace = struct {
     pub fn requiredBytes(spec: SamplerSpec) Error!usize {
         try validateSpec(spec);
         const slots: usize = spec.max_batch_slots;
+        const ring_slots: usize = spec.row_cfg_ring_slots;
+        const row_cfg_stride_bytes = amf.align64(std.math.mul(usize, slots, @sizeOf(RowSampleConfig)) catch return error.Overflow);
+        const row_cfg_ring_bytes = std.math.mul(usize, row_cfg_stride_bytes, ring_slots) catch return error.Overflow;
         const bm_words_raw = grammar.bitmaskWordCount(spec.max_vocab_size);
         const bm_stride_bytes = amf.align64(std.math.mul(usize, bm_words_raw, @sizeOf(u32)) catch return error.Overflow);
 
         const sizes = [_]usize{
-            slots * @sizeOf(RowSampleConfig),
+            row_cfg_ring_bytes,
             if (spec.enable_bitmask) (std.math.mul(usize, slots, bm_stride_bytes) catch return error.Overflow) else 64,
             if (spec.enable_overrides) slots * BIAS_TABLE_CAP * @sizeOf(GpuBiasEntry) else 64,
             if (spec.enable_overrides) slots * MAX_LOGIT_BIAS_ENTRIES * @sizeOf(u32) else 64,
@@ -464,11 +479,14 @@ pub const GpuSamplerWorkspace = struct {
     pub fn init(arena: *arena_mod.WiredArena, spec: SamplerSpec) Error!GpuSamplerWorkspace {
         try validateSpec(spec);
         const slots: usize = spec.max_batch_slots;
+        const ring_slots: usize = spec.row_cfg_ring_slots;
+        const row_cfg_stride_bytes = amf.align64(std.math.mul(usize, slots, @sizeOf(RowSampleConfig)) catch return error.Overflow);
+        const row_cfg_ring_bytes = std.math.mul(usize, row_cfg_stride_bytes, ring_slots) catch return error.Overflow;
         const bm_words_raw = grammar.bitmaskWordCount(spec.max_vocab_size);
         const bm_stride_bytes = amf.align64(bm_words_raw * @sizeOf(u32));
         const bm_stride_u32: u32 = @intCast(bm_stride_bytes / @sizeOf(u32));
 
-        const row_cfgs_raw = try arena.allocAligned(slots * @sizeOf(RowSampleConfig), 64);
+        const row_cfgs_raw = try arena.allocAligned(row_cfg_ring_bytes, 64);
         const bitmasks_raw = try arena.allocAligned(if (spec.enable_bitmask) slots * bm_stride_bytes else 64, 64);
         const bias_tables_raw = try arena.allocAligned(if (spec.enable_overrides) slots * BIAS_TABLE_CAP * @sizeOf(GpuBiasEntry) else 64, 64);
         const bias_keys_raw = try arena.allocAligned(if (spec.enable_overrides) slots * MAX_LOGIT_BIAS_ENTRIES * @sizeOf(u32) else 64, 64);
@@ -516,10 +534,17 @@ pub const GpuSamplerWorkspace = struct {
             &.{};
         for (freq_tables) |*e| e.* = .{ .token_id = EMPTY_ID, .count = 0 };
 
+        const row_cfgs_base_off = arena.offsetOf(row_cfgs_raw.ptr);
+        const row_cfgs_ring: []RowSampleConfig = @alignCast(std.mem.bytesAsSlice(RowSampleConfig, row_cfgs_raw));
         return .{
             .spec = spec,
             .bitmask_stride_u32 = bm_stride_u32,
-            .row_cfgs_off = arena.offsetOf(row_cfgs_raw.ptr),
+            .row_cfgs_off = row_cfgs_base_off,
+            .row_cfgs_base_off = row_cfgs_base_off,
+            .row_cfg_ring_slots = spec.row_cfg_ring_slots,
+            .row_cfg_ring_stride_bytes = @intCast(row_cfg_stride_bytes),
+            .row_cfg_ring_stride_elems = row_cfg_stride_bytes / @sizeOf(RowSampleConfig),
+            .row_cfg_ring_cursor = 0,
             .bitmasks_off = arena.offsetOf(bitmasks_raw.ptr),
             .bias_tables_off = arena.offsetOf(bias_tables_raw.ptr),
             .bias_keys_off = arena.offsetOf(bias_keys_raw.ptr),
@@ -535,7 +560,8 @@ pub const GpuSamplerWorkspace = struct {
             .cut_cand_counts_off = arena.offsetOf(cut_cnts_raw.ptr),
             .cut_cands_off = arena.offsetOf(cut_cands_raw.ptr),
             .outputs_off = arena.offsetOf(outputs_raw.ptr),
-            .row_cfgs = @alignCast(std.mem.bytesAsSlice(RowSampleConfig, row_cfgs_raw)),
+            .row_cfgs = row_cfgs_ring[0..slots],
+            .row_cfgs_ring = row_cfgs_ring,
             .bitmasks = if (spec.enable_bitmask) @alignCast(std.mem.bytesAsSlice(u32, bitmasks_raw)) else &.{},
             .bias_tables = bias_tables,
             .bias_keys = if (spec.enable_overrides) @alignCast(std.mem.bytesAsSlice(u32, bias_keys_raw)) else &.{},
@@ -547,6 +573,25 @@ pub const GpuSamplerWorkspace = struct {
             .freq_counts = if (spec.enable_overrides) @alignCast(std.mem.bytesAsSlice(u32, freq_cnts_raw)) else &.{},
             .outputs = @alignCast(std.mem.bytesAsSlice(GpuSampleOutput, outputs_raw)),
         };
+    }
+
+    const RowCfgSlot = struct {
+        off: u64,
+        slice: []RowSampleConfig,
+    };
+
+    /// Claims the next rotating `RowSampleConfig` ring slot so consecutive or
+    /// multi-frame `encodeSampleBatch` dispatches never overwrite earlier in-flight
+    /// GPU parameter records.
+    fn acquireRowCfgSlot(self: *GpuSamplerWorkspace) RowCfgSlot {
+        const idx: usize = self.row_cfg_ring_cursor;
+        self.row_cfg_ring_cursor = (self.row_cfg_ring_cursor + 1) % self.row_cfg_ring_slots;
+        const slot_off = self.row_cfgs_base_off + @as(u64, idx) * self.row_cfg_ring_stride_bytes;
+        const elem_base = idx * self.row_cfg_ring_stride_elems;
+        const slice = self.row_cfgs_ring[elem_base .. elem_base + self.spec.max_batch_slots];
+        self.row_cfgs_off = slot_off;
+        self.row_cfgs = slice;
+        return .{ .off = slot_off, .slice = slice };
     }
 
     pub fn bitmaskSliceMut(self: *GpuSamplerWorkspace, slot: u32) Error![]u32 {
@@ -1008,6 +1053,11 @@ pub const GpuSampler = struct {
             return error.BitmaskTooSmall;
         }
 
+        // Acquire a dedicated ring-buffered `RowSampleConfig` slice so back-to-back
+        // or multi-frame `encodeSampleBatch` calls never clobber in-flight GPU reads.
+        const rc = ws.acquireRowCfgSlot();
+        const row_cfgs_bind: metal.BufferBinding = .{ .buffer = wb, .offset = rc.off };
+
         // Populate per-row configs and sparse override hash tables in O(sparse).
         for (req.rows, 0..) |row, r_idx| {
             const slot: u32 = @intCast(r_idx);
@@ -1048,7 +1098,7 @@ pub const GpuSampler = struct {
             }
 
             const inv_temp: f32 = if (row.params.temperature > 0.0) 1.0 / row.params.temperature else 1.0;
-            ws.row_cfgs[slot] = .{
+            rc.slice[slot] = .{
                 .temperature = row.params.temperature,
                 .inv_temp = inv_temp,
                 .top_p = row.params.top_p,
@@ -1082,7 +1132,7 @@ pub const GpuSampler = struct {
             self.pipelines.constrained_pass1[v_idx],
             &.{
                 req.logits,
-                .{ .buffer = wb, .offset = ws.row_cfgs_off },
+                row_cfgs_bind,
                 bm_bind,
                 .{ .buffer = wb, .offset = ws.bias_tables_off },
                 .{ .buffer = wb, .offset = ws.bias_keys_off },
@@ -1102,7 +1152,7 @@ pub const GpuSampler = struct {
             self.pipelines.merge_stats,
             &.{
                 .{ .buffer = wb, .offset = ws.block_stats_off },
-                .{ .buffer = wb, .offset = ws.row_cfgs_off },
+                row_cfgs_bind,
                 .{ .buffer = wb, .offset = ws.row_states_off },
                 .{ .buffer = wb, .offset = ws.hist_count_off },
                 .{ .buffer = wb, .offset = ws.hist_mass_off },
@@ -1124,7 +1174,7 @@ pub const GpuSampler = struct {
                 self.pipelines.radix_pass2[v_idx],
                 &.{
                     req.logits,
-                    .{ .buffer = wb, .offset = ws.row_cfgs_off },
+                    row_cfgs_bind,
                     .{ .buffer = wb, .offset = ws.row_states_off },
                     bm_bind,
                     .{ .buffer = wb, .offset = ws.bias_tables_off },
@@ -1145,7 +1195,7 @@ pub const GpuSampler = struct {
                 self.pipelines.radix_select[v_idx],
                 &.{
                     req.logits,
-                    .{ .buffer = wb, .offset = ws.row_cfgs_off },
+                    row_cfgs_bind,
                     .{ .buffer = wb, .offset = ws.row_states_off },
                     bm_bind,
                     .{ .buffer = wb, .offset = ws.bias_tables_off },
@@ -1167,7 +1217,7 @@ pub const GpuSampler = struct {
                     self.pipelines.refine_gather[v_idx],
                     &.{
                         req.logits,
-                        .{ .buffer = wb, .offset = ws.row_cfgs_off },
+                        row_cfgs_bind,
                         .{ .buffer = wb, .offset = ws.row_states_off },
                         bm_bind,
                         .{ .buffer = wb, .offset = ws.bias_tables_off },
@@ -1187,7 +1237,7 @@ pub const GpuSampler = struct {
                     self.pipelines.refine_sort[v_idx],
                     &.{
                         req.logits,
-                        .{ .buffer = wb, .offset = ws.row_cfgs_off },
+                        row_cfgs_bind,
                         .{ .buffer = wb, .offset = ws.row_states_off },
                         bm_bind,
                         .{ .buffer = wb, .offset = ws.bias_tables_off },
@@ -1206,7 +1256,7 @@ pub const GpuSampler = struct {
                     self.pipelines.refine_tie[v_idx],
                     &.{
                         req.logits,
-                        .{ .buffer = wb, .offset = ws.row_cfgs_off },
+                        row_cfgs_bind,
                         .{ .buffer = wb, .offset = ws.row_states_off },
                         bm_bind,
                         .{ .buffer = wb, .offset = ws.bias_tables_off },
@@ -1229,7 +1279,7 @@ pub const GpuSampler = struct {
                 self.pipelines.toplogprobs_pass1[v_idx],
                 &.{
                     req.logits,
-                    .{ .buffer = wb, .offset = ws.row_cfgs_off },
+                    row_cfgs_bind,
                     .{ .buffer = wb, .offset = ws.row_states_off },
                     bm_bind,
                     .{ .buffer = wb, .offset = ws.bias_tables_off },
@@ -1247,7 +1297,7 @@ pub const GpuSampler = struct {
             try frame.encodeThreadgroups(
                 self.pipelines.toplogprobs_pass2,
                 &.{
-                    .{ .buffer = wb, .offset = ws.row_cfgs_off },
+                    row_cfgs_bind,
                     .{ .buffer = wb, .offset = ws.row_states_off },
                     .{ .buffer = wb, .offset = ws.block_top_off },
                     .{ .buffer = wb, .offset = ws.outputs_off },
@@ -1966,4 +2016,82 @@ test "gpu.sampler: 248K vocab warm GPU latency smoke check (< 0.05 ms/step on Ap
     // Generous CI margin allowing concurrent swarm GPU execution; idle ReleaseFast < 50 us.
     try std.testing.expect(best_greedy_us < 1000.0);
     try std.testing.expect(best_constrained_us < 2000.0);
+}
+
+test "L7: GpuSamplerWorkspace ring-buffers row_cfgs across back-to-back dispatches without clobbering" {
+    const device = try metal.Device.open();
+    defer device.close();
+    const lib = try metal.Library.openEmbedded(device);
+    defer lib.close();
+
+    var sampler = try GpuSampler.initStandalone(device, lib, .{
+        .max_vocab_size = 256,
+        .max_batch_slots = 2,
+        .row_cfg_ring_slots = 4,
+    });
+    defer sampler.close();
+
+    var compute = try metal.Compute.initWithFrames(device, 2);
+    defer compute.close();
+    try sampler.registerResident(compute);
+
+    const vocab_size: u32 = 128;
+    var arena = try makeTestArena(64 * 1024);
+    defer arena.deinit();
+    const logits_raw = try arena.allocAligned(2 * vocab_size * @sizeOf(f32), 64);
+    const logits_f32: []f32 = @alignCast(std.mem.bytesAsSlice(f32, logits_raw));
+    for (logits_f32, 0..) |*v, idx| {
+        v.* = @as(f32, @floatFromInt(idx % vocab_size)) * 0.05;
+    }
+    const logits_buf = try metal.Buffer.wrap(device, arena.bytes());
+    defer logits_buf.close();
+    try compute.makeResident(&.{logits_buf});
+    const logits_bind: metal.BufferBinding = .{ .buffer = logits_buf, .offset = arena.offsetOf(logits_raw.ptr) };
+
+    var frame = try compute.beginFrame(5000);
+    errdefer frame.abort();
+
+    // Dispatch 1: temperature = 0.7, top_k = 16, seed = 0x1111
+    try sampler.encodeSampleBatch(&frame, .{
+        .logits = logits_bind,
+        .logits_dtype = .f32,
+        .vocab_size = vocab_size,
+        .rows = &.{
+            .{ .params = .{ .temperature = 0.7, .top_k = 16 }, .rng_seed = 0x1111 },
+            .{ .params = .{ .temperature = 0.9, .top_k = 8 }, .rng_seed = 0x2222 },
+        },
+    }, false);
+    const slot0_off = sampler.workspace.row_cfgs_off;
+    const slot0_slice = sampler.workspace.row_cfgs;
+
+    // Dispatch 2 in the SAME uncommitted frame: distinct temperature / top_k / seed.
+    try sampler.encodeSampleBatch(&frame, .{
+        .logits = logits_bind,
+        .logits_dtype = .f32,
+        .vocab_size = vocab_size,
+        .rows = &.{
+            .{ .params = .{ .temperature = 1.5, .top_k = 4 }, .rng_seed = 0x3333 },
+            .{ .params = .{ .temperature = 0.25, .top_k = 32 }, .rng_seed = 0x4444 },
+        },
+    }, true);
+    const slot1_off = sampler.workspace.row_cfgs_off;
+    const slot1_slice = sampler.workspace.row_cfgs;
+
+    // Offsets must be distinct and non-overlapping, and Dispatch 1's configs must remain intact!
+    try std.testing.expect(slot1_off != slot0_off);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.7), slot0_slice[0].temperature, 1e-6);
+    try std.testing.expectEqual(@as(u32, 16), slot0_slice[0].top_k);
+    try std.testing.expectEqual(@as(u32, 0x1111), slot0_slice[0].seed_lo);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.9), slot0_slice[1].temperature, 1e-6);
+    try std.testing.expectEqual(@as(u32, 8), slot0_slice[1].top_k);
+
+    try std.testing.expectApproxEqAbs(@as(f32, 1.5), slot1_slice[0].temperature, 1e-6);
+    try std.testing.expectEqual(@as(u32, 4), slot1_slice[0].top_k);
+    try std.testing.expectEqual(@as(u32, 0x3333), slot1_slice[0].seed_lo);
+
+    // Commit and wait to verify both back-to-back dispatches execute cleanly on Metal 4.
+    const sig = try frame.commit();
+    try compute.wait(sig, 5000);
+    const out0 = try sampler.readOutput(0);
+    try std.testing.expect(out0.token_id < vocab_size);
 }

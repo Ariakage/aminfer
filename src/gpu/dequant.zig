@@ -169,12 +169,45 @@ const NaxRuntimeState = struct {
         return self.canary_demoted.load(.acquire) != 0;
     }
 
+    fn reset(self: *NaxRuntimeState, backend: PrefillMatmulBackend, reason: NaxFallbackReason) void {
+        self.active_backend.store(@backingInt(backend), .release);
+        self.fallback_reason.store(@backingInt(reason), .release);
+        self.canary_demoted.store(0, .release);
+    }
+
     fn demoteCanaryFailed(self: *NaxRuntimeState) void {
         self.active_backend.store(@backingInt(PrefillMatmulBackend.simdgroup_apple9), .release);
         self.fallback_reason.store(@backingInt(NaxFallbackReason.nax_canary_failed), .release);
         self.canary_demoted.store(1, .release);
     }
 };
+
+const MAX_NAX_STATE_SLOTS: usize = 256;
+
+const NaxStateSlot = struct {
+    in_use: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
+    state: NaxRuntimeState = NaxRuntimeState.init(.simdgroup_apple9, .unsupported_gpu_family),
+
+    fn release(self: *NaxStateSlot) void {
+        self.in_use.store(0, .release);
+    }
+};
+
+var nax_state_pool: [MAX_NAX_STATE_SLOTS]NaxStateSlot = @splat(.{});
+var nax_state_next_slot: std.atomic.Value(usize) = std.atomic.Value(usize).init(0);
+
+fn acquireNaxStateSlot(backend: PrefillMatmulBackend, reason: NaxFallbackReason) error{OutOfMemory}!*NaxStateSlot {
+    const start = nax_state_next_slot.fetchAdd(1, .monotonic) % MAX_NAX_STATE_SLOTS;
+    for (0..MAX_NAX_STATE_SLOTS) |off| {
+        const idx = (start + off) % MAX_NAX_STATE_SLOTS;
+        const slot = &nax_state_pool[idx];
+        if (slot.in_use.cmpxchgStrong(0, 1, .acq_rel, .monotonic) == null) {
+            slot.state.reset(backend, reason);
+            return slot;
+        }
+    }
+    return error.OutOfMemory;
+}
 
 pub const CanarySliceErrors = struct {
     max_abs_err_f16: f32,
@@ -618,7 +651,7 @@ pub const DequantPipelines = struct {
     nax_fallback_reason: NaxFallbackReason = .unsupported_gpu_family,
     strict_nax: bool = false,
     simulate_nax_canary_failure: bool = false,
-    nax_state: ?*NaxRuntimeState = null,
+    nax_state_slot: ?*NaxStateSlot = null,
 
     pub const HomogeneousLinearSet = struct {
         f16: metal.Pipeline,
@@ -1123,12 +1156,10 @@ pub const DequantPipelines = struct {
         }
 
         const nax_compiled = (nax_set != null);
-        var nax_state: ?*NaxRuntimeState = null;
-        errdefer if (nax_state) |st| std.heap.c_allocator.destroy(st);
+        var nax_state_slot: ?*NaxStateSlot = null;
+        errdefer if (nax_state_slot) |slot| slot.release();
         if (nax_compiled or opts.simulate_nax_canary_failure) {
-            const st = try std.heap.c_allocator.create(NaxRuntimeState);
-            st.* = NaxRuntimeState.init(active_backend, fallback_reason);
-            nax_state = st;
+            nax_state_slot = try acquireNaxStateSlot(active_backend, fallback_reason);
         }
 
         return .{
@@ -1191,17 +1222,17 @@ pub const DequantPipelines = struct {
             .nax_fallback_reason = fallback_reason,
             .strict_nax = opts.strict_nax,
             .simulate_nax_canary_failure = opts.simulate_nax_canary_failure,
-            .nax_state = nax_state,
+            .nax_state_slot = nax_state_slot,
         };
     }
 
     pub fn activeBackend(self: DequantPipelines) PrefillMatmulBackend {
-        if (self.nax_state) |st| return st.getBackend();
+        if (self.nax_state_slot) |slot| return slot.state.getBackend();
         return self.active_backend;
     }
 
     pub fn naxFallbackReason(self: DequantPipelines) NaxFallbackReason {
-        if (self.nax_state) |st| return st.getFallbackReason();
+        if (self.nax_state_slot) |slot| return slot.state.getFallbackReason();
         return self.nax_fallback_reason;
     }
 
@@ -1217,7 +1248,7 @@ pub const DequantPipelines = struct {
     }
 
     pub fn close(self: DequantPipelines) void {
-        if (self.nax_state) |st| std.heap.c_allocator.destroy(st);
+        if (self.nax_state_slot) |slot| slot.release();
         if (self.gemm_nax_bf16_res) |p| p.close();
         if (self.gemm_nax_f16_res) |p| p.close();
         if (self.gemm_nax_q2_res) |p| p.close();
@@ -2241,7 +2272,7 @@ pub const DequantPipelines = struct {
         const ck = canary_ck;
         const OpsQ4 = quant.QuantOps(.{ .bits = .q4, .group_size = 64 });
 
-        const already_demoted = if (self.nax_state) |st| st.isCanaryDemoted() else false;
+        const already_demoted = if (self.nax_state_slot) |slot| slot.state.isCanaryDemoted() else false;
         state.run_real_nax = self.nax_pipelines_compiled and self.activeBackend().isNax();
         state.run_simulated_nax_fail = self.simulate_nax_canary_failure and !already_demoted;
 
@@ -2555,8 +2586,8 @@ pub const DequantPipelines = struct {
                 max_nax_q4 = err_nax.max_abs_err_q4;
             } else |err| {
                 if (self.strict_nax) return err;
-                if (self.nax_state) |st| {
-                    st.demoteCanaryFailed();
+                if (self.nax_state_slot) |slot| {
+                    slot.state.demoteCanaryFailed();
                 }
                 nax_demoted = true;
             }

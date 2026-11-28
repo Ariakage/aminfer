@@ -791,7 +791,7 @@ kernel void dflare_ctx_kv_norm_rope_store(const device half *k_in [[buffer(0)]],
                                           uint lane [[thread_index_in_simdgroup]]) {
     const uint kvh = tg_pos.x;
     const uint pos_idx = tg_pos.y;
-    if (kvh >= p.num_kv_heads || pos_idx >= p.num_pos || p.head_dim > 256u) {
+    if (kvh >= p.num_kv_heads || pos_idx >= p.num_pos || p.head_dim == 0u || p.head_dim > 256u || p.max_ctx == 0u) {
         return;
     }
 
