@@ -317,6 +317,7 @@ pub const RerankScore = struct {
 };
 
 fn stableSigmoid(x: f64) f32 {
+    if (std.math.isNan(x)) return 0.0;
     if (x >= 0.0) {
         const z = @exp(-x);
         return @floatCast(1.0 / (1.0 + z));
@@ -324,6 +325,15 @@ fn stableSigmoid(x: f64) f32 {
         const z = @exp(x);
         return @floatCast(z / (1.0 + z));
     }
+}
+
+fn safeLogitDiff(pos_logit: f32, neg_logit: f32) f64 {
+    if (std.math.isNan(pos_logit) or std.math.isNan(neg_logit)) return std.math.nan(f64);
+    // Equal infinities ((-Inf) - (-Inf) or (+Inf) - (+Inf)) have zero margin rather than NaN.
+    if (!std.math.isFinite(pos_logit) and !std.math.isFinite(neg_logit) and pos_logit == neg_logit) {
+        return 0.0;
+    }
+    return @as(f64, pos_logit) - @as(f64, neg_logit);
 }
 
 /// Computes a cross-encoder relevance score from raw `f16` final-token logits (`0` heap allocs).
@@ -340,20 +350,21 @@ pub fn scoreCrossEncoderLogitsF16(
     var neg_logit: f32 = 0.0;
     const inv_t: f64 = 1.0 / @as(f64, cfg.temperature);
 
-    const score: f32 = switch (cfg.mode) {
+    const raw_score: f32 = switch (cfg.mode) {
         .yes_no_sigmoid => blk: {
             if (cfg.negative_token_id >= logits.len) return error.TokenOutOfRange;
             neg_logit = @floatCast(logits[cfg.negative_token_id]);
-            break :blk stableSigmoid((@as(f64, pos_logit) - @as(f64, neg_logit)) * inv_t);
+            break :blk stableSigmoid(safeLogitDiff(pos_logit, neg_logit) * inv_t);
         },
         .yes_no_logit_diff => blk: {
             if (cfg.negative_token_id >= logits.len) return error.TokenOutOfRange;
             neg_logit = @floatCast(logits[cfg.negative_token_id]);
-            break :blk @floatCast((@as(f64, pos_logit) - @as(f64, neg_logit)) * inv_t);
+            break :blk @floatCast(safeLogitDiff(pos_logit, neg_logit) * inv_t);
         },
         .single_token_logit => @floatCast(@as(f64, pos_logit) * inv_t),
         .single_token_sigmoid => stableSigmoid(@as(f64, pos_logit) * inv_t),
     };
+    const score: f32 = if (std.math.isNan(raw_score)) 0.0 else raw_score;
 
     return .{
         .index = doc_index,
@@ -364,6 +375,10 @@ pub fn scoreCrossEncoderLogitsF16(
 }
 
 fn rerankScoreDesc(_: void, a: RerankScore, b: RerankScore) bool {
+    const a_nan = std.math.isNan(a.score);
+    const b_nan = std.math.isNan(b.score);
+    if (a_nan != b_nan) return !a_nan;
+    if (a_nan) return a.index < b.index;
     if (a.score != b.score) return a.score > b.score;
     return a.index < b.index;
 }
@@ -471,4 +486,71 @@ test "C21 cross-encoder rerank logit scoring and deterministic top_n sorting" {
     try std.testing.expect(scores[0].score > 0.98);
     try std.testing.expect(scores[1].score > 0.80 and scores[1].score < 0.85);
     try std.testing.expect(scores[2].score < 0.01);
+}
+
+test "L8 cross-encoder rerank guards (-Inf) - (-Inf) / NaN and sorts NaN deterministically last" {
+    const neg_inf: f16 = -std.math.inf(f16);
+    const pos_inf: f16 = std.math.inf(f16);
+    const nan_f16: f16 = std.math.nan(f16);
+
+    const logits_neg_inf = [_]f16{ neg_inf, neg_inf };
+    const logits_pos_inf = [_]f16{ pos_inf, pos_inf };
+    const logits_nan = [_]f16{ nan_f16, @floatCast(1.0) };
+
+    const s_neg_sig = try scoreCrossEncoderLogitsF16(&logits_neg_inf, 0, .{
+        .mode = .yes_no_sigmoid,
+        .positive_token_id = 0,
+        .negative_token_id = 1,
+    });
+    try std.testing.expect(!std.math.isNan(s_neg_sig.score));
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), s_neg_sig.score, 1e-6);
+
+    const s_neg_diff = try scoreCrossEncoderLogitsF16(&logits_neg_inf, 1, .{
+        .mode = .yes_no_logit_diff,
+        .positive_token_id = 0,
+        .negative_token_id = 1,
+    });
+    try std.testing.expect(!std.math.isNan(s_neg_diff.score));
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), s_neg_diff.score, 1e-6);
+
+    const s_pos_sig = try scoreCrossEncoderLogitsF16(&logits_pos_inf, 2, .{
+        .mode = .yes_no_sigmoid,
+        .positive_token_id = 0,
+        .negative_token_id = 1,
+    });
+    try std.testing.expect(!std.math.isNan(s_pos_sig.score));
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), s_pos_sig.score, 1e-6);
+
+    const s_nan_sig = try scoreCrossEncoderLogitsF16(&logits_nan, 3, .{
+        .mode = .yes_no_sigmoid,
+        .positive_token_id = 0,
+        .negative_token_id = 1,
+    });
+    try std.testing.expect(!std.math.isNan(s_nan_sig.score));
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), s_nan_sig.score, 1e-6);
+
+    const s_nan_single = try scoreCrossEncoderLogitsF16(&logits_nan, 4, .{
+        .mode = .single_token_logit,
+        .positive_token_id = 0,
+    });
+    try std.testing.expect(!std.math.isNan(s_nan_single.score));
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), s_nan_single.score, 1e-6);
+
+    var mixed = [_]RerankScore{
+        .{ .index = 5, .score = std.math.nan(f32) },
+        .{ .index = 1, .score = 0.25 },
+        .{ .index = 3, .score = std.math.nan(f32) },
+        .{ .index = 0, .score = 0.90 },
+        .{ .index = 4, .score = -std.math.inf(f32) },
+        .{ .index = 2, .score = 0.25 },
+    };
+    sortRerankScoresDesc(&mixed);
+    try std.testing.expectEqual(@as(u32, 0), mixed[0].index);
+    try std.testing.expectEqual(@as(u32, 1), mixed[1].index);
+    try std.testing.expectEqual(@as(u32, 2), mixed[2].index);
+    try std.testing.expectEqual(@as(u32, 4), mixed[3].index);
+    try std.testing.expectEqual(@as(u32, 3), mixed[4].index);
+    try std.testing.expectEqual(@as(u32, 5), mixed[5].index);
+    try std.testing.expect(std.math.isNan(mixed[4].score));
+    try std.testing.expect(std.math.isNan(mixed[5].score));
 }

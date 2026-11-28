@@ -146,6 +146,12 @@ pub const Endpoint = enum(u8) {
     completions = 3,
 };
 
+pub const JobKind = enum(u8) {
+    generate = 0,
+    embeddings = 1,
+    rerank = 2,
+};
+
 pub const EffectiveSeedSource = enum(u8) {
     greedy = 0,
     explicit = 1,
@@ -705,7 +711,15 @@ pub const ServerConfig = struct {
     chat_template: chat_template.ChatTemplate = chat_template.ChatTemplate.preset(.chatml),
     max_response_bytes: ?usize = null,
     http_read_timeout_ms: u32 = 30_000,
+    /// Shorter deadline (ms) for receiving HTTP request line + headers (`\r\n\r\n`, `L3`).
+    header_read_timeout_ms: u32 = 5_000,
     keepalive_idle_timeout_ms: u32 = 60_000,
+    /// Maximum concurrent connections allowed from a single non-loopback IPv4 peer (`0` = unlimited, `L3`).
+    max_conns_per_peer: usize = 8,
+    /// Explicit override permitting unauthenticated non-loopback TCP binds (`F2`).
+    allow_unauthenticated_public_bind: bool = false,
+    /// Explicit override bypassing TCP `Host` allowlist validation when `api_key == null` (`F2`).
+    allow_any_host: bool = false,
     /// Optional native Zig BPE `Tokenizer` (`W5`) backing `POST /v1/messages/count_tokens`.
     tokenizer: ?*const tokenizer_mod.Tokenizer = null,
     /// Optional `C21` embeddings backend callback for `POST /v1/embeddings`.
@@ -721,8 +735,8 @@ pub const ServerConfig = struct {
     lora_adapters: []const LoraAdapterMeta = &.{},
     /// Optional native macOS `Network.framework` TLS 1.2/1.3 listener configuration (`C18`).
     tls: ?ServerTlsConfig = null,
-    /// Optional CORS `Access-Control-Allow-Origin` header value (`null` or `""` disables CORS, `C29`).
-    cors_allow_origin: ?[]const u8 = "*",
+    /// Optional CORS `Access-Control-Allow-Origin` header value (`null` or `""` disables CORS, `F2`/`C29`).
+    cors_allow_origin: ?[]const u8 = null,
     /// Configurable Fill-in-the-Middle delimiters for `POST /v1/completions` when `suffix` is non-empty (`C29`).
     fim_tokens: FimTokens = .{},
     /// Per-connection preallocated decoded media buffer capacity carved from `arena_slab` at `Server.init` (`C29`).
@@ -770,6 +784,7 @@ pub const InferenceJob = struct {
     slot_index: u16,
     generation: u64,
     request_id: u64,
+    kind: JobKind = .generate,
     endpoint: Endpoint,
     /// Preformatted Qwen3 ChatML prompt stored in the slot's preallocated buffer.
     /// Valid for the entire duration of `EngineHandler.generateFn` or until the
@@ -1136,15 +1151,40 @@ pub const FixedWriter = struct {
         self.pos += s.len;
     }
 
+    fn writeSanitizedUtf8(self: *FixedWriter, chunk: []const u8) error{BufferTooSmall}!void {
+        if (std.unicode.utf8ValidateSlice(chunk)) {
+            try self.writeAll(chunk);
+            return;
+        }
+        var pos: usize = 0;
+        while (pos < chunk.len) {
+            if (chunk[pos] < 0x80) {
+                const ascii_start = pos;
+                while (pos < chunk.len and chunk[pos] < 0x80) : (pos += 1) {}
+                try self.writeAll(chunk[ascii_start..pos]);
+                continue;
+            }
+            const seq_len = Utf8StreamAssembler.utf8ExpectedLen(chunk[pos]);
+            if (seq_len > 0 and pos + seq_len <= chunk.len and Utf8StreamAssembler.isValidUtf8Sequence(chunk[pos .. pos + seq_len])) {
+                try self.writeAll(chunk[pos .. pos + seq_len]);
+                pos += seq_len;
+            } else {
+                try self.writeAll("\xEF\xBF\xBD");
+                pos += 1;
+            }
+        }
+    }
+
     /// Writes `bytes` escaped for inside a JSON string literal (without outer quotes).
-    /// Vectorized with 16-byte / 64-byte ARM64 NEON scanning (`C23`, ADR-0023).
+    /// Vectorized with 16-byte / 64-byte ARM64 NEON scanning (`C23`, ADR-0023),
+    /// replacing any malformed UTF-8 sequences with U+FFFD (`L8`).
     pub fn writeJsonEscaped(self: *FixedWriter, bytes: []const u8) error{BufferTooSmall}!void {
         const hex = "0123456789abcdef";
         var run_start: usize = 0;
         while (run_start < bytes.len) {
             const span = neonFindJsonStringSpecial(bytes[run_start..]);
             if (span > 0) {
-                try self.writeAll(bytes[run_start .. run_start + span]);
+                try self.writeSanitizedUtf8(bytes[run_start .. run_start + span]);
             }
             const i = run_start + span;
             if (i >= bytes.len) break;
@@ -2085,6 +2125,34 @@ fn findJsonStringField(buf: []const u8, field_name: []const u8, dst: []u8) ?[]co
     return r.readSmallString(dst) catch null;
 }
 
+/// Depth-1 top-level JSON object string field pre-scan (`F24`).
+/// Unescapes object keys, skips keys `> 64 B`, and skips nested values without
+/// descending into `input`/`messages`/`tools`/`metadata` objects or string literals.
+fn findTopLevelJsonStringField(buf: []const u8, field_name: []const u8, dst: []u8) ?[]const u8 {
+    var r = JsonReader{ .src = buf };
+    r.expectByte('{') catch return null;
+    if (r.peek() == '}') return null;
+    while (true) {
+        var key_buf: [64]u8 = undefined;
+        const maybe_key = r.readKeyOrSkip(&key_buf) catch return null;
+        r.expectByte(':') catch return null;
+        if (maybe_key) |k| {
+            if (std.mem.eql(u8, k, field_name)) {
+                if (r.consumeKeyword("null")) return null;
+                if (r.peek() != '"') return null;
+                return r.readSmallString(dst) catch null;
+            }
+        }
+        r.skipValue(1) catch return null;
+        const sep = r.peek() orelse return null;
+        if (sep == ',') {
+            r.pos += 1;
+        } else {
+            return null;
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Zero-allocation RFC 8259 JSON parser & ChatML request decoder
 // ---------------------------------------------------------------------------
@@ -2242,6 +2310,22 @@ const JsonReader = struct {
         return val;
     }
 
+    fn readUnicodeEscape(self: *JsonReader) ParseError!u21 {
+        const hi = try self.readHex4();
+        if (hi >= 0xD800 and hi <= 0xDBFF) {
+            if (self.src.len - self.pos < 6 or self.src[self.pos] != '\\' or self.src[self.pos + 1] != 'u') {
+                return error.InvalidJson;
+            }
+            self.pos += 2;
+            const lo = try self.readHex4();
+            if (lo < 0xDC00 or lo > 0xDFFF) return error.InvalidJson;
+            return 0x10000 + (@as(u21, hi - 0xD800) << 10) + @as(u21, lo - 0xDC00);
+        } else if (hi >= 0xDC00 and hi <= 0xDFFF) {
+            return error.InvalidJson;
+        }
+        return hi;
+    }
+
     /// Reads a JSON string and writes its unescaped UTF-8 bytes into `writer`.
     /// Vectorized with 16-byte / 64-byte ARM64 NEON string-boundary scanning (`C23`).
     fn readStringInto(self: *JsonReader, writer: *FixedWriter) ParseError!void {
@@ -2274,19 +2358,7 @@ const JsonReader = struct {
                 'r' => try writer.writeByte('\r'),
                 't' => try writer.writeByte('\t'),
                 'u' => {
-                    const hi = try self.readHex4();
-                    var cp: u21 = hi;
-                    if (hi >= 0xD800 and hi <= 0xDBFF) {
-                        if (self.src.len - self.pos < 6 or self.src[self.pos] != '\\' or self.src[self.pos + 1] != 'u') {
-                            return error.InvalidJson;
-                        }
-                        self.pos += 2;
-                        const lo = try self.readHex4();
-                        if (lo < 0xDC00 or lo > 0xDFFF) return error.InvalidJson;
-                        cp = 0x10000 + (@as(u21, hi - 0xD800) << 10) + @as(u21, lo - 0xDC00);
-                    } else if (hi >= 0xDC00 and hi <= 0xDFFF) {
-                        return error.InvalidJson;
-                    }
+                    const cp = try self.readUnicodeEscape();
                     var utf8_tmp: [4]u8 = undefined;
                     const n = std.unicode.utf8Encode(cp, &utf8_tmp) catch return error.InvalidJson;
                     try writer.writeAll(utf8_tmp[0..n]);
@@ -2338,7 +2410,7 @@ const JsonReader = struct {
             switch (esc) {
                 '"', '\\', '/', 'b', 'f', 'n', 'r', 't' => {},
                 'u' => {
-                    _ = try self.readHex4();
+                    _ = try self.readUnicodeEscape();
                 },
                 else => return error.InvalidJson,
             }
@@ -5504,6 +5576,7 @@ const HttpHeadersResult = struct {
     content_length: ?usize,
     chunked: bool,
     expect_continue: bool,
+    host: ?[]const u8 = null,
     authorization_bearer: ?[]const u8 = null,
     x_api_key: ?[]const u8 = null,
     anthropic_version: ?[]const u8 = null,
@@ -5515,6 +5588,88 @@ const HttpParseError = error{
     BadRequest,
     PayloadTooLarge,
 };
+
+const StrictParseError = error{
+    InvalidSyntax,
+    Overflow,
+};
+
+/// Parses strictly `1*DIGIT` decimal integers (rejects `+`, `-`, `_`, whitespace, empty; `L4`).
+fn parseStrictDecimalUsize(s: []const u8) StrictParseError!usize {
+    if (s.len == 0) return error.InvalidSyntax;
+    var val: usize = 0;
+    for (s) |c| {
+        if (c < '0' or c > '9') return error.InvalidSyntax;
+        val = std.math.mul(usize, val, 10) catch return error.Overflow;
+        val = std.math.add(usize, val, c - '0') catch return error.Overflow;
+    }
+    return val;
+}
+
+/// Parses strictly `1*HEXDIG` hexadecimal integers (rejects `+`, `-`, `_`, `0x`, empty; `L4`).
+fn parseStrictHexUsize(s: []const u8) StrictParseError!usize {
+    if (s.len == 0) return error.InvalidSyntax;
+    var val: usize = 0;
+    for (s) |c| {
+        const digit: usize = switch (c) {
+            '0'...'9' => c - '0',
+            'a'...'f' => c - 'a' + 10,
+            'A'...'F' => c - 'A' + 10,
+            else => return error.InvalidSyntax,
+        };
+        val = std.math.mul(usize, val, 16) catch return error.Overflow;
+        val = std.math.add(usize, val, digit) catch return error.Overflow;
+    }
+    return val;
+}
+
+fn isLoopbackIpv4(host: [4]u8) bool {
+    return host[0] == 127;
+}
+
+const HostValidation = enum { ok, bad_request, forbidden };
+
+fn validateHostHeader(raw_host: []const u8, bound_host: [4]u8) HostValidation {
+    if (raw_host.len == 0) return .bad_request;
+    for (raw_host) |c| {
+        if (c <= ' ' or c == 0x7F or c == '@' or c == '/' or c == '?' or c == '#') {
+            return .bad_request;
+        }
+    }
+    var host_part: []const u8 = raw_host;
+    var port_part: ?[]const u8 = null;
+    if (raw_host[0] == '[') {
+        const close_idx = std.mem.indexOfScalar(u8, raw_host, ']') orelse return .bad_request;
+        host_part = raw_host[0 .. close_idx + 1];
+        const rest = raw_host[close_idx + 1 ..];
+        if (rest.len > 0) {
+            if (rest[0] != ':') return .bad_request;
+            port_part = rest[1..];
+        }
+    } else if (std.mem.indexOfScalar(u8, raw_host, ':')) |colon| {
+        host_part = raw_host[0..colon];
+        port_part = raw_host[colon + 1 ..];
+        if (std.mem.indexOfScalar(u8, port_part.?, ':') != null) return .bad_request;
+    }
+    if (host_part.len == 0) return .bad_request;
+    if (port_part) |p| {
+        const port_num = parseStrictDecimalUsize(p) catch return .bad_request;
+        if (port_num == 0 or port_num > 65535) return .bad_request;
+    }
+    if (std.ascii.eqlIgnoreCase(host_part, "localhost")) return .ok;
+    if (std.mem.eql(u8, host_part, "127.0.0.1")) return .ok;
+    if (std.mem.eql(u8, host_part, "[::1]")) return .ok;
+    if (std.mem.eql(u8, host_part, "0.0.0.0")) return .ok;
+    var bound_buf: [16]u8 = undefined;
+    const bound_str = std.fmt.bufPrint(&bound_buf, "{d}.{d}.{d}.{d}", .{
+        bound_host[0],
+        bound_host[1],
+        bound_host[2],
+        bound_host[3],
+    }) catch return .forbidden;
+    if (std.mem.eql(u8, host_part, bound_str)) return .ok;
+    return .forbidden;
+}
 
 fn parseHttpHeaders(buf: []const u8) HttpParseError!HttpHeadersResult {
     const sep_idx = neonFindCrlfCrlf(buf) orelse return error.Incomplete;
@@ -5550,7 +5705,9 @@ fn parseHttpHeaders(buf: []const u8) HttpParseError!HttpHeadersResult {
 
     var content_length: ?usize = null;
     var chunked = false;
+    var transfer_encoding_seen = false;
     var expect_continue = false;
+    var host: ?[]const u8 = null;
     var authorization_bearer: ?[]const u8 = null;
     var x_api_key: ?[]const u8 = null;
     var anthropic_version: ?[]const u8 = null;
@@ -5563,17 +5720,25 @@ fn parseHttpHeaders(buf: []const u8) HttpParseError!HttpHeadersResult {
         const val = std.mem.trim(u8, line[colon + 1 ..], " \t");
 
         if (std.ascii.eqlIgnoreCase(name, "content-length")) {
-            const parsed = std.fmt.parseInt(usize, val, 10) catch return error.BadRequest;
+            const parsed = parseStrictDecimalUsize(val) catch |err| switch (err) {
+                error.InvalidSyntax => return error.BadRequest,
+                error.Overflow => return error.PayloadTooLarge,
+            };
             if (content_length) |prev| {
                 if (prev != parsed) return error.BadRequest;
             }
             content_length = parsed;
         } else if (std.ascii.eqlIgnoreCase(name, "transfer-encoding")) {
-            if (asciiContainsIgnoreCase(val, "chunked")) {
+            if (transfer_encoding_seen) return error.BadRequest;
+            transfer_encoding_seen = true;
+            if (std.ascii.eqlIgnoreCase(val, "chunked")) {
                 chunked = true;
             } else {
                 return error.BadRequest;
             }
+        } else if (std.ascii.eqlIgnoreCase(name, "host")) {
+            if (host != null) return error.BadRequest;
+            host = val;
         } else if (std.ascii.eqlIgnoreCase(name, "connection")) {
             if (asciiContainsIgnoreCase(val, "close")) {
                 connection_close = true;
@@ -5606,6 +5771,7 @@ fn parseHttpHeaders(buf: []const u8) HttpParseError!HttpHeadersResult {
         .content_length = content_length,
         .chunked = chunked,
         .expect_continue = expect_continue,
+        .host = host,
         .authorization_bearer = authorization_bearer,
         .x_api_key = x_api_key,
         .anthropic_version = anthropic_version,
@@ -5633,9 +5799,12 @@ const ChunkedDecodeStatus = union(enum) {
 
 /// Validates and decodes an HTTP/1.1 `Transfer-Encoding: chunked` body in place
 /// once the terminating `0\r\n...\r\n` chunk has fully arrived.
-fn decodeChunkedInPlace(body_buf: []u8) error{BadRequest}!ChunkedDecodeStatus {
+/// Strictly overflow-free and immediately rejects any chunk or cumulative decoded
+/// size exceeding `max_body_bytes` with `error.PayloadTooLarge` (`F1`, `L4`).
+fn decodeChunkedInPlace(body_buf: []u8, max_body_bytes: usize) error{ BadRequest, PayloadTooLarge }!ChunkedDecodeStatus {
     // First verify the entire chunked payload has arrived before mutating in place.
     var scan: usize = 0;
+    var decoded_total: usize = 0;
     var consumed_len: usize = 0;
     while (true) {
         const line_rel = neonFindCrlf(body_buf[scan..]) orelse return .incomplete;
@@ -5645,7 +5814,10 @@ fn decodeChunkedInPlace(body_buf: []u8) error{BadRequest}!ChunkedDecodeStatus {
         else
             std.mem.trim(u8, size_line_full, " \t");
         if (size_line.len == 0) return error.BadRequest;
-        const chunk_len = std.fmt.parseInt(usize, size_line, 16) catch return error.BadRequest;
+        const chunk_len = parseStrictHexUsize(size_line) catch |err| switch (err) {
+            error.InvalidSyntax => return error.BadRequest,
+            error.Overflow => return error.PayloadTooLarge,
+        };
         scan += line_rel + 2;
         if (chunk_len == 0) {
             if (body_buf.len - scan < 2) return .incomplete;
@@ -5657,7 +5829,14 @@ fn decodeChunkedInPlace(body_buf: []u8) error{BadRequest}!ChunkedDecodeStatus {
             consumed_len = scan + trailer_end + 4;
             break;
         }
-        if (body_buf.len - scan < chunk_len + 2) return .incomplete;
+        const next_total = std.math.add(usize, decoded_total, chunk_len) catch return error.PayloadTooLarge;
+        if (chunk_len > max_body_bytes or next_total > max_body_bytes) {
+            return error.PayloadTooLarge;
+        }
+        decoded_total = next_total;
+
+        const remaining = body_buf.len - scan;
+        if (chunk_len > remaining or remaining - chunk_len < 2) return .incomplete;
         if (body_buf[scan + chunk_len] != '\r' or body_buf[scan + chunk_len + 1] != '\n') {
             return error.BadRequest;
         }
@@ -5674,7 +5853,7 @@ fn decodeChunkedInPlace(body_buf: []u8) error{BadRequest}!ChunkedDecodeStatus {
             std.mem.trim(u8, size_line_full[0..semi], " \t")
         else
             std.mem.trim(u8, size_line_full, " \t");
-        const chunk_len = std.fmt.parseInt(usize, size_line, 16) catch unreachable;
+        const chunk_len = parseStrictHexUsize(size_line) catch unreachable;
         read_pos += line_rel + 2;
         if (chunk_len == 0) break;
         std.mem.copyForwards(u8, body_buf[out_pos .. out_pos + chunk_len], body_buf[read_pos .. read_pos + chunk_len]);
@@ -5784,6 +5963,17 @@ const SlotState = enum(u8) {
     streaming_active = 2,
     draining_response = 3,
     waiting_worker_cancel = 4,
+    draining_worker = 5,
+};
+
+const AuxWorkerError = enum(u8) {
+    none = 0,
+    unavailable = 1,
+    payload_too_large = 2,
+    embed_failed = 3,
+    embed_invalid_dim = 4,
+    rerank_failed = 5,
+    tx_overflow = 6,
 };
 
 const AnthropicBlockState = enum(u8) {
@@ -5929,11 +6119,21 @@ const ConnectionSlot = struct {
     index: u16,
     fd: std.c.fd_t,
     state: SlotState,
+    read_armed: bool,
     write_armed: bool,
+    headers_received: bool,
+    is_network_tcp: bool,
+    peer_ipv4: ?[4]u8,
     sent_continue: bool,
     /// Server-thread-only flag guaranteeing `active_requests` is decremented
     /// at most once per admitted request across all completion/abort races.
     request_counted: bool,
+    api_cancelled: bool,
+    aux_kind: JobKind,
+    embed_req: EmbedRequest,
+    rerank_req: RerankRequest,
+    aux_response_len: usize,
+    aux_err: AuxWorkerError,
 
     // Preallocated slices carved once from `Server.arena_slab`.
     rx_buf: []u8,
@@ -6072,10 +6272,14 @@ const ConnectionSlot = struct {
         self.tx_write_pos += data.len;
     }
 
-    fn resetForConnection(self: *ConnectionSlot, fd: std.c.fd_t) void {
+    fn resetForConnection(self: *ConnectionSlot, fd: std.c.fd_t, is_network_tcp: bool, peer_ipv4: ?[4]u8) void {
         self.fd = fd;
         self.state = .reading_request;
+        self.read_armed = false;
         self.write_armed = false;
+        self.headers_received = false;
+        self.is_network_tcp = is_network_tcp;
+        self.peer_ipv4 = peer_ipv4;
         self.sent_continue = false;
         self.request_counted = false;
         self.keep_alive = false;
@@ -6093,6 +6297,7 @@ const ConnectionSlot = struct {
     fn resetForNextKeepAliveRequest(self: *ConnectionSlot, rem_rx_len: usize, now_ns: u64) void {
         self.state = .reading_request;
         self.write_armed = false;
+        self.headers_received = false;
         self.sent_continue = false;
         self.request_counted = false;
         self.has_completed_request = true;
@@ -6105,6 +6310,10 @@ const ConnectionSlot = struct {
     }
 
     fn resetPerRequestState(self: *ConnectionSlot) void {
+        self.api_cancelled = false;
+        self.aux_kind = .generate;
+        self.aux_response_len = 0;
+        self.aux_err = .none;
         self.prompt_len = 0;
         self.prompt_token_ids_len = 0;
         self.legacy_logprobs = null;
@@ -6170,6 +6379,8 @@ pub const TokenStream = struct {
     prompt_tokens: u32 = 0,
     completion_tokens: u32 = 0,
     finished: bool = false,
+    defer_terminal: bool = false,
+    deferred_terminal: ?TokenEvent = null,
     thinking_budget_tokens: ?u32 = null,
     worker_think_splitter: ThinkSplitter = .{},
     worker_splitter_initialized: bool = false,
@@ -6355,7 +6566,11 @@ pub const TokenStream = struct {
             .token_count = self.prompt_tokens,
             .text_len = 0,
         };
-        _ = self.pushEvent(ev);
+        if (self.defer_terminal) {
+            self.deferred_terminal = ev;
+        } else {
+            _ = self.pushEvent(ev);
+        }
     }
 
     /// Signals an unrecoverable inference error for this request.
@@ -6372,7 +6587,11 @@ pub const TokenStream = struct {
             .text_len = @intCast(n),
         };
         if (n > 0) @memcpy(ev.text[0..n], message[0..n]);
-        _ = self.pushEvent(ev);
+        if (self.defer_terminal) {
+            self.deferred_terminal = ev;
+        } else {
+            _ = self.pushEvent(ev);
+        }
     }
 
     fn pushEvent(self: *TokenStream, ev: TokenEvent) bool {
@@ -6569,6 +6788,10 @@ pub const Server = struct {
         if (config.api_key) |ak| {
             if (ak.len > MAX_API_KEY_BYTES) return error.InvalidConfig;
         }
+        const has_api_key = if (config.api_key) |ak| ak.len > 0 else false;
+        if (!isLoopbackIpv4(config.host) and !has_api_key and !config.allow_unauthenticated_public_bind) {
+            return error.InvalidConfig;
+        }
         if (config.unix_socket_path) |up| {
             if (up.len == 0 or up.len > MAX_UNIX_SOCKET_PATH_BYTES) return error.InvalidConfig;
         }
@@ -6721,9 +6944,19 @@ pub const Server = struct {
                 .index = @intCast(i),
                 .fd = -1,
                 .state = .free,
+                .read_armed = false,
                 .write_armed = false,
+                .headers_received = false,
+                .is_network_tcp = false,
+                .peer_ipv4 = null,
                 .sent_continue = false,
                 .request_counted = false,
+                .api_cancelled = false,
+                .aux_kind = .generate,
+                .embed_req = .{ .model = "", .model_tag = .{ .base = "" } },
+                .rerank_req = .{ .model = "", .model_tag = .{ .base = "" }, .query = "" },
+                .aux_response_len = 0,
+                .aux_err = .none,
                 .rx_buf = rx,
                 .rx_len = 0,
                 .prompt_buf = prompt,
@@ -7381,6 +7614,86 @@ pub const Server = struct {
         self.message_boundary_checkpoints.store(tel.message_boundary_checkpoints, .release);
     }
 
+    fn pushSlotControlEvent(self: *Server, slot: *ConnectionSlot, ev: TokenEvent) bool {
+        while (true) {
+            if (slot.cancelled.load(.acquire) or self.stop_requested.load(.acquire)) return false;
+            if (slot.token_ring.tryPush(ev)) {
+                self.wakeNetworkLoop();
+                return true;
+            }
+            self.wakeNetworkLoop();
+            sleepNs(50_000);
+        }
+    }
+
+    fn executeAuxWorkerJob(self: *Server, job: *const InferenceJob) void {
+        const slot = &self.slots[job.slot_index];
+        const HEADER_RESERVE: usize = 768;
+        if (!self.stop_requested.load(.acquire) and !slot.cancelled.load(.acquire)) {
+            slot.aux_response_len = 0;
+            slot.aux_err = .none;
+            switch (job.kind) {
+                .embeddings => {
+                    if (self.embedding_handler) |handler| {
+                        if (handler.embedFn(handler.ctx, &slot.embed_req, self.aux_embed_vectors)) |res| {
+                            if (res.dim == 0 or slot.embed_req.input_count * res.dim > self.aux_embed_vectors.len) {
+                                slot.aux_err = .embed_invalid_dim;
+                            } else if (slot.tx_buf.len <= HEADER_RESERVE) {
+                                slot.aux_err = .tx_overflow;
+                            } else if (formatEmbeddingsResponse(
+                                &slot.embed_req,
+                                self.aux_embed_vectors[0 .. slot.embed_req.input_count * res.dim],
+                                res,
+                                slot.tx_buf[HEADER_RESERVE..],
+                            )) |json_body| {
+                                slot.aux_response_len = json_body.len;
+                            } else |_| {
+                                slot.aux_err = .tx_overflow;
+                            }
+                        } else |err| {
+                            slot.aux_err = if (err == error.BufferTooSmall) .payload_too_large else .embed_failed;
+                        }
+                    } else {
+                        slot.aux_err = .unavailable;
+                    }
+                },
+                .rerank => {
+                    if (self.rerank_handler) |handler| {
+                        var items_buf: [MAX_RERANK_DOCS]RerankItem = undefined;
+                        if (handler.rerankFn(handler.ctx, &slot.rerank_req, &items_buf)) |res| {
+                            const n = @min(res.count, MAX_RERANK_DOCS);
+                            if (slot.tx_buf.len <= HEADER_RESERVE) {
+                                slot.aux_err = .tx_overflow;
+                            } else if (formatRerankResponse(
+                                &slot.rerank_req,
+                                items_buf[0..n],
+                                res.prompt_tokens,
+                                slot.tx_buf[HEADER_RESERVE..],
+                            )) |json_body| {
+                                slot.aux_response_len = json_body.len;
+                            } else |_| {
+                                slot.aux_err = .tx_overflow;
+                            }
+                        } else |err| {
+                            slot.aux_err = if (err == error.BufferTooSmall) .payload_too_large else .rerank_failed;
+                        }
+                    } else {
+                        slot.aux_err = .unavailable;
+                    }
+                },
+                .generate => {},
+            }
+            const ev = TokenEvent{
+                .generation = job.generation,
+                .kind = if (slot.aux_err == .none) .finished else .failed,
+                .token_count = @intCast(@min(slot.aux_response_len, std.math.maxInt(u32))),
+            };
+            _ = self.pushSlotControlEvent(slot, ev);
+        }
+        slot.worker_active.store(false, .release);
+        self.wakeNetworkLoop();
+    }
+
     /// Single-slot inference worker loop (backward compatible with M5 `EngineHandler`):
     /// blocks with 0% idle CPU in `worker_kq_fd` (`EVFILT_USER`), drains admitted
     /// `InferenceJob`s from the lock-free `job_ring`, and executes `handler.generateFn`
@@ -7395,6 +7708,10 @@ pub const Server = struct {
             self.worker_wakeup_pending.store(false, .seq_cst);
 
             while (self.job_ring.tryPop()) |job| {
+                if (job.kind != .generate) {
+                    self.executeAuxWorkerJob(&job);
+                    continue;
+                }
                 const slot = &self.slots[job.slot_index];
                 if (!self.stop_requested.load(.acquire) and !slot.cancelled.load(.acquire)) {
                     self.active_batch_size.store(1, .release);
@@ -7402,6 +7719,7 @@ pub const Server = struct {
                         .server = self,
                         .slot = slot,
                         .generation = job.generation,
+                        .defer_terminal = true,
                     };
                     stream.setThinkingBudget(job.thinking_budget_tokens, job.template_dialect, job.starts_in_think);
                     handler.generateFn(handler.ctx, &job, &stream);
@@ -7409,9 +7727,14 @@ pub const Server = struct {
                         stream.finish(.stop, stream.prompt_tokens);
                     }
                     self.active_batch_size.store(0, .release);
+                    if (stream.deferred_terminal) |term_ev| {
+                        if (!stream.isCancelled()) {
+                            _ = stream.pushEvent(term_ev);
+                        }
+                    }
                 }
                 // Release worker ownership of the slot and wake kqueue so cancelled
-                // slots recycle immediately.
+                // or keep-alive slots recycle immediately.
                 slot.worker_active.store(false, .release);
                 self.wakeNetworkLoop();
             }
@@ -7432,6 +7755,71 @@ pub const Server = struct {
         }
     }
 
+    fn enqueueBatchGenerateJob(
+        self: *Server,
+        handler: *const BatchEngineHandler,
+        free_bsid: u16,
+        job: *const InferenceJob,
+    ) void {
+        const conn = &self.slots[job.slot_index];
+        if (self.stop_requested.load(.acquire) or conn.cancelled.load(.acquire)) {
+            conn.worker_active.store(false, .release);
+            self.wakeNetworkLoop();
+            return;
+        }
+
+        self.batch_slot_streams[free_bsid] = .{
+            .server = self,
+            .slot = conn,
+            .generation = job.generation,
+        };
+        self.batch_slot_streams[free_bsid].setThinkingBudget(job.thinking_budget_tokens, job.template_dialect, job.starts_in_think);
+
+        const prompt_buf = self.batch_scheduler.slotPromptBuffer(free_bsid);
+        const tok_res: TokenizeResult = if (handler.tokenizeWithBoundaryFn) |f|
+            f(handler.ctx, job, prompt_buf) catch {
+                self.batch_slot_streams[free_bsid].fail("prompt tokenization failed");
+                conn.worker_active.store(false, .release);
+                self.wakeNetworkLoop();
+                return;
+            }
+        else blk: {
+            const prompt_len = handler.tokenizeFn(handler.ctx, job, prompt_buf) catch {
+                self.batch_slot_streams[free_bsid].fail("prompt tokenization failed");
+                conn.worker_active.store(false, .release);
+                self.wakeNetworkLoop();
+                return;
+            };
+            break :blk .{ .prompt_len = prompt_len, .message_boundary_token = null };
+        };
+
+        const msg_boundary_tok: ?u32 = if (self.config.message_boundary_cache) blk: {
+            if (tok_res.message_boundary_token) |b| {
+                if (b > 0 and b < tok_res.prompt_len) break :blk b;
+            }
+            break :blk null;
+        } else null;
+
+        self.batch_scheduler.enqueueInPlace(free_bsid, tok_res.prompt_len, .{
+            .request_id = job.request_id,
+            .user_tag = job.slot_index,
+            .max_tokens = job.max_tokens,
+            .temperature = job.temperature,
+            .external_rng = job.rng,
+            .ignore_eos = job.ignore_eos,
+            .eos_token_ids = handler.eos_token_ids[0..handler.eos_token_count],
+            .ngram_domain = job.ngram_domain,
+            .message_boundary_token = msg_boundary_tok,
+        }) catch {
+            self.batch_slot_streams[free_bsid].fail("failed to enqueue batch slot");
+            conn.worker_active.store(false, .release);
+            self.wakeNetworkLoop();
+            return;
+        };
+
+        self.batch_slot_conns[free_bsid] = job.slot_index;
+    }
+
     /// `C14` iteration-level continuous-batching worker loop:
     /// drains admitted `InferenceJob`s into preallocated `BatchScheduler` slots,
     /// executes fair chunked prefill (`max_prefill_chunk_tokens` + `R8` prefix skip)
@@ -7441,6 +7829,7 @@ pub const Server = struct {
     pub fn runBatchedWorkerLoop(self: *Server, handler: BatchEngineHandler) void {
         var empty_changes: [1]std.c.kevent64_s = .{std.mem.zeroes(std.c.kevent64_s)};
         var ev_out: [4]std.c.kevent64_s = undefined;
+        var pending_gen_job: ?InferenceJob = null;
 
         for (0..batch_sched.MAX_BATCH_SLOTS) |i| {
             self.batch_slot_conns[i] = null;
@@ -7478,11 +7867,11 @@ pub const Server = struct {
                     .cancelled => .cancelled,
                     .err => .err,
                 };
-                if (mapped_reason != .cancelled and !stream.finished and !stream.isCancelled()) {
-                    stream.finish(mapped_reason, prompt_tokens);
-                }
                 if (ctx.server.batch_slot_conns[slot_id]) |conn_idx| {
                     ctx.server.batch_slot_conns[slot_id] = null;
+                    if (mapped_reason != .cancelled and !stream.finished and !stream.isCancelled()) {
+                        stream.finish(mapped_reason, prompt_tokens);
+                    }
                     ctx.server.slots[conn_idx].worker_active.store(false, .release);
                     ctx.server.wakeNetworkLoop();
                 }
@@ -7491,11 +7880,11 @@ pub const Server = struct {
             fn onError(ctx_ptr: *anyopaque, slot_id: u16, _: u64, _: batch_sched.BackendError) void {
                 const ctx: *@This() = @ptrCast(@alignCast(ctx_ptr));
                 const stream = &ctx.server.batch_slot_streams[slot_id];
-                if (!stream.finished and !stream.isCancelled()) {
-                    stream.fail("batched inference step failed");
-                }
                 if (ctx.server.batch_slot_conns[slot_id]) |conn_idx| {
                     ctx.server.batch_slot_conns[slot_id] = null;
+                    if (!stream.finished and !stream.isCancelled()) {
+                        stream.fail("batched inference step failed");
+                    }
                     ctx.server.slots[conn_idx].worker_active.store(false, .release);
                     ctx.server.wakeNetworkLoop();
                 }
@@ -7533,71 +7922,44 @@ pub const Server = struct {
                     }
                 }
             }
-
-            // 2. Drain newly admitted jobs into all available preallocated batch slots.
-            while (self.batch_scheduler.findFreeSlot()) |free_bsid| {
-                const job = self.job_ring.tryPop() orelse break;
-                const conn = &self.slots[job.slot_index];
-                if (self.stop_requested.load(.acquire) or conn.cancelled.load(.acquire)) {
-                    conn.worker_active.store(false, .release);
+            if (pending_gen_job) |pj| {
+                const pconn = &self.slots[pj.slot_index];
+                if (stopping or pconn.cancelled.load(.acquire)) {
+                    pconn.worker_active.store(false, .release);
                     self.wakeNetworkLoop();
+                    pending_gen_job = null;
+                }
+            }
+
+            // 2. Drain newly admitted jobs into all available preallocated batch slots
+            //    and execute any `/v1/embeddings` / `/v1/rerank` jobs on the worker thread.
+            if (pending_gen_job) |pj| {
+                if (self.batch_scheduler.findFreeSlot()) |free_bsid| {
+                    pending_gen_job = null;
+                    self.enqueueBatchGenerateJob(&handler, free_bsid, &pj);
+                }
+            }
+            while (pending_gen_job == null) {
+                const job = self.job_ring.tryPop() orelse break;
+                if (job.kind != .generate) {
+                    self.executeAuxWorkerJob(&job);
                     continue;
                 }
-
-                self.batch_slot_streams[free_bsid] = .{
-                    .server = self,
-                    .slot = conn,
-                    .generation = job.generation,
-                };
-                self.batch_slot_streams[free_bsid].setThinkingBudget(job.thinking_budget_tokens, job.template_dialect, job.starts_in_think);
-
-                const prompt_buf = self.batch_scheduler.slotPromptBuffer(free_bsid);
-                const tok_res: TokenizeResult = if (handler.tokenizeWithBoundaryFn) |f|
-                    f(handler.ctx, &job, prompt_buf) catch {
-                        self.batch_slot_streams[free_bsid].fail("prompt tokenization failed");
-                        conn.worker_active.store(false, .release);
-                        self.wakeNetworkLoop();
-                        continue;
-                    }
-                else blk: {
-                    const prompt_len = handler.tokenizeFn(handler.ctx, &job, prompt_buf) catch {
-                        self.batch_slot_streams[free_bsid].fail("prompt tokenization failed");
-                        conn.worker_active.store(false, .release);
-                        self.wakeNetworkLoop();
-                        continue;
-                    };
-                    break :blk .{ .prompt_len = prompt_len, .message_boundary_token = null };
-                };
-
-                const msg_boundary_tok: ?u32 = if (self.config.message_boundary_cache) blk: {
-                    if (tok_res.message_boundary_token) |b| {
-                        if (b > 0 and b < tok_res.prompt_len) break :blk b;
-                    }
-                    break :blk null;
-                } else null;
-
-                self.batch_scheduler.enqueueInPlace(free_bsid, tok_res.prompt_len, .{
-                    .request_id = job.request_id,
-                    .user_tag = job.slot_index,
-                    .max_tokens = job.max_tokens,
-                    .temperature = job.temperature,
-                    .external_rng = job.rng,
-                    .ignore_eos = job.ignore_eos,
-                    .eos_token_ids = handler.eos_token_ids[0..handler.eos_token_count],
-                    .ngram_domain = job.ngram_domain,
-                    .message_boundary_token = msg_boundary_tok,
-                }) catch {
-                    self.batch_slot_streams[free_bsid].fail("failed to enqueue batch slot");
-                    conn.worker_active.store(false, .release);
-                    self.wakeNetworkLoop();
-                    continue;
-                };
-
-                self.batch_slot_conns[free_bsid] = job.slot_index;
+                if (self.batch_scheduler.findFreeSlot()) |free_bsid| {
+                    self.enqueueBatchGenerateJob(&handler, free_bsid, &job);
+                } else {
+                    pending_gen_job = job;
+                    break;
+                }
             }
 
             // 3. On shutdown, release any remaining queued jobs cleanly before returning.
             if (self.stop_requested.load(.acquire)) {
+                if (pending_gen_job) |pj| {
+                    self.slots[pj.slot_index].worker_active.store(false, .release);
+                    self.wakeNetworkLoop();
+                    pending_gen_job = null;
+                }
                 while (self.job_ring.tryPop()) |job| {
                     self.slots[job.slot_index].worker_active.store(false, .release);
                     self.wakeNetworkLoop();
@@ -7737,19 +8099,47 @@ pub const Server = struct {
         return null;
     }
 
-    fn admitAcceptedClientFd(self: *Server, client_fd: std.c.fd_t) void {
+    fn countActiveConnsFromPeer(self: *const Server, peer_ipv4: [4]u8) usize {
+        var count: usize = 0;
+        for (self.slots) |*slot| {
+            if (slot.state != .free) {
+                if (slot.peer_ipv4) |p| {
+                    if (std.mem.eql(u8, &p, &peer_ipv4)) count += 1;
+                }
+            }
+        }
+        return count;
+    }
+
+    fn shouldRejectPeerLimit(self: *const Server, peer_ipv4: [4]u8) bool {
+        if (isLoopbackIpv4(peer_ipv4)) return false;
+        if (self.config.max_conns_per_peer == 0) return false;
+        return self.countActiveConnsFromPeer(peer_ipv4) >= self.config.max_conns_per_peer;
+    }
+
+    fn rejectClientWith503(self: *Server, client_fd: std.c.fd_t) void {
+        _ = self.rejected_503_count.fetchAdd(1, .monotonic);
+        _ = std.c.send(client_fd, STATIC_503_RESPONSE.ptr, STATIC_503_RESPONSE.len, 0);
+        _ = std.c.shutdown(client_fd, std.c.SHUT.WR);
+        var drain_sink: [512]u8 = undefined;
+        _ = std.c.recv(client_fd, &drain_sink, drain_sink.len, 0);
+        _ = std.c.close(client_fd);
+    }
+
+    fn admitAcceptedClientFd(self: *Server, client_fd: std.c.fd_t, is_network_tcp: bool, peer_ipv4: ?[4]u8) void {
+        if (peer_ipv4) |p| {
+            if (self.shouldRejectPeerLimit(p)) {
+                self.rejectClientWith503(client_fd);
+                return;
+            }
+        }
         const slot = self.findFreeSlot() orelse {
             // Connection pool completely saturated: best-effort zero-alloc 503 + graceful half-close.
-            _ = self.rejected_503_count.fetchAdd(1, .monotonic);
-            _ = std.c.send(client_fd, STATIC_503_RESPONSE.ptr, STATIC_503_RESPONSE.len, 0);
-            _ = std.c.shutdown(client_fd, std.c.SHUT.WR);
-            var drain_sink: [512]u8 = undefined;
-            _ = std.c.recv(client_fd, &drain_sink, drain_sink.len, 0);
-            _ = std.c.close(client_fd);
+            self.rejectClientWith503(client_fd);
             return;
         };
 
-        slot.resetForConnection(client_fd);
+        slot.resetForConnection(client_fd, is_network_tcp, peer_ipv4);
         _ = self.active_conns.fetchAdd(1, .acq_rel);
 
         const reg = [1]std.c.kevent64_s{.{
@@ -7765,7 +8155,9 @@ pub const Server = struct {
         const rc = std.c.kevent64(self.kq_fd, &reg, 1, &empty, 0, std.c.KEVENT.FLAG.NONE, null);
         if (rc < 0) {
             self.closeSlotSocketAndRelease(slot, false);
+            return;
         }
+        slot.read_armed = true;
     }
 
     fn acceptPendingTlsConnections(self: *Server, tl: *tls_mod.TlsListener) void {
@@ -7773,15 +8165,20 @@ pub const Server = struct {
             const client_fd = (tl.popAcceptedFd() catch return) orelse return;
             // Accepted TLS bridge fd is already an AF_UNIX SOCK_STREAM socketpair with
             // FD_CLOEXEC, O_NONBLOCK, and SO_NOSIGPIPE configured by `apple_bridge.m`;
-            // do NOT apply TCP_NODELAY to it.
-            self.admitAcceptedClientFd(client_fd);
+            // do NOT apply TCP_NODELAY to it. TLS clients arrive over TCP so Host validation applies.
+            self.admitAcceptedClientFd(client_fd, true, null);
         }
     }
 
     fn acceptPendingConnectionsOn(self: *Server, listen_fd: std.c.fd_t, is_tcp: bool) void {
         if (listen_fd < 0) return;
         while (true) {
-            const client_fd = std.c.accept(listen_fd, null, null);
+            var peer_addr: std.c.sockaddr.in = std.mem.zeroes(std.c.sockaddr.in);
+            var peer_len: std.c.socklen_t = @sizeOf(std.c.sockaddr.in);
+            const client_fd = if (is_tcp)
+                std.c.accept(listen_fd, @ptrCast(&peer_addr), &peer_len)
+            else
+                std.c.accept(listen_fd, null, null);
             if (client_fd < 0) {
                 const err = std.c.errno(client_fd);
                 if (err == .INTR) continue;
@@ -7808,8 +8205,29 @@ pub const Server = struct {
                 };
             }
 
-            self.admitAcceptedClientFd(client_fd);
+            const peer_ipv4: ?[4]u8 = if (is_tcp and peer_len >= @sizeOf(std.c.sockaddr.in))
+                @bitCast(peer_addr.addr)
+            else
+                null;
+            self.admitAcceptedClientFd(client_fd, is_tcp, peer_ipv4);
         }
+    }
+
+    fn setReadInterest(self: *Server, slot: *ConnectionSlot, enable: bool) void {
+        if (slot.fd < 0 or slot.read_armed == enable) return;
+        const flags: u16 = if (enable) std.c.EV.ENABLE else std.c.EV.DISABLE;
+        const change = [1]std.c.kevent64_s{.{
+            .ident = @intCast(slot.fd),
+            .filter = std.c.EVFILT.READ,
+            .flags = flags,
+            .fflags = 0,
+            .data = 0,
+            .udata = slot.index,
+            .ext = .{ 0, 0 },
+        }};
+        var empty: [1]std.c.kevent64_s = .{std.mem.zeroes(std.c.kevent64_s)};
+        _ = std.c.kevent64(self.kq_fd, &change, 1, &empty, 0, std.c.KEVENT.FLAG.NONE, null);
+        slot.read_armed = enable;
     }
 
     fn setWriteInterest(self: *Server, slot: *ConnectionSlot, enable: bool) void {
@@ -7839,12 +8257,20 @@ pub const Server = struct {
         }
     }
 
+    fn effectiveReadTimeoutMs(self: *const Server, slot: *const ConnectionSlot) u32 {
+        const body_ms = self.config.http_read_timeout_ms;
+        if (body_ms == 0) return 0;
+        if (slot.headers_received) return body_ms;
+        const hdr_ms = self.config.header_read_timeout_ms;
+        return if (hdr_ms > 0) @min(hdr_ms, body_ms) else body_ms;
+    }
+
     fn nextConnectionDeadlineNs(self: *const Server, now_ns: u64) ?u64 {
-        const read_ms = self.config.http_read_timeout_ms;
         const idle_ms = self.config.keepalive_idle_timeout_ms;
         var min_rem: ?u64 = null;
         for (self.slots) |*slot| {
             if (slot.state != .reading_request) continue;
+            const read_ms = self.effectiveReadTimeoutMs(slot);
             const deadline_ns: ?u64 = if (slot.read_start_ns > 0 and read_ms > 0)
                 slot.read_start_ns + @as(u64, read_ms) * std.time.ns_per_ms
             else if (slot.read_start_ns == 0 and slot.has_completed_request and idle_ms > 0)
@@ -7860,10 +8286,10 @@ pub const Server = struct {
     }
 
     fn sweepConnectionTimeouts(self: *Server, now_ns: u64) void {
-        const read_ms = self.config.http_read_timeout_ms;
         const idle_ms = self.config.keepalive_idle_timeout_ms;
         for (self.slots) |*slot| {
             if (slot.state != .reading_request) continue;
+            const read_ms = self.effectiveReadTimeoutMs(slot);
             if (slot.read_start_ns > 0 and read_ms > 0) {
                 if ((now_ns -| slot.read_start_ns) >= @as(u64, read_ms) * std.time.ns_per_ms) {
                     slot.keep_alive = false;
@@ -7890,6 +8316,28 @@ pub const Server = struct {
             self.closeSlotSocketAndRelease(slot, false);
             return;
         }
+        if (slot.worker_active.load(.acquire)) {
+            // Worker is still unwinding its turn (e.g. early `stop`-sequence completion):
+            // park keep-alive recycling until worker clears `worker_active` (`F6`).
+            self.setWriteInterest(slot, false);
+            self.setReadInterest(slot, false);
+            slot.state = .draining_worker;
+            return;
+        }
+        self.completeKeepAliveRecycle(slot);
+    }
+
+    fn completeKeepAliveRecycle(self: *Server, slot: *ConnectionSlot) void {
+        if (!slot.keep_alive or slot.fd < 0) {
+            self.closeSlotSocketAndRelease(slot, false);
+            return;
+        }
+        if (slot.worker_active.load(.acquire)) {
+            self.setWriteInterest(slot, false);
+            self.setReadInterest(slot, false);
+            slot.state = .draining_worker;
+            return;
+        }
         const rem = slot.rx_len -| slot.rx_consumed_len;
         if (rem > 0 and slot.rx_consumed_len > 0) {
             std.mem.copyForwards(
@@ -7899,6 +8347,7 @@ pub const Server = struct {
             );
         }
         self.setWriteInterest(slot, false);
+        self.setReadInterest(slot, true);
         slot.resetForNextKeepAliveRequest(rem, monotonicNowNs());
         if (rem > 0) {
             self.tryDispatchHttpRequest(slot, false);
@@ -7909,6 +8358,7 @@ pub const Server = struct {
         if (slot.fd >= 0) {
             _ = std.c.close(slot.fd);
             slot.fd = -1;
+            slot.read_armed = false;
             slot.write_armed = false;
             _ = self.active_conns.fetchSub(1, .acq_rel);
         }
@@ -7929,6 +8379,7 @@ pub const Server = struct {
 
         self.releaseRequestCount(slot);
         while (slot.token_ring.tryPop() != null) {}
+        slot.peer_ipv4 = null;
         slot.state = .free;
     }
 
@@ -7978,7 +8429,7 @@ pub const Server = struct {
                     self.closeSlotSocketAndRelease(slot, true);
                 }
             },
-            .free, .waiting_worker_cancel => {},
+            .free, .waiting_worker_cancel, .draining_worker => {},
         }
     }
 
@@ -7992,6 +8443,8 @@ pub const Server = struct {
             self.drainSlotTokens(slot);
         } else if (slot.state == .draining_response and slot.pendingTxLen() == 0) {
             self.finishHttpExchange(slot);
+        } else if (slot.state == .reading_request and slot.pendingTxLen() == 0 and slot.rx_len > 0) {
+            self.tryDispatchHttpRequest(slot, false);
         }
     }
 
@@ -8025,6 +8478,18 @@ pub const Server = struct {
         return true;
     }
 
+    fn checkApiKeyHeaders(self: *const Server, hdr: *const HttpHeadersResult) bool {
+        if (self.api_key_len == 0) return true;
+        const expected = self.api_key_buf[0..self.api_key_len];
+        if (hdr.authorization_bearer) |b| {
+            if (constantTimeEql(b, expected)) return true;
+        }
+        if (hdr.x_api_key) |k| {
+            if (constantTimeEql(k, expected)) return true;
+        }
+        return false;
+    }
+
     fn tryDispatchHttpRequest(self: *Server, slot: *ConnectionSlot, eof_seen: bool) void {
         const hdr = parseHttpHeaders(slot.rx_buf[0..slot.rx_len]) catch |err| switch (err) {
             error.Incomplete => {
@@ -8049,22 +8514,98 @@ pub const Server = struct {
             },
         };
 
+        slot.headers_received = true;
         slot.keep_alive = !hdr.connection_close;
 
-        // Support curl's `Expect: 100-continue` immediately so large POST bodies never stall.
+        // Validate `Host` header against DNS rebinding on TCP sockets when `api_key` is unset (`F2`).
+        if (self.api_key_len == 0 and !self.config.allow_any_host and slot.is_network_tcp) {
+            const raw_host = hdr.host orelse {
+                slot.keep_alive = false;
+                self.sendErrorResponse(slot, 400, "Bad Request", null, "missing Host header", "invalid_request_error", "bad_request");
+                return;
+            };
+            switch (validateHostHeader(raw_host, self.config.host)) {
+                .ok => {},
+                .bad_request => {
+                    slot.keep_alive = false;
+                    self.sendErrorResponse(slot, 400, "Bad Request", null, "invalid Host header", "invalid_request_error", "bad_request");
+                    return;
+                },
+                .forbidden => {
+                    slot.keep_alive = false;
+                    self.sendErrorResponse(slot, 403, "Forbidden", null, "Host header rejected", "invalid_request_error", "forbidden_host");
+                    return;
+                },
+            }
+        }
+
+        const route_path = hdr.path;
+        const norm_path = normalizeApiPath(route_path);
+        const is_preflight = (hdr.method == .options and isKnownRoute(route_path, norm_path));
+        const is_health = std.mem.eql(u8, route_path, "/health");
+
+        // Early `--api-key` validation (`L3`) as soon as `\r\n\r\n` arrives, BEFORE `100 Continue`
+        // and BEFORE buffering multi-MB request bodies.
+        if (self.api_key_len > 0 and !is_preflight and !is_health) {
+            if (!self.checkApiKeyHeaders(&hdr)) {
+                slot.keep_alive = false;
+                self.sendErrorResponse(
+                    slot,
+                    401,
+                    "Unauthorized",
+                    null,
+                    "invalid or missing API key",
+                    "authentication_error",
+                    "invalid_api_key",
+                );
+                return;
+            }
+        }
+
+        // Support curl's `Expect: 100-continue` immediately so large POST bodies never stall (`L3` checked send).
         if (hdr.expect_continue and !slot.sent_continue) {
             slot.sent_continue = true;
-            _ = std.c.send(slot.fd, STATIC_100_CONTINUE.ptr, STATIC_100_CONTINUE.len, 0);
+            var sent: usize = 0;
+            while (sent < STATIC_100_CONTINUE.len) {
+                const n = std.c.send(slot.fd, STATIC_100_CONTINUE[sent..].ptr, STATIC_100_CONTINUE.len - sent, 0);
+                if (n > 0) {
+                    sent += @intCast(n);
+                } else if (n < 0) {
+                    const err = std.c.errno(n);
+                    if (err == .INTR) continue;
+                    if (err == .AGAIN) {
+                        slot.appendTx(STATIC_100_CONTINUE[sent..]) catch {
+                            self.closeSlotSocketAndRelease(slot, true);
+                            return;
+                        };
+                        self.setWriteInterest(slot, true);
+                        break;
+                    }
+                    self.closeSlotSocketAndRelease(slot, true);
+                    return;
+                } else {
+                    self.closeSlotSocketAndRelease(slot, true);
+                    return;
+                }
+            }
         }
 
         // Wait until the full request body (if any) has arrived.
         var body: []const u8 = "";
         slot.rx_consumed_len = hdr.header_end;
         if (hdr.chunked) {
-            const decoded = decodeChunkedInPlace(slot.rx_buf[hdr.header_end..slot.rx_len]) catch {
-                slot.keep_alive = false;
-                self.sendErrorResponse(slot, 400, "Bad Request", null, "malformed chunked request body", "invalid_request_error", "bad_request");
-                return;
+            const max_body_bytes = slot.rx_buf.len - hdr.header_end;
+            const decoded = decodeChunkedInPlace(slot.rx_buf[hdr.header_end..slot.rx_len], max_body_bytes) catch |err| switch (err) {
+                error.BadRequest => {
+                    slot.keep_alive = false;
+                    self.sendErrorResponse(slot, 400, "Bad Request", null, "malformed chunked request body", "invalid_request_error", "bad_request");
+                    return;
+                },
+                error.PayloadTooLarge => {
+                    slot.keep_alive = false;
+                    self.sendErrorResponse(slot, 413, "Payload Too Large", null, "chunked body exceeds preallocated slot buffer", "invalid_request_error", "payload_too_large");
+                    return;
+                },
             };
             switch (decoded) {
                 .incomplete => {
@@ -8104,17 +8645,16 @@ pub const Server = struct {
             slot.rx_consumed_len = total_needed;
         }
 
-        const route_path = hdr.path;
-        const norm_path = normalizeApiPath(route_path);
+        if (slot.pendingTxLen() > 0) return;
 
         // Handle CORS preflight (`OPTIONS`) BEFORE `--api-key` authentication on known routes (`C29`).
-        if (hdr.method == .options and isKnownRoute(route_path, norm_path)) {
+        if (is_preflight) {
             self.handleOptionsPreflight(slot);
             return;
         }
 
         // Route dispatch.
-        if (std.mem.eql(u8, route_path, "/health")) {
+        if (is_health) {
             if (hdr.method != .get) {
                 self.sendErrorResponse(slot, 405, "Method Not Allowed", "GET", "method not allowed", "invalid_request_error", "method_not_allowed");
                 return;
@@ -8123,31 +8663,18 @@ pub const Server = struct {
             return;
         }
 
-        // Constant-time `--api-key` validation (`C18`) across all `/v1/*` and prefix-free routes:
-        // accepts either `Authorization: Bearer <key>` or `x-api-key: <key>`.
-        if (self.api_key_len > 0) {
-            const expected = self.api_key_buf[0..self.api_key_len];
-            const auth_ok = blk: {
-                if (hdr.authorization_bearer) |b| {
-                    if (constantTimeEql(b, expected)) break :blk true;
-                }
-                if (hdr.x_api_key) |k| {
-                    if (constantTimeEql(k, expected)) break :blk true;
-                }
-                break :blk false;
-            };
-            if (!auth_ok) {
-                self.sendErrorResponse(
-                    slot,
-                    401,
-                    "Unauthorized",
-                    null,
-                    "invalid or missing API key",
-                    "authentication_error",
-                    "invalid_api_key",
-                );
-                return;
-            }
+        // Constant-time `--api-key` defense-in-depth check.
+        if (!self.checkApiKeyHeaders(&hdr)) {
+            self.sendErrorResponse(
+                slot,
+                401,
+                "Unauthorized",
+                null,
+                "invalid or missing API key",
+                "authentication_error",
+                "invalid_api_key",
+            );
+            return;
         }
 
         if (std.mem.eql(u8, norm_path, "/models")) {
@@ -9166,7 +9693,7 @@ pub const Server = struct {
     fn handleResponsesInputTokens(self: *Server, slot: *ConnectionSlot, body: []const u8) void {
         var prior_chatml: ?[]const u8 = null;
         var prev_probe_buf: [MAX_RESPONSE_ID_BYTES]u8 = undefined;
-        if (findJsonStringField(body, "previous_response_id", &prev_probe_buf)) |prev_id| {
+        if (findTopLevelJsonStringField(body, "previous_response_id", &prev_probe_buf)) |prev_id| {
             if (prev_id.len > 0) {
                 const prev_rec = self.findStatefulResponseById(prev_id) orelse {
                     self.sendErrorResponse(
@@ -9250,12 +9777,156 @@ pub const Server = struct {
         self.sendJsonResponse(slot, 200, "OK", null, null, null, w.written());
     }
 
+    fn admitAuxWorkerRequest(
+        self: *Server,
+        slot: *ConnectionSlot,
+        kind: JobKind,
+        embed_req_opt: ?EmbedRequest,
+        rerank_req_opt: ?RerankRequest,
+    ) void {
+        const current_active = self.active_requests.load(.acquire);
+        if (current_active >= self.config.max_active_requests or self.job_ring.isFull()) {
+            _ = self.rejected_503_count.fetchAdd(1, .monotonic);
+            self.sendErrorResponse(
+                slot,
+                503,
+                "Service Unavailable",
+                null,
+                "server busy: all preallocated request slots are in use",
+                "server_error",
+                "server_overloaded",
+            );
+            return;
+        }
+
+        slot.generation +%= 1;
+        slot.request_id = self.next_request_id;
+        self.next_request_id +%= 1;
+        slot.aux_kind = kind;
+        slot.aux_response_len = 0;
+        slot.aux_err = .none;
+        slot.stream = false;
+        if (embed_req_opt) |er| slot.embed_req = er;
+        if (rerank_req_opt) |rr| slot.rerank_req = rr;
+        slot.cancelled.store(false, .release);
+        while (slot.token_ring.tryPop() != null) {}
+
+        slot.worker_active.store(true, .release);
+        slot.state = .streaming_active;
+        slot.request_counted = true;
+        _ = self.active_requests.fetchAdd(1, .acq_rel);
+        _ = self.total_requests.fetchAdd(1, .monotonic);
+
+        const model_tag = if (kind == .embeddings) slot.embed_req.model_tag else slot.rerank_req.model_tag;
+        const job = InferenceJob{
+            .slot_index = slot.index,
+            .generation = slot.generation,
+            .request_id = slot.request_id,
+            .kind = kind,
+            .endpoint = .completions,
+            .prompt = "",
+            .rng = &slot.rng,
+            .seed_used = 0,
+            .seed_source = .greedy,
+            .max_tokens = 0,
+            .temperature = 0.0,
+            .stream = false,
+            .ignore_eos = false,
+            .enable_thinking = false,
+            .model_base = model_tag.base,
+            .lora_adapter = model_tag.adapter,
+        };
+
+        if (!self.job_ring.tryPush(job)) {
+            slot.worker_active.store(false, .release);
+            self.releaseRequestCount(slot);
+            _ = self.rejected_503_count.fetchAdd(1, .monotonic);
+            slot.keep_alive = false;
+            self.sendErrorResponse(
+                slot,
+                503,
+                "Service Unavailable",
+                null,
+                "server busy: inference job queue full",
+                "server_error",
+                "server_overloaded",
+            );
+            return;
+        }
+
+        self.wakeWorkerLoop();
+    }
+
+    fn sendAuxErrorResponse(self: *Server, slot: *ConnectionSlot, err_kind: AuxWorkerError) void {
+        switch (err_kind) {
+            .none => self.closeSlotSocketAndRelease(slot, false),
+            .unavailable => self.sendErrorResponse(
+                slot,
+                501,
+                "Not Implemented",
+                null,
+                if (slot.aux_kind == .embeddings) "embeddings backend not configured" else "rerank backend not configured",
+                "api_error",
+                if (slot.aux_kind == .embeddings) "embeddings_unavailable" else "rerank_unavailable",
+            ),
+            .payload_too_large => self.sendErrorResponse(
+                slot,
+                413,
+                "Payload Too Large",
+                null,
+                "request input exceeds preallocated backend scratch capacity",
+                "invalid_request_error",
+                "payload_too_large",
+            ),
+            .embed_failed => self.sendErrorResponse(
+                slot,
+                500,
+                "Internal Server Error",
+                null,
+                "embedding computation failed",
+                "server_error",
+                "embedding_failed",
+            ),
+            .embed_invalid_dim => self.sendErrorResponse(
+                slot,
+                500,
+                "Internal Server Error",
+                null,
+                "invalid embedding dimension returned by backend",
+                "server_error",
+                "embedding_failed",
+            ),
+            .rerank_failed => self.sendErrorResponse(
+                slot,
+                500,
+                "Internal Server Error",
+                null,
+                "rerank computation failed",
+                "server_error",
+                "rerank_failed",
+            ),
+            .tx_overflow => self.sendErrorResponse(
+                slot,
+                500,
+                "Internal Server Error",
+                null,
+                if (slot.aux_kind == .embeddings) "embeddings response exceeds tx buffer" else "rerank response exceeds tx buffer",
+                "server_error",
+                "tx_overflow",
+            ),
+        }
+    }
+
     fn handleEmbeddings(self: *Server, slot: *ConnectionSlot, body: []const u8) void {
+        const scratch_buf = if (slot.nonstream_content_buf.len >= slot.prompt_buf.len)
+            slot.nonstream_content_buf
+        else
+            slot.prompt_buf;
         const req = parseEmbeddingsRequest(
             body,
             self.modelId(),
             &slot.model_buf,
-            self.aux_text_scratch,
+            scratch_buf,
         ) catch |err| {
             const msg = switch (err) {
                 error.InvalidJson => "invalid JSON request body",
@@ -9272,7 +9943,7 @@ pub const Server = struct {
             return;
         };
 
-        const handler = self.embedding_handler orelse {
+        if (self.embedding_handler == null) {
             self.sendErrorResponse(
                 slot,
                 501,
@@ -9283,57 +9954,23 @@ pub const Server = struct {
                 "embeddings_unavailable",
             );
             return;
-        };
-
-        const res = handler.embedFn(handler.ctx, &req, self.aux_embed_vectors) catch {
-            self.sendErrorResponse(
-                slot,
-                500,
-                "Internal Server Error",
-                null,
-                "embedding computation failed",
-                "server_error",
-                "embedding_failed",
-            );
-            return;
-        };
-        if (res.dim == 0 or req.input_count * res.dim > self.aux_embed_vectors.len) {
-            self.sendErrorResponse(
-                slot,
-                500,
-                "Internal Server Error",
-                null,
-                "invalid embedding dimension returned by backend",
-                "server_error",
-                "embedding_failed",
-            );
-            return;
         }
 
-        const HEADER_RESERVE: usize = 768;
-        if (slot.tx_buf.len <= HEADER_RESERVE) {
-            self.closeSlotSocketAndRelease(slot, false);
-            return;
-        }
-        const json_body = formatEmbeddingsResponse(
-            &req,
-            self.aux_embed_vectors[0 .. req.input_count * res.dim],
-            res,
-            slot.tx_buf[HEADER_RESERVE..],
-        ) catch {
-            self.sendErrorResponse(slot, 500, "Internal Server Error", null, "embeddings response exceeds tx buffer", "server_error", "tx_overflow");
-            return;
-        };
-
-        self.writeHttpJsonOkHeadersAndSend(slot, json_body.len, HEADER_RESERVE, null, null);
+        // Offload `embedFn` execution onto the worker thread via `job_ring` (`F7`)
+        // so `kqueue` never acquires `model_mutex`.
+        self.admitAuxWorkerRequest(slot, .embeddings, req, null);
     }
 
     fn handleRerank(self: *Server, slot: *ConnectionSlot, body: []const u8) void {
+        const scratch_buf = if (slot.nonstream_content_buf.len >= slot.prompt_buf.len)
+            slot.nonstream_content_buf
+        else
+            slot.prompt_buf;
         const req = parseRerankRequest(
             body,
             self.modelId(),
             &slot.model_buf,
-            self.aux_text_scratch,
+            scratch_buf,
         ) catch |err| {
             const msg = switch (err) {
                 error.InvalidJson => "invalid JSON request body",
@@ -9350,7 +9987,7 @@ pub const Server = struct {
             return;
         };
 
-        const handler = self.rerank_handler orelse {
+        if (self.rerank_handler == null) {
             self.sendErrorResponse(
                 slot,
                 501,
@@ -9361,39 +9998,11 @@ pub const Server = struct {
                 "rerank_unavailable",
             );
             return;
-        };
-
-        var items_buf: [MAX_RERANK_DOCS]RerankItem = undefined;
-        const res = handler.rerankFn(handler.ctx, &req, &items_buf) catch {
-            self.sendErrorResponse(
-                slot,
-                500,
-                "Internal Server Error",
-                null,
-                "rerank computation failed",
-                "server_error",
-                "rerank_failed",
-            );
-            return;
-        };
-        const n = @min(res.count, MAX_RERANK_DOCS);
-
-        const HEADER_RESERVE: usize = 768;
-        if (slot.tx_buf.len <= HEADER_RESERVE) {
-            self.closeSlotSocketAndRelease(slot, false);
-            return;
         }
-        const json_body = formatRerankResponse(
-            &req,
-            items_buf[0..n],
-            res.prompt_tokens,
-            slot.tx_buf[HEADER_RESERVE..],
-        ) catch {
-            self.sendErrorResponse(slot, 500, "Internal Server Error", null, "rerank response exceeds tx buffer", "server_error", "tx_overflow");
-            return;
-        };
 
-        self.writeHttpJsonOkHeadersAndSend(slot, json_body.len, HEADER_RESERVE, null, null);
+        // Offload `rerankFn` execution onto the worker thread via `job_ring` (`F7`)
+        // so `kqueue` never acquires `model_mutex`.
+        self.admitAuxWorkerRequest(slot, .rerank, null, req);
     }
 
     fn findStatefulResponseById(self: *Server, resp_id: []const u8) ?*StatefulResponseSlot {
@@ -9728,10 +10337,12 @@ pub const Server = struct {
             rec.status = .cancelled;
             if (rec.active_conn_slot) |cidx| {
                 if (cidx < self.slots.len and self.slots[cidx].generation == rec.active_generation) {
+                    self.slots[cidx].api_cancelled = true;
                     if (!self.slots[cidx].cancelled.swap(true, .acq_rel)) {
                         _ = self.cancelled_count.fetchAdd(1, .monotonic);
                     }
                     self.wakeWorkerLoop();
+                    self.wakeNetworkLoop();
                 }
             }
             rec.active_conn_slot = null;
@@ -10144,7 +10755,7 @@ pub const Server = struct {
         var prev_rec_ptr: ?*const StatefulResponseSlot = null;
         if (endpoint == .responses) {
             var prev_probe_buf: [MAX_RESPONSE_ID_BYTES]u8 = undefined;
-            if (findJsonStringField(body, "previous_response_id", &prev_probe_buf)) |prev_id| {
+            if (findTopLevelJsonStringField(body, "previous_response_id", &prev_probe_buf)) |prev_id| {
                 if (prev_id.len > 0) {
                     const prev_rec = self.findStatefulResponseById(prev_id) orelse {
                         self.sendErrorResponse(
@@ -10585,6 +11196,11 @@ pub const Server = struct {
                         self.finishHttpExchange(slot);
                     }
                 },
+                .draining_worker => {
+                    if (!slot.worker_active.load(.acquire)) {
+                        self.completeKeepAliveRecycle(slot);
+                    }
+                },
                 .free, .reading_request => {},
             }
         }
@@ -10603,10 +11219,17 @@ pub const Server = struct {
             }
 
             const ev = slot.token_ring.tryPop() orelse {
-                // If worker exited unexpectedly without pushing `.finished`, finish cleanly.
+                // If worker exited unexpectedly (or stopped after API cancel) without pushing `.finished`.
                 if (!slot.worker_active.load(.acquire) and slot.token_ring.isEmpty()) {
                     if (slot.cancelled.load(.acquire)) {
-                        self.closeSlotSocketAndRelease(slot, false);
+                        if (slot.api_cancelled and slot.fd >= 0) {
+                            self.finishSlotResponse(slot, .cancelled);
+                        } else {
+                            self.closeSlotSocketAndRelease(slot, false);
+                        }
+                    } else if (slot.aux_kind != .generate) {
+                        self.releaseRequestCount(slot);
+                        self.sendAuxErrorResponse(slot, if (slot.aux_err != .none) slot.aux_err else .embed_failed);
                     } else {
                         self.finishSlotResponse(slot, .stop);
                     }
@@ -10615,6 +11238,31 @@ pub const Server = struct {
             };
 
             if (ev.generation != slot.generation) continue;
+
+            if (slot.aux_kind != .generate) {
+                switch (ev.kind) {
+                    .finished => {
+                        self.releaseRequestCount(slot);
+                        const HEADER_RESERVE: usize = 768;
+                        if (slot.tx_buf.len <= HEADER_RESERVE) {
+                            self.closeSlotSocketAndRelease(slot, false);
+                            return;
+                        }
+                        if (slot.aux_err != .none) {
+                            self.sendAuxErrorResponse(slot, slot.aux_err);
+                            return;
+                        }
+                        self.writeHttpJsonOkHeadersAndSend(slot, slot.aux_response_len, HEADER_RESERVE, null, null);
+                        return;
+                    },
+                    .failed => {
+                        self.releaseRequestCount(slot);
+                        self.sendAuxErrorResponse(slot, if (slot.aux_err != .none) slot.aux_err else .embed_failed);
+                        return;
+                    },
+                    .prefill_done, .token_text => continue,
+                }
+            }
 
             switch (ev.kind) {
                 .prefill_done => {
@@ -10652,7 +11300,9 @@ pub const Server = struct {
                 },
                 .finished => {
                     if (ev.token_count > 0) slot.prompt_tokens = ev.token_count;
-                    const final_reason: FinishReason = if (slot.stop_holdback.stopped)
+                    const final_reason: FinishReason = if (slot.api_cancelled)
+                        .cancelled
+                    else if (slot.stop_holdback.stopped)
                         .stop_sequence
                     else
                         ev.finish_reason;
@@ -11620,9 +12270,10 @@ pub const Server = struct {
                 const reasoning = slot.nonstream_reasoning_buf[0..slot.nonstream_reasoning_len];
                 const content = slot.nonstream_content_buf[0..slot.nonstream_content_len];
                 const write_ok: bool = blk: {
+                    const term_event_name = if (rec_status == .cancelled) "response.cancelled" else "response.completed";
                     w.print(
-                        "event: response.completed\ndata: {{\"type\":\"response.completed\",\"sequence_number\":{d},\"response\":{{\"id\":\"resp_{d}\",\"object\":\"response\",\"created_at\":{d},\"status\":\"{s}\",\"model\":\"",
-                        .{ sc, slot.request_id, slot.created_unix, rec_status.name() },
+                        "event: {s}\ndata: {{\"type\":\"{s}\",\"sequence_number\":{d},\"response\":{{\"id\":\"resp_{d}\",\"object\":\"response\",\"created_at\":{d},\"status\":\"{s}\",\"model\":\"",
+                        .{ term_event_name, term_event_name, sc, slot.request_id, slot.created_unix, rec_status.name() },
                     ) catch break :blk false;
                     w.writeJsonEscaped(slot.modelSlice()) catch break :blk false;
                     w.print("\",\"seed_used\":{d},\"seed_source\":\"{s}\"", .{
@@ -17645,5 +18296,632 @@ test "C29 unauthenticated OPTIONS CORS preflight, CORS headers across JSON/SSE/H
         );
         try std.testing.expect(std.mem.startsWith(u8, r_tls_opt.resp, "HTTP/1.1 204 No Content\r\n"));
         try std.testing.expectEqualStrings("*", extractHeaderValue(r_tls_opt.resp, "Access-Control-Allow-Origin") orelse "");
+    }
+}
+
+test "F1 & L4 overflow-free decodeChunkedInPlace, 413 oversized chunks, and strict HTTP number/TE parsing" {
+    // 1. Appendix A.1 standalone `decodeChunkedInPlace` overflow and 413 checks.
+    {
+        var b1: [4096]u8 = undefined;
+        const s1 = "fffffffffffffffe\r\n0\r\n\r\n";
+        @memcpy(b1[0..s1.len], s1);
+        try std.testing.expectError(error.PayloadTooLarge, decodeChunkedInPlace(b1[0..s1.len], b1.len));
+
+        var b2: [4096]u8 = undefined;
+        const s2 = "ffffffffffffffff\r\n0\r\n\r\n";
+        @memcpy(b2[0..s2.len], s2);
+        try std.testing.expectError(error.PayloadTooLarge, decodeChunkedInPlace(b2[0..s2.len], b2.len));
+
+        var b3: [4096]u8 = undefined;
+        const s3 = "2000\r\nabcd"; // chunk_len (8192) > rx_buf.len (4096)
+        @memcpy(b3[0..s3.len], s3);
+        try std.testing.expectError(error.PayloadTooLarge, decodeChunkedInPlace(b3[0..s3.len], b3.len));
+
+        var b4: [4096]u8 = undefined;
+        const s4 = "100000\r\npartial_unterminated";
+        @memcpy(b4[0..s4.len], s4);
+        try std.testing.expectError(error.PayloadTooLarge, decodeChunkedInPlace(b4[0..s4.len], b4.len));
+
+        // Cumulative chunk size exceeding max_body_bytes (64): 40 + 40 = 80 > 64 -> 413!
+        var b5: [128]u8 = undefined;
+        const s5 = "28\r\n0123456789012345678901234567890123456789\r\n28\r\n";
+        @memcpy(b5[0..s5.len], s5);
+        try std.testing.expectError(error.PayloadTooLarge, decodeChunkedInPlace(b5[0..s5.len], 64));
+
+        // Incomplete chunk within bounds returns `.incomplete` rather than erroring.
+        var b6: [128]u8 = undefined;
+        const s6 = "10\r\nhello";
+        @memcpy(b6[0..s6.len], s6);
+        const st6 = try decodeChunkedInPlace(b6[0..s6.len], b6.len);
+        try std.testing.expect(st6 == .incomplete);
+    }
+
+    // 2. Appendix A.2 strict decimal/hex parsers and Transfer-Encoding exact match.
+    {
+        try std.testing.expectError(error.InvalidSyntax, parseStrictDecimalUsize(""));
+        try std.testing.expectError(error.InvalidSyntax, parseStrictDecimalUsize("+5"));
+        try std.testing.expectError(error.InvalidSyntax, parseStrictDecimalUsize("-0"));
+        try std.testing.expectError(error.InvalidSyntax, parseStrictDecimalUsize("1_0"));
+        try std.testing.expectError(error.InvalidSyntax, parseStrictDecimalUsize("0x10"));
+        try std.testing.expectEqual(@as(usize, 42), try parseStrictDecimalUsize("42"));
+
+        try std.testing.expectError(error.InvalidSyntax, parseStrictHexUsize(""));
+        try std.testing.expectError(error.InvalidSyntax, parseStrictHexUsize("+a"));
+        try std.testing.expectError(error.InvalidSyntax, parseStrictHexUsize("-1"));
+        try std.testing.expectError(error.InvalidSyntax, parseStrictHexUsize("a_b"));
+        try std.testing.expectError(error.InvalidSyntax, parseStrictHexUsize("0x10"));
+        try std.testing.expectEqual(@as(usize, 0x1aF), try parseStrictHexUsize("1aF"));
+
+        try std.testing.expectError(
+            error.BadRequest,
+            parseHttpHeaders("POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: gzip, chunked\r\n\r\n"),
+        );
+        try std.testing.expectError(
+            error.BadRequest,
+            parseHttpHeaders("POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\nContent-Length: +5\r\n\r\nhello"),
+        );
+        try std.testing.expectError(
+            error.BadRequest,
+            parseHttpHeaders("POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\nContent-Length: 1_0\r\n\r\n0123456789"),
+        );
+        const ok_te = try parseHttpHeaders("POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: Chunked\r\n\r\n");
+        try std.testing.expect(ok_te.chunked);
+    }
+
+    // 3. Live server wire checks for F1 (413) & L4 (400).
+    const Mock = struct {
+        fn generate(_: *anyopaque, _: *const InferenceJob, stream: *TokenStream) void {
+            _ = stream.setPromptTokens(1);
+            _ = stream.emitTokenBytes("ok");
+            stream.finish(.stop, 1);
+        }
+    };
+    var dummy: u8 = 0;
+    const srv = try Server.init(std.testing.allocator, .{
+        .port = 0,
+        .max_request_bytes = 2048,
+        .max_conns = 4,
+        .max_active_requests = 2,
+        .apply_qos = false,
+    });
+    defer srv.deinit(std.testing.allocator);
+    try srv.start(.{ .ctx = &dummy, .generateFn = Mock.generate });
+    defer srv.stop();
+
+    const port = srv.boundPort();
+    var resp_buf: [4096]u8 = undefined;
+
+    const r_overflow_fe = try testHttpExchange(
+        port,
+        "POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1\r\nTransfer-Encoding: chunked\r\n\r\nfffffffffffffffe\r\n0\r\n\r\n",
+        &resp_buf,
+    );
+    try std.testing.expect(std.mem.startsWith(u8, r_overflow_fe, "HTTP/1.1 413 Payload Too Large\r\n"));
+
+    const r_overflow_ff = try testHttpExchange(
+        port,
+        "POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1\r\nTransfer-Encoding: chunked\r\n\r\nffffffffffffffff\r\n0\r\n\r\n",
+        &resp_buf,
+    );
+    try std.testing.expect(std.mem.startsWith(u8, r_overflow_ff, "HTTP/1.1 413 Payload Too Large\r\n"));
+
+    const r_huge_chunk = try testHttpExchange(
+        port,
+        "POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1\r\nTransfer-Encoding: chunked\r\n\r\n1000\r\npartial",
+        &resp_buf,
+    );
+    try std.testing.expect(std.mem.startsWith(u8, r_huge_chunk, "HTTP/1.1 413 Payload Too Large\r\n"));
+
+    const r_bad_te = try testHttpExchange(
+        port,
+        "POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1\r\nTransfer-Encoding: gzip, chunked\r\n\r\n0\r\n\r\n",
+        &resp_buf,
+    );
+    try std.testing.expect(std.mem.startsWith(u8, r_bad_te, "HTTP/1.1 400 Bad Request\r\n"));
+
+    const r_bad_chunk_hex = try testHttpExchange(
+        port,
+        "POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1\r\nTransfer-Encoding: chunked\r\n\r\n+5\r\nhello\r\n0\r\n\r\n",
+        &resp_buf,
+    );
+    try std.testing.expect(std.mem.startsWith(u8, r_bad_chunk_hex, "HTTP/1.1 400 Bad Request\r\n"));
+}
+
+test "F2 & L3 default CORS null, public-bind guard, Host DNS-rebinding rejection, early auth before 100-continue, header timeout, and peer cap" {
+    const gpa = std.testing.allocator;
+    const Mock = struct {
+        fn generate(_: *anyopaque, _: *const InferenceJob, stream: *TokenStream) void {
+            _ = stream.setPromptTokens(2);
+            _ = stream.emitTokenBytes("ok");
+            stream.finish(.stop, 2);
+        }
+    };
+    var dummy: u8 = 0;
+
+    // 1. Default `ServerConfig` disables CORS (`cors_allow_origin == null`) and rejects non-loopback unauthenticated bind.
+    const def_cfg = ServerConfig{};
+    try std.testing.expect(def_cfg.cors_allow_origin == null);
+    try std.testing.expectError(error.InvalidConfig, Server.init(gpa, .{
+        .host = .{ 0, 0, 0, 0 },
+        .port = 0,
+        .apply_qos = false,
+    }));
+    try std.testing.expectError(error.InvalidConfig, Server.init(gpa, .{
+        .host = .{ 192, 168, 1, 50 },
+        .port = 0,
+        .apply_qos = false,
+    }));
+
+    // Explicit override `allow_unauthenticated_public_bind = true` permits bind.
+    {
+        const pub_srv = try Server.init(gpa, .{
+            .host = .{ 0, 0, 0, 0 },
+            .port = 0,
+            .allow_unauthenticated_public_bind = true,
+            .max_conns = 2,
+            .max_active_requests = 1,
+            .apply_qos = false,
+        });
+        pub_srv.deinit(gpa);
+    }
+
+    // 2. Host validation & default-off CORS on TCP + unrestricted Host on AF_UNIX + header_read_timeout_ms.
+    var uds_buf: [128]u8 = undefined;
+    var uw = FixedWriter.init(&uds_buf);
+    try uw.print("/tmp/aminfer_f2_l3_{d}.sock", .{std.c.getpid()});
+    const uds_path = uw.written();
+
+    const srv = try Server.init(gpa, .{
+        .port = 0,
+        .unix_socket_path = uds_path,
+        .header_read_timeout_ms = 50,
+        .http_read_timeout_ms = 5_000,
+        .max_conns = 6,
+        .max_active_requests = 2,
+        .max_conns_per_peer = 2,
+        .apply_qos = false,
+    });
+    defer srv.deinit(gpa);
+    try srv.start(.{ .ctx = &dummy, .generateFn = Mock.generate });
+    defer srv.stop();
+
+    const port = srv.boundPort();
+    var resp_buf: [4096]u8 = undefined;
+
+    // Default CORS is disabled.
+    const r_def = try testHttpExchange(port, "GET /health HTTP/1.1\r\nHost: localhost:8080\r\n\r\n", &resp_buf);
+    try std.testing.expect(std.mem.startsWith(u8, r_def, "HTTP/1.1 200 OK\r\n"));
+    try std.testing.expectEqual(@as(?[]const u8, null), extractHeaderValue(r_def, "Access-Control-Allow-Origin"));
+
+    // Loopback Host variants allowed (`localhost`, `127.0.0.1`, `[::1]`, `0.0.0.0`).
+    for ([_][]const u8{ "localhost", "127.0.0.1:8080", "[::1]:8080", "0.0.0.0" }) |h| {
+        var req: [256]u8 = undefined;
+        var rw = FixedWriter.init(&req);
+        try rw.print("GET /health HTTP/1.1\r\nHost: {s}\r\n\r\n", .{h});
+        const rh = try testHttpExchange(port, rw.written(), &resp_buf);
+        try std.testing.expect(std.mem.startsWith(u8, rh, "HTTP/1.1 200 OK\r\n"));
+    }
+
+    // Foreign Host rejected with 403 against DNS rebinding; malformed/missing Host rejected with 400.
+    const r_evil = try testHttpExchange(port, "GET /health HTTP/1.1\r\nHost: evil.com\r\n\r\n", &resp_buf);
+    try std.testing.expect(std.mem.startsWith(u8, r_evil, "HTTP/1.1 403 Forbidden\r\n"));
+    const r_sub = try testHttpExchange(port, "GET /health HTTP/1.1\r\nHost: localhost.evil.com:8080\r\n\r\n", &resp_buf);
+    try std.testing.expect(std.mem.startsWith(u8, r_sub, "HTTP/1.1 403 Forbidden\r\n"));
+    const r_nohost = try testHttpExchange(port, "GET /health HTTP/1.1\r\n\r\n", &resp_buf);
+    try std.testing.expect(std.mem.startsWith(u8, r_nohost, "HTTP/1.1 400 Bad Request\r\n"));
+
+    // AF_UNIX IPC allows arbitrary Host header even without api_key.
+    const r_unix = try testUnixExchange(uds_path, "GET /health HTTP/1.1\r\nHost: local-ipc\r\n\r\n", &resp_buf);
+    try std.testing.expect(std.mem.startsWith(u8, r_unix, "HTTP/1.1 200 OK\r\n"));
+
+    // Short header_read_timeout_ms (50 ms) fires 408 promptly even though http_read_timeout_ms = 5000 ms!
+    {
+        const t0 = monotonicNowNs();
+        const fd = try testConnectLoopback(port);
+        defer _ = std.c.close(fd);
+        try testSendAll(fd, "GET /health HTTP/1.1\r\nHost: localhost\r\n");
+        const r_to = try testRecvAll(fd, &resp_buf);
+        const elapsed_ms = (monotonicNowNs() -| t0) / std.time.ns_per_ms;
+        try std.testing.expect(std.mem.startsWith(u8, r_to, "HTTP/1.1 408 Request Timeout\r\n"));
+        try std.testing.expect(elapsed_ms < 1000);
+    }
+
+    // Per-peer cap ignores loopback (127.0.0.1) and caps non-loopback IPv4 peers at `max_conns_per_peer` (2).
+    {
+        srv.slots[0].state = .reading_request;
+        srv.slots[0].peer_ipv4 = .{ 10, 20, 30, 40 };
+        srv.slots[1].state = .reading_request;
+        srv.slots[1].peer_ipv4 = .{ 10, 20, 30, 40 };
+        defer {
+            srv.slots[0].state = .free;
+            srv.slots[0].peer_ipv4 = null;
+            srv.slots[1].state = .free;
+            srv.slots[1].peer_ipv4 = null;
+        }
+        try std.testing.expect(!srv.shouldRejectPeerLimit(.{ 127, 0, 0, 1 }));
+        try std.testing.expect(srv.shouldRejectPeerLimit(.{ 10, 20, 30, 40 }));
+        try std.testing.expect(!srv.shouldRejectPeerLimit(.{ 10, 20, 30, 41 }));
+    }
+
+    // 3. `allow_any_host = true` bypasses Host check, and early `--api-key` auth rejects BEFORE `100 Continue` & body buffering.
+    const auth_srv = try Server.init(gpa, .{
+        .port = 0,
+        .api_key = "sk-early-auth",
+        .allow_any_host = true,
+        .max_conns = 4,
+        .max_active_requests = 2,
+        .apply_qos = false,
+    });
+    defer auth_srv.deinit(gpa);
+    try auth_srv.start(.{ .ctx = &dummy, .generateFn = Mock.generate });
+    defer auth_srv.stop();
+
+    {
+        // Send ONLY headers with Expect: 100-continue + huge Content-Length (32768) and NO body and NO API key!
+        // Server must reject immediately with 401 without waiting for body and without emitting 100 Continue.
+        const fd = try testConnectLoopback(auth_srv.boundPort());
+        defer _ = std.c.close(fd);
+        try testSendAll(
+            fd,
+            "POST /v1/chat/completions HTTP/1.1\r\nHost: evil.example\r\nExpect: 100-continue\r\nContent-Length: 32768\r\n\r\n",
+        );
+        const r_401 = try testRecvAll(fd, &resp_buf);
+        try std.testing.expect(std.mem.startsWith(u8, r_401, "HTTP/1.1 401 Unauthorized\r\n"));
+        try std.testing.expect(std.mem.indexOf(u8, r_401, "100 Continue") == null);
+    }
+    {
+        // With valid API key + Expect: 100-continue, server sends 100 Continue then accepts the body and replies 200 OK.
+        const fd = try testConnectLoopback(auth_srv.boundPort());
+        defer _ = std.c.close(fd);
+        const body = "{\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"stream\":false}";
+        var hbuf: [256]u8 = undefined;
+        var hw = FixedWriter.init(&hbuf);
+        try hw.print(
+            "POST /v1/chat/completions HTTP/1.1\r\nHost: custom.local\r\nAuthorization: Bearer sk-early-auth\r\nExpect: 100-continue\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n",
+            .{body.len},
+        );
+        try testSendAll(fd, hw.written());
+        var cont_buf: [64]u8 = undefined;
+        var got: usize = 0;
+        while (got < STATIC_100_CONTINUE.len) {
+            const n = std.c.recv(fd, cont_buf[got..].ptr, cont_buf.len - got, 0);
+            try std.testing.expect(n > 0);
+            got += @intCast(n);
+        }
+        try std.testing.expectEqualStrings(STATIC_100_CONTINUE, cont_buf[0..STATIC_100_CONTINUE.len]);
+        try testSendAll(fd, body);
+        const r_ok = try testRecvAll(fd, &resp_buf);
+        try std.testing.expect(std.mem.startsWith(u8, r_ok, "HTTP/1.1 200 OK\r\n"));
+    }
+}
+
+test "F6 keep-alive slot waits for worker_active via .draining_worker on early stop-sequence completion without slot clobber" {
+    const gpa = std.testing.allocator;
+    const SlowTailMock = struct {
+        req_count: std.atomic.Value(u32) = .init(0),
+        req1_still_reading_prompt: std.atomic.Value(bool) = .init(false),
+        saw_clobbered_prompt: std.atomic.Value(bool) = .init(false),
+
+        fn generate(ctx_ptr: *anyopaque, job: *const InferenceJob, stream: *TokenStream) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx_ptr));
+            const n = self.req_count.fetchAdd(1, .acq_rel) + 1;
+            if (n == 1) {
+                const had_first = std.mem.indexOf(u8, job.prompt, "FIRST_REQ") != null;
+                _ = stream.setPromptTokens(4);
+                _ = stream.emitTokenBytes("prefix STOP_NOW tail");
+                // Deliberately hold worker_active == true AFTER stop sequence triggers early completion on kqueue,
+                // then re-read job.prompt & job.rng to verify Request #2 did NOT clobber the slot!
+                self.req1_still_reading_prompt.store(true, .release);
+                sleepNs(25 * std.time.ns_per_ms);
+                const still_first = std.mem.indexOf(u8, job.prompt, "FIRST_REQ") != null;
+                const has_second = std.mem.indexOf(u8, job.prompt, "SECOND_REQ") != null;
+                if (!had_first or !still_first or has_second) {
+                    self.saw_clobbered_prompt.store(true, .release);
+                }
+                _ = job.rng.nextU64();
+                stream.finish(.stop, 4);
+            } else {
+                _ = stream.setPromptTokens(4);
+                _ = stream.emitTokenBytes("second_ok");
+                stream.finish(.stop, 4);
+            }
+        }
+    };
+
+    var mock = SlowTailMock{};
+    const srv = try Server.init(gpa, .{
+        .port = 0,
+        .max_conns = 2,
+        .max_active_requests = 1,
+        .apply_qos = false,
+    });
+    defer srv.deinit(gpa);
+    try srv.start(.{ .ctx = &mock, .generateFn = SlowTailMock.generate });
+    defer srv.stop();
+
+    const fd = try testConnectLoopback(srv.boundPort());
+    defer _ = std.c.close(fd);
+
+    const b1 = "{\"messages\":[{\"role\":\"user\",\"content\":\"FIRST_REQ\"}],\"stop\":[\"STOP_NOW\"],\"stream\":false}";
+    const b2 = "{\"messages\":[{\"role\":\"user\",\"content\":\"SECOND_REQ\"}],\"stream\":false}";
+    var req_buf: [1024]u8 = undefined;
+    var w = FixedWriter.init(&req_buf);
+    try w.print(
+        "POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: keep-alive\r\n\r\n{s}" ++
+            "POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}",
+        .{ b1.len, b1, b2.len, b2 },
+    );
+    try testSendAll(fd, w.written());
+
+    var resp_buf: [16384]u8 = undefined;
+    const r1 = try testRecvOneHttpResponse(fd, &resp_buf);
+    try std.testing.expect(std.mem.startsWith(u8, r1, "HTTP/1.1 200 OK\r\n"));
+    try std.testing.expect(std.mem.indexOf(u8, r1, "\"content\":\"prefix \"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r1, "STOP_NOW") == null);
+
+    const r2 = try testRecvOneHttpResponse(fd, &resp_buf);
+    try std.testing.expect(std.mem.startsWith(u8, r2, "HTTP/1.1 200 OK\r\n"));
+    try std.testing.expect(std.mem.indexOf(u8, r2, "\"content\":\"second_ok\"") != null);
+    try std.testing.expect(!mock.saw_clobbered_prompt.load(.acquire));
+    try std.testing.expectEqual(@as(u32, 2), mock.req_count.load(.acquire));
+}
+
+test "F7 /v1/embeddings and /v1/rerank offload onto worker thread without kqueue model_mutex deadlock" {
+    const gpa = std.testing.allocator;
+    const SharedModelMock = struct {
+        model_mutex: std.c.pthread_mutex_t = std.c.PTHREAD_MUTEX_INITIALIZER,
+        entered_gen: std.atomic.Value(bool) = .init(false),
+        release_gen: std.atomic.Value(bool) = .init(false),
+        embed_on_worker: std.atomic.Value(bool) = .init(false),
+        rerank_on_worker: std.atomic.Value(bool) = .init(false),
+        worker_tid: std.atomic.Value(usize) = .init(0),
+
+        fn generate(ctx_ptr: *anyopaque, _: *const InferenceJob, stream: *TokenStream) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx_ptr));
+            self.worker_tid.store(@intFromPtr(std.c.pthread_self()), .release);
+            _ = std.c.pthread_mutex_lock(&self.model_mutex);
+            defer _ = std.c.pthread_mutex_unlock(&self.model_mutex);
+
+            _ = stream.setPromptTokens(2);
+            self.entered_gen.store(true, .release);
+            // Hold model_mutex until cancelled by client disconnect or release flag.
+            while (!self.release_gen.load(.acquire) and !stream.isCancelled()) {
+                sleepNs(1_000_000);
+            }
+            if (stream.isCancelled()) return;
+            _ = stream.emitTokenBytes("done");
+            stream.finish(.stop, 2);
+        }
+
+        fn embed(ctx_ptr: *anyopaque, req: *const EmbedRequest, out_vectors: []f32) anyerror!EmbedResult {
+            const self: *@This() = @ptrCast(@alignCast(ctx_ptr));
+            _ = std.c.pthread_mutex_lock(&self.model_mutex);
+            defer _ = std.c.pthread_mutex_unlock(&self.model_mutex);
+            const tid: usize = @intFromPtr(std.c.pthread_self());
+            if (tid == self.worker_tid.load(.acquire)) {
+                self.embed_on_worker.store(true, .release);
+            }
+            const dim: usize = if (req.dimensions) |d| @intCast(d) else 2;
+            for (0..req.input_count) |i| {
+                for (0..dim) |j| out_vectors[i * dim + j] = 0.5;
+            }
+            return .{ .dim = dim, .prompt_tokens = 3 };
+        }
+
+        fn rerank(ctx_ptr: *anyopaque, req: *const RerankRequest, out_items: []RerankItem) anyerror!RerankResult {
+            const self: *@This() = @ptrCast(@alignCast(ctx_ptr));
+            _ = std.c.pthread_mutex_lock(&self.model_mutex);
+            defer _ = std.c.pthread_mutex_unlock(&self.model_mutex);
+            const tid: usize = @intFromPtr(std.c.pthread_self());
+            if (tid == self.worker_tid.load(.acquire)) {
+                self.rerank_on_worker.store(true, .release);
+            }
+            for (0..req.document_count) |i| {
+                out_items[i] = .{ .index = @intCast(i), .relevance_score = 0.9 - @as(f32, @floatFromInt(i)) * 0.1 };
+            }
+            return .{ .count = req.document_count, .prompt_tokens = 4 };
+        }
+    };
+
+    var mock = SharedModelMock{};
+    const srv = try Server.init(gpa, .{
+        .port = 0,
+        .max_conns = 6,
+        .max_active_requests = 2,
+        .embedding_handler = .{ .ctx = &mock, .embedFn = SharedModelMock.embed },
+        .rerank_handler = .{ .ctx = &mock, .rerankFn = SharedModelMock.rerank },
+        .apply_qos = false,
+    });
+    defer srv.deinit(gpa);
+    try srv.start(.{ .ctx = &mock, .generateFn = SharedModelMock.generate });
+    defer srv.stop();
+
+    const port = srv.boundPort();
+    var req_buf: [1024]u8 = undefined;
+    var resp_buf: [8192]u8 = undefined;
+
+    // 1. Start streaming request holding `model_mutex` on the worker thread.
+    const s_fd = try testConnectLoopback(port);
+    errdefer _ = std.c.close(s_fd);
+    const s_body = "{\"messages\":[{\"role\":\"user\",\"content\":\"hold\"}],\"stream\":true}";
+    var sw = FixedWriter.init(&req_buf);
+    try sw.print("POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ s_body.len, s_body });
+    try testSendAll(s_fd, sw.written());
+
+    var waited: usize = 0;
+    while (!mock.entered_gen.load(.acquire) and waited < 400) : (waited += 1) {
+        sleepNs(1_000_000);
+    }
+    try std.testing.expect(mock.entered_gen.load(.acquire));
+
+    // 2. While worker holds `model_mutex`, open `/v1/embeddings` request on a second socket (non-blocking send).
+    const e_fd = try testConnectLoopback(port);
+    defer _ = std.c.close(e_fd);
+    const e_body = "{\"input\":\"vec\",\"dimensions\":2}";
+    var ew = FixedWriter.init(&req_buf);
+    try ew.print("POST /v1/embeddings HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ e_body.len, e_body });
+    try testSendAll(e_fd, ew.written());
+
+    // 3. Even with `/v1/embeddings` queued and `model_mutex` locked by worker, kqueue responds to `GET /health` immediately!
+    const h_resp = try testHttpExchange(port, "GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n", &resp_buf);
+    try std.testing.expect(std.mem.startsWith(u8, h_resp, "HTTP/1.1 200 OK\r\n"));
+
+    // 4. Disconnect stalled streaming client (`EV_EOF` handled by unblocked kqueue!), releasing worker & `model_mutex` -> `/v1/embeddings` completes!
+    _ = std.c.close(s_fd);
+    const e_resp = try testRecvAll(e_fd, &resp_buf);
+    try std.testing.expect(std.mem.startsWith(u8, e_resp, "HTTP/1.1 200 OK\r\n"));
+    try std.testing.expect(mock.embed_on_worker.load(.acquire));
+
+    // 5. `/v1/rerank` also runs on the worker thread.
+    const r_resp = try testHttpPostJson(port, "/v1/rerank", "{\"query\":\"q\",\"documents\":[\"d0\",\"d1\"]}", &req_buf, &resp_buf);
+    try std.testing.expect(std.mem.startsWith(u8, r_resp, "HTTP/1.1 200 OK\r\n"));
+    try std.testing.expect(mock.rerank_on_worker.load(.acquire));
+}
+
+test "F24 & L8 depth-1 previous_response_id scan, >64B keys, lone JSON surrogates, U+FFFD escaping, and /responses cancel body/SSE" {
+    const gpa = std.testing.allocator;
+
+    // 1. L8 `JsonReader.skipString` rejects lone surrogates, accepts valid pair, and `readKeyOrSkip` skips >64 B keys.
+    {
+        var r_lone_hi = JsonReader{ .src = "\"\\uD800\"" };
+        try std.testing.expectError(error.InvalidJson, r_lone_hi.skipString());
+
+        var r_lone_lo = JsonReader{ .src = "\"\\uDC00\"" };
+        try std.testing.expectError(error.InvalidJson, r_lone_lo.skipString());
+
+        var r_bad_pair = JsonReader{ .src = "\"\\uD800\\u0041\"" };
+        try std.testing.expectError(error.InvalidJson, r_bad_pair.skipString());
+
+        var r_good_pair = JsonReader{ .src = "\"\\uD83D\\uDE80\"" };
+        try r_good_pair.skipString();
+
+        // > 64 B unknown key skipped cleanly without `error.InvalidJson` (Appendix A.6 parity).
+        const long_key_json = "{\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\":123,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}";
+        var pbuf: [1024]u8 = undefined;
+        var mbuf: [MAX_MODEL_ID_BYTES]u8 = undefined;
+        const parsed = try parseInferenceRequest(.chat_completions, long_key_json, "m", &pbuf, &mbuf);
+        try std.testing.expect(parsed.prompt_len > 0);
+    }
+
+    // 2. L8 `writeJsonEscaped` replaces invalid UTF-8 bytes with U+FFFD (`\xEF\xBF\xBD`).
+    {
+        var out: [128]u8 = undefined;
+        var w = FixedWriter.init(&out);
+        try w.writeJsonEscaped("ok-\x80-\xE4\xBD-end");
+        try std.testing.expect(std.unicode.utf8ValidateSlice(w.written()));
+        try std.testing.expectEqualStrings("ok-\xEF\xBF\xBD-\xEF\xBF\xBD\xEF\xBF\xBD-end", w.written());
+    }
+
+    // 3. F24.1 `findTopLevelJsonStringField` ignores nested `"previous_response_id"` while matching top-level (even escaped or after >64 B key).
+    {
+        var dst: [MAX_RESPONSE_ID_BYTES]u8 = undefined;
+        const nested_only =
+            "{\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\":{\"previous_response_id\":\"resp_1\"}," ++
+            "\"metadata\":{\"previous_response_id\":\"resp_1\"}," ++
+            "\"input\":[{\"role\":\"user\",\"content\":\"{\\\"previous_response_id\\\":\\\"resp_1\\\"}\"}]}";
+        try std.testing.expectEqual(@as(?[]const u8, null), findTopLevelJsonStringField(nested_only, "previous_response_id", &dst));
+
+        const top_level_after_nested =
+            "{\"metadata\":{\"previous_response_id\":\"resp_wrong\"},\"previous\\u005fresponse_id\":\"resp_right\"}";
+        try std.testing.expectEqualStrings("resp_right", findTopLevelJsonStringField(top_level_after_nested, "previous_response_id", &dst).?);
+    }
+
+    // 4. Live server: F24.1 isolation + L8 `POST /v1/responses/{id}/cancel` sends valid cancelled JSON (`stream: false`) and `event: response.cancelled` (`stream: true`).
+    const CancelMock = struct {
+        hold_open: std.atomic.Value(bool) = .init(false),
+        entered_hold: std.atomic.Value(bool) = .init(false),
+        saw_secret: std.atomic.Value(bool) = .init(false),
+
+        fn generate(ctx_ptr: *anyopaque, job: *const InferenceJob, stream: *TokenStream) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx_ptr));
+            if (std.mem.indexOf(u8, job.prompt, "TOP_SECRET_TURN1") != null) {
+                self.saw_secret.store(true, .release);
+            }
+            _ = stream.setPromptTokens(4);
+            if (self.hold_open.load(.acquire)) {
+                self.entered_hold.store(true, .release);
+                while (!stream.isCancelled()) {
+                    sleepNs(1_000_000);
+                }
+                return;
+            }
+            _ = stream.emitTokenBytes("TOP_SECRET_TURN1");
+            stream.finish(.stop, 4);
+        }
+    };
+
+    var mock = CancelMock{};
+    const srv = try Server.init(gpa, .{
+        .port = 0,
+        .max_conns = 6,
+        .max_active_requests = 2,
+        .apply_qos = false,
+    });
+    defer srv.deinit(gpa);
+    try srv.start(.{ .ctx = &mock, .generateFn = CancelMock.generate });
+    defer srv.stop();
+
+    const port = srv.boundPort();
+    var req_buf: [2048]u8 = undefined;
+    var resp_buf: [16384]u8 = undefined;
+
+    // Seed resp_1 with TOP_SECRET_TURN1.
+    const r1 = try testHttpPostJson(port, "/v1/responses", "{\"input\":\"turn1\",\"stream\":false}", &req_buf, &resp_buf);
+    try std.testing.expect(std.mem.startsWith(u8, r1, "HTTP/1.1 200 OK\r\n"));
+
+    // Send nested `"previous_response_id":"resp_1"` inside metadata/input WITHOUT top-level previous_response_id -> must NOT leak resp_1 transcript!
+    const nested_req =
+        \\{"metadata":{"previous_response_id":"resp_1"},"input":[{"role":"user","content":"{\"previous_response_id\":\"resp_1\"} hi"}],"stream":false}
+    ;
+    const r2 = try testHttpPostJson(port, "/v1/responses", nested_req, &req_buf, &resp_buf);
+    try std.testing.expect(std.mem.startsWith(u8, r2, "HTTP/1.1 200 OK\r\n"));
+    try std.testing.expect(!mock.saw_secret.load(.acquire));
+
+    // Non-streaming `/v1/responses` cancelled via `POST /v1/responses/resp_3/cancel` -> original requester receives valid JSON `"status":"cancelled"`.
+    mock.hold_open.store(true, .release);
+    {
+        mock.entered_hold.store(false, .release);
+        const orig_fd = try testConnectLoopback(port);
+        defer _ = std.c.close(orig_fd);
+        const body = "{\"input\":\"wait\",\"stream\":false}";
+        var w = FixedWriter.init(&req_buf);
+        try w.print("POST /v1/responses HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ body.len, body });
+        try testSendAll(orig_fd, w.written());
+
+        var waited: usize = 0;
+        while (!mock.entered_hold.load(.acquire) and waited < 400) : (waited += 1) sleepNs(1_000_000);
+        try std.testing.expect(mock.entered_hold.load(.acquire));
+
+        const c_resp = try testHttpExchange(port, "POST /v1/responses/resp_3/cancel HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n", &resp_buf);
+        try std.testing.expect(std.mem.startsWith(u8, c_resp, "HTTP/1.1 200 OK\r\n"));
+
+        const orig_resp = try testRecvAll(orig_fd, &resp_buf);
+        try std.testing.expect(std.mem.startsWith(u8, orig_resp, "HTTP/1.1 200 OK\r\n"));
+        const orig_json = extractHttpBody(orig_resp) orelse return error.TestUnexpectedResult;
+        try expectValidJson(orig_json);
+        try std.testing.expect(std.mem.indexOf(u8, orig_json, "\"status\":\"cancelled\"") != null);
+    }
+
+    // Streaming `/v1/responses` cancelled via `POST /v1/responses/resp_4/cancel` -> original requester receives `event: response.cancelled`.
+    {
+        mock.entered_hold.store(false, .release);
+        const orig_fd = try testConnectLoopback(port);
+        defer _ = std.c.close(orig_fd);
+        const body = "{\"input\":\"wait-sse\",\"stream\":true}";
+        var w = FixedWriter.init(&req_buf);
+        try w.print("POST /v1/responses HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ body.len, body });
+        try testSendAll(orig_fd, w.written());
+
+        var waited: usize = 0;
+        while (!mock.entered_hold.load(.acquire) and waited < 400) : (waited += 1) sleepNs(1_000_000);
+        try std.testing.expect(mock.entered_hold.load(.acquire));
+
+        const c_resp = try testHttpExchange(port, "POST /v1/responses/resp_4/cancel HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n", &resp_buf);
+        try std.testing.expect(std.mem.startsWith(u8, c_resp, "HTTP/1.1 200 OK\r\n"));
+
+        const orig_sse = try testRecvAll(orig_fd, &resp_buf);
+        try std.testing.expect(std.mem.startsWith(u8, orig_sse, "HTTP/1.1 200 OK\r\n"));
+        try std.testing.expect(std.mem.indexOf(u8, orig_sse, "event: response.cancelled\n") != null);
+        try std.testing.expect(std.mem.indexOf(u8, orig_sse, "\"status\":\"cancelled\"") != null);
     }
 }
