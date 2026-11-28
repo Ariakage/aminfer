@@ -31,6 +31,19 @@ kernels.
 - Remote experts will reuse the cold-expert machinery with their own latency
   and bandwidth model.
 
+## Transport security and authentication
+
+- Baseline cluster execution assumes a dedicated, trusted point-to-point
+  Thunderbolt Bridge / RDMA link between peers rather than an untrusted shared
+  LAN (`L5`).
+- Every framed cluster RPC (`FrameChannel` in
+  [`src/cluster/transport.zig`](../../src/cluster/transport.zig)) supports
+  optional pre-shared key (`psk`) HMAC-SHA256 authentication across all frame
+  headers and payloads (`PeerWorkerConfig.psk` and `CoordinatorConfig.psk`,
+  landed in `0fe3d1e`). When `psk` is configured via `--cluster-psk` or
+  `AMINFER_CLUSTER_PSK` (`d52873b`), unauthenticated or mismatched peers are
+  rejected with `error.AuthenticationFailed`.
+
 ## Evidence
 
 - The baseline machine is Thunderbolt 4 class (40 Gb/s): IP over Thunderbolt
