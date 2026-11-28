@@ -97,6 +97,8 @@ struct ami_compute {
     int32_t active_slot;             // -1 when no frame is open
     uint32_t uniform_cursor;
     uint64_t next_signal;
+    uint64_t last_committed_signal;
+    bool needs_queue_barrier;
     ami_frame_slot slots[AMI_MAX_FRAMES_IN_FLIGHT];
 };
 
@@ -771,23 +773,93 @@ ami_status ami_compute_create_with_frames(ami_device *device, uint32_t frames_in
     return AMI_OK;
 }
 
+static uint64_t ami_compute_max_pending_signal(const ami_compute *compute) {
+    uint64_t max_sig = compute->last_committed_signal;
+    for (uint32_t i = 0; i < compute->frame_count; i++) {
+        if (compute->slots[i].in_flight && compute->slots[i].last_signal > max_sig) {
+            max_sig = compute->slots[i].last_signal;
+        }
+    }
+    return max_sig;
+}
+
+static void ami_compute_clear_completed_slots(ami_compute *compute, uint64_t signaled) {
+    for (uint32_t i = 0; i < compute->frame_count; i++) {
+        if (compute->slots[i].in_flight && signaled >= compute->slots[i].last_signal) {
+            compute->slots[i].in_flight = false;
+        }
+    }
+}
+
+static bool ami_compute_wait_idle_internal(ami_compute *compute,
+                                           uint64_t total_timeout_ms,
+                                           uint64_t step_ms) {
+    if (compute == NULL) {
+        return true;
+    }
+    @autoreleasepool {
+        id<MTLSharedEvent> event = (__bridge id<MTLSharedEvent>)compute->mtl_event;
+        const uint64_t max_sig = ami_compute_max_pending_signal(compute);
+        if (max_sig == 0 || event == nil) {
+            ami_compute_clear_completed_slots(compute, UINT64_MAX);
+            return true;
+        }
+        uint64_t signaled = event.signaledValue;
+        if (signaled >= max_sig) {
+            ami_compute_clear_completed_slots(compute, signaled);
+            return true;
+        }
+        if (total_timeout_ms == 0) {
+            return false;
+        }
+        uint64_t remaining = total_timeout_ms;
+        const uint64_t step = (step_ms > 0) ? step_ms : total_timeout_ms;
+        while (remaining > 0) {
+            const uint64_t chunk = (remaining < step) ? remaining : step;
+            if ([event waitUntilSignaledValue:max_sig timeoutMS:chunk] ||
+                event.signaledValue >= max_sig) {
+                ami_compute_clear_completed_slots(compute, event.signaledValue);
+                return true;
+            }
+            remaining -= chunk;
+        }
+        signaled = event.signaledValue;
+        ami_compute_clear_completed_slots(compute, signaled);
+        return signaled >= max_sig;
+    }
+}
+
+ami_status ami_compute_wait_idle(ami_compute *compute, uint64_t timeout_ms) {
+    if (compute == NULL) {
+        return AMI_ERR_INVALID_ARGUMENT;
+    }
+    return ami_compute_wait_idle_internal(compute, timeout_ms, 1000ull)
+               ? AMI_OK
+               : AMI_ERR_TIMEOUT;
+}
+
+void ami_compute_wait_idle_best_effort(ami_compute *compute) {
+    if (compute == NULL) {
+        return;
+    }
+    ami_compute_abort_frame(compute);
+    (void)ami_compute_wait_idle_internal(compute, 30000ull, 5000ull);
+}
+
 void ami_compute_destroy(ami_compute *compute) {
     if (compute == NULL) {
         return;
     }
     ami_compute_abort_frame(compute);
+    // Bounded retries with completion fence check so timed-out GPU command buffers
+    // finish (or hit Metal watchdog reset) before residency/slots are torn down.
+    if (!ami_compute_wait_idle_internal(compute, 30000ull, 5000ull)) {
+        fprintf(stderr,
+                "aminfer: ami_compute_destroy timed out waiting for GPU completion after 30000ms; "
+                "skipping unsafe residency/slot teardown\n");
+        return;
+    }
     @autoreleasepool {
-        id<MTLSharedEvent> event = (__bridge id<MTLSharedEvent>)compute->mtl_event;
-        uint64_t max_sig = 0;
-        for (uint32_t i = 0; i < compute->frame_count; i++) {
-            if (compute->slots[i].in_flight && compute->slots[i].last_signal > max_sig) {
-                max_sig = compute->slots[i].last_signal;
-            }
-        }
-        if (max_sig > 0 && event != nil) {
-            [event waitUntilSignaledValue:max_sig timeoutMS:5000];
-        }
-
         id<MTL4CommandQueue> queue = (__bridge id<MTL4CommandQueue>)compute->mtl_queue;
         id<MTLResidencySet> user_res =
             (__bridge id<MTLResidencySet>)compute->mtl_user_residency_set;
@@ -935,6 +1007,22 @@ ami_status ami_compute_clear_residency(ami_compute *compute) {
     return AMI_OK;
 }
 
+static void ami_compute_apply_dispatch_barriers(ami_compute *compute,
+                                                id<MTL4ComputeCommandEncoder> encoder,
+                                                uint32_t insert_barrier_before) {
+    if (compute->needs_queue_barrier) {
+        [encoder barrierAfterQueueStages:MTLStageDispatch
+                            beforeStages:MTLStageDispatch
+                       visibilityOptions:MTL4VisibilityOptionDevice];
+        compute->needs_queue_barrier = false;
+    }
+    if (insert_barrier_before != 0) {
+        [encoder barrierAfterEncoderStages:MTLStageDispatch
+                       beforeEncoderStages:MTLStageDispatch
+                         visibilityOptions:MTL4VisibilityOptionDevice];
+    }
+}
+
 ami_status ami_compute_begin_frame(ami_compute *compute, uint64_t timeout_ms,
                                    uint32_t *out_slot) {
     if (compute == NULL || compute->active_slot >= 0) {
@@ -957,11 +1045,17 @@ ami_status ami_compute_begin_frame(ami_compute *compute, uint64_t timeout_ms,
             slot->in_flight = false;
         }
 
+        const uint64_t signaled = (event != nil) ? event.signaledValue : UINT64_MAX;
+        ami_compute_clear_completed_slots(compute, signaled);
+        compute->needs_queue_barrier =
+            (compute->last_committed_signal > 0 && signaled < compute->last_committed_signal);
+
         [cb beginCommandBufferWithAllocator:allocator];
         id<MTL4ComputeCommandEncoder> encoder = [cb computeCommandEncoder];
         if (encoder == nil) {
             [cb endCommandBuffer];
             [allocator reset];
+            compute->needs_queue_barrier = false;
             return AMI_ERR_COMPUTE;
         }
         compute->active_encoder = (__bridge_retained void *)encoder;
@@ -994,6 +1088,7 @@ void ami_compute_abort_frame(ami_compute *compute) {
     }
     compute->active_slot = -1;
     compute->uniform_cursor = 0;
+    compute->needs_queue_barrier = false;
 }
 
 ami_status ami_compute_encode_dispatch(ami_compute *compute, const ami_pipeline *pipeline,
@@ -1052,11 +1147,7 @@ ami_status ami_compute_encode_dispatch_ex(ami_compute *compute, const ami_pipeli
         id<MTL4ArgumentTable> arg_table = (__bridge id<MTL4ArgumentTable>)slot->mtl_arg_table;
         id<MTLComputePipelineState> state = pipeline_of(pipeline);
 
-        if (insert_barrier_before != 0) {
-            [encoder barrierAfterEncoderStages:MTLStageDispatch
-                           beforeEncoderStages:MTLStageDispatch
-                             visibilityOptions:MTL4VisibilityOptionDevice];
-        }
+        ami_compute_apply_dispatch_barriers(compute, encoder, insert_barrier_before);
 
         for (size_t i = 0; i < binding_count; i++) {
             MTLGPUAddress addr = buffer_of(bindings[i].buffer).gpuAddress + bindings[i].offset;
@@ -1141,11 +1232,7 @@ ami_status ami_mtl4_compute_dispatch_indirect(ami_compute *compute, const ami_pi
         id<MTL4ArgumentTable> arg_table = (__bridge id<MTL4ArgumentTable>)slot->mtl_arg_table;
         id<MTLComputePipelineState> state = pipeline_of(pipeline);
 
-        if (insert_barrier_before != 0) {
-            [encoder barrierAfterEncoderStages:MTLStageDispatch
-                           beforeEncoderStages:MTLStageDispatch
-                             visibilityOptions:MTL4VisibilityOptionDevice];
-        }
+        ami_compute_apply_dispatch_barriers(compute, encoder, insert_barrier_before);
 
         for (size_t i = 0; i < binding_count; i++) {
             MTLGPUAddress addr = buffer_of(bindings[i].buffer).gpuAddress + bindings[i].offset;
@@ -1194,6 +1281,8 @@ ami_status ami_compute_commit_frame(ami_compute *compute, uint64_t *out_signal) 
         uint64_t sig = compute->next_signal++;
         slot->last_signal = sig;
         slot->in_flight = true;
+        compute->last_committed_signal = sig;
+        compute->needs_queue_barrier = false;
         [queue signalEvent:event value:sig];
 
         compute->active_slot = -1;
@@ -1269,7 +1358,8 @@ struct ami_ane_model {
 
 struct ami_ane_tensor {
     void *ml_array; // MLMultiArray *, retained (backed zero-copy by CVPixelBuffer)
-    CVPixelBufferRef pixel_buffer; // borrowed for zero-copy identity checks
+    CVPixelBufferRef pixel_buffer; // explicitly retained when owns_pixel_buffer is true
+    bool owns_pixel_buffer;
     uint32_t rank;
     uint32_t shape[AMI_ANE_MAX_DIMS];
 };
@@ -1596,6 +1686,39 @@ ami_status ami_ane_model_io_name(const ami_ane_model *model, uint32_t is_output,
     return AMI_OK;
 }
 
+static ami_status ami_ane_tensor_wrap_pixel_buffer(CVPixelBufferRef pb,
+                                                   const uint32_t *shape,
+                                                   size_t rank,
+                                                   ami_ane_tensor **out_tensor) {
+    ami_ane_tensor *tensor = calloc(1, sizeof *tensor);
+    if (tensor == NULL) {
+        return AMI_ERR_OUT_OF_MEMORY;
+    }
+
+    @autoreleasepool {
+        NSMutableArray<NSNumber *> *ns_shape = [NSMutableArray arrayWithCapacity:rank];
+        for (size_t i = 0; i < rank; i++) {
+            [ns_shape addObject:@(shape[i])];
+        }
+
+        MLMultiArray *arr = [[MLMultiArray alloc] initWithPixelBuffer:pb shape:ns_shape];
+        if (arr == nil) {
+            free(tensor);
+            return AMI_ERR_ANE;
+        }
+        CVPixelBufferRetain(pb);
+        tensor->ml_array = (__bridge_retained void *)arr;
+        tensor->pixel_buffer = pb;
+        tensor->owns_pixel_buffer = true;
+        tensor->rank = (uint32_t)rank;
+        for (size_t i = 0; i < rank; i++) {
+            tensor->shape[i] = shape[i];
+        }
+        *out_tensor = tensor;
+    }
+    return AMI_OK;
+}
+
 ami_status ami_ane_tensor_from_kv_tile(const ami_kv_tile *tile, const uint32_t *shape,
                                        size_t rank, ami_ane_tensor **out_tensor) {
     if (out_tensor == NULL) {
@@ -1623,46 +1746,23 @@ ami_status ami_ane_tensor_from_kv_tile(const ami_kv_tile *tile, const uint32_t *
         return AMI_ERR_INVALID_ARGUMENT;
     }
 
-    @autoreleasepool {
-        NSMutableArray<NSNumber *> *ns_shape = [NSMutableArray arrayWithCapacity:rank];
-        for (size_t i = 0; i < rank; i++) {
-            [ns_shape addObject:@(shape[i])];
-        }
-
-        // Balance CoreVideo ownership whether CoreML retains or adopts pixel_buffer.
-        CFIndex rc_before = CFGetRetainCount(tile->pixel_buffer);
-        MLMultiArray *arr = [[MLMultiArray alloc] initWithPixelBuffer:tile->pixel_buffer
-                                                                shape:ns_shape];
-        if (arr == nil) {
-            return AMI_ERR_ANE;
-        }
-        CFIndex rc_after = CFGetRetainCount(tile->pixel_buffer);
-        if (rc_after <= rc_before) {
-            CVPixelBufferRetain(tile->pixel_buffer);
-        }
-
-        ami_ane_tensor *tensor = calloc(1, sizeof *tensor);
-        if (tensor == NULL) {
-            return AMI_ERR_OUT_OF_MEMORY;
-        }
-        tensor->ml_array = (__bridge_retained void *)arr;
-        tensor->pixel_buffer = tile->pixel_buffer;
-        tensor->rank = (uint32_t)rank;
-        for (size_t i = 0; i < rank; i++) {
-            tensor->shape[i] = shape[i];
-        }
-        *out_tensor = tensor;
-    }
-    return AMI_OK;
+    return ami_ane_tensor_wrap_pixel_buffer(tile->pixel_buffer, shape, rank, out_tensor);
 }
 
 void ami_ane_tensor_destroy(ami_ane_tensor *tensor) {
     if (tensor == NULL) {
         return;
     }
-    if (tensor->ml_array != NULL) {
-        CFRelease(tensor->ml_array);
-        tensor->ml_array = NULL;
+    @autoreleasepool {
+        if (tensor->ml_array != NULL) {
+            CFRelease(tensor->ml_array);
+            tensor->ml_array = NULL;
+        }
+        if (tensor->owns_pixel_buffer && tensor->pixel_buffer != NULL) {
+            CVPixelBufferRelease(tensor->pixel_buffer);
+            tensor->pixel_buffer = NULL;
+            tensor->owns_pixel_buffer = false;
+        }
     }
     free(tensor);
 }
@@ -1916,6 +2016,8 @@ static id<MTLTexture> vision_plane_texture_of(const ami_vision_frame *frame, uin
 static ami_status vision_frame_init_from_mtl_device(id<MTLDevice> mtl_device,
                                                     CVPixelBufferRef pixel_buffer,
                                                     uint64_t requested_alloc_bytes,
+                                                    uint32_t max_dim,
+                                                    uint64_t max_pixels,
                                                     uint32_t vt_decoded,
                                                     int64_t pts_value,
                                                     int32_t pts_timescale,
@@ -1924,7 +2026,7 @@ static ami_status vision_frame_init_from_mtl_device(id<MTLDevice> mtl_device,
         return AMI_ERR_INVALID_ARGUMENT;
     }
     *out_frame = NULL;
-    if (mtl_device == nil || pixel_buffer == NULL) {
+    if (mtl_device == nil || pixel_buffer == NULL || max_dim == 0 || max_pixels == 0) {
         return AMI_ERR_INVALID_ARGUMENT;
     }
 
@@ -1967,7 +2069,8 @@ static ami_status vision_frame_init_from_mtl_device(id<MTLDevice> mtl_device,
 
     const size_t width = CVPixelBufferGetWidth(pixel_buffer);
     const size_t height = CVPixelBufferGetHeight(pixel_buffer);
-    if (width == 0 || height == 0 || width > AMI_MAX_TEXTURE_DIM || height > AMI_MAX_TEXTURE_DIM) {
+    if (width == 0 || height == 0 || width > max_dim || height > max_dim ||
+        (uint64_t)width > max_pixels / (uint64_t)height) {
         return AMI_ERR_VISION;
     }
 
@@ -2231,7 +2334,9 @@ ami_status ami_vision_frame_create(ami_device *device, uint32_t format,
         return st;
     }
 
-    st = vision_frame_init_from_mtl_device(device_of(device), pb, alloc_bytes, 0u, 0, 0, out_frame);
+    st = vision_frame_init_from_mtl_device(
+        device_of(device), pb, alloc_bytes, AMI_MAX_TEXTURE_DIM,
+        (uint64_t)AMI_MAX_TEXTURE_DIM * (uint64_t)AMI_MAX_TEXTURE_DIM, 0u, 0, 0, out_frame);
     CVPixelBufferRelease(pb);
     return st;
 }
@@ -2357,14 +2462,9 @@ ami_status ami_vision_frame_probe_ane(const ami_vision_frame *frame,
         if (frame->format == AMI_VISION_FMT_F16 &&
             frame->plane_bytes_per_row[0] == frame->width * 2u) {
             NSArray<NSNumber *> *shape = @[ @(frame->height), @(frame->width) ];
-            CFIndex rc_before = CFGetRetainCount(frame->pixel_buffer);
             MLMultiArray *arr = [[MLMultiArray alloc] initWithPixelBuffer:frame->pixel_buffer
                                                                     shape:shape];
             if (arr != nil) {
-                CFIndex rc_after = CFGetRetainCount(frame->pixel_buffer);
-                if (rc_after <= rc_before) {
-                    CVPixelBufferRetain(frame->pixel_buffer);
-                }
                 CVPixelBufferRef arr_pb = arr.pixelBuffer;
                 IOSurfaceRef arr_surface = (arr_pb != NULL) ? CVPixelBufferGetIOSurface(arr_pb) : NULL;
                 if (arr_pb == frame->pixel_buffer &&
@@ -2413,36 +2513,7 @@ ami_status ami_ane_tensor_from_vision_frame(const ami_vision_frame *frame,
         return AMI_ERR_INVALID_ARGUMENT;
     }
 
-    @autoreleasepool {
-        NSMutableArray<NSNumber *> *ns_shape = [NSMutableArray arrayWithCapacity:rank];
-        for (size_t i = 0; i < rank; i++) {
-            [ns_shape addObject:@(shape[i])];
-        }
-
-        CFIndex rc_before = CFGetRetainCount(frame->pixel_buffer);
-        MLMultiArray *arr = [[MLMultiArray alloc] initWithPixelBuffer:frame->pixel_buffer
-                                                                shape:ns_shape];
-        if (arr == nil) {
-            return AMI_ERR_ANE;
-        }
-        CFIndex rc_after = CFGetRetainCount(frame->pixel_buffer);
-        if (rc_after <= rc_before) {
-            CVPixelBufferRetain(frame->pixel_buffer);
-        }
-
-        ami_ane_tensor *tensor = calloc(1, sizeof *tensor);
-        if (tensor == NULL) {
-            return AMI_ERR_OUT_OF_MEMORY;
-        }
-        tensor->ml_array = (__bridge_retained void *)arr;
-        tensor->pixel_buffer = frame->pixel_buffer;
-        tensor->rank = (uint32_t)rank;
-        for (size_t i = 0; i < rank; i++) {
-            tensor->shape[i] = shape[i];
-        }
-        *out_tensor = tensor;
-    }
-    return AMI_OK;
+    return ami_ane_tensor_wrap_pixel_buffer(frame->pixel_buffer, shape, rank, out_tensor);
 }
 
 ami_status ami_compute_make_vision_frames_resident(ami_compute *compute,
@@ -2471,6 +2542,7 @@ ami_status ami_compute_make_vision_frames_resident(ami_compute *compute,
             }
         }
         [user_res commit];
+        [user_res requestResidency];
     }
     return AMI_OK;
 }
@@ -2555,11 +2627,7 @@ ami_status ami_compute_encode_dispatch_vision(ami_compute *compute,
         id<MTL4ArgumentTable> arg_table = (__bridge id<MTL4ArgumentTable>)slot->mtl_arg_table;
         id<MTLComputePipelineState> state = pipeline_of(pipeline);
 
-        if (insert_barrier_before != 0) {
-            [encoder barrierAfterEncoderStages:MTLStageDispatch
-                           beforeEncoderStages:MTLStageDispatch
-                             visibilityOptions:MTL4VisibilityOptionDevice];
-        }
+        ami_compute_apply_dispatch_barriers(compute, encoder, insert_barrier_before);
 
         for (size_t i = 0; i < binding_count; i++) {
             MTLGPUAddress addr = buffer_of(bindings[i].buffer).gpuAddress + bindings[i].offset;
@@ -2608,7 +2676,8 @@ static ami_status vision_frame_from_cg_image(ami_device *device,
 
     const size_t width = CGImageGetWidth(cg_img);
     const size_t height = CGImageGetHeight(cg_img);
-    if (width == 0 || height == 0 || width > max_dim || height > max_dim) {
+    if (width == 0 || height == 0 || width > max_dim || height > max_dim ||
+        (uint64_t)width > AMI_VISION_MAX_IMAGE_PIXELS / (uint64_t)height) {
         return AMI_ERR_VISION;
     }
 
@@ -2701,6 +2770,89 @@ static ami_status cg_image_from_vision_frame(ami_vision_frame *frame,
     return AMI_OK;
 }
 
+static ami_status vision_validate_image_source_index(CGImageSourceRef src,
+                                                     size_t idx,
+                                                     NSDictionary *src_opts,
+                                                     uint32_t max_dim,
+                                                     uint64_t *out_est_bytes) {
+    if (out_est_bytes != NULL) {
+        *out_est_bytes = 0;
+    }
+    CFDictionaryRef props_cf =
+        CGImageSourceCopyPropertiesAtIndex(src, idx, (__bridge CFDictionaryRef)src_opts);
+    if (props_cf == NULL) {
+        return AMI_ERR_VISION;
+    }
+    NSDictionary *props = (__bridge_transfer NSDictionary *)props_cf;
+    NSNumber *w_num = props[(__bridge id)kCGImagePropertyPixelWidth];
+    NSNumber *h_num = props[(__bridge id)kCGImagePropertyPixelHeight];
+    if (![w_num isKindOfClass:[NSNumber class]] || ![h_num isKindOfClass:[NSNumber class]]) {
+        return AMI_ERR_VISION;
+    }
+    const long long ws = [w_num longLongValue];
+    const long long hs = [h_num longLongValue];
+    if (ws <= 0 || hs <= 0 ||
+        (uint64_t)ws > (uint64_t)max_dim || (uint64_t)hs > (uint64_t)max_dim) {
+        return AMI_ERR_VISION;
+    }
+    const uint64_t w = (uint64_t)ws;
+    const uint64_t h = (uint64_t)hs;
+    if (w > AMI_VISION_MAX_IMAGE_PIXELS / h) {
+        return AMI_ERR_VISION;
+    }
+    if (out_est_bytes != NULL) {
+        const uint64_t bpr = align_up_u64(w * 4u, 64u);
+        *out_est_bytes = align_up_u64(bpr * h, AMI_PAGE_SIZE);
+    }
+    return AMI_OK;
+}
+
+static ami_status vision_decode_cg_image_source_index(ami_device *device,
+                                                      CGImageSourceRef src,
+                                                      size_t idx,
+                                                      NSDictionary *src_opts,
+                                                      uint32_t max_dim,
+                                                      uint64_t *io_total_surface_bytes,
+                                                      ami_vision_frame **out_frame) {
+    *out_frame = NULL;
+    uint64_t est_bytes = 0;
+    ami_status st = vision_validate_image_source_index(src, idx, src_opts, max_dim, &est_bytes);
+    if (st != AMI_OK) {
+        return st;
+    }
+    if (io_total_surface_bytes != NULL &&
+        est_bytes > AMI_VISION_MAX_TOTAL_SURFACE_BYTES - *io_total_surface_bytes) {
+        return AMI_ERR_VISION;
+    }
+
+    NSDictionary *img_opts = @{
+        (__bridge id)kCGImageSourceShouldCache: @NO,
+        (__bridge id)kCGImageSourceShouldCacheImmediately: @NO,
+    };
+    CGImageRef cg_img = CGImageSourceCreateImageAtIndex(
+        src, idx, (__bridge CFDictionaryRef)img_opts);
+    if (cg_img == NULL) {
+        return AMI_ERR_VISION;
+    }
+
+    ami_vision_frame *frame = NULL;
+    st = vision_frame_from_cg_image(device, cg_img, max_dim, &frame);
+    CGImageRelease(cg_img);
+    if (st != AMI_OK) {
+        return st;
+    }
+    if (io_total_surface_bytes != NULL) {
+        if (frame->surface_alloc_size >
+            AMI_VISION_MAX_TOTAL_SURFACE_BYTES - *io_total_surface_bytes) {
+            ami_vision_frame_destroy(frame);
+            return AMI_ERR_VISION;
+        }
+        *io_total_surface_bytes += frame->surface_alloc_size;
+    }
+    *out_frame = frame;
+    return AMI_OK;
+}
+
 ami_status ami_image_load_iosurface(ami_device *device, const char *path,
                                     ami_vision_frame **out_frame) {
     if (out_frame == NULL) {
@@ -2717,18 +2869,21 @@ ami_status ami_image_load_iosurface(ami_device *device, const char *path,
             return AMI_ERR_INVALID_ARGUMENT;
         }
         NSURL *url = [NSURL fileURLWithPath:ns_path];
-        CGImageSourceRef src = CGImageSourceCreateWithURL((__bridge CFURLRef)url, NULL);
+        NSDictionary *src_opts = @{
+            (__bridge id)kCGImageSourceShouldCache: @NO,
+        };
+        CGImageSourceRef src = CGImageSourceCreateWithURL(
+            (__bridge CFURLRef)url, (__bridge CFDictionaryRef)src_opts);
         if (src == NULL) {
             return AMI_ERR_VISION;
         }
-        CGImageRef cg_img = CGImageSourceCreateImageAtIndex(src, 0, NULL);
-        CFRelease(src);
-        if (cg_img == NULL) {
+        if (CGImageSourceGetCount(src) == 0) {
+            CFRelease(src);
             return AMI_ERR_VISION;
         }
-
-        ami_status st = vision_frame_from_cg_image(device, cg_img, AMI_MAX_TEXTURE_DIM, out_frame);
-        CGImageRelease(cg_img);
+        ami_status st = vision_decode_cg_image_source_index(
+            device, src, 0u, src_opts, AMI_VISION_MAX_BYTES_IMAGE_DIM, NULL, out_frame);
+        CFRelease(src);
         return st;
     }
 }
@@ -2796,20 +2951,9 @@ ami_status ami_image_decode_bytes_iosurface(ami_device *device,
             CFRelease(src);
             return AMI_ERR_VISION;
         }
-        NSDictionary *img_opts = @{
-            (__bridge id)kCGImageSourceShouldCache: @NO,
-            (__bridge id)kCGImageSourceShouldCacheImmediately: @YES,
-        };
-        CGImageRef cg_img = CGImageSourceCreateImageAtIndex(
-            src, 0, (__bridge CFDictionaryRef)img_opts);
+        ami_status st = vision_decode_cg_image_source_index(
+            device, src, 0u, src_opts, AMI_VISION_MAX_BYTES_IMAGE_DIM, NULL, out_frame);
         CFRelease(src);
-        if (cg_img == NULL) {
-            return AMI_ERR_VISION;
-        }
-
-        ami_status st = vision_frame_from_cg_image(
-            device, cg_img, AMI_VISION_MAX_BYTES_IMAGE_DIM, out_frame);
-        CGImageRelease(cg_img);
         return st;
     }
 }
@@ -3439,6 +3583,8 @@ ami_status ami_vt_decode_clip_frame(ami_vt_decode_session *session,
         mtl_dev,
         out.pixel_buffer,
         0u,
+        AMI_VISION_MAX_BYTES_IMAGE_DIM,
+        AMI_VISION_MAX_IMAGE_PIXELS,
         1u,
         out.pts.value,
         out.pts.timescale,
@@ -3972,6 +4118,18 @@ static void vt_batch_decompress_callback(void *decompressionOutputRefCon,
     }
     const uintptr_t slot_1based = (uintptr_t)sourceFrameRefCon;
     if (slot_1based >= 1u && slot_1based <= (uintptr_t)col->capacity && imageBuffer != NULL) {
+        const size_t w = CVPixelBufferGetWidth(imageBuffer);
+        const size_t h = CVPixelBufferGetHeight(imageBuffer);
+        if (w == 0 || h == 0 ||
+            w > AMI_VISION_MAX_BYTES_IMAGE_DIM ||
+            h > AMI_VISION_MAX_BYTES_IMAGE_DIM ||
+            (uint64_t)w > AMI_VISION_MAX_IMAGE_PIXELS / (uint64_t)h) {
+            if (col->first_error == noErr) {
+                col->first_error = -1;
+            }
+            pthread_mutex_unlock(&col->mu);
+            return;
+        }
         const uint32_t slot = (uint32_t)(slot_1based - 1u);
         if (col->slots[slot] != NULL) {
             CVPixelBufferRelease(col->slots[slot]);
@@ -4030,11 +4188,17 @@ static ami_status decode_compressed_samples_iosurface(
     const CMVideoDimensions dims = CMVideoFormatDescriptionGetDimensions(fmt_desc);
     if (dims.width <= 0 || dims.height <= 0 ||
         dims.width > (int32_t)AMI_VISION_MAX_BYTES_IMAGE_DIM ||
-        dims.height > (int32_t)AMI_VISION_MAX_BYTES_IMAGE_DIM) {
+        dims.height > (int32_t)AMI_VISION_MAX_BYTES_IMAGE_DIM ||
+        (uint64_t)dims.width > AMI_VISION_MAX_IMAGE_PIXELS / (uint64_t)dims.height) {
         return AMI_ERR_VISION;
     }
 
     const uint32_t k_count = (sample_count < max_frames) ? sample_count : max_frames;
+    const uint64_t min_nv12_bytes = ((uint64_t)dims.width * (uint64_t)dims.height * 3u) / 2u;
+    if (min_nv12_bytes == 0 ||
+        (uint64_t)k_count > AMI_VISION_MAX_TOTAL_SURFACE_BYTES / min_nv12_bytes) {
+        return AMI_ERR_VISION;
+    }
 
     uint32_t *want_slot = calloc(sample_count, sizeof(uint32_t));
     bool *need_decode = calloc(sample_count, sizeof(bool));
@@ -4054,6 +4218,7 @@ static ami_status decode_compressed_samples_iosurface(
         qsort(pres, sample_count, sizeof(ami_pres_order_entry), cmp_pres_order);
     }
 
+    uint32_t total_need_decode = 0;
     for (uint32_t k = 0; k < k_count; k++) {
         const uint32_t pres_idx = (k_count == 1u)
             ? 0u
@@ -4063,16 +4228,37 @@ static ami_status decode_compressed_samples_iosurface(
 
         uint32_t sync_start = d_idx;
         while (sync_start > 0 && !samples[sync_start].is_sync) {
+            if ((d_idx - sync_start) >= AMI_VISION_MAX_DECODED_VIDEO_SAMPLES) {
+                free(pres);
+                free(want_slot);
+                free(need_decode);
+                return AMI_ERR_VISION;
+            }
             sync_start--;
         }
         uint32_t gop_end = d_idx;
         if (has_reordering) {
             while (gop_end + 1u < sample_count && !samples[gop_end + 1u].is_sync) {
+                if ((gop_end - sync_start + 1u) >= AMI_VISION_MAX_DECODED_VIDEO_SAMPLES) {
+                    free(pres);
+                    free(want_slot);
+                    free(need_decode);
+                    return AMI_ERR_VISION;
+                }
                 gop_end++;
             }
         }
         for (uint32_t j = sync_start; j <= gop_end; j++) {
-            need_decode[j] = true;
+            if (!need_decode[j]) {
+                need_decode[j] = true;
+                total_need_decode++;
+                if (total_need_decode > AMI_VISION_MAX_DECODED_VIDEO_SAMPLES) {
+                    free(pres);
+                    free(want_slot);
+                    free(need_decode);
+                    return AMI_ERR_VISION;
+                }
+            }
         }
     }
     free(pres);
@@ -4225,12 +4411,15 @@ static ami_status decode_compressed_samples_iosurface(
     }
 
     uint32_t built = 0;
+    uint64_t total_surface_bytes = 0;
     if (st == AMI_OK) {
         for (uint32_t k = 0; k < k_count; k++) {
             st = vision_frame_init_from_mtl_device(
                 mtl_dev,
                 col.slots[k],
                 0u,
+                AMI_VISION_MAX_BYTES_IMAGE_DIM,
+                AMI_VISION_MAX_IMAGE_PIXELS,
                 1u,
                 col.pts_vals[k],
                 col.pts_scales[k],
@@ -4238,6 +4427,14 @@ static ami_status decode_compressed_samples_iosurface(
             if (st != AMI_OK) {
                 break;
             }
+            if (out_frames[k]->surface_alloc_size >
+                AMI_VISION_MAX_TOTAL_SURFACE_BYTES - total_surface_bytes) {
+                ami_vision_frame_destroy(out_frames[k]);
+                out_frames[k] = NULL;
+                st = AMI_ERR_VISION;
+                break;
+            }
+            total_surface_bytes += out_frames[k]->surface_alloc_size;
             built++;
         }
     }
@@ -4643,13 +4840,33 @@ static ami_status parse_hvcc_format_desc(const uint8_t *cfg, size_t cfg_len,
     return AMI_OK;
 }
 
+static bool is_heif_avif_brand(uint32_t brand) {
+    return brand == AMI_ISO_FOURCC('h', 'e', 'i', 'c') ||
+           brand == AMI_ISO_FOURCC('h', 'e', 'i', 'x') ||
+           brand == AMI_ISO_FOURCC('h', 'e', 'v', 'c') ||
+           brand == AMI_ISO_FOURCC('h', 'e', 'v', 'x') ||
+           brand == AMI_ISO_FOURCC('h', 'e', 'i', 'm') ||
+           brand == AMI_ISO_FOURCC('h', 'e', 'i', 's') ||
+           brand == AMI_ISO_FOURCC('h', 'e', 'v', 'm') ||
+           brand == AMI_ISO_FOURCC('h', 'e', 'v', 's') ||
+           brand == AMI_ISO_FOURCC('m', 'i', 'f', '1') ||
+           brand == AMI_ISO_FOURCC('m', 's', 'f', '1') ||
+           brand == AMI_ISO_FOURCC('a', 'v', 'i', 'f') ||
+           brand == AMI_ISO_FOURCC('a', 'v', 'i', 's');
+}
+
 static bool is_isobmff_container(const uint8_t *bytes, size_t len) {
     if (bytes == NULL || len < 8u) {
         return false;
     }
     const uint32_t tag = ami_read_be32(bytes + 4u);
-    if (tag == AMI_ISO_FOURCC('f', 't', 'y', 'p') ||
-        tag == AMI_ISO_FOURCC('m', 'o', 'o', 'v')) {
+    if (tag == AMI_ISO_FOURCC('f', 't', 'y', 'p')) {
+        if (len >= 12u && is_heif_avif_brand(ami_read_be32(bytes + 8u))) {
+            return false;
+        }
+        return true;
+    }
+    if (tag == AMI_ISO_FOURCC('m', 'o', 'o', 'v')) {
         return true;
     }
     if (tag == AMI_ISO_FOURCC('w', 'i', 'd', 'e') ||
@@ -4679,7 +4896,11 @@ static ami_status decode_isobmff_bytes(ami_device *device,
                                        const uint8_t *bytes, size_t len,
                                        uint32_t max_frames,
                                        ami_vision_frame **out_frames,
-                                       uint32_t *out_frame_count) {
+                                       uint32_t *out_frame_count,
+                                       bool *out_no_video_track) {
+    if (out_no_video_track != NULL) {
+        *out_no_video_track = false;
+    }
     bool found_moov = false;
     bool found_video = false;
     ami_iso_video_track video_trk = { 0 };
@@ -4727,8 +4948,13 @@ static ami_status decode_isobmff_bytes(ami_device *device,
         }
     }
 
-    if (!found_moov || !found_video ||
-        video_trk.stsz_ptr == NULL || video_trk.stsc_ptr == NULL || video_trk.stco_ptr == NULL ||
+    if (!found_moov || !found_video) {
+        if (out_no_video_track != NULL) {
+            *out_no_video_track = true;
+        }
+        return AMI_ERR_VISION;
+    }
+    if (video_trk.stsz_ptr == NULL || video_trk.stsc_ptr == NULL || video_trk.stco_ptr == NULL ||
         video_trk.timescale == 0) {
         return AMI_ERR_VISION;
     }
@@ -4786,9 +5012,11 @@ static ami_status decode_isobmff_bytes(ami_device *device,
         return AMI_ERR_OUT_OF_MEMORY;
     }
 
-    // Resolve chunk offsets + stsc + stsz -> exact verified sample slices
+    // Resolve chunk offsets + stsc + stsz -> exact verified monotonic non-aliased sample slices
     uint32_t stsc_idx = 0;
     uint32_t s_idx = 0;
+    uint64_t prev_chunk_end = 0;
+    uint64_t total_sample_bytes = 0;
     for (uint32_t c = 0; c < chunk_count && s_idx < sample_count; c++) {
         const uint32_t chunk_1 = c + 1u;
         while (stsc_idx + 1u < stsc_count) {
@@ -4805,11 +5033,16 @@ static ami_status decode_isobmff_bytes(ami_device *device,
         uint64_t off = video_trk.stco_is_64
             ? ami_read_be64(video_trk.stco_ptr + 8u + (size_t)c * 8u)
             : (uint64_t)ami_read_be32(video_trk.stco_ptr + 8u + (size_t)c * 4u);
+        if (spc > 0 && off < prev_chunk_end) {
+            free(samples);
+            return AMI_ERR_VISION;
+        }
         for (uint32_t j = 0; j < spc && s_idx < sample_count; j++) {
             const uint32_t sz = (uniform_size != 0)
                 ? uniform_size
                 : ami_read_be32(video_trk.stsz_ptr + 12u + (size_t)s_idx * 4u);
-            if (sz == 0 || off > (uint64_t)len || (uint64_t)sz > (uint64_t)len - off) {
+            if (sz == 0 || off > (uint64_t)len || (uint64_t)sz > (uint64_t)len - off ||
+                (uint64_t)sz > (uint64_t)len - total_sample_bytes) {
                 free(samples);
                 return AMI_ERR_VISION;
             }
@@ -4817,7 +5050,11 @@ static ami_status decode_isobmff_bytes(ami_device *device,
             samples[s_idx].size = (size_t)sz;
             samples[s_idx].is_sync = true;
             off += (uint64_t)sz;
+            total_sample_bytes += (uint64_t)sz;
             s_idx++;
+        }
+        if (spc > 0) {
+            prev_chunk_end = off;
         }
     }
     if (s_idx != sample_count) {
@@ -5215,7 +5452,13 @@ ami_status ami_video_decode_bytes_iosurface(ami_device *device,
 
     // 1. ISO-BMFF MP4 / MOV container path (H.264 / HEVC -> hardware VideoToolbox NV12 IOSurface)
     if (is_isobmff_container(bytes, len)) {
-        return decode_isobmff_bytes(device, bytes, len, max_frames, out_frames, out_frame_count);
+        bool no_video_track = false;
+        ami_status iso_st = decode_isobmff_bytes(
+            device, bytes, len, max_frames, out_frames, out_frame_count, &no_video_track);
+        if (iso_st == AMI_OK || !no_video_track) {
+            return iso_st;
+        }
+        // Container had no video track (e.g. still-image HEIC/AVIF); fall through to ImageIO.
     }
 
     // 2. Raw Annex-B H.264 / HEVC bitstream path
@@ -5223,7 +5466,7 @@ ami_status ami_video_decode_bytes_iosurface(ami_device *device,
         return decode_annexb_bytes(device, bytes, len, max_frames, out_frames, out_frame_count);
     }
 
-    // 3. Multi-frame animated ImageIO (GIF / APNG / WebP / multi-page TIFF) or single-image fallback
+    // 3. Multi-frame animated ImageIO (GIF / APNG / WebP / AVIF / multi-page TIFF) or single-image fallback
     @autoreleasepool {
         NSData *data = [NSData dataWithBytesNoCopy:(void *)(uintptr_t)bytes
                                             length:(NSUInteger)len
@@ -5246,26 +5489,16 @@ ami_status ami_video_decode_bytes_iosurface(ami_device *device,
         }
 
         const uint32_t k_count = (total < (size_t)max_frames) ? (uint32_t)total : max_frames;
-        NSDictionary *img_opts = @{
-            (__bridge id)kCGImageSourceShouldCache: @NO,
-            (__bridge id)kCGImageSourceShouldCacheImmediately: @YES,
-        };
-
+        uint64_t total_surface_bytes = 0;
         uint32_t decoded = 0;
         ami_status st = AMI_OK;
         for (uint32_t k = 0; k < k_count; k++) {
             const size_t idx = (k_count == 1u)
                 ? 0u
                 : (size_t)(((uint64_t)k * (uint64_t)(total - 1u)) / (uint64_t)(k_count - 1u));
-            CGImageRef cg_img = CGImageSourceCreateImageAtIndex(
-                src, idx, (__bridge CFDictionaryRef)img_opts);
-            if (cg_img == NULL) {
-                st = AMI_ERR_VISION;
-                break;
-            }
-            st = vision_frame_from_cg_image(
-                device, cg_img, AMI_VISION_MAX_BYTES_IMAGE_DIM, &out_frames[k]);
-            CGImageRelease(cg_img);
+            st = vision_decode_cg_image_source_index(
+                device, src, idx, src_opts, AMI_VISION_MAX_BYTES_IMAGE_DIM,
+                &total_surface_bytes, &out_frames[k]);
             if (st != AMI_OK) {
                 break;
             }
@@ -6706,6 +6939,32 @@ static bool ami_verify_cert_matches_priv_key(SecCertificateRef cert, SecKeyRef p
     return match;
 }
 
+static NSMutableArray *ami_parse_pem_certificates(const uint8_t *pem_bytes, size_t pem_len) {
+    if (pem_bytes == NULL || pem_len == 0) {
+        return nil;
+    }
+    NSMutableArray *certs = [NSMutableArray array];
+    size_t cert_off = 0;
+    ami_pem_block cblk;
+    while (ami_pem_next_block(pem_bytes, pem_len, cert_off, &cblk)) {
+        cert_off = cblk.next_offset;
+        if (strcmp(cblk.label, "CERTIFICATE") != 0) {
+            continue;
+        }
+        NSMutableData *der = ami_base64_decode_pem(cblk.body, cblk.body_len);
+        if (der == nil) {
+            return nil;
+        }
+        SecCertificateRef cert = SecCertificateCreateWithData(NULL, (__bridge CFDataRef)der);
+        ami_secure_wipe_mutable_data(der);
+        if (cert == NULL) {
+            return nil;
+        }
+        [certs addObject:CFBridgingRelease(cert)];
+    }
+    return (certs.count > 0) ? certs : nil;
+}
+
 static ami_status ami_load_sec_identity(const ami_tls_config *cfg, sec_identity_t *out_sec_id) {
     *out_sec_id = nil;
     if (cfg->cert_bytes == NULL || cfg->cert_len == 0) {
@@ -6791,26 +7050,8 @@ static ami_status ami_load_sec_identity(const ami_tls_config *cfg, sec_identity_
         return AMI_STATUS_TLS_IDENTITY_INVALID;
     }
 
-    NSMutableArray *certs = [NSMutableArray array];
-    size_t cert_off = 0;
-    ami_pem_block cblk;
-    while (ami_pem_next_block(cfg->cert_bytes, cfg->cert_len, cert_off, &cblk)) {
-        cert_off = cblk.next_offset;
-        if (strcmp(cblk.label, "CERTIFICATE") != 0) {
-            continue;
-        }
-        NSMutableData *der = ami_base64_decode_pem(cblk.body, cblk.body_len);
-        if (der == nil) {
-            return AMI_STATUS_TLS_IDENTITY_INVALID;
-        }
-        SecCertificateRef cert = SecCertificateCreateWithData(NULL, (__bridge CFDataRef)der);
-        ami_secure_wipe_mutable_data(der);
-        if (cert == NULL) {
-            return AMI_STATUS_TLS_IDENTITY_INVALID;
-        }
-        [certs addObject:CFBridgingRelease(cert)];
-    }
-    if (certs.count == 0) {
+    NSMutableArray *certs = ami_parse_pem_certificates(cfg->cert_bytes, cfg->cert_len);
+    if (certs == nil) {
         return AMI_STATUS_TLS_IDENTITY_INVALID;
     }
 
@@ -7664,37 +7905,99 @@ ami_status ami_tls_listener_pop_accepted_fd(ami_tls_listener *listener, int32_t 
     return AMI_OK;
 }
 
-ami_status ami_tls_client_connect_socketpair(const uint8_t host_ipv4[4],
-                                             uint16_t port,
-                                             uint16_t min_tls_version,
-                                             uint16_t max_tls_version,
-                                             int32_t *out_client_fd,
-                                             uint16_t *out_tls_version) {
+static ami_status ami_tls_client_connect_socketpair_impl(const uint8_t host_ipv4[4],
+                                                       uint16_t port,
+                                                       bool verify_peer,
+                                                       const char *server_name,
+                                                       const uint8_t *anchor_pem_bytes,
+                                                       size_t anchor_pem_len,
+                                                       uint16_t min_tls_version,
+                                                       uint16_t max_tls_version,
+                                                       int32_t *out_client_fd,
+                                                       uint16_t *out_tls_version) {
     if (out_client_fd != NULL) *out_client_fd = -1;
     if (out_tls_version != NULL) *out_tls_version = 0;
     if (host_ipv4 == NULL || port == 0 || out_client_fd == NULL || out_tls_version == NULL) {
         return AMI_ERR_INVALID_ARGUMENT;
     }
+    if ((anchor_pem_bytes == NULL && anchor_pem_len > 0) ||
+        (anchor_pem_bytes != NULL && anchor_pem_len == 0)) {
+        return AMI_ERR_INVALID_ARGUMENT;
+    }
 
     @autoreleasepool {
+        NSArray *anchor_certs = nil;
+        if (verify_peer && anchor_pem_bytes != NULL && anchor_pem_len > 0) {
+            anchor_certs = ami_parse_pem_certificates(anchor_pem_bytes, anchor_pem_len);
+            if (anchor_certs == nil) {
+                return AMI_STATUS_TLS_IDENTITY_INVALID;
+            }
+        }
+
         dispatch_queue_attr_t cq_attr = dispatch_queue_attr_make_with_autorelease_frequency(
             DISPATCH_QUEUE_SERIAL, DISPATCH_AUTORELEASE_FREQUENCY_WORK_ITEM);
         dispatch_queue_t cq = dispatch_queue_create("com.aminfer.tls.client", cq_attr);
         uint16_t min_v = min_tls_version != 0 ? min_tls_version : (uint16_t)tls_protocol_version_TLSv12;
         uint16_t max_v = max_tls_version != 0 ? max_tls_version : (uint16_t)tls_protocol_version_TLSv13;
 
+        __block bool trust_rejected = false;
         nw_parameters_t params = nw_parameters_create_secure_tcp(
             ^(nw_protocol_options_t tls_opts) {
                 sec_protocol_options_t sec_opts = nw_tls_copy_sec_protocol_options(tls_opts);
                 sec_protocol_options_set_min_tls_protocol_version(sec_opts, (tls_protocol_version_t)min_v);
                 sec_protocol_options_set_max_tls_protocol_version(sec_opts, (tls_protocol_version_t)max_v);
-                sec_protocol_options_set_verify_block(sec_opts,
-                    ^(sec_protocol_metadata_t metadata, sec_trust_t trust,
-                      sec_protocol_verify_complete_t complete) {
-                        (void)metadata;
-                        (void)trust;
-                        complete(true);
-                    }, cq);
+                if (verify_peer && server_name != NULL && server_name[0] != '\0') {
+                    sec_protocol_options_set_tls_server_name(sec_opts, server_name);
+                }
+                if (!verify_peer) {
+                    sec_protocol_options_set_verify_block(sec_opts,
+                        ^(sec_protocol_metadata_t metadata, sec_trust_t trust,
+                          sec_protocol_verify_complete_t complete) {
+                            (void)metadata;
+                            (void)trust;
+                            complete(true);
+                        }, cq);
+                } else {
+                    sec_protocol_options_set_verify_block(sec_opts,
+                        ^(sec_protocol_metadata_t metadata, sec_trust_t trust,
+                          sec_protocol_verify_complete_t complete) {
+                            (void)metadata;
+                            if (trust == nil) {
+                                trust_rejected = true;
+                                complete(false);
+                                return;
+                            }
+                            SecTrustRef trust_ref = sec_trust_copy_ref(trust);
+                            if (trust_ref == NULL) {
+                                trust_rejected = true;
+                                complete(false);
+                                return;
+                            }
+                            if (anchor_certs != nil) {
+                                OSStatus ast = SecTrustSetAnchorCertificates(
+                                    trust_ref, (__bridge CFArrayRef)anchor_certs);
+                                OSStatus ost = (ast == errSecSuccess)
+                                    ? SecTrustSetAnchorCertificatesOnly(trust_ref, true)
+                                    : ast;
+                                if (ost != errSecSuccess) {
+                                    CFRelease(trust_ref);
+                                    trust_rejected = true;
+                                    complete(false);
+                                    return;
+                                }
+                            }
+                            CFErrorRef eval_err = NULL;
+                            bool trusted = SecTrustEvaluateWithError(trust_ref, &eval_err);
+                            if (eval_err != NULL) {
+                                CFRelease(eval_err);
+                            }
+                            CFRelease(trust_ref);
+                            if (!trusted) {
+                                trust_rejected = true;
+                            }
+                            complete(trusted);
+                        }, cq);
+                }
             },
             ^(nw_protocol_options_t tcp_opts) {
                 nw_tcp_options_set_no_delay(tcp_opts, true);
@@ -7758,7 +8061,9 @@ ami_status ami_tls_client_connect_socketpair(const uint8_t host_ipv4[4],
                 nw_connection_set_state_changed_handler(conn, NULL);
                 nw_connection_cancel(conn);
             });
-            return AMI_STATUS_TLS_BIND_FAILED;
+            return (verify_peer && trust_rejected)
+                       ? AMI_STATUS_TLS_IDENTITY_INVALID
+                       : AMI_STATUS_TLS_BIND_FAILED;
         }
 
         int fds[2] = {-1, -1};
@@ -7803,4 +8108,39 @@ ami_status ami_tls_client_connect_socketpair(const uint8_t host_ipv4[4],
         *out_tls_version = negotiated;
         return AMI_OK;
     }
+}
+
+ami_status ami_tls_client_connect_socketpair_insecure_loopback(const uint8_t host_ipv4[4],
+                                                               uint16_t port,
+                                                               uint16_t min_tls_version,
+                                                               uint16_t max_tls_version,
+                                                               int32_t *out_client_fd,
+                                                               uint16_t *out_tls_version) {
+    return ami_tls_client_connect_socketpair_impl(
+        host_ipv4, port, false, NULL, NULL, 0,
+        min_tls_version, max_tls_version, out_client_fd, out_tls_version);
+}
+
+ami_status ami_tls_client_connect_socketpair(const uint8_t host_ipv4[4],
+                                             uint16_t port,
+                                             uint16_t min_tls_version,
+                                             uint16_t max_tls_version,
+                                             int32_t *out_client_fd,
+                                             uint16_t *out_tls_version) {
+    return ami_tls_client_connect_socketpair_insecure_loopback(
+        host_ipv4, port, min_tls_version, max_tls_version, out_client_fd, out_tls_version);
+}
+
+ami_status ami_tls_client_connect_socketpair_verified(const uint8_t host_ipv4[4],
+                                                      uint16_t port,
+                                                      const char *server_name,
+                                                      const uint8_t *anchor_pem_bytes,
+                                                      size_t anchor_pem_len,
+                                                      uint16_t min_tls_version,
+                                                      uint16_t max_tls_version,
+                                                      int32_t *out_client_fd,
+                                                      uint16_t *out_tls_version) {
+    return ami_tls_client_connect_socketpair_impl(
+        host_ipv4, port, true, server_name, anchor_pem_bytes, anchor_pem_len,
+        min_tls_version, max_tls_version, out_client_fd, out_tls_version);
 }

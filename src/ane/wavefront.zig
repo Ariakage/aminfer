@@ -444,6 +444,10 @@ pub const WavefrontPrefill = struct {
                         .ctx = ctx,
                         .step_fn = ane_step_fn,
                     });
+                    var ane_drained = false;
+                    errdefer if (!ane_drained) {
+                        _ = self.waitDone();
+                    };
                     const gt0 = try vmstat.nowNs();
                     const gpu_err: ?anyerror = if (gpu_ffn_step_fn(ctx, cur)) |_| null else |e| e;
                     const gt1 = try vmstat.nowNs();
@@ -451,6 +455,7 @@ pub const WavefrontPrefill = struct {
 
                     // Always drain in-flight ANE command before propagating any error.
                     const ane_done = self.waitDone();
+                    ane_drained = true;
                     ane_total_ns += ane_done.elapsed_ns;
                     overlapped_steps += 1;
 

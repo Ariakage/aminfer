@@ -767,6 +767,17 @@ pub const Compute = struct {
         try check(c.ami_compute_wait(self.handle, signal, timeout_ms));
     }
 
+    /// Waits with bounded retries until all committed frames complete or `timeout_ms` elapses.
+    pub fn waitIdle(self: Compute, timeout_ms: u64) Error!void {
+        try check(c.ami_compute_wait_idle(self.handle, timeout_ms));
+    }
+
+    /// Best-effort bounded wait for any in-flight GPU work before tearing down
+    /// residency, NoCopy wired arenas, or IOSurface vision frames after a timeout.
+    pub fn waitIdleBestEffort(self: Compute) void {
+        c.ami_compute_wait_idle_best_effort(self.handle);
+    }
+
     /// Encodes a GPU-driven indirect threadgroup dispatch into the active Metal 4
     /// frame (`G20`, ADR-0023). Zero dynamic heap allocation; validates 4-byte
     /// indirect-buffer alignment, binding limits, and buffer bounds.
@@ -2714,7 +2725,7 @@ test "KvTile texture binding via MTL4ArgumentTable writes RGBA16Float zero-copy 
 }
 
 test "UNIFORM_SLOTS_PER_FRAME accommodates 48-layer tree verification and in-CB drafting" {
-    try std.testing.expectEqual(@as(u32, 4096), UNIFORM_SLOTS_PER_FRAME);
+    try std.testing.expectEqual(@as(u32, 16384), UNIFORM_SLOTS_PER_FRAME);
 }
 
 test "CoreML ANE zero-copy IOSurface conv1x1 and innerProduct match CPU reference with zero-copy outputBackings" {
@@ -3704,5 +3715,55 @@ test "G20 Metal 4 Compute.dispatchIndirect executes non-zero/zero grids and vali
     }
     for (128..256) |i| {
         try std.testing.expectEqual(@as(u32, 0), data_u32[i]);
+    }
+}
+
+test "F15.4 & L1: Compute.waitIdle, waitIdleBestEffort, and cross-frame queue barrier ordering" {
+    const device = try Device.open();
+    defer device.close();
+    const lib = try Library.openEmbedded(device);
+    defer lib.close();
+
+    const iota_pipe = try Pipeline.init(device, lib, "ami_smoke_iota");
+    defer iota_pipe.close();
+    const scale_pipe = try Pipeline.initSpecialized(
+        device,
+        lib,
+        "ami_smoke_scale_add",
+        &.{.{ .index = 0, .value = .{ .u32 = 2 } }},
+    );
+    defer scale_pipe.close();
+
+    const region = try page.WiredRegion.init(page.APPLE_PAGE_SIZE);
+    defer region.deinit();
+    const words: []u32 = @alignCast(std.mem.bytesAsSlice(u32, region.bytes));
+    @memset(words, 0);
+
+    const buf = try Buffer.wrap(device, region.bytes);
+    defer buf.close();
+
+    var compute = try Compute.initWithFrames(device, 2);
+    defer compute.close();
+    try compute.makeResident(&.{buf});
+
+    // Frame 1 writes 64 words; Frame 2 immediately reads & scales them without explicit caller wait.
+    var f1 = try compute.beginFrame(5000);
+    errdefer f1.abort();
+    try f1.encodeThreads(iota_pipe, &.{.{ .buffer = buf, .offset = 0 }}, null, .{ 64, 1, 1 }, .{ 32, 1, 1 }, false);
+    _ = try f1.commit();
+
+    const SmokeParams = extern struct { addend: u32 };
+    const params: SmokeParams = .{ .addend = 7 };
+    var f2 = try compute.beginFrame(5000);
+    errdefer f2.abort();
+    try f2.encodeThreads(scale_pipe, &.{.{ .buffer = buf, .offset = 0 }}, std.mem.asBytes(&params), .{ 64, 1, 1 }, .{ 32, 1, 1 }, false);
+    _ = try f2.commit();
+
+    try compute.waitIdle(5000);
+    compute.waitIdleBestEffort();
+
+    for (0..64) |i| {
+        const expected = (@as(u32, @intCast(i)) ^ 0xA5A5_A5A5) *% 2 +% 7;
+        try std.testing.expectEqual(expected, words[i]);
     }
 }

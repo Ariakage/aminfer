@@ -112,6 +112,8 @@ pub const AsyncPredictResult = struct {
     result: PredictResult,
 };
 
+const BUF_SLOTS: usize = 2;
+
 const ModelBlock = struct {
     /// First target layer represented at output slice 0 of this block.
     start_target_layer: u32,
@@ -121,15 +123,68 @@ const ModelBlock = struct {
     out_cols: u32,
     model: metal.AneModel,
     model_info: metal.AneModelInfo,
-    logits_tile: metal.KvTile,
-    logits_tensor: metal.AneTensor,
-    plan: metal.AnePlan,
+    logits_tiles: [BUF_SLOTS]metal.KvTile,
+    logits_tensors: [BUF_SLOTS]metal.AneTensor,
+    plans: [BUF_SLOTS]metal.AnePlan,
     compile_ns: u64,
 
+    fn init(
+        device: metal.Device,
+        max_tokens: u32,
+        x_tensors: *const [BUF_SLOTS]metal.AneTensor,
+        in_name: [:0]const u8,
+        out_name: [:0]const u8,
+        start_target_layer: u32,
+        window_layers: u32,
+        out_cols: u32,
+        model: metal.AneModel,
+        model_info: metal.AneModelInfo,
+        compile_ns: u64,
+    ) AneExpertPredictor.Error!ModelBlock {
+        var tiles: [BUF_SLOTS]metal.KvTile = undefined;
+        var tensors: [BUF_SLOTS]metal.AneTensor = undefined;
+        var plans: [BUF_SLOTS]metal.AnePlan = undefined;
+        var built: usize = 0;
+        errdefer for (0..built) |s| {
+            plans[s].close();
+            tensors[s].close();
+            tiles[s].close();
+        };
+
+        for (0..BUF_SLOTS) |s| {
+            const lt = try metal.KvTile.init(device, out_cols, max_tokens, .{});
+            errdefer lt.close();
+            const lten = try metal.AneTensor.fromKvTile(lt, &.{ max_tokens, out_cols });
+            errdefer lten.close();
+            const p = try metal.AnePlan.init(
+                &.{.{ .name = in_name, .tensor = x_tensors[s] }},
+                &.{.{ .name = out_name, .tensor = lten }},
+            );
+            tiles[s] = lt;
+            tensors[s] = lten;
+            plans[s] = p;
+            built += 1;
+        }
+
+        return .{
+            .start_target_layer = start_target_layer,
+            .window_layers = window_layers,
+            .out_cols = out_cols,
+            .model = model,
+            .model_info = model_info,
+            .logits_tiles = tiles,
+            .logits_tensors = tensors,
+            .plans = plans,
+            .compile_ns = compile_ns,
+        };
+    }
+
     fn deinit(self: *ModelBlock) void {
-        self.plan.close();
-        self.logits_tensor.close();
-        self.logits_tile.close();
+        for (0..BUF_SLOTS) |s| {
+            self.plans[s].close();
+            self.logits_tensors[s].close();
+            self.logits_tiles[s].close();
+        }
         self.model.close();
     }
 };
@@ -140,6 +195,7 @@ const AsyncReq = struct {
     current_layer: u32,
     num_tokens: u32,
     block_idx: usize,
+    buf_slot: u8,
 };
 
 const AsyncResp = struct {
@@ -147,6 +203,7 @@ const AsyncResp = struct {
     current_layer: u32,
     num_tokens: u32,
     block_idx: usize,
+    buf_slot: u8,
     all_zero_copy: bool,
     elapsed_ns: u64,
     err: ?metal.Error,
@@ -163,8 +220,13 @@ pub const AneExpertPredictor = struct {
 
     config: PredictorConfig,
     mode: PredictorMode,
-    x_tile: metal.KvTile,
-    x_tensor: metal.AneTensor,
+    x_tiles: [BUF_SLOTS]metal.KvTile,
+    x_tensors: [BUF_SLOTS]metal.AneTensor,
+    active_write_slot: u8,
+    last_written_slot: u8,
+    last_completed_slot: u8,
+    has_written_after_submit: bool,
+    slot_inflight: [BUF_SLOTS]bool,
     blocks: []ModelBlock,
     last_predict_ns: u64,
     last_all_zero_copy: bool,
@@ -176,6 +238,8 @@ pub const AneExpertPredictor = struct {
     resp_ring: ring.SpscRing(AsyncResp),
     req_seq: std.atomic.Value(u32) align(ring.CACHE_LINE_BYTES),
     resp_seq: std.atomic.Value(u32) align(ring.CACHE_LINE_BYTES),
+    x_busy: [BUF_SLOTS]std.atomic.Value(u32),
+    shutdown: std.atomic.Value(u32) align(ring.CACHE_LINE_BYTES),
     worker_ready: std.atomic.Value(u32) align(ring.CACHE_LINE_BYTES),
     worker_qos_raw: std.atomic.Value(u32),
     worker_thread: ?std.Thread,
@@ -183,6 +247,7 @@ pub const AneExpertPredictor = struct {
     pub const Error = error{
         InvalidConfig,
         AsyncNotEnabled,
+        AsyncSlotBusy,
         InvalidLayer,
         InvalidTokenCount,
         BufferTooSmall,
@@ -201,10 +266,22 @@ pub const AneExpertPredictor = struct {
         const self = try allocator.create(AneExpertPredictor);
         errdefer allocator.destroy(self);
 
-        const x_tile = try metal.KvTile.init(device, config.hidden_size, config.max_tokens, .{ .alias_buffer = true });
-        errdefer x_tile.close();
-        const x_tensor = try metal.AneTensor.fromKvTile(x_tile, &.{ config.max_tokens, config.hidden_size });
-        errdefer x_tensor.close();
+        var x_tiles: [BUF_SLOTS]metal.KvTile = undefined;
+        var x_tensors: [BUF_SLOTS]metal.AneTensor = undefined;
+        var built_x: usize = 0;
+        errdefer for (0..built_x) |s| {
+            x_tensors[s].close();
+            x_tiles[s].close();
+        };
+
+        for (0..BUF_SLOTS) |s| {
+            const xt = try metal.KvTile.init(device, config.hidden_size, config.max_tokens, .{ .alias_buffer = true });
+            errdefer xt.close();
+            const xten = try metal.AneTensor.fromKvTile(xt, &.{ config.max_tokens, config.hidden_size });
+            x_tiles[s] = xt;
+            x_tensors[s] = xten;
+            built_x += 1;
+        }
 
         const blocks = try allocator.alloc(ModelBlock, num_blocks);
         errdefer allocator.free(blocks);
@@ -212,8 +289,13 @@ pub const AneExpertPredictor = struct {
         self.* = .{
             .config = config,
             .mode = mode,
-            .x_tile = x_tile,
-            .x_tensor = x_tensor,
+            .x_tiles = x_tiles,
+            .x_tensors = x_tensors,
+            .active_write_slot = 0,
+            .last_written_slot = 0,
+            .last_completed_slot = 0,
+            .has_written_after_submit = false,
+            .slot_inflight = .{ false, false },
             .blocks = blocks,
             .last_predict_ns = 0,
             .last_all_zero_copy = false,
@@ -223,11 +305,20 @@ pub const AneExpertPredictor = struct {
             .resp_ring = undefined,
             .req_seq = .init(0),
             .resp_seq = .init(0),
+            .x_busy = .{ .init(0), .init(0) },
+            .shutdown = .init(0),
             .worker_ready = .init(0),
             .worker_qos_raw = .init(@backingInt(qos.QosClass.unspecified)),
             .worker_thread = null,
         };
         return self;
+    }
+
+    fn closeInputTiles(self: *AneExpertPredictor) void {
+        for (0..BUF_SLOTS) |s| {
+            self.x_tensors[s].close();
+            self.x_tiles[s].close();
+        }
     }
 
     fn startAsyncWorkerIfEnabled(self: *AneExpertPredictor) Error!void {
@@ -244,7 +335,7 @@ pub const AneExpertPredictor = struct {
         allocator: std.mem.Allocator,
         device: metal.Device,
         config: PredictorConfig,
-        x_tensor: metal.AneTensor,
+        x_tensors: *const [BUF_SLOTS]metal.AneTensor,
         start_target_layer: u32,
         window_layers: u32,
         layer_weights: []const []const f16,
@@ -278,26 +369,19 @@ pub const AneExpertPredictor = struct {
         const t1 = try vmstat.nowNs();
         const minfo = try model.info();
 
-        const logits_tile = try metal.KvTile.init(device, out_cols, config.max_tokens, .{});
-        errdefer logits_tile.close();
-        const logits_tensor = try metal.AneTensor.fromKvTile(logits_tile, &.{ config.max_tokens, out_cols });
-        errdefer logits_tensor.close();
-
-        const plan = try metal.AnePlan.init(
-            &.{.{ .name = "x", .tensor = x_tensor }},
-            &.{.{ .name = "logits", .tensor = logits_tensor }},
+        return ModelBlock.init(
+            device,
+            config.max_tokens,
+            x_tensors,
+            "x",
+            "logits",
+            start_target_layer,
+            window_layers,
+            out_cols,
+            model,
+            minfo,
+            t1 -| t0,
         );
-        return .{
-            .start_target_layer = start_target_layer,
-            .window_layers = window_layers,
-            .out_cols = out_cols,
-            .model = model,
-            .model_info = minfo,
-            .logits_tile = logits_tile,
-            .logits_tensor = logits_tensor,
-            .plan = plan,
-            .compile_ns = t1 -| t0,
-        };
     }
 
     /// Compiles an ANE expert predictor directly in memory from target router
@@ -324,15 +408,14 @@ pub const AneExpertPredictor = struct {
             const self = try allocateBase(allocator, device, config, .single_window, 1);
             errdefer {
                 allocator.free(self.blocks);
-                self.x_tensor.close();
-                self.x_tile.close();
+                self.closeInputTiles();
                 allocator.destroy(self);
             }
             self.blocks[0] = try buildLinearBlock(
                 allocator,
                 device,
                 config,
-                self.x_tensor,
+                &self.x_tensors,
                 1,
                 config.lookahead_layers,
                 router_weights_per_layer,
@@ -353,8 +436,7 @@ pub const AneExpertPredictor = struct {
         errdefer {
             for (0..built) |i| self.blocks[i].deinit();
             allocator.free(self.blocks);
-            self.x_tensor.close();
-            self.x_tile.close();
+            self.closeInputTiles();
             allocator.destroy(self);
         }
 
@@ -369,7 +451,7 @@ pub const AneExpertPredictor = struct {
                 allocator,
                 device,
                 config,
-                self.x_tensor,
+                &self.x_tensors,
                 start_target,
                 win_layers,
                 router_weights_per_layer[start_target..end_target_excl],
@@ -404,8 +486,7 @@ pub const AneExpertPredictor = struct {
         const self = try allocateBase(allocator, device, config, .single_window, 1);
         errdefer {
             allocator.free(self.blocks);
-            self.x_tensor.close();
-            self.x_tile.close();
+            self.closeInputTiles();
             allocator.destroy(self);
         }
 
@@ -426,25 +507,19 @@ pub const AneExpertPredictor = struct {
         const t1 = try vmstat.nowNs();
         const minfo = try model.info();
 
-        const logits_tile = try metal.KvTile.init(device, out_cols, config.max_tokens, .{});
-        errdefer logits_tile.close();
-        const logits_tensor = try metal.AneTensor.fromKvTile(logits_tile, &.{ config.max_tokens, out_cols });
-        errdefer logits_tensor.close();
-        const plan = try metal.AnePlan.init(
-            &.{.{ .name = "x", .tensor = self.x_tensor }},
-            &.{.{ .name = "logits", .tensor = logits_tensor }},
+        self.blocks[0] = try ModelBlock.init(
+            device,
+            config.max_tokens,
+            &self.x_tensors,
+            "x",
+            "logits",
+            1,
+            config.lookahead_layers,
+            out_cols,
+            model,
+            minfo,
+            t1 -| t0,
         );
-        self.blocks[0] = .{
-            .start_target_layer = 1,
-            .window_layers = config.lookahead_layers,
-            .out_cols = out_cols,
-            .model = model,
-            .model_info = minfo,
-            .logits_tile = logits_tile,
-            .logits_tensor = logits_tensor,
-            .plan = plan,
-            .compile_ns = t1 -| t0,
-        };
         errdefer self.blocks[0].deinit();
 
         try self.startAsyncWorkerIfEnabled();
@@ -495,8 +570,7 @@ pub const AneExpertPredictor = struct {
         const self = try allocateBase(allocator, device, config, mode, 1);
         errdefer {
             allocator.free(self.blocks);
-            self.x_tensor.close();
-            self.x_tile.close();
+            self.closeInputTiles();
             allocator.destroy(self);
         }
 
@@ -511,25 +585,19 @@ pub const AneExpertPredictor = struct {
         const in_name: [:0]const u8 = config.input_name orelse try model.ioName(false, 0, &in_name_buf);
         const out_name: [:0]const u8 = config.output_name orelse try model.ioName(true, 0, &out_name_buf);
 
-        const logits_tile = try metal.KvTile.init(device, out_cols, config.max_tokens, .{});
-        errdefer logits_tile.close();
-        const logits_tensor = try metal.AneTensor.fromKvTile(logits_tile, &.{ config.max_tokens, out_cols });
-        errdefer logits_tensor.close();
-        const plan = try metal.AnePlan.init(
-            &.{.{ .name = in_name, .tensor = self.x_tensor }},
-            &.{.{ .name = out_name, .tensor = logits_tensor }},
+        self.blocks[0] = try ModelBlock.init(
+            device,
+            config.max_tokens,
+            &self.x_tensors,
+            in_name,
+            out_name,
+            if (packed_all_layers) 0 else 1,
+            out_layers,
+            out_cols,
+            model,
+            minfo,
+            t1 -| t0,
         );
-        self.blocks[0] = .{
-            .start_target_layer = if (packed_all_layers) 0 else 1,
-            .window_layers = out_layers,
-            .out_cols = out_cols,
-            .model = model,
-            .model_info = minfo,
-            .logits_tile = logits_tile,
-            .logits_tensor = logits_tensor,
-            .plan = plan,
-            .compile_ns = t1 -| t0,
-        };
         errdefer self.blocks[0].deinit();
 
         try self.startAsyncWorkerIfEnabled();
@@ -538,41 +606,40 @@ pub const AneExpertPredictor = struct {
 
     pub fn deinit(self: *AneExpertPredictor, allocator: std.mem.Allocator) void {
         if (self.worker_thread) |t| {
-            const stop_req: AsyncReq = .{
-                .kind = .shutdown,
-                .req_id = 0,
-                .current_layer = 0,
-                .num_tokens = 0,
-                .block_idx = 0,
-            };
-            while (!self.req_ring.tryPush(stop_req)) {
-                std.atomic.spinLoopHint();
-            }
-            _ = self.req_seq.fetchAdd(1, .release);
+            self.shutdown.store(1, .release);
+            _ = self.req_seq.fetchAdd(1, .acq_rel);
             futexWakeOneU32(&self.req_seq);
+            while (self.resp_ring.tryPop()) |_| {}
             t.join();
             self.worker_thread = null;
         }
         for (self.blocks) |*b| b.deinit();
         allocator.free(self.blocks);
-        self.x_tensor.close();
-        self.x_tile.close();
+        self.closeInputTiles();
         allocator.destroy(self);
+    }
+
+    fn waitSlotInputIdle(self: *AneExpertPredictor, slot: usize) void {
+        while (true) {
+            const cur = self.x_busy[slot].load(.acquire);
+            if (cur == 0) return;
+            futexWaitU32(&self.x_busy[slot], cur);
+        }
     }
 
     /// Zero-copy IOSurface input tile (`[max_tokens, hidden_size]` fp16, with alias buffer).
     pub fn inputTile(self: *const AneExpertPredictor) metal.KvTile {
-        return self.x_tile;
+        return self.x_tiles[self.active_write_slot];
     }
 
     /// Zero-copy `MTLBuffer` alias over `x_tile` so GPU kernels can write hidden
     /// states straight into the ANE predictor's input pages with zero `memcpy`.
     pub fn inputAliasBuffer(self: *const AneExpertPredictor) metal.Buffer {
-        return self.x_tile.aliasBuffer() orelse unreachable;
+        return self.x_tiles[self.active_write_slot].aliasBuffer() orelse unreachable;
     }
 
-    /// Copies `num_tokens` hidden rows `[num_tokens, hidden_size]` into `x_tile`
-    /// and zeroes any unused padded rows up to `max_tokens`.
+    /// Copies `num_tokens` hidden rows `[num_tokens, hidden_size]` into the active
+    /// input tile and zeroes any unused padded rows up to `max_tokens`.
     pub fn writeInputHiddenF16(
         self: *AneExpertPredictor,
         hidden_rows: []const f16,
@@ -582,7 +649,10 @@ pub const AneExpertPredictor = struct {
         const needed = @as(usize, num_tokens) * self.config.hidden_size;
         if (hidden_rows.len < needed) return error.BufferTooSmall;
 
-        var guard = try self.x_tile.lock(false);
+        const slot: usize = self.active_write_slot;
+        self.waitSlotInputIdle(slot);
+
+        var guard = try self.x_tiles[slot].lock(false);
         errdefer guard.release();
         const dst = guard.f16Slice();
         @memcpy(dst[0..needed], hidden_rows[0..needed]);
@@ -591,6 +661,8 @@ pub const AneExpertPredictor = struct {
             @memset(dst[needed..total], @as(f16, @floatCast(0.0)));
         }
         try guard.unlock();
+        self.last_written_slot = @intCast(slot);
+        self.has_written_after_submit = true;
     }
 
     pub fn usesNeuralEngine(self: *const AneExpertPredictor) bool {
@@ -650,6 +722,7 @@ pub const AneExpertPredictor = struct {
     fn unpackBlockOutputs(
         self: *AneExpertPredictor,
         block: *ModelBlock,
+        buf_slot: usize,
         current_layer: u32,
         num_tokens: u32,
         top_m_prefetch: u32,
@@ -668,7 +741,7 @@ pub const AneExpertPredictor = struct {
         const top_k = self.config.top_k;
         const out_cols = block.out_cols;
 
-        var guard = try block.logits_tile.lock(true);
+        var guard = try block.logits_tiles[buf_slot].lock(true);
         errdefer guard.release();
         const logits_f16 = guard.f16Slice();
 
@@ -795,18 +868,27 @@ pub const AneExpertPredictor = struct {
             };
         }
 
+        const slot: usize = if (!self.has_written_after_submit and !self.slot_inflight[self.last_written_slot])
+            self.last_written_slot
+        else
+            self.active_write_slot;
+        if (self.slot_inflight[slot]) return error.AsyncSlotBusy;
+        self.waitSlotInputIdle(slot);
+
         const block_idx = try self.resolveBlockIndex(current_layer);
         const block = &self.blocks[block_idx];
 
         const t0 = try vmstat.nowNs();
-        const pinfo = try block.model.predict(block.plan);
+        const pinfo = try block.model.predict(block.plans[slot]);
         const t1 = try vmstat.nowNs();
 
         self.last_predict_ns = t1 -| t0;
         self.last_all_zero_copy = pinfo.allOutputsZeroCopy();
+        self.last_completed_slot = @intCast(slot);
 
         const unpacked = try self.unpackBlockOutputs(
             block,
+            slot,
             current_layer,
             num_tokens,
             top_m_prefetch,
@@ -845,21 +927,29 @@ pub const AneExpertPredictor = struct {
         }
         if (out_node_layer_bitsets.len < @as(usize, num_tokens) * pred_layers) return error.BufferTooSmall;
 
+        const slot: usize = if (!self.has_written_after_submit and !self.slot_inflight[self.last_written_slot])
+            self.last_written_slot
+        else
+            self.active_write_slot;
+        if (self.slot_inflight[slot]) return error.AsyncSlotBusy;
+        self.waitSlotInputIdle(slot);
+
         const block_idx = try self.resolveBlockIndex(current_layer);
         const block = &self.blocks[block_idx];
 
         const t0 = try vmstat.nowNs();
-        const pinfo = try block.model.predict(block.plan);
+        const pinfo = try block.model.predict(block.plans[slot]);
         const t1 = try vmstat.nowNs();
 
         self.last_predict_ns = t1 -| t0;
         self.last_all_zero_copy = pinfo.allOutputsZeroCopy();
+        self.last_completed_slot = @intCast(slot);
 
         const n_exp = self.config.num_experts;
         const top_k = self.config.top_k;
         const out_cols = block.out_cols;
 
-        var guard = try block.logits_tile.lock(true);
+        var guard = try block.logits_tiles[slot].lock(true);
         errdefer guard.release();
         const logits_f16 = guard.f16Slice();
 
@@ -918,7 +1008,7 @@ pub const AneExpertPredictor = struct {
         const target_layer = current_layer + 1 + delta;
         const win_slot = self.blockOffsetForTarget(block, target_layer, delta);
 
-        var guard = try block.logits_tile.lock(true);
+        var guard = try block.logits_tiles[self.last_completed_slot].lock(true);
         errdefer guard.release();
         const row = guard.f16Slice()[@as(usize, token_idx) * block.out_cols + @as(usize, win_slot) * self.config.num_experts ..][0..self.config.num_experts];
         for (row, 0..) |h, i| dst[i] = @floatCast(h);
@@ -929,7 +1019,8 @@ pub const AneExpertPredictor = struct {
 
     /// Enqueues a non-blocking ANE prediction request onto the lock-free `SpscRing`
     /// so the `USER_INITIATED` ANE driver thread runs concurrently with GPU layers.
-    /// Returns `false` if the request ring is temporarily full.
+    /// Uses double-buffered input/output tiles (`BUF_SLOTS = 2`) and returns
+    /// `false` if both tile slots are currently in flight or unconsumed.
     pub fn submitAsync(
         self: *AneExpertPredictor,
         req_id: u64,
@@ -940,18 +1031,28 @@ pub const AneExpertPredictor = struct {
         if (num_tokens == 0 or num_tokens > self.config.max_tokens) return error.InvalidTokenCount;
         const block_idx = try self.resolveBlockIndex(current_layer);
 
+        const slot: u8 = self.active_write_slot;
+        if (self.slot_inflight[slot]) return false;
+
+        self.x_busy[slot].store(1, .release);
         const pushed = self.req_ring.tryPush(.{
             .kind = .predict,
             .req_id = req_id,
             .current_layer = current_layer,
             .num_tokens = num_tokens,
             .block_idx = block_idx,
+            .buf_slot = slot,
         });
-        if (pushed) {
-            _ = self.req_seq.fetchAdd(1, .release);
-            futexWakeOneU32(&self.req_seq);
+        if (!pushed) {
+            self.x_busy[slot].store(0, .release);
+            return false;
         }
-        return pushed;
+        self.slot_inflight[slot] = true;
+        self.active_write_slot = 1 - slot;
+        self.has_written_after_submit = false;
+        _ = self.req_seq.fetchAdd(1, .release);
+        futexWakeOneU32(&self.req_seq);
+        return true;
     }
 
     /// Polls the completion `SpscRing` without blocking. When ready, unpacks
@@ -998,12 +1099,17 @@ pub const AneExpertPredictor = struct {
         out_bitsets_per_layer: []tree_mod.ExpertBitset,
         out_prefetch_list: []PrefetchCandidate,
     ) Error!AsyncPredictResult {
+        const slot: usize = @min(@as(usize, resp.buf_slot), BUF_SLOTS - 1);
+        defer self.slot_inflight[slot] = false;
+
         if (resp.err) |e| return e;
         self.last_predict_ns = resp.elapsed_ns;
         self.last_all_zero_copy = resp.all_zero_copy;
+        self.last_completed_slot = @intCast(slot);
         const block = &self.blocks[resp.block_idx];
         const unpacked = try self.unpackBlockOutputs(
             block,
+            slot,
             resp.current_layer,
             resp.num_tokens,
             top_m_prefetch,
@@ -1039,33 +1145,41 @@ pub const AneExpertPredictor = struct {
         while (true) {
             const req = blk: {
                 while (true) {
+                    if (self.shutdown.load(.acquire) != 0) return;
                     if (self.req_ring.tryPop()) |item| break :blk item;
                     const seen = self.req_seq.load(.acquire);
+                    if (self.shutdown.load(.acquire) != 0) return;
                     if (self.req_ring.tryPop()) |item| break :blk item;
                     futexWaitU32(&self.req_seq, seen);
                 }
             };
-            if (req.kind == .shutdown) return;
+            if (req.kind == .shutdown or self.shutdown.load(.acquire) != 0) return;
 
+            const slot: usize = @min(@as(usize, req.buf_slot), BUF_SLOTS - 1);
             const block = &self.blocks[req.block_idx];
             const t0 = vmstat.nowNs() catch 0;
             var zc = false;
-            const err_opt: ?metal.Error = if (block.model.predict(block.plan)) |pinfo| blk: {
+            const err_opt: ?metal.Error = if (block.model.predict(block.plans[slot])) |pinfo| blk: {
                 zc = pinfo.allOutputsZeroCopy();
                 break :blk null;
             } else |e| e;
             const t1 = vmstat.nowNs() catch t0;
+
+            self.x_busy[slot].store(0, .release);
+            futexWakeOneU32(&self.x_busy[slot]);
 
             const resp: AsyncResp = .{
                 .req_id = req.req_id,
                 .current_layer = req.current_layer,
                 .num_tokens = req.num_tokens,
                 .block_idx = req.block_idx,
+                .buf_slot = @intCast(slot),
                 .all_zero_copy = zc,
                 .elapsed_ns = t1 -| t0,
                 .err = err_opt,
             };
             while (!self.resp_ring.tryPush(resp)) {
+                if (self.shutdown.load(.acquire) != 0) return;
                 std.atomic.spinLoopHint();
             }
             _ = self.resp_seq.fetchAdd(1, .release);
@@ -1727,4 +1841,92 @@ test "AneExpertPredictor loadFromPath auto-discovers feature names from .mlpacka
     try rep.write(&aw.writer);
     try std.testing.expect(std.mem.indexOf(u8, aw.written(), "a2.ane_recall") != null);
     try std.testing.expect(std.mem.indexOf(u8, aw.written(), "a2.lead_time_us") != null);
+}
+
+test "AneExpertPredictor F23: double-buffered submitAsync isolates concurrent tile slots and deinit drains cleanly without deadlock" {
+    const gpa = std.testing.allocator;
+    const device = try metal.Device.open();
+    defer device.close();
+
+    const num_layers: u32 = 4;
+    const num_experts: u32 = 32;
+    const hidden_size: u32 = 64;
+    const lookahead: u32 = 2;
+    const num_tokens: u32 = 2;
+
+    const router_storage = try gpa.alloc(f16, num_layers * num_experts * hidden_size);
+    defer gpa.free(router_storage);
+    var router_slices: [num_layers][]const f16 = undefined;
+    var rng: u64 = 0xF23F_2300_0001;
+    for (0..num_layers) |l| {
+        const dst = router_storage[l * num_experts * hidden_size ..][0 .. num_experts * hidden_size];
+        for (dst) |*w| w.* = @floatCast(lcgNextF32(&rng) * 0.125);
+        router_slices[l] = dst;
+    }
+
+    const cfg: PredictorConfig = .{
+        .num_layers = num_layers,
+        .num_experts = num_experts,
+        .hidden_size = hidden_size,
+        .lookahead_layers = lookahead,
+        .max_tokens = num_tokens,
+        .top_k = 4,
+        .compute_units = .cpu_and_neural_engine,
+        .enable_async_thread = true,
+    };
+
+    // 1. Idle init + immediate deinit must wake and join without deadlock.
+    {
+        var idle_pred = try AneExpertPredictor.initFromRouterWeights(gpa, device, cfg, &router_slices);
+        idle_pred.deinit(gpa);
+    }
+
+    // 2. Double-buffered async submission isolates two distinct inputs without overwriting.
+    var pred = try AneExpertPredictor.initFromRouterWeights(gpa, device, cfg, &router_slices);
+    defer pred.deinit(gpa);
+
+    var x0: [num_tokens * hidden_size]f16 = undefined;
+    var x1: [num_tokens * hidden_size]f16 = undefined;
+    for (&x0, 0..) |*v, i| v.* = if (i % 2 == 0) @as(f16, 0.5) else @as(f16, -0.25);
+    for (&x1, 0..) |*v, i| v.* = if (i % 3 == 0) @as(f16, -0.75) else @as(f16, 0.35);
+
+    var cpu_logits: [num_experts]f32 = undefined;
+    var cpu_topk: [4]u32 = undefined;
+    var exp_bs0: [lookahead]tree_mod.ExpertBitset = undefined;
+    var exp_bs1: [lookahead]tree_mod.ExpertBitset = undefined;
+    for (0..lookahead) |d_u| {
+        exp_bs0[d_u] = tree_mod.ExpertBitset.empty();
+        exp_bs1[d_u] = tree_mod.ExpertBitset.empty();
+        for (0..num_tokens) |tok| {
+            routeCpuTopK(x0[tok * hidden_size ..][0..hidden_size], router_slices[1 + d_u], num_experts, hidden_size, 4, &cpu_logits, &cpu_topk);
+            for (cpu_topk) |eid| exp_bs0[d_u].set(eid);
+            routeCpuTopK(x1[tok * hidden_size ..][0..hidden_size], router_slices[1 + d_u], num_experts, hidden_size, 4, &cpu_logits, &cpu_topk);
+            for (cpu_topk) |eid| exp_bs1[d_u].set(eid);
+        }
+    }
+
+    try pred.writeInputHiddenF16(&x0, num_tokens);
+    try std.testing.expect(try pred.submitAsync(101, 0, num_tokens));
+    try pred.writeInputHiddenF16(&x1, num_tokens);
+    try std.testing.expect(try pred.submitAsync(102, 0, num_tokens));
+    // Both buffer slots are now in-flight/unconsumed; a 3rd submitAsync must cleanly return false.
+    try std.testing.expect(!(try pred.submitAsync(103, 0, num_tokens)));
+
+    var out_bs0: [lookahead]tree_mod.ExpertBitset = undefined;
+    var out_bs1: [lookahead]tree_mod.ExpertBitset = undefined;
+    var prefetches: [8]PrefetchCandidate = undefined;
+    const r0 = try pred.waitAsync(8, null, &out_bs0, &prefetches);
+    const r1 = try pred.waitAsync(8, null, &out_bs1, &prefetches);
+    try std.testing.expectEqual(@as(u64, 101), r0.req_id);
+    try std.testing.expectEqual(@as(u64, 102), r1.req_id);
+    for (0..lookahead) |d_u| {
+        try std.testing.expectEqualSlices(u64, &exp_bs0[d_u].words, &out_bs0[d_u].words);
+        try std.testing.expectEqualSlices(u64, &exp_bs1[d_u].words, &out_bs1[d_u].words);
+    }
+
+    // 3. Submit unpolled async predictions right before deinit: teardown must not deadlock.
+    try pred.writeInputHiddenF16(&x0, num_tokens);
+    try std.testing.expect(try pred.submitAsync(201, 0, num_tokens));
+    try pred.writeInputHiddenF16(&x1, num_tokens);
+    try std.testing.expect(try pred.submitAsync(202, 0, num_tokens));
 }

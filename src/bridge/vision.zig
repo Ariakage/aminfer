@@ -8,7 +8,10 @@ const metal = @import("metal.zig");
 const page = @import("../mem/page.zig");
 
 pub const MAX_IMAGE_DIM: u32 = c.AMI_VISION_MAX_BYTES_IMAGE_DIM;
+pub const MAX_IMAGE_PIXELS: u64 = c.AMI_VISION_MAX_IMAGE_PIXELS;
 pub const MAX_VIDEO_FRAMES: u32 = c.AMI_VISION_MAX_VIDEO_FRAMES;
+pub const MAX_TOTAL_SURFACE_BYTES: u64 = c.AMI_VISION_MAX_TOTAL_SURFACE_BYTES;
+pub const MAX_DECODED_VIDEO_SAMPLES: u32 = c.AMI_VISION_MAX_DECODED_VIDEO_SAMPLES;
 
 pub const Device = metal.Device;
 pub const VisionFrame = metal.VisionFrame;
@@ -531,4 +534,258 @@ test "bridge.vision: rejects empty, invalid image, and truncated/corrupt ISO-BMF
     } else {
         return error.TestUnexpectedResult;
     }
+}
+
+fn appendPngChunk(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, tag: *const [4]u8, payload: []const u8) !void {
+    var len_be: [4]u8 = undefined;
+    std.mem.writeInt(u32, &len_be, @intCast(payload.len), .big);
+    try buf.appendSlice(allocator, &len_be);
+    try buf.appendSlice(allocator, tag);
+    try buf.appendSlice(allocator, payload);
+    var crc = std.hash.Crc32.init();
+    crc.update(tag);
+    crc.update(payload);
+    var crc_be: [4]u8 = undefined;
+    std.mem.writeInt(u32, &crc_be, crc.final(), .big);
+    try buf.appendSlice(allocator, &crc_be);
+}
+
+fn makeTinyPngWithDimsAlloc(allocator: std.mem.Allocator, width: u32, height: u32) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try out.appendSlice(allocator, "\x89PNG\r\n\x1a\n");
+    var ihdr: [13]u8 = undefined;
+    std.mem.writeInt(u32, ihdr[0..4], width, .big);
+    std.mem.writeInt(u32, ihdr[4..8], height, .big);
+    ihdr[8] = 8; // bit depth
+    ihdr[9] = 6; // RGBA
+    ihdr[10] = 0;
+    ihdr[11] = 0;
+    ihdr[12] = 0;
+    try appendPngChunk(&out, allocator, "IHDR", &ihdr);
+    // Minimal zlib stream (valid empty/tiny deflate block) + IEND so ImageIO parses header cleanly.
+    const idat = [_]u8{ 0x78, 0x9C, 0x63, 0x00, 0x00, 0x00, 0x02, 0x00, 0x01 };
+    try appendPngChunk(&out, allocator, "IDAT", &idat);
+    try appendPngChunk(&out, allocator, "IEND", &.{});
+    return out.toOwnedSlice(allocator);
+}
+
+fn appendIsoBox(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, tag: *const [4]u8, payload: []const u8) !void {
+    var hdr: [8]u8 = undefined;
+    std.mem.writeInt(u32, hdr[0..4], @intCast(8 + payload.len), .big);
+    @memcpy(hdr[4..8], tag);
+    try buf.appendSlice(allocator, &hdr);
+    try buf.appendSlice(allocator, payload);
+}
+
+test "bridge.vision: F8 rejects oversized PNG header bombs (16384x16384 and 8192x8192) before pixel allocation" {
+    const gpa = std.testing.allocator;
+    const device = try Device.open();
+    defer device.close();
+
+    var out_buf: [2]VisionFrame = undefined;
+
+    // 1. 16384x16384 exceeds MAX_IMAGE_DIM (8192).
+    const bomb_16k = try makeTinyPngWithDimsAlloc(gpa, 16384, 16384);
+    defer gpa.free(bomb_16k);
+    try std.testing.expectError(error.VisionFailed, decodeImageBytes(device, bomb_16k));
+    try std.testing.expectError(error.VisionFailed, decodeVideoBytesInto(device, bomb_16k, &out_buf));
+
+    // 2. 8192x8192 fits per-axis 8192 but exceeds MAX_IMAGE_PIXELS (32 MP / 128 MiB RGBA).
+    const bomb_64mp = try makeTinyPngWithDimsAlloc(gpa, 8192, 8192);
+    defer gpa.free(bomb_64mp);
+    try std.testing.expectError(error.VisionFailed, decodeImageBytes(device, bomb_64mp));
+    try std.testing.expectError(error.VisionFailed, decodeVideoBytesInto(device, bomb_64mp, &out_buf));
+}
+
+test "bridge.vision: F9 rejects aliased stco chunks and excessive GOP decode amplification, and N5 supports HEIC fallback" {
+    const gpa = std.testing.allocator;
+    const device = try Device.open();
+    defer device.close();
+
+    // Build a valid baseline MP4 to borrow genuine avcC and sample bytes.
+    const clip = try VtClip.encodeTestClip(.h264, 64, 64, 2, 30);
+    defer clip.close();
+    const valid_mp4 = try exportClipMp4BytesAlloc(clip, gpa);
+    defer gpa.free(valid_mp4);
+
+    const avcc_tag_pos = std.mem.indexOf(u8, valid_mp4, "avcC") orelse return error.TestUnexpectedResult;
+    const avcc_len = std.mem.readInt(u32, valid_mp4[avcc_tag_pos - 4 ..][0..4], .big);
+    const avcc_payload = valid_mp4[avcc_tag_pos + 4 .. avcc_tag_pos - 4 + avcc_len];
+
+    const mdat_tag_pos = std.mem.indexOf(u8, valid_mp4, "mdat") orelse return error.TestUnexpectedResult;
+    const mdat_payload_off: u32 = @intCast(mdat_tag_pos + 4);
+    const stsz_tag_pos = std.mem.indexOf(u8, valid_mp4, "stsz") orelse return error.TestUnexpectedResult;
+    const sample0_sz = std.mem.readInt(u32, valid_mp4[stsz_tag_pos + 16 ..][0..4], .big);
+
+    // Helper closure-style builder for crafted MP4 tables (`stsz`, `stco`, `stsc`, optional `stss`).
+    const Builder = struct {
+        fn buildMp4(
+            alloc: std.mem.Allocator,
+            avcc: []const u8,
+            sample_count: u32,
+            uniform_sz: u32,
+            chunk_offsets: []const u32,
+            stsc_entries: []const [3]u32,
+            stss_syncs: ?[]const u32,
+            mdat_bytes: []const u8,
+        ) ![]u8 {
+            var stsd: std.ArrayList(u8) = .empty;
+            defer stsd.deinit(alloc);
+            var avc1: std.ArrayList(u8) = .empty;
+            defer avc1.deinit(alloc);
+            try avc1.appendNTimes(alloc, 0, 24);
+            var wh: [4]u8 = undefined;
+            std.mem.writeInt(u16, wh[0..2], 64, .big);
+            std.mem.writeInt(u16, wh[2..4], 64, .big);
+            try avc1.appendSlice(alloc, &wh);
+            try avc1.appendNTimes(alloc, 0, 50);
+            try appendIsoBox(&avc1, alloc, "avcC", avcc);
+
+            var stsd_head: [8]u8 = .{ 0, 0, 0, 0, 0, 0, 0, 1 };
+            try stsd.appendSlice(alloc, &stsd_head);
+            try appendIsoBox(&stsd, alloc, "avc1", avc1.items);
+
+            var stsz: std.ArrayList(u8) = .empty;
+            defer stsz.deinit(alloc);
+            var stsz_hdr: [12]u8 = @splat(0);
+            std.mem.writeInt(u32, stsz_hdr[4..8], uniform_sz, .big);
+            std.mem.writeInt(u32, stsz_hdr[8..12], sample_count, .big);
+            try stsz.appendSlice(alloc, &stsz_hdr);
+
+            var stsc: std.ArrayList(u8) = .empty;
+            defer stsc.deinit(alloc);
+            var stsc_hdr: [8]u8 = @splat(0);
+            std.mem.writeInt(u32, stsc_hdr[4..8], @intCast(stsc_entries.len), .big);
+            try stsc.appendSlice(alloc, &stsc_hdr);
+            for (stsc_entries) |e| {
+                var rec: [12]u8 = undefined;
+                std.mem.writeInt(u32, rec[0..4], e[0], .big);
+                std.mem.writeInt(u32, rec[4..8], e[1], .big);
+                std.mem.writeInt(u32, rec[8..12], e[2], .big);
+                try stsc.appendSlice(alloc, &rec);
+            }
+
+            var stco: std.ArrayList(u8) = .empty;
+            defer stco.deinit(alloc);
+            var stco_hdr: [8]u8 = @splat(0);
+            std.mem.writeInt(u32, stco_hdr[4..8], @intCast(chunk_offsets.len), .big);
+            try stco.appendSlice(alloc, &stco_hdr);
+            for (chunk_offsets) |off| {
+                var rec: [4]u8 = undefined;
+                std.mem.writeInt(u32, &rec, off, .big);
+                try stco.appendSlice(alloc, &rec);
+            }
+
+            var stbl: std.ArrayList(u8) = .empty;
+            defer stbl.deinit(alloc);
+            try appendIsoBox(&stbl, alloc, "stsd", stsd.items);
+            try appendIsoBox(&stbl, alloc, "stsz", stsz.items);
+            try appendIsoBox(&stbl, alloc, "stsc", stsc.items);
+            try appendIsoBox(&stbl, alloc, "stco", stco.items);
+            if (stss_syncs) |syncs| {
+                var stss: std.ArrayList(u8) = .empty;
+                defer stss.deinit(alloc);
+                var stss_hdr: [8]u8 = @splat(0);
+                std.mem.writeInt(u32, stss_hdr[4..8], @intCast(syncs.len), .big);
+                try stss.appendSlice(alloc, &stss_hdr);
+                for (syncs) |s1| {
+                    var rec: [4]u8 = undefined;
+                    std.mem.writeInt(u32, &rec, s1, .big);
+                    try stss.appendSlice(alloc, &rec);
+                }
+                try appendIsoBox(&stbl, alloc, "stss", stss.items);
+            }
+
+            var minf: std.ArrayList(u8) = .empty;
+            defer minf.deinit(alloc);
+            try appendIsoBox(&minf, alloc, "stbl", stbl.items);
+
+            var mdia: std.ArrayList(u8) = .empty;
+            defer mdia.deinit(alloc);
+            var mdhd: [20]u8 = @splat(0);
+            std.mem.writeInt(u32, mdhd[12..16], 30000, .big);
+            try appendIsoBox(&mdia, alloc, "mdhd", &mdhd);
+            try appendIsoBox(&mdia, alloc, "minf", minf.items);
+
+            var trak: std.ArrayList(u8) = .empty;
+            defer trak.deinit(alloc);
+            try appendIsoBox(&trak, alloc, "mdia", mdia.items);
+
+            var moov: std.ArrayList(u8) = .empty;
+            defer moov.deinit(alloc);
+            try appendIsoBox(&moov, alloc, "trak", trak.items);
+
+            var file: std.ArrayList(u8) = .empty;
+            errdefer file.deinit(alloc);
+            try appendIsoBox(&file, alloc, "ftyp", "isom\x00\x00\x02\x00isom");
+            try appendIsoBox(&file, alloc, "mdat", mdat_bytes);
+            try appendIsoBox(&file, alloc, "moov", moov.items);
+            return file.toOwnedSlice(alloc);
+        }
+    };
+
+    var out_buf: [2]VisionFrame = undefined;
+    const mdat_sample = valid_mp4[mdat_payload_off..][0..sample0_sz];
+
+    // 1. Aliased/overlapping stco chunk offsets pointing to the same offset (16 = inside mdat payload)
+    const aliased_mp4 = try Builder.buildMp4(
+        gpa,
+        avcc_payload,
+        2,
+        sample0_sz,
+        &.{ 28, 28 },
+        &.{.{ 1, 1, 1 }},
+        null,
+        mdat_sample,
+    );
+    defer gpa.free(aliased_mp4);
+    try std.testing.expectError(error.VisionFailed, decodeVideoBytesInto(device, aliased_mp4, &out_buf));
+
+    // 2. Crafted MP4 exceeding MAX_DECODED_VIDEO_SAMPLES (2048) with 1 sync frame at sample 1
+    //    (non-overlapping uniform 4-byte samples inside a ~9 KB mdat).
+    const big_count: u32 = MAX_DECODED_VIDEO_SAMPLES + 16;
+    const fake_mdat = try gpa.alloc(u8, big_count * 4);
+    defer gpa.free(fake_mdat);
+    @memset(fake_mdat, 0);
+    const amp_mp4 = try Builder.buildMp4(
+        gpa,
+        avcc_payload,
+        big_count,
+        4,
+        &.{28},
+        &.{.{ 1, big_count, 1 }},
+        &.{1},
+        fake_mdat,
+    );
+    defer gpa.free(amp_mp4);
+    try std.testing.expectError(error.VisionFailed, decodeVideoBytesInto(device, amp_mp4, &out_buf));
+
+    // 3. N5: Single HEIC image (`ftyp` major brand `heic`) via decodeVideoBytesInto succeeds!
+    const src_f = try VisionFrame.init(device, .bgra8, 32, 32);
+    defer src_f.close();
+    {
+        var g = try src_f.lockPlane(0, false);
+        errdefer g.release();
+        for (0..32) |y| {
+            const row = g.rowBytes(@intCast(y));
+            for (0..32) |x| {
+                row[x * 4 + 0] = 40;
+                row[x * 4 + 1] = 180;
+                row[x * 4 + 2] = 90;
+                row[x * 4 + 3] = 255;
+            }
+        }
+        try g.unlock();
+    }
+    const heic_bytes = try encodeImageBytesAlloc(src_f, "public.heic", gpa);
+    defer gpa.free(heic_bytes);
+    try std.testing.expect(heic_bytes.len > 16);
+    try std.testing.expectEqualStrings("ftyp", heic_bytes[4..8]);
+    const heic_frames = try decodeVideoBytesInto(device, heic_bytes, &out_buf);
+    defer for (heic_frames) |f| f.close();
+    try std.testing.expectEqual(@as(usize, 1), heic_frames.len);
+    const hi = try heic_frames[0].info();
+    try std.testing.expectEqual(@as(u32, 32), hi.width());
+    try std.testing.expectEqual(@as(u32, 32), hi.height());
 }

@@ -187,7 +187,11 @@ pub const ClientConnection = struct {
     tls_version: u16,
 };
 
-pub fn clientConnectSocketpair(
+/// WARNING: INSECURE LOOPBACK TEST HELPER ONLY.
+/// Connects a TLS client over loopback with server certificate verification
+/// DISABLED (`complete(true)` unconditionally). Do NOT use in production; use
+/// `clientConnectSocketpairVerified` whenever peer authenticity is required.
+pub fn clientConnectSocketpairInsecureLoopback(
     host_ipv4: [4]u8,
     port: u16,
     min_tls_version: u16,
@@ -195,9 +199,54 @@ pub fn clientConnectSocketpair(
 ) TlsError!ClientConnection {
     var fd: i32 = -1;
     var ver: u16 = 0;
-    try check(c.ami_tls_client_connect_socketpair(
+    try check(c.ami_tls_client_connect_socketpair_insecure_loopback(
         &host_ipv4,
         port,
+        min_tls_version,
+        max_tls_version,
+        &fd,
+        &ver,
+    ));
+    if (fd < 0) return error.TlsBindFailed;
+    return .{ .fd = fd, .tls_version = ver };
+}
+
+/// Legacy alias delegating to `clientConnectSocketpairInsecureLoopback`.
+/// WARNING: Disables X.509 certificate verification; retained solely for
+/// existing loopback benchmarks and tests.
+pub fn clientConnectSocketpair(
+    host_ipv4: [4]u8,
+    port: u16,
+    min_tls_version: u16,
+    max_tls_version: u16,
+) TlsError!ClientConnection {
+    return clientConnectSocketpairInsecureLoopback(host_ipv4, port, min_tls_version, max_tls_version);
+}
+
+/// Certificate-verifying TLS client backed by `nw_connection_t` + `socketpair`.
+/// Evaluates peer trust via `SecTrustEvaluateWithError` inside the verify block.
+/// Pass `server_name` for SNI/hostname checking (or `null` to check `host_ipv4`),
+/// and `anchor_pem` to pin against caller-provided PEM trust anchor(s) (or
+/// `null` to validate against the macOS system trust store).
+pub fn clientConnectSocketpairVerified(
+    host_ipv4: [4]u8,
+    port: u16,
+    server_name: ?[:0]const u8,
+    anchor_pem: ?[]const u8,
+    min_tls_version: u16,
+    max_tls_version: u16,
+) TlsError!ClientConnection {
+    var fd: i32 = -1;
+    var ver: u16 = 0;
+    const sn_ptr: ?[*:0]const u8 = if (server_name) |sn| sn.ptr else null;
+    const anchor_ptr: ?[*]const u8 = if (anchor_pem) |ap| (if (ap.len > 0) ap.ptr else null) else null;
+    const anchor_len: usize = if (anchor_pem) |ap| ap.len else 0;
+    try check(c.ami_tls_client_connect_socketpair_verified(
+        &host_ipv4,
+        port,
+        sn_ptr,
+        anchor_ptr,
+        anchor_len,
         min_tls_version,
         max_tls_version,
         &fd,
@@ -788,4 +837,123 @@ test "bridge.tls: multi-megabyte backpressure streaming, concurrent clients, and
 
     srv_thread.join();
     srv_joined = true;
+}
+
+test "bridge.tls: L2 clientConnectSocketpairInsecureLoopback and clientConnectSocketpairVerified trust evaluation" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var threaded_io: std.Io.Threaded = .init(gpa, .{});
+    defer threaded_io.deinit();
+    const io = threaded_io.io();
+
+    const dir = try std.fmt.allocPrint(gpa, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer gpa.free(dir);
+    const key_path = try std.fmt.allocPrint(gpa, "{s}/srv.key.pem", .{dir});
+    defer gpa.free(key_path);
+    const cert_path = try std.fmt.allocPrint(gpa, "{s}/srv.cert.pem", .{dir});
+    defer gpa.free(cert_path);
+    const other_key_path = try std.fmt.allocPrint(gpa, "{s}/other.key.pem", .{dir});
+    defer gpa.free(other_key_path);
+    const other_cert_path = try std.fmt.allocPrint(gpa, "{s}/other.cert.pem", .{dir});
+    defer gpa.free(other_cert_path);
+
+    try runCmdChecked(gpa, io, &.{
+        "/usr/bin/openssl", "ecparam", "-name", "prime256v1", "-genkey", "-noout", "-out", key_path,
+    });
+    try runCmdChecked(gpa, io, &.{
+        "/usr/bin/openssl",
+        "req",
+        "-x509",
+        "-new",
+        "-key",
+        key_path,
+        "-subj",
+        "/CN=localhost",
+        "-addext",
+        "subjectAltName=DNS:localhost,IP:127.0.0.1",
+        "-addext",
+        "extendedKeyUsage=serverAuth",
+        "-days",
+        "1",
+        "-out",
+        cert_path,
+    });
+    try runCmdChecked(gpa, io, &.{
+        "/usr/bin/openssl", "ecparam", "-name", "prime256v1", "-genkey", "-noout", "-out", other_key_path,
+    });
+    try runCmdChecked(gpa, io, &.{
+        "/usr/bin/openssl",
+        "req",
+        "-x509",
+        "-new",
+        "-key",
+        other_key_path,
+        "-subj",
+        "/CN=other",
+        "-addext",
+        "subjectAltName=DNS:localhost,IP:127.0.0.1",
+        "-addext",
+        "extendedKeyUsage=serverAuth",
+        "-days",
+        "1",
+        "-out",
+        other_cert_path,
+    });
+
+    var server_files = try loadFiles(gpa, cert_path, key_path);
+    defer server_files.deinit(gpa);
+    var other_files = try loadFiles(gpa, other_cert_path, other_key_path);
+    defer other_files.deinit(gpa);
+
+    const lst = try TlsListener.init(.{
+        .host_ipv4 = .{ 127, 0, 0, 1 },
+        .port = 0,
+        .backlog = 16,
+        .cert_bytes = server_files.cert_bytes,
+        .key_bytes = server_files.key_bytes,
+    });
+    defer lst.deinit();
+    const port = lst.boundPort();
+
+    // 1. Insecure loopback variant succeeds against self-signed server without anchor.
+    {
+        const cc = try clientConnectSocketpairInsecureLoopback(.{ 127, 0, 0, 1 }, port, TLS_VERSION_1_3, TLS_VERSION_1_3);
+        defer _ = std.c.close(cc.fd);
+        try std.testing.expectEqual(TLS_VERSION_1_3, cc.tls_version);
+        const sfd = try popAcceptedWithWait(lst, 3000);
+        defer _ = std.c.close(sfd);
+        try writeAllFd(cc.fd, "ping");
+        var rx: [4]u8 = undefined;
+        try std.testing.expectEqual(@as(usize, 4), try readExactOrEofFd(sfd, &rx));
+        try std.testing.expectEqualStrings("ping", &rx);
+    }
+
+    // 2. Verified variant rejects untrusted self-signed cert when anchor_pem is null or mismatched.
+    try std.testing.expectError(
+        error.TlsIdentityInvalid,
+        clientConnectSocketpairVerified(.{ 127, 0, 0, 1 }, port, "localhost", null, TLS_VERSION_1_3, TLS_VERSION_1_3),
+    );
+    try std.testing.expectError(
+        error.TlsIdentityInvalid,
+        clientConnectSocketpairVerified(.{ 127, 0, 0, 1 }, port, "localhost", other_files.cert_bytes, TLS_VERSION_1_3, TLS_VERSION_1_3),
+    );
+    try std.testing.expectError(
+        error.TlsIdentityInvalid,
+        clientConnectSocketpairVerified(.{ 127, 0, 0, 1 }, port, "wrong.example.com", server_files.cert_bytes, TLS_VERSION_1_3, TLS_VERSION_1_3),
+    );
+
+    // 3. Verified variant succeeds when matching anchor PEM and matching SNI/IP are supplied.
+    {
+        const vc = try clientConnectSocketpairVerified(.{ 127, 0, 0, 1 }, port, "localhost", server_files.cert_bytes, TLS_VERSION_1_3, TLS_VERSION_1_3);
+        defer _ = std.c.close(vc.fd);
+        try std.testing.expectEqual(TLS_VERSION_1_3, vc.tls_version);
+        const sfd = try popAcceptedWithWait(lst, 3000);
+        defer _ = std.c.close(sfd);
+        try writeAllFd(vc.fd, "verified");
+        var rx: [8]u8 = undefined;
+        try std.testing.expectEqual(@as(usize, 8), try readExactOrEofFd(sfd, &rx));
+        try std.testing.expectEqualStrings("verified", &rx);
+    }
 }

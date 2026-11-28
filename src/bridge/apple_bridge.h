@@ -22,7 +22,7 @@ extern "C" {
 #define AMI_KV_TILE_ROW_ALIGN_F16 32u
 #define AMI_MAX_FRAMES_IN_FLIGHT 4u
 #define AMI_UNIFORM_STRIDE 256u
-#define AMI_UNIFORM_SLOTS_PER_FRAME 4096u
+#define AMI_UNIFORM_SLOTS_PER_FRAME 16384u
 #define AMI_ANE_MAX_DIMS 5u
 #define AMI_ANE_MAX_BINDINGS 16u
 #define AMI_MAX_CPU_CORES 128u
@@ -265,6 +265,18 @@ ami_status ami_compute_clear_residency(ami_compute *compute);
 /*
  * Multi-dispatch Metal 4 frame encoding (zero heap allocation on the hot path).
  * Call sequence: begin_frame -> 1+ encode_dispatch -> commit_frame -> wait.
+ *
+ * Metal 4 hazard-tracking contract:
+ *   MTL4CommandBuffer / MTL4ComputeCommandEncoder do not implicitly track
+ *   read/write hazards across command buffers or across dispatches inside an
+ *   encoder. To prevent cross-frame data races on shared buffers or KV tiles
+ *   when overlapping frames in flight, `ami_compute_begin_frame` inspects the
+ *   shared event and marks the opened frame when any earlier committed frame is
+ *   still in flight; the first dispatch in that frame automatically emits a
+ *   queue-level barrier (`barrierAfterQueueStages:MTLStageDispatch
+ *   beforeStages:MTLStageDispatch visibilityOptions:MTL4VisibilityOptionDevice`).
+ *   Within a single frame, callers remain responsible for passing
+ *   `insert_barrier_before != 0` on dependent dispatches.
  */
 ami_status ami_compute_begin_frame(ami_compute *compute, uint64_t timeout_ms,
                                    uint32_t *out_slot);
@@ -317,6 +329,15 @@ ami_status ami_mtl4_compute_dispatch_indirect(ami_compute *compute, const ami_pi
 
 ami_status ami_compute_commit_frame(ami_compute *compute, uint64_t *out_signal);
 ami_status ami_compute_wait(ami_compute *compute, uint64_t signal, uint64_t timeout_ms);
+
+/*
+ * Waits with bounded retries until all committed frames on `compute` reach
+ * their completion fence, or until `timeout_ms` elapses. `best_effort` performs
+ * a bounded multi-step drain so callers tearing down after a timeout can
+ * synchronize before releasing residency or unmapping NoCopy memory.
+ */
+ami_status ami_compute_wait_idle(ami_compute *compute, uint64_t timeout_ms);
+void ami_compute_wait_idle_best_effort(ami_compute *compute);
 
 /*
  * Convenience single-dispatch synchronous helper built on the reusable frame
@@ -636,13 +657,17 @@ ami_status ami_vt_decode_clip_frame(ami_vt_decode_session *session,
                                     ami_vision_frame **out_frame);
 
 #define AMI_VISION_MAX_BYTES_IMAGE_DIM 8192u
+#define AMI_VISION_MAX_IMAGE_PIXELS 33554432ull
 #define AMI_VISION_MAX_VIDEO_FRAMES 64u
+#define AMI_VISION_MAX_TOTAL_SURFACE_BYTES (512ull * 1024ull * 1024ull)
+#define AMI_VISION_MAX_DECODED_VIDEO_SAMPLES 2048u
 
 /*
  * Decodes an in-memory image payload (PNG, JPEG, WebP, HEIC, GIF, BMP, TIFF)
  * via ImageIO CGImageSourceCreateWithData directly into a 16 KiB-aligned BGRA8
- * IOSurface-backed ami_vision_frame with zero temp files. Enforces width and
- * height in 1..8192.
+ * IOSurface-backed ami_vision_frame with zero temp files. Inspects image header
+ * properties before pixel decode and enforces width, height in 1..8192 and
+ * width * height <= 33554432 (32 MP / 128 MiB BGRA8).
  */
 ami_status ami_image_decode_bytes_iosurface(ami_device *device,
                                             const uint8_t *bytes, size_t len,
@@ -677,11 +702,12 @@ ami_status ami_vt_clip_export_mp4_bytes(const ami_vt_clip *clip,
 
 /*
  * Decodes up to `max_frames` (1..64, evenly sampled across total frame count
- * when clip has > max_frames frames) from an in-memory video/animated payload
- * (ISO-BMFF MP4/MOV H.264/HEVC, raw Annex-B H.264/HEVC, or multi-frame/single
- * ImageIO GIF/APNG/WebP/PNG/JPEG) directly into 16 KiB-aligned IOSurface
- * ami_vision_frames (NV12 or BGRA8) with zero temp files and zero AVFoundation.
- * `out_frames` must hold at least `max_frames` pointers.
+ * when clip has > max_frames frames, capped at 512 MiB cumulative IOSurface
+ * bytes and 2048 VideoToolbox GOP samples) from an in-memory video/animated
+ * payload (ISO-BMFF MP4/MOV H.264/HEVC, raw Annex-B H.264/HEVC, or multi-frame/
+ * single ImageIO GIF/APNG/WebP/HEIC/AVIF/PNG/JPEG) directly into 16 KiB-aligned
+ * IOSurface ami_vision_frames (NV12 or BGRA8) with zero temp files and zero
+ * AVFoundation. `out_frames` must hold at least `max_frames` pointers.
  */
 ami_status ami_video_decode_bytes_iosurface(ami_device *device,
                                             const uint8_t *bytes, size_t len,
@@ -797,9 +823,24 @@ ami_status ami_tls_listener_pop_accepted_fd(ami_tls_listener *listener,
                                             int32_t *out_fd);
 
 /*
- * Loopback TLS test client helper backed by `nw_connection_t` + `socketpair`.
- * Accepts self-signed certs on loopback and reports the negotiated TLS
- * protocol version (`0x0303` = TLS 1.2, `0x0304` = TLS 1.3).
+ * WARNING: INSECURE LOOPBACK TEST HELPER ONLY.
+ * Connects a TLS client backed by `nw_connection_t` + `socketpair` with
+ * server certificate verification DISABLED (`complete(true)` unconditionally).
+ * Never use in production; use `ami_tls_client_connect_socketpair_verified`
+ * whenever peer authenticity is required. Reports the negotiated TLS protocol
+ * version (`0x0303` = TLS 1.2, `0x0304` = TLS 1.3).
+ */
+ami_status ami_tls_client_connect_socketpair_insecure_loopback(const uint8_t host_ipv4[4],
+                                                               uint16_t port,
+                                                               uint16_t min_tls_version,
+                                                               uint16_t max_tls_version,
+                                                               int32_t *out_client_fd,
+                                                               uint16_t *out_tls_version);
+
+/*
+ * Legacy alias delegating to `ami_tls_client_connect_socketpair_insecure_loopback`.
+ * Certificate verification is DISABLED; retained solely for existing loopback tests
+ * and benchmarks.
  */
 ami_status ami_tls_client_connect_socketpair(const uint8_t host_ipv4[4],
                                              uint16_t port,
@@ -807,6 +848,24 @@ ami_status ami_tls_client_connect_socketpair(const uint8_t host_ipv4[4],
                                              uint16_t max_tls_version,
                                              int32_t *out_client_fd,
                                              uint16_t *out_tls_version);
+
+/*
+ * Certificate-verifying TLS client backed by `nw_connection_t` + `socketpair`.
+ * Evaluates peer X.509 trust inside `sec_protocol_options_set_verify_block`
+ * via `SecTrustEvaluateWithError`. Pass `server_name` (NULL-terminated SNI /
+ * hostname) or NULL to verify against `host_ipv4`. Pass `anchor_pem_bytes` /
+ * `anchor_pem_len` to restrict trust anchors to caller-provided PEM cert(s),
+ * or NULL / 0 to evaluate against the macOS system trust store.
+ */
+ami_status ami_tls_client_connect_socketpair_verified(const uint8_t host_ipv4[4],
+                                                      uint16_t port,
+                                                      const char *server_name,
+                                                      const uint8_t *anchor_pem_bytes,
+                                                      size_t anchor_pem_len,
+                                                      uint16_t min_tls_version,
+                                                      uint16_t max_tls_version,
+                                                      int32_t *out_client_fd,
+                                                      uint16_t *out_tls_version);
 
 #ifdef __cplusplus
 }
