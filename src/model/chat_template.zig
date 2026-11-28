@@ -405,6 +405,8 @@ pub const RenderOptions = struct {
     parallel_tool_calls: bool = true,
     add_vision_id: bool = false,
     prior_prompt: ?[]const u8 = null,
+    /// Optional span permissions corresponding to `prior_prompt` so replayed turns preserve untrusted isolation.
+    prior_spans: ?[]const PromptSpan = null,
     /// Preserves single-`\n` `<think>\n\n</think>\n` formatting for `chat_repl.zig` ChatML compatibility.
     repl_compact_nothink: bool = false,
 };
@@ -635,6 +637,12 @@ const JsonScan = struct {
         return self.src[start..self.pos];
     }
 };
+
+/// Fuzz/property-test entrypoint exercising `JsonScan` over untrusted JSON bytes.
+pub fn fuzzJsonScan(src: []const u8) TemplateError!void {
+    var scan = JsonScan{ .src = src };
+    try scan.skipValue(0);
+}
 
 fn readSmallStrOpt(r: *JsonScan, out: anytype) TemplateError!void {
     if (r.consumeKeyword("null")) {
@@ -1595,6 +1603,117 @@ fn parseMultimodalObject(r: *JsonScan, mm: *MultimodalSpec) TemplateError!void {
 // ---------------------------------------------------------------------------
 
 pub const MAX_TRACKED_TOOL_CALL_NAMES: usize = 64;
+pub const MAX_PROMPT_SPANS: usize = 512;
+
+pub const PromptSpan = struct {
+    len: u32,
+    allow_special: bool,
+};
+
+/// Records contiguous `(len, allow_special)` spans emitted by `PromptRenderer`
+/// into a fixed caller buffer so downstream tokenizers preserve role isolation
+/// with zero heap allocation.
+pub const PromptSpanRecorder = struct {
+    spans: []PromptSpan,
+    count: usize = 0,
+    total_bytes: usize = 0,
+
+    pub fn init(spans: []PromptSpan) PromptSpanRecorder {
+        return .{ .spans = spans };
+    }
+
+    pub fn slice(self: *const PromptSpanRecorder) []const PromptSpan {
+        return self.spans[0..self.count];
+    }
+
+    pub fn sink(self: *PromptSpanRecorder) SegmentSink {
+        return .{ .ctx = self, .emitFn = emit };
+    }
+
+    pub fn record(self: *PromptSpanRecorder, byte_len: usize, allow_special: bool) TemplateError!void {
+        if (byte_len == 0) return;
+        const len_u32 = std.math.cast(u32, byte_len) orelse return error.BufferTooSmall;
+        if (self.count > 0 and self.spans[self.count - 1].allow_special == allow_special) {
+            const merged = std.math.add(u32, self.spans[self.count - 1].len, len_u32) catch return error.BufferTooSmall;
+            self.spans[self.count - 1].len = merged;
+            self.total_bytes += byte_len;
+            return;
+        }
+        if (self.count >= self.spans.len) return error.BufferTooSmall;
+        self.spans[self.count] = .{ .len = len_u32, .allow_special = allow_special };
+        self.count += 1;
+        self.total_bytes += byte_len;
+    }
+
+    fn emit(raw_ctx: *anyopaque, bytes: []const u8, allow_special: bool) TemplateError!void {
+        const self: *PromptSpanRecorder = @ptrCast(@alignCast(raw_ctx));
+        return self.record(bytes.len, allow_special);
+    }
+};
+
+/// Tokenizes `prompt[byte_start..byte_end]` while enforcing per-span `allow_special`
+/// permissions (failing closed to `allow_special = false` if no matching span covers
+/// a suffix). When `spans_opt == null`, falls back to standard `encodeWithScratch`.
+pub fn encodePromptSpansRangeWithScratch(
+    tok: anytype,
+    scratch: anytype,
+    prompt: []const u8,
+    spans_opt: ?[]const PromptSpan,
+    byte_start: usize,
+    byte_end: usize,
+    out_ids: []u32,
+) ![]u32 {
+    const lo = @min(byte_start, prompt.len);
+    const hi = @min(@max(byte_end, lo), prompt.len);
+    if (lo == hi) return out_ids[0..0];
+    const spans = spans_opt orelse {
+        return tok.encodeWithScratch(scratch, prompt[lo..hi], out_ids);
+    };
+    var pos: usize = 0;
+    var cursor: usize = 0;
+    for (spans) |sp| {
+        const sp_len: usize = sp.len;
+        const sp_end = @min(cursor + sp_len, prompt.len);
+        if (sp_end > lo and cursor < hi) {
+            const seg_lo = @max(cursor, lo);
+            const seg_hi = @min(sp_end, hi);
+            if (seg_hi > seg_lo) {
+                const written = try tok.encodeWithScratchOptions(
+                    scratch,
+                    prompt[seg_lo..seg_hi],
+                    out_ids[pos..],
+                    .{ .allow_special = sp.allow_special },
+                );
+                pos += written.len;
+            }
+        }
+        cursor = sp_end;
+        if (cursor >= hi) break;
+    }
+    if (cursor < hi) {
+        const seg_lo = @max(cursor, lo);
+        if (hi > seg_lo) {
+            const written = try tok.encodeWithScratchOptions(
+                scratch,
+                prompt[seg_lo..hi],
+                out_ids[pos..],
+                .{ .allow_special = false },
+            );
+            pos += written.len;
+        }
+    }
+    return out_ids[0..pos];
+}
+
+pub fn encodePromptSpansWithScratch(
+    tok: anytype,
+    scratch: anytype,
+    prompt: []const u8,
+    spans_opt: ?[]const PromptSpan,
+    out_ids: []u32,
+) ![]u32 {
+    return encodePromptSpansRangeWithScratch(tok, scratch, prompt, spans_opt, 0, prompt.len, out_ids);
+}
 
 pub const SegmentSink = struct {
     ctx: *anyopaque,
@@ -1722,7 +1841,26 @@ pub const PromptRenderer = struct {
     pub fn begin(self: *PromptRenderer) TemplateError!void {
         if (self.opts.prior_prompt) |prior| {
             if (prior.len > 0) {
-                try self.writeStructural(prior);
+                if (self.opts.prior_spans) |pspans| {
+                    var cursor: usize = 0;
+                    for (pspans) |sp| {
+                        const end = @min(cursor + @as(usize, sp.len), prior.len);
+                        if (end > cursor) {
+                            if (sp.allow_special) {
+                                try self.writeStructural(prior[cursor..end]);
+                            } else {
+                                try self.writeUntrusted(prior[cursor..end]);
+                            }
+                        }
+                        cursor = end;
+                        if (cursor >= prior.len) break;
+                    }
+                    if (cursor < prior.len) {
+                        try self.writeUntrusted(prior[cursor..]);
+                    }
+                } else {
+                    try self.writeStructural(prior);
+                }
                 self.has_prior_messages = true;
                 self.effort_emitted = true;
             }

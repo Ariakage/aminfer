@@ -400,7 +400,7 @@ class StreamingPackTests(unittest.TestCase):
         ckpt, _ = self.build_moe_checkpoint(tie=True)
         resolved = resolve_checkpoint(ckpt)
         self.assertEqual(len(resolved.shard_paths), 2)
-        self.assertEqual(resolved.config_path, ckpt / "config.json")
+        self.assertEqual(resolved.config_path, (ckpt / "config.json").resolve())
         with mock.patch.object(amf, "_read_exact", side_effect=AssertionError("tensor data read in pass 1")):
             plan = amf.plan_amf_entries(amf._collect_tensors(resolved.shard_paths), tie_word_embeddings=True)
         self.assertEqual(len(plan), 18)

@@ -14888,7 +14888,11 @@ pub const GraphModel = struct {
         var total_wired_bytes: u64 = 0;
         for (shard_sizes.items, 0..) |sz, si| {
             const aligned_sz = try page.alignUp(sz);
-            try wired_budget.checkPlan(total_wired_bytes + aligned_sz);
+            const shard_plan_bytes: u64 = if (wired_budget.enforce_process_ledger)
+                aligned_sz
+            else
+                total_wired_bytes + aligned_sz;
+            try wired_budget.checkPlan(shard_plan_bytes);
             var w_arena = try arena_mod.WiredArena.init(aligned_sz, wired_budget);
             errdefer w_arena.deinit();
             const w_buf = try metal.Buffer.wrap(device, w_arena.bytes());
@@ -16080,16 +16084,33 @@ pub const GraphModel = struct {
         // Generous page margin for sub-arena page rounding.
         const scratch_bytes = try page.alignUp(aliased_block_bytes + persist_bytes + 32 * page.APPLE_PAGE_SIZE);
         // Update live admission with exact required wired footprint (enforcing `--strict-live-ram` before mlock).
-        live_admission = try wired_budget.planWithLiveRam(
-            total_wired_bytes + scratch_bytes + vis_sidecar_bytes,
-            optional_cold_bytes + optional_ple_bytes,
-            live_reclaimable_bytes,
-            .{
-                .live_safety_margin_bytes = options.live_safety_margin_bytes,
-                .strict_live_ram = options.strict_live_ram,
-            },
-        );
-        try wired_budget.checkPlan(total_wired_bytes + scratch_bytes + vis_sidecar_bytes);
+        const scratch_new_bytes: u64 = scratch_bytes + vis_sidecar_bytes;
+        if (wired_budget.enforce_process_ledger) {
+            live_admission = try wired_budget.planWithLiveRam(
+                scratch_new_bytes,
+                optional_cold_bytes + optional_ple_bytes,
+                live_reclaimable_bytes -| total_wired_bytes,
+                .{
+                    .live_safety_margin_bytes = options.live_safety_margin_bytes,
+                    .strict_live_ram = options.strict_live_ram,
+                },
+            );
+            live_admission.required_wired_bytes += total_wired_bytes;
+            live_admission.live_reclaimable_bytes = live_reclaimable_bytes;
+            live_admission.live_budget_bytes = live_reclaimable_bytes -| options.live_safety_margin_bytes;
+            try wired_budget.checkPlan(scratch_new_bytes);
+        } else {
+            live_admission = try wired_budget.planWithLiveRam(
+                total_wired_bytes + scratch_new_bytes,
+                optional_cold_bytes + optional_ple_bytes,
+                live_reclaimable_bytes,
+                .{
+                    .live_safety_margin_bytes = options.live_safety_margin_bytes,
+                    .strict_live_ram = options.strict_live_ram,
+                },
+            );
+            try wired_budget.checkPlan(total_wired_bytes + scratch_new_bytes);
+        }
 
         var scratch_arena = try arena_mod.WiredArena.init(scratch_bytes, wired_budget);
         errdefer scratch_arena.deinit();
@@ -19971,8 +19992,12 @@ pub const GraphBatchRuntime = struct {
         else
             0;
 
-        if (model.totalWiredBytes() > wired_budget.limit_bytes) return error.BudgetExceeded;
-        const rem_limit_raw: u64 = wired_budget.limit_bytes - model.totalWiredBytes();
+        const already_wired: u64 = if (wired_budget.enforce_process_ledger)
+            @max(budget_mod.currentProcessWiredBytes(), model.totalWiredBytes())
+        else
+            model.totalWiredBytes();
+        if (already_wired > wired_budget.limit_bytes) return error.BudgetExceeded;
+        const rem_limit_raw: u64 = wired_budget.limit_bytes - already_wired;
         const rem_budget: budget_mod.Budget = .{
             .limit_bytes = rem_limit_raw - (rem_limit_raw % page.APPLE_PAGE_SIZE),
             .binding_limit = wired_budget.binding_limit,
@@ -20073,7 +20098,7 @@ pub const GraphBatchRuntime = struct {
                 cfg.kv_pool_chunk_groups
             else
                 cfg.max_slots * max_chunks + eff_prefix_cache_chunks;
-            const base_used: u64 = model.totalWiredBytes() + batch_arena_bytes;
+            const base_used: u64 = already_wired + batch_arena_bytes;
             if (base_used + @as(u64, cfg.max_slots) * bytes_per_group > wired_budget.limit_bytes) {
                 return error.BudgetExceeded;
             }
@@ -20102,7 +20127,11 @@ pub const GraphBatchRuntime = struct {
         }
 
         const total_wired_bytes: u64 = batch_arena_bytes + pool_kv_bytes;
-        try wired_budget.checkPlan(model.totalWiredBytes() + total_wired_bytes);
+        const plan_bytes: u64 = if (wired_budget.enforce_process_ledger)
+            total_wired_bytes
+        else
+            model.totalWiredBytes() + total_wired_bytes;
+        try wired_budget.checkPlan(plan_bytes);
 
         var batch_arena = try arena_mod.WiredArena.init(batch_arena_bytes, wired_budget);
         errdefer batch_arena.deinit();
@@ -23855,7 +23884,11 @@ fn loadStepLoraAdapters(
             need_bytes += try page.alignUp(@intCast(e.blob_bytes));
         }
         const aligned = try page.alignUp(@max(need_bytes, page.APPLE_PAGE_SIZE));
-        try wired_budget.checkPlan(total_wired_bytes.* + aligned);
+        const adapter_plan_bytes: u64 = if (wired_budget.enforce_process_ledger)
+            aligned
+        else
+            total_wired_bytes.* + aligned;
+        try wired_budget.checkPlan(adapter_plan_bytes);
         var ea = try arena_mod.WiredArena.init(aligned, wired_budget);
         errdefer ea.deinit();
         const slices = try allocator.alloc([]u8, f.parsed.entries.len);
@@ -24725,7 +24758,11 @@ fn initGraphVisionState(
         is_sidecar = true;
         const sc_entries = sf.parsed.entries;
         const alloc_bytes = try page.alignUp(@max(sidecar_bytes, page.APPLE_PAGE_SIZE));
-        try wired_budget.checkPlan(total_wired_bytes.* + alloc_bytes);
+        const vis_plan_bytes: u64 = if (wired_budget.enforce_process_ledger)
+            alloc_bytes
+        else
+            total_wired_bytes.* + alloc_bytes;
+        try wired_budget.checkPlan(vis_plan_bytes);
         var sa = try arena_mod.WiredArena.init(alloc_bytes, wired_budget);
         errdefer if (sidecar_arena_opt == null) sa.deinit();
         const sb = try metal.Buffer.wrap(device, sa.bytes());

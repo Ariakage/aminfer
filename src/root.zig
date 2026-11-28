@@ -38,6 +38,9 @@ pub const embed_rerank = @import("model/embed_rerank.zig");
 pub const graph = @import("model/graph.zig");
 pub const m82_runtime = @import("model/m82_runtime.zig");
 pub const bench = @import("bench/runner.zig");
+pub const bench_m81 = @import("bench/m81.zig");
+pub const bench_m82 = @import("bench/m82.zig");
+pub const bench_m825 = @import("bench/m825.zig");
 pub const bench_m83 = @import("bench/m83.zig");
 pub const bench_m91 = @import("bench/m91.zig");
 pub const bench_m92 = @import("bench/m92.zig");
@@ -70,6 +73,7 @@ pub const http_sse = server;
 pub const theme = @import("monitor/theme.zig");
 pub const tui = @import("monitor/tui.zig");
 pub const chat_repl = @import("cli/chat_repl.zig");
+pub const test_fuzz_parsers = @import("test_fuzz_parsers.zig");
 
 test {
     _ = metal;
@@ -109,6 +113,9 @@ test {
     _ = graph;
     _ = m82_runtime;
     _ = bench;
+    _ = bench_m81;
+    _ = bench_m82;
+    _ = bench_m825;
     _ = bench_m83;
     _ = bench_m91;
     _ = bench_m92;
@@ -140,4 +147,5 @@ test {
     _ = theme;
     _ = tui;
     _ = chat_repl;
+    _ = test_fuzz_parsers;
 }

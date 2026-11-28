@@ -350,6 +350,8 @@ pub const TurnRequest = struct {
     turn_index: u32,
     /// Full Qwen3 ChatML formatted prompt in preallocated session buffer.
     chatml_prompt: []const u8,
+    /// Role-isolated `(len, allow_special)` spans covering `chatml_prompt` (`F13`).
+    prompt_spans: ?[]const chat_template.PromptSpan = null,
     /// Raw user message text for the current turn.
     user_message: []const u8,
     /// Exact byte offset in `chatml_prompt` right before the final `<|im_start|>user\n`
@@ -614,6 +616,7 @@ pub const ChatSession = struct {
     text_pool: []u8,
     text_pool_used: usize = 0,
     prompt_buf: []u8,
+    prompt_spans_buf: [chat_template.MAX_PROMPT_SPANS]chat_template.PromptSpan = undefined,
 
     pub fn init(allocator: std.mem.Allocator, cfg: ChatConfig) Error!ChatSession {
         return initWithCapacities(allocator, cfg, DEFAULT_TEXT_POOL_BYTES, DEFAULT_PROMPT_BUF_BYTES);
@@ -952,6 +955,7 @@ pub const ChatSession = struct {
         const req: TurnRequest = .{
             .turn_index = @intCast(self.turn_count),
             .chatml_prompt = built.prompt,
+            .prompt_spans = built.prompt_spans,
             .user_message = self.sliceText(user_off, user_len),
             .last_user_msg_byte_offset = built.last_user_msg_byte_offset,
             .parent_checkpoint_entry_id = parent_ckpt,
@@ -1057,6 +1061,7 @@ pub const ChatSession = struct {
 
     const BuiltPrompt = struct {
         prompt: []const u8,
+        prompt_spans: []const chat_template.PromptSpan,
         last_user_msg_byte_offset: ?usize,
         starts_in_think: bool,
     };
@@ -1127,7 +1132,8 @@ pub const ChatSession = struct {
         const last_user_idx = (if (has_leading_sys) @as(usize, 1) else 0) + (self.turn_count * 2);
 
         var fw = chat_template.FixedWriter.init(self.prompt_buf);
-        var renderer = chat_template.PromptRenderer.init(
+        var span_rec = chat_template.PromptSpanRecorder.init(&self.prompt_spans_buf);
+        var renderer = chat_template.PromptRenderer.initWithSink(
             &self.cfg.chat_template,
             &fw,
             .{
@@ -1137,6 +1143,7 @@ pub const ChatSession = struct {
             },
             has_leading_sys,
             last_user_idx,
+            span_rec.sink(),
         );
         renderer.begin() catch |err| return mapTemplateErr(err);
 
@@ -1165,6 +1172,7 @@ pub const ChatSession = struct {
 
         return .{
             .prompt = fw.written(),
+            .prompt_spans = span_rec.slice(),
             .last_user_msg_byte_offset = renderer.last_user_msg_byte_offset,
             .starts_in_think = renderer.starts_in_think,
         };

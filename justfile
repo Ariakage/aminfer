@@ -15,17 +15,25 @@ build:
 build-fast:
     zig build -Doptimize=ReleaseFast
 
-# Full test suite in Debug mode.
+# Full test suite in Debug + ReleaseSafe (-j1), Python SDK tests, and tools tests.
 test:
-    zig build test --summary all
+    zig build test --summary all -j1
+    zig build test -Doptimize=ReleaseSafe --summary all -j1
+    just python-sdk-test
+    just tools-test
 
 # Full test suite with safety and alignment assertions kept on.
 test-safe:
-    zig build test -Doptimize=ReleaseSafe --summary all
+    zig build test -Doptimize=ReleaseSafe --summary all -j1
 
 # Verify Zig formatting across build.zig and src/.
 fmt-check:
     zig fmt --check build.zig src
+
+# Run all Zig, Python SDK, and offline tools test suites plus formatting check.
+check:
+    just fmt-check
+    just test
 
 # Print kernel, Metal, and Neural Engine facts of this machine.
 probe:
@@ -73,6 +81,10 @@ swap-check:
 # Sync the offline Python toolchain environment under tools/.
 tools-sync:
     cd tools && uv sync
+
+# Run unit tests for the Python ctypes SDK (builds shared library first).
+python-sdk-test: build
+    cd python && uv run python -m unittest discover -s tests -v
 
 # Run unit tests for the offline Python toolchain.
 tools-test:

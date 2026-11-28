@@ -6839,11 +6839,12 @@ pub const Qwen3Model = struct {
         logits_last_row_only: bool,
         commit_kv: bool,
     ) StepError![]const moe.TopKCandidate {
-        if (token_ids.len == 0 or positions.len != token_ids.len or slot_ancestor_masks.len != token_ids.len) {
+        const total_slots_u64 = @as(u64, slot_start) + token_ids.len;
+        if (total_slots_u64 > self.max_tree_nodes) return error.TreeTooLarge;
+        if (token_ids.len == 0 or positions.len != token_ids.len or slot_ancestor_masks.len < total_slots_u64) {
             return error.InvalidArgument;
         }
-        if (@as(u64, slot_start) + token_ids.len > self.max_tree_nodes) return error.TreeTooLarge;
-        if (commit_kv and @as(u64, kv_base_pos) + token_ids.len > self.max_seq_len) return error.PositionOutOfRange;
+        if (commit_kv and (slot_start != 0 or @as(u64, kv_base_pos) + token_ids.len > self.max_seq_len)) return error.PositionOutOfRange;
         if (kv_base_pos > self.max_seq_len) return error.PositionOutOfRange;
         for (token_ids, positions) |tid, p| {
             if (tid >= self.config.vocab_size) return error.TokenOutOfRange;
@@ -10873,8 +10874,12 @@ pub const Qwen3BatchRuntime = struct {
         else
             0;
 
-        if (model.totalWiredBytes() > wired_budget.limit_bytes) return error.BudgetExceeded;
-        const rem_limit_raw: u64 = wired_budget.limit_bytes - model.totalWiredBytes();
+        const already_wired: u64 = if (wired_budget.enforce_process_ledger)
+            @max(budget_mod.currentProcessWiredBytes(), model.totalWiredBytes())
+        else
+            model.totalWiredBytes();
+        if (already_wired > wired_budget.limit_bytes) return error.BudgetExceeded;
+        const rem_limit_raw: u64 = wired_budget.limit_bytes - already_wired;
         const rem_budget: budget_mod.Budget = .{
             .limit_bytes = rem_limit_raw - (rem_limit_raw % page.APPLE_PAGE_SIZE),
             .binding_limit = wired_budget.binding_limit,
@@ -10943,7 +10948,7 @@ pub const Qwen3BatchRuntime = struct {
         else
             cfg.max_slots * active_per_slot + eff_prefix_cache_chunks;
 
-        const base_used: u64 = model.totalWiredBytes() + batch_arena_bytes;
+        const base_used: u64 = already_wired + batch_arena_bytes;
         if (base_used + @as(u64, cfg.max_slots) * bytes_per_group > wired_budget.limit_bytes) {
             return error.BudgetExceeded;
         }
@@ -10968,7 +10973,11 @@ pub const Qwen3BatchRuntime = struct {
 
         const pool_kv_bytes: u64 = @as(u64, pool_chunk_groups) * bytes_per_group;
         const total_wired_bytes: u64 = batch_arena_bytes + pool_kv_bytes;
-        try wired_budget.checkPlan(model.totalWiredBytes() + total_wired_bytes);
+        const plan_bytes: u64 = if (wired_budget.enforce_process_ledger)
+            total_wired_bytes
+        else
+            model.totalWiredBytes() + total_wired_bytes;
+        try wired_budget.checkPlan(plan_bytes);
 
         // Allocate `batch_arena` + wrap `MTLBuffer` + register resident.
         var batch_arena = try arena_mod.WiredArena.init(batch_arena_bytes, wired_budget);

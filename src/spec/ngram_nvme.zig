@@ -143,7 +143,7 @@ pub fn computeHeaderCrc32(hdr: *const Header) u32 {
     return std.hash.Crc32.hash(std.mem.asBytes(&copy));
 }
 
-inline fn validateSlotContinuation(slot: *const NgramSlot, vocab_size: u32) ?usize {
+pub inline fn validateSlotContinuation(slot: *const NgramSlot, vocab_size: u32) ?usize {
     if (slot.cont_len == 0 or slot.cont_len > MAX_CONT_TOKENS) return null;
     const clen: usize = @min(@as(usize, slot.cont_len), MAX_CONT_TOKENS);
     if (vocab_size > 0) {

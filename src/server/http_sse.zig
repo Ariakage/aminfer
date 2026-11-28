@@ -826,6 +826,8 @@ pub const InferenceJob = struct {
     stream_include_usage: bool = false,
     /// Optional pre-tokenized completion prompt token IDs (`POST /v1/completions` with `[u32, ...]`, `C29`).
     prompt_token_ids: ?[]const u32 = null,
+    /// Role-isolated `(len, allow_special)` spans covering `prompt` (`F13`).
+    prompt_spans: ?[]const chat_template.PromptSpan = null,
     /// Preallocated decoded multimodal attachments pointing into `slot.media_buf` (`C29`).
     media_items: [MAX_MEDIA_ITEMS_PER_REQUEST]MediaAttachment = undefined,
     media_count: u8 = 0,
@@ -2216,9 +2218,16 @@ pub const ParsedRequest = struct {
     /// Pre-tokenized prompt IDs on `POST /v1/completions` when `prompt` is `[u32, ...]` (`C29`).
     prompt_token_ids_buf: [MAX_COMPLETION_TOKEN_IDS]u32 = undefined,
     prompt_token_ids_len: u16 = 0,
+    /// Role-isolated `(len, allow_special)` spans for `prompt_buf[0..prompt_len]` (`F13`).
+    prompt_spans_buf: [chat_template.MAX_PROMPT_SPANS]chat_template.PromptSpan = undefined,
+    prompt_span_count: u16 = 0,
     /// Decoded multimodal attachments extracted into `media_buf` (`C29`).
     media_items: [MAX_MEDIA_ITEMS_PER_REQUEST]MediaAttachment = undefined,
     media_count: u8 = 0,
+
+    pub fn promptSpansSlice(self: *const ParsedRequest) []const chat_template.PromptSpan {
+        return self.prompt_spans_buf[0..self.prompt_span_count];
+    }
 
     pub fn promptTokenIdsSlice(self: *const ParsedRequest) []const u32 {
         return self.prompt_token_ids_buf[0..self.prompt_token_ids_len];
@@ -2547,6 +2556,12 @@ const JsonReader = struct {
         }
     }
 };
+
+/// Fuzz/property-test entrypoint exercising `JsonReader` over untrusted JSON bytes.
+pub fn fuzzJsonReader(src: []const u8) ParseError!void {
+    var r = JsonReader{ .src = src };
+    try r.skipValue(0);
+}
 
 /// Appends either a JSON string, `null`, or an array of content blocks
 /// (OpenAI `text`/`input_text`/`output_text`, Anthropic `text`, `tool_use`,
@@ -3925,6 +3940,7 @@ fn renderProtocolToTemplate(
     tpl: *const chat_template.ChatTemplate,
     prompt_buf: []u8,
     prior_prompt: ?[]const u8,
+    prior_spans: ?[]const chat_template.PromptSpan,
     system_slice: ?[]const u8,
     messages_slice: ?[]const u8,
     input_slice: ?[]const u8,
@@ -3941,7 +3957,8 @@ fn renderProtocolToTemplate(
     signature_model_id: []const u8,
     out_cache_control: *bool,
     media_ctx: *MediaContext,
-) ParseError!struct { prompt_len: usize, last_user_msg_byte_offset: ?usize, starts_in_think: bool } {
+    out_spans: []chat_template.PromptSpan,
+) ParseError!struct { prompt_len: usize, span_count: u16, last_user_msg_byte_offset: ?usize, starts_in_think: bool } {
     var stack_scratch: [32 * 1024]u8 = undefined;
     const scratch: []u8 = unescape_scratch orelse &stack_scratch;
     var scratch_pos: usize = 0;
@@ -3999,7 +4016,8 @@ fn renderProtocolToTemplate(
     };
 
     var fw = chat_template.FixedWriter.init(prompt_buf);
-    var renderer = chat_template.PromptRenderer.init(
+    var span_rec = chat_template.PromptSpanRecorder.init(out_spans);
+    var renderer = chat_template.PromptRenderer.initWithSink(
         tpl,
         &fw,
         .{
@@ -4012,9 +4030,11 @@ fn renderProtocolToTemplate(
             .tool_choice_name = tool_choice_name,
             .parallel_tool_calls = parallel_tool_calls,
             .prior_prompt = prior_prompt,
+            .prior_spans = prior_spans,
         },
         has_leading_sys,
         last_user_idx,
+        span_rec.sink(),
     );
     renderer.begin() catch |err| return mapTemplateError(err);
 
@@ -4261,6 +4281,7 @@ fn renderProtocolToTemplate(
         null;
     return .{
         .prompt_len = fw.pos,
+        .span_count = @intCast(span_rec.count),
         .last_user_msg_byte_offset = boundary,
         .starts_in_think = renderer.starts_in_think,
     };
@@ -4548,6 +4569,38 @@ pub fn parseInferenceRequestFull(
     default_model: []const u8,
     tpl: *const chat_template.ChatTemplate,
     prior_chatml: ?[]const u8,
+    unescape_scratch: ?[]u8,
+    signature_key: ?*const [32]u8,
+    fim_tokens: FimTokens,
+    tok: ?*const tokenizer_mod.Tokenizer,
+    media_buf: ?[]u8,
+    prompt_buf: []u8,
+    model_buf: []u8,
+) ParseError!ParsedRequest {
+    return parseInferenceRequestFullWithPriorSpans(
+        endpoint,
+        body,
+        default_model,
+        tpl,
+        prior_chatml,
+        null,
+        unescape_scratch,
+        signature_key,
+        fim_tokens,
+        tok,
+        media_buf,
+        prompt_buf,
+        model_buf,
+    );
+}
+
+pub fn parseInferenceRequestFullWithPriorSpans(
+    endpoint: Endpoint,
+    body: []const u8,
+    default_model: []const u8,
+    tpl: *const chat_template.ChatTemplate,
+    prior_chatml: ?[]const u8,
+    prior_spans: ?[]const chat_template.PromptSpan,
     unescape_scratch: ?[]u8,
     signature_key: ?*const [32]u8,
     fim_tokens: FimTokens,
@@ -5118,6 +5171,8 @@ pub fn parseInferenceRequestFull(
 
     var prompt_token_ids_buf: [MAX_COMPLETION_TOKEN_IDS]u32 = undefined;
     var prompt_token_ids_len: u16 = 0;
+    var prompt_spans_buf: [chat_template.MAX_PROMPT_SPANS]chat_template.PromptSpan = undefined;
+    var prompt_span_count: u16 = 0;
     var media_items: [MAX_MEDIA_ITEMS_PER_REQUEST]MediaAttachment = undefined;
     var media_count: u8 = 0;
 
@@ -5144,6 +5199,7 @@ pub fn parseInferenceRequestFull(
             tpl,
             prompt_buf,
             prior_chatml,
+            prior_spans,
             system_slice,
             messages_slice,
             input_slice,
@@ -5160,7 +5216,9 @@ pub fn parseInferenceRequestFull(
             model_buf[0..model_len],
             &cache_control_pin,
             &media_ctx,
+            &prompt_spans_buf,
         );
+        prompt_span_count = rendered.span_count;
         break :blk .{ rendered.prompt_len, rendered.last_user_msg_byte_offset, rendered.starts_in_think };
     };
 
@@ -5211,6 +5269,8 @@ pub fn parseInferenceRequestFull(
         .legacy_logprobs = legacy_logprobs,
         .prompt_token_ids_buf = prompt_token_ids_buf,
         .prompt_token_ids_len = prompt_token_ids_len,
+        .prompt_spans_buf = prompt_spans_buf,
+        .prompt_span_count = prompt_span_count,
         .media_items = media_items,
         .media_count = media_count,
     };
@@ -5863,6 +5923,16 @@ fn decodeChunkedInPlace(body_buf: []u8, max_body_bytes: usize) error{ BadRequest
     return .{ .complete = .{ .decoded_len = out_pos, .consumed_len = consumed_len } };
 }
 
+/// Fuzz/property-test entrypoint exercising HTTP request-line & header parsing.
+pub fn fuzzParseHttpHeaders(buf: []const u8) HttpParseError!void {
+    _ = try parseHttpHeaders(buf);
+}
+
+/// Fuzz/property-test entrypoint exercising `decodeChunkedInPlace` framing.
+pub fn fuzzDecodeChunkedInPlace(body_buf: []u8, max_body_bytes: usize) error{ BadRequest, PayloadTooLarge }!void {
+    _ = try decodeChunkedInPlace(body_buf, max_body_bytes);
+}
+
 // ---------------------------------------------------------------------------
 // Darwin time, socket & kqueue helpers
 // ---------------------------------------------------------------------------
@@ -6091,6 +6161,8 @@ const StatefulResponseSlot = struct {
     /// Slices carved once at `Server.init` from `response_store_slab` (16 KiB aligned).
     chatml_buf: []u8 = &.{},
     chatml_len: usize = 0,
+    chatml_spans: [chat_template.MAX_PROMPT_SPANS]chat_template.PromptSpan = undefined,
+    chatml_span_count: u16 = 0,
     reasoning_buf: []u8 = &.{},
     reasoning_len: usize = 0,
     content_buf: []u8 = &.{},
@@ -6112,6 +6184,10 @@ const StatefulResponseSlot = struct {
 
     fn previousIdSlice(self: *const StatefulResponseSlot) []const u8 {
         return self.previous_id_buf[0..self.previous_id_len];
+    }
+
+    fn chatmlSpansSlice(self: *const StatefulResponseSlot) []const chat_template.PromptSpan {
+        return self.chatml_spans[0..self.chatml_span_count];
     }
 };
 
@@ -6150,6 +6226,8 @@ const ConnectionSlot = struct {
     media_buf: []u8,
     prompt_token_ids_buf: [MAX_COMPLETION_TOKEN_IDS]u32,
     prompt_token_ids_len: u16,
+    prompt_spans_buf: [chat_template.MAX_PROMPT_SPANS]chat_template.PromptSpan,
+    prompt_span_count: u16,
     legacy_logprobs: ?u8,
 
     // Lock-free worker->server token ring backed by `Server.token_ring_storage`.
@@ -6316,6 +6394,7 @@ const ConnectionSlot = struct {
         self.aux_err = .none;
         self.prompt_len = 0;
         self.prompt_token_ids_len = 0;
+        self.prompt_span_count = 0;
         self.legacy_logprobs = null;
         self.tx_read_pos = 0;
         self.tx_write_pos = 0;
@@ -6971,6 +7050,8 @@ pub const Server = struct {
                 .media_buf = media,
                 .prompt_token_ids_buf = undefined,
                 .prompt_token_ids_len = 0,
+                .prompt_spans_buf = undefined,
+                .prompt_span_count = 0,
                 .legacy_logprobs = null,
                 .token_ring = tok_ring,
                 .cancelled = .init(false),
@@ -9668,7 +9749,11 @@ pub const Server = struct {
         };
 
         const prompt_bytes = slot.prompt_buf[0..parsed.prompt_len];
-        const ids = tok.encodeWithScratch(&self.aux_encode_scratch, prompt_bytes, self.aux_token_ids) catch {
+        const spans_opt: ?[]const chat_template.PromptSpan = if (parsed.prompt_span_count > 0)
+            parsed.promptSpansSlice()
+        else
+            null;
+        const ids = chat_template.encodePromptSpansWithScratch(tok, &self.aux_encode_scratch, prompt_bytes, spans_opt, self.aux_token_ids) catch {
             self.sendErrorResponse(
                 slot,
                 413,
@@ -9692,6 +9777,7 @@ pub const Server = struct {
 
     fn handleResponsesInputTokens(self: *Server, slot: *ConnectionSlot, body: []const u8) void {
         var prior_chatml: ?[]const u8 = null;
+        var prior_spans: ?[]const chat_template.PromptSpan = null;
         var prev_probe_buf: [MAX_RESPONSE_ID_BYTES]u8 = undefined;
         if (findTopLevelJsonStringField(body, "previous_response_id", &prev_probe_buf)) |prev_id| {
             if (prev_id.len > 0) {
@@ -9720,15 +9806,19 @@ pub const Server = struct {
                     return;
                 }
                 prior_chatml = prev_rec.chatml_buf[0..prev_rec.chatml_len];
+                if (prev_rec.chatml_span_count > 0) {
+                    prior_spans = prev_rec.chatmlSpansSlice();
+                }
             }
         }
 
-        const parsed = parseInferenceRequestFull(
+        const parsed = parseInferenceRequestFullWithPriorSpans(
             .responses,
             body,
             self.modelId(),
             &self.config.chat_template,
             prior_chatml,
+            prior_spans,
             slot.nonstream_content_buf,
             &self.signature_key,
             self.fim_tokens.asFimTokens(),
@@ -9755,7 +9845,11 @@ pub const Server = struct {
         };
 
         const prompt_bytes = slot.prompt_buf[0..parsed.prompt_len];
-        const ids = tok.encodeWithScratch(&self.aux_encode_scratch, prompt_bytes, self.aux_token_ids) catch {
+        const r_spans_opt: ?[]const chat_template.PromptSpan = if (parsed.prompt_span_count > 0)
+            parsed.promptSpansSlice()
+        else
+            null;
+        const ids = chat_template.encodePromptSpansWithScratch(tok, &self.aux_encode_scratch, prompt_bytes, r_spans_opt, self.aux_token_ids) catch {
             self.sendErrorResponse(
                 slot,
                 413,
@@ -10360,79 +10454,109 @@ pub const Server = struct {
         self.writeHttpJsonOkHeadersAndSend(slot, bw.pos, HEADER_RESERVE, null, null);
     }
 
+    fn appendTranscriptSlice(
+        cw: *FixedWriter,
+        span_rec: *chat_template.PromptSpanRecorder,
+        bytes: []const u8,
+        allow_special: bool,
+    ) error{BufferTooSmall}!void {
+        if (bytes.len == 0) return;
+        try cw.writeAll(bytes);
+        span_rec.record(bytes.len, allow_special) catch return error.BufferTooSmall;
+    }
+
+    fn appendTranscriptJsonEscaped(
+        cw: *FixedWriter,
+        span_rec: *chat_template.PromptSpanRecorder,
+        bytes: []const u8,
+    ) error{BufferTooSmall}!void {
+        if (bytes.len == 0) return;
+        const begin_pos = cw.pos;
+        try cw.writeJsonEscaped(bytes);
+        span_rec.record(cw.pos - begin_pos, false) catch return error.BufferTooSmall;
+    }
+
     fn appendCompletedTranscriptTurn(
         tpl: *const chat_template.ChatTemplate,
         rec: *const StatefulResponseSlot,
         prompt_bytes: []const u8,
+        prompt_spans: []const chat_template.PromptSpan,
         cw: *FixedWriter,
+        span_rec: *chat_template.PromptSpanRecorder,
     ) error{BufferTooSmall}!void {
         try cw.writeAll(prompt_bytes);
+        if (prompt_spans.len > 0) {
+            for (prompt_spans) |sp| {
+                span_rec.record(sp.len, sp.allow_special) catch return error.BufferTooSmall;
+            }
+        } else {
+            span_rec.record(prompt_bytes.len, true) catch return error.BufferTooSmall;
+        }
         const reasoning = rec.reasoning_buf[0..rec.reasoning_len];
         const content = rec.content_buf[0..rec.content_len];
         switch (tpl.dialect) {
             .inkling2 => {
                 if (reasoning.len > 0) {
-                    try cw.writeAll(tpl.role_tokens.header_assistant.slice());
-                    try cw.writeAll(tpl.thinking.open_tag.slice());
-                    try cw.writeAll(reasoning);
-                    try cw.writeAll(tpl.role_tokens.end_message_tag.slice());
+                    try appendTranscriptSlice(cw, span_rec, tpl.role_tokens.header_assistant.slice(), true);
+                    try appendTranscriptSlice(cw, span_rec, tpl.thinking.open_tag.slice(), true);
+                    try appendTranscriptSlice(cw, span_rec, reasoning, false);
+                    try appendTranscriptSlice(cw, span_rec, tpl.role_tokens.end_message_tag.slice(), true);
                 }
                 if (content.len > 0) {
-                    try cw.writeAll(tpl.role_tokens.header_assistant.slice());
-                    try cw.writeAll(tpl.role_tokens.content_text_tag.slice());
-                    try cw.writeAll(content);
-                    try cw.writeAll(tpl.role_tokens.end_message_tag.slice());
+                    try appendTranscriptSlice(cw, span_rec, tpl.role_tokens.header_assistant.slice(), true);
+                    try appendTranscriptSlice(cw, span_rec, tpl.role_tokens.content_text_tag.slice(), true);
+                    try appendTranscriptSlice(cw, span_rec, content, false);
+                    try appendTranscriptSlice(cw, span_rec, tpl.role_tokens.end_message_tag.slice(), true);
                 }
                 for (rec.tool_calls[0..rec.tool_call_count]) |*tc| {
-                    try cw.writeAll(tpl.role_tokens.header_assistant.slice());
-                    try cw.writeAll(tc.nameSlice());
-                    try cw.writeAll(tpl.tool_calling.call_open.slice());
-                    try cw.writeAll("{\"name\":\"");
-                    try cw.writeJsonEscaped(tc.nameSlice());
-                    try cw.writeAll("\",\"args\":");
-                    try cw.writeAll(if (tc.args_len > 0) tc.argsSlice() else "{}");
-                    try cw.writeByte('}');
-                    try cw.writeAll(tpl.tool_calling.call_close.slice());
+                    try appendTranscriptSlice(cw, span_rec, tpl.role_tokens.header_assistant.slice(), true);
+                    try appendTranscriptSlice(cw, span_rec, tc.nameSlice(), false);
+                    try appendTranscriptSlice(cw, span_rec, tpl.tool_calling.call_open.slice(), true);
+                    try appendTranscriptSlice(cw, span_rec, "{\"name\":\"", true);
+                    try appendTranscriptJsonEscaped(cw, span_rec, tc.nameSlice());
+                    try appendTranscriptSlice(cw, span_rec, "\",\"args\":", true);
+                    try appendTranscriptSlice(cw, span_rec, if (tc.args_len > 0) tc.argsSlice() else "{}", false);
+                    try appendTranscriptSlice(cw, span_rec, "}", true);
+                    try appendTranscriptSlice(cw, span_rec, tpl.tool_calling.call_close.slice(), true);
                 }
-                try cw.writeAll(tpl.eos_token.slice());
+                try appendTranscriptSlice(cw, span_rec, tpl.eos_token.slice(), true);
             },
             .hy4 => {
                 const open_tag = tpl.thinking.open_tag.slice();
                 if (std.mem.endsWith(u8, prompt_bytes, open_tag)) {
-                    try cw.writeAll(reasoning);
-                    try cw.writeAll(tpl.thinking.close_tag.slice());
+                    try appendTranscriptSlice(cw, span_rec, reasoning, false);
+                    try appendTranscriptSlice(cw, span_rec, tpl.thinking.close_tag.slice(), true);
                 } else if (reasoning.len > 0) {
-                    try cw.writeAll(open_tag);
-                    try cw.writeAll(reasoning);
-                    try cw.writeAll(tpl.thinking.close_tag.slice());
+                    try appendTranscriptSlice(cw, span_rec, open_tag, true);
+                    try appendTranscriptSlice(cw, span_rec, reasoning, false);
+                    try appendTranscriptSlice(cw, span_rec, tpl.thinking.close_tag.slice(), true);
                 }
-                if (content.len > 0) try cw.writeAll(content);
+                if (content.len > 0) try appendTranscriptSlice(cw, span_rec, content, false);
                 if (rec.tool_call_count > 0) {
-                    try cw.writeAll(tpl.tool_calling.call_open.slice());
+                    try appendTranscriptSlice(cw, span_rec, tpl.tool_calling.call_open.slice(), true);
                     for (rec.tool_calls[0..rec.tool_call_count]) |*tc| {
-                        try cw.writeAll("<tool_call:opensource>");
-                        try cw.writeAll(tc.nameSlice());
-                        // Preserve arguments as raw JSON or key/value fallback.
-                        try cw.writeAll("<arg_key:opensource>args</arg_key:opensource><arg_value:opensource>");
-                        try cw.writeAll(if (tc.args_len > 0) tc.argsSlice() else "{}");
-                        try cw.writeAll("</arg_value:opensource></tool_call:opensource>");
+                        try appendTranscriptSlice(cw, span_rec, "<tool_call:opensource>", true);
+                        try appendTranscriptSlice(cw, span_rec, tc.nameSlice(), false);
+                        try appendTranscriptSlice(cw, span_rec, "<arg_key:opensource>args</arg_key:opensource><arg_value:opensource>", true);
+                        try appendTranscriptSlice(cw, span_rec, if (tc.args_len > 0) tc.argsSlice() else "{}", false);
+                        try appendTranscriptSlice(cw, span_rec, "</arg_value:opensource></tool_call:opensource>", true);
                     }
-                    try cw.writeAll(tpl.tool_calling.call_close.slice());
+                    try appendTranscriptSlice(cw, span_rec, tpl.tool_calling.call_close.slice(), true);
                 }
-                try cw.writeAll(tpl.role_tokens.hy4_end.slice());
+                try appendTranscriptSlice(cw, span_rec, tpl.role_tokens.hy4_end.slice(), true);
             },
             .chatml, .deepseek, .custom => {
-                if (content.len > 0) try cw.writeAll(content);
+                if (content.len > 0) try appendTranscriptSlice(cw, span_rec, content, false);
                 for (rec.tool_calls[0..rec.tool_call_count]) |*tc| {
-                    try cw.writeAll(tpl.tool_calling.call_open.slice());
-                    try cw.writeAll("{\"name\":\"");
-                    try cw.writeJsonEscaped(tc.nameSlice());
-                    try cw.writeAll("\",\"arguments\":");
-                    try cw.writeAll(if (tc.args_len > 0) tc.argsSlice() else "{}");
-                    try cw.writeByte('}');
-                    try cw.writeAll(tpl.tool_calling.call_close.slice());
+                    try appendTranscriptSlice(cw, span_rec, tpl.tool_calling.call_open.slice(), true);
+                    try appendTranscriptSlice(cw, span_rec, "{\"name\":\"", true);
+                    try appendTranscriptJsonEscaped(cw, span_rec, tc.nameSlice());
+                    try appendTranscriptSlice(cw, span_rec, "\",\"arguments\":", true);
+                    try appendTranscriptSlice(cw, span_rec, if (tc.args_len > 0) tc.argsSlice() else "{}", false);
+                    try appendTranscriptSlice(cw, span_rec, "}", true);
+                    try appendTranscriptSlice(cw, span_rec, tpl.tool_calling.call_close.slice(), true);
                 }
-                try cw.writeAll(tpl.assistantEndDelimiter());
+                try appendTranscriptSlice(cw, span_rec, tpl.assistantEndDelimiter(), true);
             },
         }
     }
@@ -10488,15 +10612,19 @@ pub const Server = struct {
         }
 
         var cw = FixedWriter.init(rec.chatml_buf);
-        appendCompletedTranscriptTurn(&self.config.chat_template, rec, slot.prompt_buf[0..slot.prompt_len], &cw) catch {
+        var c_spans = chat_template.PromptSpanRecorder.init(&rec.chatml_spans);
+        const slot_spans = slot.prompt_spans_buf[0..slot.prompt_span_count];
+        appendCompletedTranscriptTurn(&self.config.chat_template, rec, slot.prompt_buf[0..slot.prompt_len], slot_spans, &cw, &c_spans) catch {
             rec.status = .incomplete;
             rec.incomplete_reason = .max_response_bytes;
             rec.transcript_corrupt = true;
             rec.chatml_len = 0;
+            rec.chatml_span_count = 0;
             return;
         };
         rec.transcript_corrupt = false;
         rec.chatml_len = cw.pos;
+        rec.chatml_span_count = @intCast(c_spans.count);
     }
 
     const TempInputItem = struct {
@@ -10752,6 +10880,7 @@ pub const Server = struct {
         // Resolve optional `previous_response_id` on `/v1/responses` before building ChatML prompt
         // so the full chained transcript is prepended directly into `slot.prompt_buf` (`0` heap alloc).
         var prior_chatml: ?[]const u8 = null;
+        var prior_spans: ?[]const chat_template.PromptSpan = null;
         var prev_rec_ptr: ?*const StatefulResponseSlot = null;
         if (endpoint == .responses) {
             var prev_probe_buf: [MAX_RESPONSE_ID_BYTES]u8 = undefined;
@@ -10782,17 +10911,21 @@ pub const Server = struct {
                         return;
                     }
                     prior_chatml = prev_rec.chatml_buf[0..prev_rec.chatml_len];
+                    if (prev_rec.chatml_span_count > 0) {
+                        prior_spans = prev_rec.chatmlSpansSlice();
+                    }
                     prev_rec_ptr = prev_rec;
                 }
             }
         }
 
-        const parsed = parseInferenceRequestFull(
+        const parsed = parseInferenceRequestFullWithPriorSpans(
             endpoint,
             body,
             self.modelId(),
             &self.config.chat_template,
             prior_chatml,
+            prior_spans,
             slot.nonstream_content_buf,
             &self.signature_key,
             self.fim_tokens.asFimTokens(),
@@ -10943,6 +11076,13 @@ pub const Server = struct {
             @memcpy(
                 slot.prompt_token_ids_buf[0..parsed.prompt_token_ids_len],
                 parsed.prompt_token_ids_buf[0..parsed.prompt_token_ids_len],
+            );
+        }
+        slot.prompt_span_count = parsed.prompt_span_count;
+        if (parsed.prompt_span_count > 0) {
+            @memcpy(
+                slot.prompt_spans_buf[0..parsed.prompt_span_count],
+                parsed.prompt_spans_buf[0..parsed.prompt_span_count],
             );
         }
         slot.legacy_logprobs = parsed.legacy_logprobs;
@@ -11137,6 +11277,10 @@ pub const Server = struct {
             .stream_include_usage = parsed.stream_include_usage,
             .prompt_token_ids = if (slot.prompt_token_ids_len > 0)
                 slot.prompt_token_ids_buf[0..slot.prompt_token_ids_len]
+            else
+                null,
+            .prompt_spans = if (slot.prompt_span_count > 0)
+                slot.prompt_spans_buf[0..slot.prompt_span_count]
             else
                 null,
             .media_items = parsed.media_items,

@@ -2,10 +2,15 @@
 .zig-cache/
 zig-out/
 
-# Python offline tools (uv)
+# Python offline tools & SDK packaging (uv)
 tools/.venv/
+python/.venv/
 __pycache__/
 *.pyc
+python/*.egg-info/
+python/build/
+python/dist/
+python/uv.lock
 
 # Model artifacts are never committed
 *.amf
