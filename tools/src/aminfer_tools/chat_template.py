@@ -37,6 +37,42 @@ def _resolve_hy4_suffix(template_text: str) -> str:
     return ":opensource"
 
 
+_JINJA_ESCAPE_MAP: dict[str, str] = {
+    "a": "\a",
+    "b": "\b",
+    "f": "\f",
+    "n": "\n",
+    "r": "\r",
+    "t": "\t",
+    "v": "\v",
+    "\\": "\\",
+    "'": "'",
+    '"': '"',
+}
+
+_JINJA_ESCAPE_RE = re.compile(
+    r"\\(U[0-9a-fA-F]{8}|u[0-9a-fA-F]{4}|x[0-9a-fA-F]{2}|[0-7]{1,3}|.)"
+)
+
+
+def _unescape_jinja_literal(raw: str) -> str:
+    """Decode backslash escapes in a Jinja string literal while preserving UTF-8 characters."""
+    if "\\" not in raw:
+        return raw
+
+    def _replace(match: re.Match[str]) -> str:
+        seq = match.group(1)
+        if seq in _JINJA_ESCAPE_MAP:
+            return _JINJA_ESCAPE_MAP[seq]
+        if seq[0] in ("x", "u", "U"):
+            return chr(int(seq[1:], 16))
+        if "0" <= seq[0] <= "7":
+            return chr(int(seq, 8))
+        return "\\" + seq
+
+    return _JINJA_ESCAPE_RE.sub(_replace, raw)
+
+
 def _resolve_jinja_string_vars(template_text: str) -> dict[str, str]:
     """Extract simple `{-% set name = '...' -%}` string/format variables."""
     hytk = _resolve_hy4_suffix(template_text)
@@ -46,7 +82,7 @@ def _resolve_jinja_string_vars(template_text: str) -> dict[str, str]:
         template_text,
     ):
         var_name = m.group(1)
-        literal = m.group(3).encode("utf-8").decode("unicode_escape") if "\\" in m.group(3) else m.group(3)
+        literal = _unescape_jinja_literal(m.group(3))
         fmt_arg = m.group(4)
         if fmt_arg is not None:
             arg_val = vars_map.get(fmt_arg, hytk if fmt_arg == "HYTK" else "")

@@ -25,9 +25,11 @@ import os
 import pathlib
 import random
 import re
+import stat
 import struct
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 import zlib
 from collections.abc import Callable, Iterable, Sequence
@@ -1152,6 +1154,8 @@ class MemoryRangeReader:
 class HttpRangeStreamReader:
     """HTTP `Range` stream reader using stdlib `urllib.request` with bounded chunks."""
 
+    _ALLOWED_SCHEMES = ("http", "https")
+
     def __init__(
         self,
         url: str,
@@ -1160,11 +1164,24 @@ class HttpRangeStreamReader:
         timeout: float = 30.0,
         max_chunk_bytes: int = 16 * 1024 * 1024,
     ) -> None:
+        parsed = urllib.parse.urlsplit(url)
+        if parsed.scheme.lower() not in self._ALLOWED_SCHEMES or not parsed.netloc:
+            raise ValueError(
+                f"HttpRangeStreamReader only supports http/https URLs with host, got {url!r}"
+            )
         self.url = url
         self._headers = dict(headers or {})
         self._timeout = float(timeout)
         self._max_chunk = int(max_chunk_bytes)
         self._size: int | None = None
+
+    def _validate_response_url(self, resp: object) -> None:
+        geturl = getattr(resp, "geturl", None)
+        if callable(geturl):
+            final_url = str(geturl())
+            scheme = urllib.parse.urlsplit(final_url).scheme.lower()
+            if scheme not in self._ALLOWED_SCHEMES:
+                raise ValueError(f"HttpRangeStreamReader disallowed redirect scheme in {final_url!r}")
 
     def size(self) -> int:
         if self._size is not None:
@@ -1172,6 +1189,7 @@ class HttpRangeStreamReader:
         req = urllib.request.Request(self.url, headers=self._headers, method="HEAD")
         try:
             with urllib.request.urlopen(req, timeout=self._timeout) as resp:
+                self._validate_response_url(resp)
                 cl = resp.headers.get("Content-Length")
                 if cl is not None:
                     self._size = int(cl)
@@ -1183,6 +1201,7 @@ class HttpRangeStreamReader:
         probe_headers["Range"] = "bytes=0-0"
         req2 = urllib.request.Request(self.url, headers=probe_headers, method="GET")
         with urllib.request.urlopen(req2, timeout=self._timeout) as resp:
+            self._validate_response_url(resp)
             cr = resp.headers.get("Content-Range")
             if cr and "/" in cr:
                 total_str = cr.rsplit("/", 1)[-1].strip()
@@ -1211,6 +1230,7 @@ class HttpRangeStreamReader:
             hdrs["Range"] = f"bytes={start}-{end}"
             req = urllib.request.Request(self.url, headers=hdrs, method="GET")
             with urllib.request.urlopen(req, timeout=self._timeout) as resp:
+                self._validate_response_url(resp)
                 status = getattr(resp, "status", 206)
                 raw = resp.read()
                 if status == 200:
@@ -1300,15 +1320,55 @@ class ResolvedCheckpoint:
     config_path: pathlib.Path | None
 
 
+def _resolve_contained_file(
+    base_dir: pathlib.Path,
+    rel_name: str,
+    *,
+    label: str = "file",
+    missing_is_not_found: bool = True,
+) -> pathlib.Path:
+    """Resolve `rel_name` strictly inside `base_dir.resolve()`, rejecting traversal, symlinks escaping root, and special files."""
+    if not isinstance(rel_name, str) or not rel_name:
+        raise ValueError(f"{label} name must be a non-empty string")
+    if "\x00" in rel_name or "\\" in rel_name:
+        raise ValueError(f"unsafe {label} path {rel_name!r}")
+    pure_posix = pathlib.PurePosixPath(rel_name)
+    raw_path = pathlib.Path(rel_name)
+    if (
+        pure_posix.is_absolute()
+        or raw_path.is_absolute()
+        or os.path.isabs(rel_name)
+        or ".." in pure_posix.parts
+        or ".." in raw_path.parts
+    ):
+        raise ValueError(f"{label} path {rel_name!r} traverses outside {base_dir}")
+
+    root_resolved = base_dir.resolve()
+    candidate = base_dir / raw_path
+    resolved = candidate.resolve()
+    if not resolved.is_relative_to(root_resolved):
+        raise ValueError(f"{label} path {rel_name!r} resolves outside {root_resolved}")
+    if not resolved.exists():
+        if missing_is_not_found:
+            raise FileNotFoundError(f"{label} listed in checkpoint is missing: {candidate}")
+        raise ValueError(f"{label} path {rel_name!r} does not exist")
+    st = resolved.stat()
+    if not stat.S_ISREG(st.st_mode):
+        raise ValueError(f"{label} path {rel_name!r} is not a regular file")
+    return resolved
+
+
 def resolve_checkpoint(input_path: pathlib.Path) -> ResolvedCheckpoint:
     """Resolve a `.safetensors` file, an `index.json` file, or a checkpoint directory."""
     input_path = pathlib.Path(input_path)
     if input_path.is_dir():
-        index_path = input_path / "model.safetensors.index.json"
-        single_path = input_path / "model.safetensors"
-        if index_path.is_file():
+        index_cand = input_path / "model.safetensors.index.json"
+        single_cand = input_path / "model.safetensors"
+        if index_cand.exists() or index_cand.is_symlink():
+            index_path = _resolve_contained_file(input_path, "model.safetensors.index.json", label="index")
             return resolve_checkpoint(index_path)
-        if single_path.is_file():
+        if single_cand.exists() or single_cand.is_symlink():
+            single_path = _resolve_contained_file(input_path, "model.safetensors", label="checkpoint")
             return resolve_checkpoint(single_path)
         raise FileNotFoundError(
             f"{input_path} contains neither model.safetensors.index.json nor model.safetensors"
@@ -1316,21 +1376,34 @@ def resolve_checkpoint(input_path: pathlib.Path) -> ResolvedCheckpoint:
     if not input_path.is_file():
         raise FileNotFoundError(f"input checkpoint not found: {input_path}")
 
+    st_in = input_path.resolve().stat()
+    if not stat.S_ISREG(st_in.st_mode):
+        raise ValueError(f"input checkpoint is not a regular file: {input_path}")
+
     parent = input_path.parent
-    config_path = parent / "config.json"
-    config = config_path if config_path.is_file() else None
+    config_cand = parent / "config.json"
+    config: pathlib.Path | None = None
+    if config_cand.exists() or config_cand.is_symlink():
+        config = _resolve_contained_file(parent, "config.json", label="config")
+
     if input_path.name.endswith(".json"):
         index = json.loads(input_path.read_text(encoding="utf-8"))
         weight_map = index.get("weight_map") if isinstance(index, dict) else None
         if not isinstance(weight_map, dict) or not weight_map:
             raise ValueError(f"{input_path} has no non-empty 'weight_map'")
-        shard_names = sorted({str(v) for v in weight_map.values()})
-        shards = []
-        for shard in shard_names:
-            shard_path = parent / shard
-            if not shard_path.is_file():
-                raise FileNotFoundError(f"shard listed in {input_path.name} is missing: {shard_path}")
-            shards.append(shard_path)
+        shard_names: list[str] = []
+        seen_names: set[str] = set()
+        for raw_val in weight_map.values():
+            if not isinstance(raw_val, str) or not raw_val:
+                raise ValueError(f"{input_path} contains invalid shard filename {raw_val!r}")
+            if raw_val not in seen_names:
+                seen_names.add(raw_val)
+                shard_names.append(raw_val)
+        shard_names.sort()
+        shards = [
+            _resolve_contained_file(parent, shard, label=f"shard listed in {input_path.name}")
+            for shard in shard_names
+        ]
         return ResolvedCheckpoint(tuple(shards), config)
     return ResolvedCheckpoint((input_path,), config)
 
@@ -1357,16 +1430,30 @@ def _read_shard_header_from_reader(source_id: pathlib.Path | str, reader: RangeS
     for name, spec in header.items():
         if name == "__metadata__":
             continue
+        if not isinstance(spec, dict):
+            raise ValueError(f"tensor {name} entry in {source_id} must be a JSON object")
         dtype = str(spec["dtype"])
-        shape = tuple(int(x) for x in spec["shape"])
-        start, end = (int(x) for x in spec["data_offsets"])
+        raw_shape = spec["shape"]
+        if not isinstance(raw_shape, list):
+            raise ValueError(f"tensor {name} shape in {source_id} must be a list")
+        if any(isinstance(x, bool) for x in raw_shape):
+            raise ValueError(f"tensor {name} shape in {source_id} contains invalid bool dimension")
+        shape = tuple(int(x) for x in raw_shape)
+        if any(d < 0 for d in shape):
+            raise ValueError(f"tensor {name} in {source_id} has negative dimension in shape {list(shape)}")
+        raw_offsets = spec["data_offsets"]
+        if not isinstance(raw_offsets, list) or len(raw_offsets) != 2:
+            raise ValueError(f"tensor {name} in {source_id} has invalid data_offsets {raw_offsets!r}")
+        if any(isinstance(x, bool) for x in raw_offsets):
+            raise ValueError(f"tensor {name} in {source_id} has invalid bool data_offsets")
+        start, end = int(raw_offsets[0]), int(raw_offsets[1])
         elem = _SAFETENSORS_DTYPE_BYTES.get(dtype)
         if elem is None:
             raise ValueError(f"unsupported safetensors dtype {dtype} for {name} in {source_id}")
         numel = 1
         for d in shape:
             numel *= d
-        if end < start or end - start != numel * elem:
+        if start < 0 or end < start or end - start != numel * elem:
             raise ValueError(
                 f"tensor {name} in {source_id}: data_offsets {start}..{end} do not match {dtype}{list(shape)}"
             )

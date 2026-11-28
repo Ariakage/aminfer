@@ -633,11 +633,45 @@ def validate_hf_metadata_dir(metadata_dir: pathlib.Path) -> Hy4MetadataReport:
         total_size = int((idx_obj.get("metadata") or {}).get("total_size", 0) or 0)
         shard_cnt = len(set(weight_map.values()))
     elif single_sf.is_file():
+        file_size = single_sf.stat().st_size
+        if file_size < 8:
+            raise ValueError(f"truncated safetensors header in {single_sf}")
         with single_sf.open("rb") as fh:
-            hlen, = struct.unpack("<Q", fh.read(8))
-            hdr = json.loads(fh.read(hlen))
+            hdr_len_bytes = fh.read(8)
+            if len(hdr_len_bytes) != 8:
+                raise ValueError(f"truncated safetensors header in {single_sf}")
+            (hlen,) = struct.unpack("<Q", hdr_len_bytes)
+            if hlen > 256 * 1024 * 1024 or 8 + hlen > file_size:
+                raise ValueError(f"implausible safetensors header length {hlen} in {single_sf}")
+            hdr_raw = fh.read(hlen)
+            if len(hdr_raw) != hlen:
+                raise ValueError(f"truncated safetensors JSON in {single_sf}")
+            hdr = json.loads(hdr_raw.decode("utf-8"))
+        if not isinstance(hdr, dict):
+            raise ValueError(f"safetensors header must be a JSON object in {single_sf}")
+        data_base = 8 + hlen
+        for tname, spec in hdr.items():
+            if tname == "__metadata__":
+                continue
+            if not isinstance(spec, dict):
+                raise ValueError(f"tensor {tname} entry in {single_sf} must be a JSON object")
+            shape = spec.get("shape")
+            offsets = spec.get("data_offsets")
+            if not isinstance(shape, list) or any(isinstance(dim, bool) or int(dim) < 0 for dim in shape):
+                raise ValueError(f"tensor {tname} in {single_sf} has invalid shape {shape!r}")
+            if (
+                not isinstance(offsets, list)
+                or len(offsets) != 2
+                or any(isinstance(x, bool) for x in offsets)
+            ):
+                raise ValueError(f"tensor {tname} in {single_sf} has invalid data_offsets {offsets!r}")
+            start, end = int(offsets[0]), int(offsets[1])
+            if start < 0 or end < start or data_base + end > file_size:
+                raise ValueError(
+                    f"tensor {tname} in {single_sf} has out-of-bounds data_offsets {start}..{end}"
+                )
         weight_map = {k: "model.safetensors" for k in hdr if k != "__metadata__"}
-        total_size = single_sf.stat().st_size
+        total_size = file_size
         shard_cnt = 1
 
     from aminfer_tools.amf import _normalize_name

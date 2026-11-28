@@ -58,6 +58,7 @@ AMI_SDK_ERR_SEQUENCE_FULL: Final[int] = -12
 AMI_SDK_ERR_VISION: Final[int] = -13
 AMI_SDK_ERR_CANCELLED: Final[int] = -14
 AMI_SDK_ERR_UNSUPPORTED: Final[int] = -15
+AMI_SDK_ERR_BUSY: Final[int] = -16
 
 
 class AminferError(RuntimeError):
@@ -89,6 +90,10 @@ class SequenceFullError(AminferError):
 
 class VisionError(AminferError):
     """Raised when zero-copy IOSurface / CVPixelBuffer vision ingress fails."""
+
+
+class BusyError(AminferError):
+    """Raised when concurrent mutating calls target the same engine handle (F3)."""
 
 
 class HostVmInfoC(ctypes.Structure):
@@ -694,4 +699,6 @@ def check_status(lib: ctypes.CDLL, status: int) -> None:
         raise SequenceFullError(status, status_name, detail)
     if status == AMI_SDK_ERR_VISION:
         raise VisionError(status, status_name, detail)
+    if status == AMI_SDK_ERR_BUSY:
+        raise BusyError(status, status_name, detail)
     raise AminferError(status, status_name, detail)

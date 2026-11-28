@@ -17,6 +17,7 @@ import math
 import os
 import queue
 import threading
+import weakref
 from collections.abc import Callable, Iterator, Sequence
 from typing import Any, overload
 
@@ -727,38 +728,38 @@ class VisionInput:
 
     @classmethod
     def from_cvpixelbuffer(cls, engine: Engine, cv_pixel_buffer_ptr: int | ctypes.c_void_p) -> VisionInput:
-        eng_h = engine._require_open()
         handle = ctypes.c_void_p()
-        check_status(
-            engine._lib,
-            engine._lib.ami_sdk_vision_from_cvpixelbuffer(
-                eng_h, cls._coerce_ptr(cv_pixel_buffer_ptr), ctypes.byref(handle)
-            ),
-        )
+        with engine._use_handle() as eng_h:
+            check_status(
+                engine._lib,
+                engine._lib.ami_sdk_vision_from_cvpixelbuffer(
+                    eng_h, cls._coerce_ptr(cv_pixel_buffer_ptr), ctypes.byref(handle)
+                ),
+            )
         return cls(engine._lib, handle, engine)
 
     @classmethod
     def from_iosurface(cls, engine: Engine, iosurface_ptr: int | ctypes.c_void_p) -> VisionInput:
-        eng_h = engine._require_open()
         handle = ctypes.c_void_p()
-        check_status(
-            engine._lib,
-            engine._lib.ami_sdk_vision_from_iosurface(
-                eng_h, cls._coerce_ptr(iosurface_ptr), ctypes.byref(handle)
-            ),
-        )
+        with engine._use_handle() as eng_h:
+            check_status(
+                engine._lib,
+                engine._lib.ami_sdk_vision_from_iosurface(
+                    eng_h, cls._coerce_ptr(iosurface_ptr), ctypes.byref(handle)
+                ),
+            )
         return cls(engine._lib, handle, engine)
 
     @classmethod
     def from_iosurface_id(cls, engine: Engine, iosurface_id: int) -> VisionInput:
-        eng_h = engine._require_open()
         handle = ctypes.c_void_p()
-        check_status(
-            engine._lib,
-            engine._lib.ami_sdk_vision_from_iosurface_id(
-                eng_h, ctypes.c_uint32(int(iosurface_id)), ctypes.byref(handle)
-            ),
-        )
+        with engine._use_handle() as eng_h:
+            check_status(
+                engine._lib,
+                engine._lib.ami_sdk_vision_from_iosurface_id(
+                    eng_h, ctypes.c_uint32(int(iosurface_id)), ctypes.byref(handle)
+                ),
+            )
         return cls(engine._lib, handle, engine)
 
     @classmethod
@@ -770,25 +771,25 @@ class VisionInput:
         *,
         fmt: VisionFormat = VisionFormat.BGRA8,
     ) -> VisionInput:
-        eng_h = engine._require_open()
         handle = ctypes.c_void_p()
-        check_status(
-            engine._lib,
-            engine._lib.ami_sdk_vision_create_iosurface(
-                eng_h, int(fmt), int(width), int(height), ctypes.byref(handle)
-            ),
-        )
+        with engine._use_handle() as eng_h:
+            check_status(
+                engine._lib,
+                engine._lib.ami_sdk_vision_create_iosurface(
+                    eng_h, int(fmt), int(width), int(height), ctypes.byref(handle)
+                ),
+            )
         return cls(engine._lib, handle, engine)
 
     @classmethod
     def from_image_file(cls, engine: Engine, path: str | os.PathLike[str]) -> VisionInput:
-        eng_h = engine._require_open()
         handle = ctypes.c_void_p()
         raw_path = os.fsencode(os.fspath(path))
-        check_status(
-            engine._lib,
-            engine._lib.ami_sdk_vision_load_image(eng_h, raw_path, ctypes.byref(handle)),
-        )
+        with engine._use_handle() as eng_h:
+            check_status(
+                engine._lib,
+                engine._lib.ami_sdk_vision_load_image(eng_h, raw_path, ctypes.byref(handle)),
+            )
         return cls(engine._lib, handle, engine)
 
     def close(self) -> None:
@@ -861,6 +862,7 @@ class VisionInput:
                 ctypes.byref(height),
             ),
         )
+        mv: memoryview | None = None
         try:
             byte_len = int(bpr.value) * int(height.value)
             mv = _make_memoryview(
@@ -872,7 +874,11 @@ class VisionInput:
             )
             yield mv
         finally:
-            check_status(self._lib, self._lib.ami_sdk_vision_unlock(handle, ro_flag))
+            try:
+                if mv is not None:
+                    mv.release()
+            finally:
+                check_status(self._lib, self._lib.ami_sdk_vision_unlock(handle, ro_flag))
 
 
 class Engine:
@@ -901,6 +907,13 @@ class Engine:
         cold_expert_min_weight: float = 0.0,
         lib_path: str | os.PathLike[str] | None = None,
     ) -> None:
+        self._state_lock = threading.Lock()
+        self._op_cond = threading.Condition(self._state_lock)
+        self._closing = False
+        self._active_ops = 0
+        self._active_streams: list[tuple[threading.Thread, threading.Event, CancelToken | None]] = []
+        self._live_views: list[weakref.ref[memoryview]] = []
+        self._lib_path = lib_path
         self._lib = load_lib(lib_path)
         self._handle: ctypes.c_void_p | None = None
         self._tokenizer_view: Tokenizer | None = None
@@ -975,12 +988,48 @@ class Engine:
         )
 
     def close(self) -> None:
-        if getattr(self, "_tokenizer_view", None) is not None:
-            self._tokenizer_view.close()
+        lock = getattr(self, "_state_lock", None)
+        if lock is None:
+            if getattr(self, "_tokenizer_view", None) is not None:
+                self._tokenizer_view.close()
+                self._tokenizer_view = None
+            if getattr(self, "_handle", None) is not None:
+                self._lib.ami_sdk_engine_destroy(self._handle)
+                self._handle = None
+            return
+
+        current = threading.current_thread()
+        with lock:
+            if self._handle is None and not self._active_streams and self._active_ops == 0:
+                self._closing = True
+                return
+            self._closing = True
+            streams_to_join: list[threading.Thread] = []
+            for worker, stop_ev, ctok in self._active_streams:
+                stop_ev.set()
+                if ctok is not None and ctok._handle is not None:
+                    ctok.cancel()
+                if worker is not current:
+                    streams_to_join.append(worker)
+
+        for worker in streams_to_join:
+            worker.join()
+
+        with lock:
+            self._op_cond.wait_for(lambda: self._active_ops == 0)
+            live_views = [mv for ref in self._live_views if (mv := ref()) is not None]
+            self._live_views.clear()
+            tok_view = getattr(self, "_tokenizer_view", None)
             self._tokenizer_view = None
-        if getattr(self, "_handle", None) is not None:
-            self._lib.ami_sdk_engine_destroy(self._handle)
+            handle = getattr(self, "_handle", None)
             self._handle = None
+
+        for mv in live_views:
+            mv.release()
+        if tok_view is not None:
+            tok_view.close()
+        if handle is not None:
+            self._lib.ami_sdk_engine_destroy(handle)
 
     def __del__(self) -> None:
         self.close()
@@ -992,9 +1041,33 @@ class Engine:
         self.close()
 
     def _require_open(self) -> ctypes.c_void_p:
-        if self._handle is None:
-            raise RuntimeError("Engine is closed")
-        return self._handle
+        with self._state_lock:
+            if self._closing or self._handle is None:
+                raise RuntimeError("Engine is closed")
+            return self._handle
+
+    @contextlib.contextmanager
+    def _use_handle(self) -> Iterator[ctypes.c_void_p]:
+        with self._state_lock:
+            if self._closing or self._handle is None:
+                raise RuntimeError("Engine is closed")
+            self._active_ops += 1
+            handle = self._handle
+        try:
+            yield handle
+        finally:
+            with self._state_lock:
+                self._active_ops -= 1
+                if self._active_ops == 0:
+                    self._op_cond.notify_all()
+
+    def _track_view(self, mv: memoryview) -> None:
+        # Store weakref.ref instead of WeakSet because typed memoryviews ('f'/'e') are unhashable.
+        ref = weakref.ref(mv)
+        with self._state_lock:
+            if len(self._live_views) >= 16:
+                self._live_views = [r for r in self._live_views if r() is not None]
+            self._live_views.append(ref)
 
     @property
     def tokenizer(self) -> Tokenizer | None:
@@ -1010,10 +1083,11 @@ class Engine:
     @property
     def stats(self) -> EngineStats:
         raw = EngineStatsC(struct_size=ctypes.sizeof(EngineStatsC))
-        check_status(
-            self._lib,
-            self._lib.ami_sdk_engine_query_stats(self._require_open(), ctypes.byref(raw)),
-        )
+        with self._use_handle() as handle:
+            check_status(
+                self._lib,
+                self._lib.ami_sdk_engine_query_stats(handle, ctypes.byref(raw)),
+            )
         return EngineStats(
             is_graph_model=bool(raw.is_graph_model),
             vocab_size=int(raw.vocab_size),
@@ -1055,18 +1129,20 @@ class Engine:
         opts.max_tree_nodes = max_nodes_u32
         opts.enable_pruning = 1 if enable_pruning else 0
         opts.confidence_threshold = float(conf_f)
-        check_status(
-            self._lib,
-            self._lib.ami_sdk_engine_configure_speculative(self._require_open(), ctypes.byref(opts)),
-        )
+        with self._use_handle() as handle:
+            check_status(
+                self._lib,
+                self._lib.ami_sdk_engine_configure_speculative(handle, ctypes.byref(opts)),
+            )
 
     @property
     def spec_stats(self) -> SpecStats:
         raw = SpecStatsC(struct_size=ctypes.sizeof(SpecStatsC))
-        check_status(
-            self._lib,
-            self._lib.ami_sdk_engine_query_spec_stats(self._require_open(), ctypes.byref(raw)),
-        )
+        with self._use_handle() as handle:
+            check_status(
+                self._lib,
+                self._lib.ami_sdk_engine_query_spec_stats(handle, ctypes.byref(raw)),
+            )
         return SpecStats(
             active_draft_mode=DraftMode(int(raw.active_draft_mode)),
             rounds=int(raw.rounds),
@@ -1083,10 +1159,11 @@ class Engine:
         """Preallocates the 16 KiB-aligned wired LoRA pool on this engine."""
         if isinstance(pool_bytes, bool) or not isinstance(pool_bytes, int) or pool_bytes < 0:
             raise _invalid_arg("pool_bytes must be a non-negative int")
-        check_status(
-            self._lib,
-            self._lib.ami_sdk_engine_init_lora_pool(self._require_open(), int(pool_bytes)),
-        )
+        with self._use_handle() as handle:
+            check_status(
+                self._lib,
+                self._lib.ami_sdk_engine_init_lora_pool(handle, int(pool_bytes)),
+            )
 
     def load_lora(
         self,
@@ -1096,53 +1173,54 @@ class Engine:
         pool_bytes: int | None = None,
     ) -> int:
         """Hot-loads an `.amlora` (LoRA or DoRA) bundle under `name` and returns its slot ID."""
-        handle = self._require_open()
         if not isinstance(name, str) or not name:
             raise _invalid_arg("LoRA adapter name must be a non-empty string")
-        if pool_bytes is not None:
-            self.init_lora_pool(pool_bytes)
-        name_b = name.encode("utf-8")
-        path_b = os.fsencode(os.fspath(path))
-        out_slot = ctypes.c_uint32(0)
-        check_status(
-            self._lib,
-            self._lib.ami_sdk_engine_load_lora(handle, name_b, path_b, ctypes.byref(out_slot)),
-        )
-        return int(out_slot.value)
+        with self._use_handle() as handle:
+            if pool_bytes is not None:
+                self.init_lora_pool(pool_bytes)
+            name_b = name.encode("utf-8")
+            path_b = os.fsencode(os.fspath(path))
+            out_slot = ctypes.c_uint32(0)
+            check_status(
+                self._lib,
+                self._lib.ami_sdk_engine_load_lora(handle, name_b, path_b, ctypes.byref(out_slot)),
+            )
+            return int(out_slot.value)
 
     def unload_lora(self, name: str) -> None:
         """Hot-unloads adapter `name`, returning its wired 16 KiB pages to the pool."""
-        handle = self._require_open()
         if not isinstance(name, str) or not name:
             raise _invalid_arg("LoRA adapter name must be a non-empty string")
-        check_status(
-            self._lib,
-            self._lib.ami_sdk_engine_unload_lora(handle, name.encode("utf-8")),
-        )
-        if self._active_lora == name:
-            self._active_lora = None
+        with self._use_handle() as handle:
+            check_status(
+                self._lib,
+                self._lib.ami_sdk_engine_unload_lora(handle, name.encode("utf-8")),
+            )
+            if self._active_lora == name:
+                self._active_lora = None
 
     def set_lora(self, name: str | None) -> None:
         """Activates loaded adapter `name`, or restores bit-exact base model when `name is None`."""
-        handle = self._require_open()
-        if name is None:
-            check_status(self._lib, self._lib.ami_sdk_engine_set_active_lora(handle, None))
-            self._active_lora = None
-            return
-        if not isinstance(name, str):
-            raise _invalid_arg("LoRA adapter name must be a string or None")
-        name_b = name.encode("utf-8") if name else None
-        check_status(self._lib, self._lib.ami_sdk_engine_set_active_lora(handle, name_b))
-        self._active_lora = name if name else None
+        with self._use_handle() as handle:
+            if name is None:
+                check_status(self._lib, self._lib.ami_sdk_engine_set_active_lora(handle, None))
+                self._active_lora = None
+                return
+            if not isinstance(name, str):
+                raise _invalid_arg("LoRA adapter name must be a string or None")
+            name_b = name.encode("utf-8") if name else None
+            check_status(self._lib, self._lib.ami_sdk_engine_set_active_lora(handle, name_b))
+            self._active_lora = name if name else None
 
     @property
     def lora_info(self) -> LoraInfo:
         """Queries current wired LoRA pool usage and active adapter state."""
         raw = LoraInfoC(struct_size=ctypes.sizeof(LoraInfoC))
-        check_status(
-            self._lib,
-            self._lib.ami_sdk_engine_query_lora_info(self._require_open(), ctypes.byref(raw)),
-        )
+        with self._use_handle() as handle:
+            check_status(
+                self._lib,
+                self._lib.ami_sdk_engine_query_lora_info(handle, ctypes.byref(raw)),
+            )
         slot_val = int(raw.active_slot)
         return LoraInfo(
             active_adapters=int(raw.active_adapters),
@@ -1184,31 +1262,33 @@ class Engine:
         )
 
     def reset_kv_cache(self) -> None:
-        check_status(self._lib, self._lib.ami_sdk_engine_reset_kv(self._require_open()))
+        with self._use_handle() as handle:
+            check_status(self._lib, self._lib.ami_sdk_engine_reset_kv(handle))
 
     def set_cold_expert_min_weight(self, min_weight: float) -> None:
         """Sets the C27 opt-in cold-tail skipping weight threshold in [0.0, 1.0)."""
-        handle = self._require_open()
         if isinstance(min_weight, bool) or not isinstance(min_weight, (int, float)):
             raise _invalid_arg("cold_expert_min_weight must be a finite float in [0.0, 1.0)")
         val = float(min_weight)
         if not math.isfinite(val) or val < 0.0 or val >= 1.0:
             raise _invalid_arg("cold_expert_min_weight must be finite in [0.0, 1.0)")
-        check_status(
-            self._lib,
-            self._lib.ami_sdk_engine_set_cold_expert_min_weight(handle, ctypes.c_float(val)),
-        )
+        with self._use_handle() as handle:
+            check_status(
+                self._lib,
+                self._lib.ami_sdk_engine_set_cold_expert_min_weight(handle, ctypes.c_float(val)),
+            )
 
     @property
     def cold_expert_min_weight(self) -> float:
         """Queries the active C27 cold-tail skipping weight threshold (0.0 = lossless)."""
         out = ctypes.c_float(0.0)
-        check_status(
-            self._lib,
-            self._lib.ami_sdk_engine_get_cold_expert_min_weight(
-                self._require_open(), ctypes.byref(out)
-            ),
-        )
+        with self._use_handle() as handle:
+            check_status(
+                self._lib,
+                self._lib.ami_sdk_engine_get_cold_expert_min_weight(
+                    handle, ctypes.byref(out)
+                ),
+            )
         return float(out.value)
 
     def _prompt_to_ids(self, prompt: str | bytes | Sequence[int]) -> list[int]:
@@ -1230,29 +1310,30 @@ class Engine:
             raise InvalidArgumentError(-1, "AMI_SDK_ERR_INVALID_ARGUMENT", "prompt is empty")
         arr = (ctypes.c_uint32 * len(ids))(*ids)
         ctok = cancel_token._require_open() if cancel_token is not None else None
-        check_status(
-            self._lib,
-            self._lib.ami_sdk_prefill_tokens(
-                self._require_open(),
-                arr,
-                len(ids),
-                1 if compute_logits else 0,
-                1 if reset_kv_cache else 0,
-                ctok,
-            ),
-        )
+        with self._use_handle() as handle:
+            check_status(
+                self._lib,
+                self._lib.ami_sdk_prefill_tokens(
+                    handle,
+                    arr,
+                    len(ids),
+                    1 if compute_logits else 0,
+                    1 if reset_kv_cache else 0,
+                    ctok,
+                ),
+            )
 
     def step_decode(self, token_id: int) -> int:
-        handle = self._require_open()
         v = self._vocab_size if self._vocab_size > 0 else None
         tid = _validate_token_id(token_id, vocab_size=v, name="token_id")
         out_next = ctypes.c_uint32()
-        check_status(
-            self._lib,
-            self._lib.ami_sdk_step_decode(
-                handle, tid, ctypes.byref(out_next)
-            ),
-        )
+        with self._use_handle() as handle:
+            check_status(
+                self._lib,
+                self._lib.ami_sdk_step_decode(
+                    handle, tid, ctypes.byref(out_next)
+                ),
+            )
         return int(out_next.value)
 
     def generate(
@@ -1263,18 +1344,18 @@ class Engine:
         on_chunk: Callable[[StreamChunk], bool | None] | None = None,
         lora: str | None | object = _LORA_UNSET,
     ) -> GenerationOutput:
-        handle = self._require_open()
-        lora_switched = lora is not _LORA_UNSET
-        prev_lora = self._active_lora
-        if lora_switched:
-            if lora is not None and not isinstance(lora, str):
-                raise _invalid_arg("lora must be a string or None")
-            self.set_lora(lora)
-        try:
-            return self._generate_inner(handle, prompt, config, on_chunk=on_chunk)
-        finally:
+        with self._use_handle() as handle:
+            lora_switched = lora is not _LORA_UNSET
+            prev_lora = self._active_lora
             if lora_switched:
-                self.set_lora(prev_lora)
+                if lora is not None and not isinstance(lora, str):
+                    raise _invalid_arg("lora must be a string or None")
+                self.set_lora(lora)
+            try:
+                return self._generate_inner(handle, prompt, config, on_chunk=on_chunk)
+            finally:
+                if lora_switched:
+                    self.set_lora(prev_lora)
 
     def _generate_inner(
         self,
@@ -1413,24 +1494,40 @@ class Engine:
         self._require_open()
         q: queue.SimpleQueue[StreamChunk | BaseException | None] = queue.SimpleQueue()
         stop_event = threading.Event()
+        internal_cancel: CancelToken | None = None
+        eff_config = config
+        if eff_config is None or eff_config.cancel_token is None:
+            internal_cancel = CancelToken(lib_path=self._lib_path)
+            eff_config = (
+                GenerationConfig(cancel_token=internal_cancel)
+                if eff_config is None
+                else dataclasses.replace(eff_config, cancel_token=internal_cancel)
+            )
 
         def _on_chunk(chunk: StreamChunk) -> bool:
-            if stop_event.is_set():
+            if stop_event.is_set() or (internal_cancel is not None and internal_cancel.is_cancelled):
                 return False
             q.put(chunk)
             return not stop_event.is_set()
 
         def _worker() -> None:
             try:
-                self.generate(prompt, config, on_chunk=_on_chunk, lora=lora)
+                self.generate(prompt, eff_config, on_chunk=_on_chunk, lora=lora)
             except BaseException as exc:  # noqa: BLE001
                 q.put(exc)
             finally:
                 q.put(None)
 
         worker = threading.Thread(target=_worker, name="aminfer-stream", daemon=True)
-        worker.start()
+        entry = (worker, stop_event, internal_cancel)
+        started = False
         try:
+            with self._state_lock:
+                if self._closing or self._handle is None:
+                    raise RuntimeError("Engine is closed")
+                self._active_streams.append(entry)
+                worker.start()
+                started = True
             while True:
                 item = q.get()
                 if item is None:
@@ -1440,25 +1537,37 @@ class Engine:
                 yield item
         finally:
             stop_event.set()
-            worker.join()
+            with self._state_lock:
+                if internal_cancel is not None and internal_cancel._handle is not None:
+                    internal_cancel.cancel()
+            if started:
+                worker.join()
+            with self._state_lock:
+                if entry in self._active_streams:
+                    self._active_streams.remove(entry)
+            if internal_cancel is not None:
+                internal_cancel.close()
 
     def logits_view(self, dtype: DType | str = DType.F32) -> memoryview:
         """Returns a read-only zero-copy PEP 3118 memoryview over wired logits."""
         dt = _coerce_dtype(dtype)
         view = TensorViewC(struct_size=ctypes.sizeof(TensorViewC))
-        check_status(
-            self._lib,
-            self._lib.ami_sdk_get_logits_view(self._require_open(), int(dt), ctypes.byref(view)),
-        )
-        fmt = "e" if dt == DType.F16 else "f"
-        cols = int(view.shape[1])
-        return _make_memoryview(
-            int(view.data or 0),
-            int(view.byte_len),
-            read_only=True,
-            fmt=fmt,
-            shape=(cols,),
-        )
+        with self._use_handle() as handle:
+            check_status(
+                self._lib,
+                self._lib.ami_sdk_get_logits_view(handle, int(dt), ctypes.byref(view)),
+            )
+            fmt = "e" if dt == DType.F16 else "f"
+            cols = int(view.shape[1])
+            mv = _make_memoryview(
+                int(view.data or 0),
+                int(view.byte_len),
+                read_only=True,
+                fmt=fmt,
+                shape=(cols,),
+            )
+            self._track_view(mv)
+            return mv
 
     def hidden_states_view(
         self, dtype: DType | str = DType.F32, *, normalized: bool = True
@@ -1466,24 +1575,27 @@ class Engine:
         """Returns a read-only zero-copy PEP 3118 memoryview over the latest hidden state."""
         dt = _coerce_dtype(dtype)
         view = TensorViewC(struct_size=ctypes.sizeof(TensorViewC))
-        check_status(
-            self._lib,
-            self._lib.ami_sdk_get_hidden_state_view(
-                self._require_open(),
-                int(dt),
-                1 if normalized else 0,
-                ctypes.byref(view),
-            ),
-        )
-        fmt = "e" if dt == DType.F16 else "f"
-        cols = int(view.shape[1])
-        return _make_memoryview(
-            int(view.data or 0),
-            int(view.byte_len),
-            read_only=True,
-            fmt=fmt,
-            shape=(cols,),
-        )
+        with self._use_handle() as handle:
+            check_status(
+                self._lib,
+                self._lib.ami_sdk_get_hidden_state_view(
+                    handle,
+                    int(dt),
+                    1 if normalized else 0,
+                    ctypes.byref(view),
+                ),
+            )
+            fmt = "e" if dt == DType.F16 else "f"
+            cols = int(view.shape[1])
+            mv = _make_memoryview(
+                int(view.data or 0),
+                int(view.byte_len),
+                read_only=True,
+                fmt=fmt,
+                shape=(cols,),
+            )
+            self._track_view(mv)
+            return mv
 
     @overload
     def embed(
@@ -1517,65 +1629,67 @@ class Engine:
         cancel_token: CancelToken | None = None,
     ) -> list[float] | list[list[float]]:
         """Extracts pooled embeddings while eliding lm_head (C21)."""
-        handle = self._require_open()
-        pool_mode = _coerce_pooling(pooling)
-        c_params = EmbedParamsC()
-        self._lib.ami_sdk_embed_params_init(ctypes.byref(c_params))
-        c_params.pooling = int(pool_mode)
-        c_params.dimensions = 0 if dimensions is None else int(dimensions)
-        c_params.normalize = 1 if normalize else 0
-        c_params.cancel_token = (
-            cancel_token._require_open() if cancel_token is not None else None
-        )
-
-        target_cap = self.hidden_size if not dimensions else int(dimensions)
-        if target_cap <= 0:
-            raise InvalidArgumentError(
-                -1, "AMI_SDK_ERR_INVALID_ARGUMENT", "dimensions must be positive"
+        with self._use_handle() as handle:
+            if not isinstance(inputs, (str, bytes)) and len(inputs) == 0:
+                return []
+            pool_mode = _coerce_pooling(pooling)
+            c_params = EmbedParamsC()
+            self._lib.ami_sdk_embed_params_init(ctypes.byref(c_params))
+            c_params.pooling = int(pool_mode)
+            c_params.dimensions = 0 if dimensions is None else int(dimensions)
+            c_params.normalize = 1 if normalize else 0
+            c_params.cancel_token = (
+                cancel_token._require_open() if cancel_token is not None else None
             )
 
-        def _embed_one(item: str | bytes | Sequence[int]) -> list[float]:
-            out_buf = (ctypes.c_float * target_cap)()
-            out_dims = ctypes.c_size_t()
-            if isinstance(item, (str, bytes)):
-                raw = _as_utf8(item)
-                check_status(
-                    self._lib,
-                    self._lib.ami_sdk_embed_text(
-                        handle,
-                        raw,
-                        len(raw),
-                        ctypes.byref(c_params),
-                        out_buf,
-                        target_cap,
-                        ctypes.byref(out_dims),
-                    ),
+            target_cap = self.hidden_size if not dimensions else int(dimensions)
+            if target_cap <= 0:
+                raise InvalidArgumentError(
+                    -1, "AMI_SDK_ERR_INVALID_ARGUMENT", "dimensions must be positive"
                 )
-            else:
-                v = self._vocab_size if self._vocab_size > 0 else None
-                ids = _validate_token_ids(item, vocab_size=v, name="token_ids")
-                if not ids:
-                    raise _invalid_arg("token_ids sequence is empty")
-                ids_arr = (ctypes.c_uint32 * len(ids))(*ids)
-                check_status(
-                    self._lib,
-                    self._lib.ami_sdk_embed_tokens(
-                        handle,
-                        ids_arr,
-                        len(ids),
-                        ctypes.byref(c_params),
-                        out_buf,
-                        target_cap,
-                        ctypes.byref(out_dims),
-                    ),
-                )
-            return [float(x) for x in out_buf[: int(out_dims.value)]]
 
-        if isinstance(inputs, (str, bytes)):
-            return _embed_one(inputs)
-        if len(inputs) > 0 and isinstance(inputs[0], str):
-            return [_embed_one(s) for s in inputs]  # type: ignore[arg-type]
-        return _embed_one(inputs)  # type: ignore[arg-type]
+            def _embed_one(item: str | bytes | Sequence[int]) -> list[float]:
+                out_buf = (ctypes.c_float * target_cap)()
+                out_dims = ctypes.c_size_t()
+                if isinstance(item, (str, bytes)):
+                    raw = _as_utf8(item)
+                    check_status(
+                        self._lib,
+                        self._lib.ami_sdk_embed_text(
+                            handle,
+                            raw,
+                            len(raw),
+                            ctypes.byref(c_params),
+                            out_buf,
+                            target_cap,
+                            ctypes.byref(out_dims),
+                        ),
+                    )
+                else:
+                    v = self._vocab_size if self._vocab_size > 0 else None
+                    ids = _validate_token_ids(item, vocab_size=v, name="token_ids")
+                    if not ids:
+                        raise _invalid_arg("token_ids sequence is empty")
+                    ids_arr = (ctypes.c_uint32 * len(ids))(*ids)
+                    check_status(
+                        self._lib,
+                        self._lib.ami_sdk_embed_tokens(
+                            handle,
+                            ids_arr,
+                            len(ids),
+                            ctypes.byref(c_params),
+                            out_buf,
+                            target_cap,
+                            ctypes.byref(out_dims),
+                        ),
+                    )
+                return [float(x) for x in out_buf[: int(out_dims.value)]]
+
+            if isinstance(inputs, (str, bytes)):
+                return _embed_one(inputs)
+            if isinstance(inputs[0], str):
+                return [_embed_one(s) for s in inputs]  # type: ignore[arg-type]
+            return _embed_one(inputs)  # type: ignore[arg-type]
 
     def rerank(
         self,
@@ -1589,10 +1703,10 @@ class Engine:
         cancel_token: CancelToken | None = None,
     ) -> list[RerankItem]:
         """Scores (query, document) pairs via C21 cross-encoder logit scoring and sorts descending."""
-        handle = self._require_open()
-        num_docs = len(documents)
-        if num_docs == 0:
-            return []
+        with self._use_handle() as handle:
+            num_docs = len(documents)
+            if num_docs == 0:
+                return []
 
         rmode = _coerce_rerank_mode(mode)
         c_params = RerankParamsC()
@@ -1679,51 +1793,51 @@ class Engine:
         cancel_token: CancelToken | None = None,
     ) -> VisionPrefillResult:
         """Runs G14 zero-copy IOSurface / CVPixelBuffer vision ingress + multimodal prefill."""
-        handle = self._require_open()
-        frame_list = [frames] if isinstance(frames, VisionInput) else list(frames)
-        if not frame_list:
-            raise InvalidArgumentError(-1, "AMI_SDK_ERR_INVALID_ARGUMENT", "frames is empty")
+        with self._use_handle() as handle:
+            frame_list = [frames] if isinstance(frames, VisionInput) else list(frames)
+            if not frame_list:
+                raise InvalidArgumentError(-1, "AMI_SDK_ERR_INVALID_ARGUMENT", "frames is empty")
 
-        prefix_ids = self._prompt_to_ids(prefix) if prefix else []
-        suffix_ids = self._prompt_to_ids(suffix) if suffix else []
+            prefix_ids = self._prompt_to_ids(prefix) if prefix else []
+            suffix_ids = self._prompt_to_ids(suffix) if suffix else []
 
-        p_arr = (ctypes.c_uint32 * len(prefix_ids))(*prefix_ids) if prefix_ids else None
-        s_arr = (ctypes.c_uint32 * len(suffix_ids))(*suffix_ids) if suffix_ids else None
-        f_ptrs = (ctypes.c_void_p * len(frame_list))(*(f._require_open() for f in frame_list))
+            p_arr = (ctypes.c_uint32 * len(prefix_ids))(*prefix_ids) if prefix_ids else None
+            s_arr = (ctypes.c_uint32 * len(suffix_ids))(*suffix_ids) if suffix_ids else None
+            f_ptrs = (ctypes.c_void_p * len(frame_list))(*(f._require_open() for f in frame_list))
 
-        c_params = VisionParamsC()
-        self._lib.ami_sdk_vision_params_init(ctypes.byref(c_params))
-        c_params.patch_size = int(patch_size)
-        c_params.t_patch = int(t_patch)
-        c_params.spatial_merge = int(spatial_merge)
-        c_params.compute_logits = 1 if compute_logits else 0
-        c_params.cancel_token = (
-            cancel_token._require_open() if cancel_token is not None else None
-        )
+            c_params = VisionParamsC()
+            self._lib.ami_sdk_vision_params_init(ctypes.byref(c_params))
+            c_params.patch_size = int(patch_size)
+            c_params.t_patch = int(t_patch)
+            c_params.spatial_merge = int(spatial_merge)
+            c_params.compute_logits = 1 if compute_logits else 0
+            c_params.cancel_token = (
+                cancel_token._require_open() if cancel_token is not None else None
+            )
 
-        c_res = VisionResultC(struct_size=ctypes.sizeof(VisionResultC))
-        check_status(
-            self._lib,
-            self._lib.ami_sdk_prefill_vision(
-                handle,
-                p_arr,
-                len(prefix_ids),
-                f_ptrs,
-                len(frame_list),
-                s_arr,
-                len(suffix_ids),
-                ctypes.byref(c_params),
-                ctypes.byref(c_res),
-            ),
-        )
-        return VisionPrefillResult(
-            first_token_id=int(c_res.first_token_id),
-            prefix_tokens=int(c_res.prefix_tokens),
-            vision_tokens=int(c_res.vision_tokens),
-            suffix_tokens=int(c_res.suffix_tokens),
-            total_prompt_tokens=int(c_res.total_prompt_tokens),
-            grid=(int(c_res.grid_t), int(c_res.grid_h), int(c_res.grid_w)),
-            all_frames_zero_copy=bool(c_res.all_frames_zero_copy),
-            all_frames_page_aligned=bool(c_res.all_frames_page_aligned),
-            vision_encode_us=float(c_res.vision_encode_us),
-        )
+            c_res = VisionResultC(struct_size=ctypes.sizeof(VisionResultC))
+            check_status(
+                self._lib,
+                self._lib.ami_sdk_prefill_vision(
+                    handle,
+                    p_arr,
+                    len(prefix_ids),
+                    f_ptrs,
+                    len(frame_list),
+                    s_arr,
+                    len(suffix_ids),
+                    ctypes.byref(c_params),
+                    ctypes.byref(c_res),
+                ),
+            )
+            return VisionPrefillResult(
+                first_token_id=int(c_res.first_token_id),
+                prefix_tokens=int(c_res.prefix_tokens),
+                vision_tokens=int(c_res.vision_tokens),
+                suffix_tokens=int(c_res.suffix_tokens),
+                total_prompt_tokens=int(c_res.total_prompt_tokens),
+                grid=(int(c_res.grid_t), int(c_res.grid_h), int(c_res.grid_w)),
+                all_frames_zero_copy=bool(c_res.all_frames_zero_copy),
+                all_frames_page_aligned=bool(c_res.all_frames_page_aligned),
+                vision_encode_us=float(c_res.vision_encode_us),
+            )

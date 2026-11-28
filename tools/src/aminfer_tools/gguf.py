@@ -357,16 +357,28 @@ class GgufShard:
     tensors: tuple[GgufTensorInfo, ...]
 
 
+_MAX_GGUF_ARRAY_DEPTH = 4
+_MAX_GGUF_TOTAL_ARRAY_ELEMS = 10_000_000
+
+
 class _GgufStreamCursor:
     """Bounded-buffer forward reader for GGUF headers and KV sections."""
 
-    def __init__(self, fh) -> None:
+    def __init__(self, fh, *, file_size: int | None = None) -> None:
         self._fh = fh
+        self._file_size = file_size
         self.pos = 0
+        self._array_elems_total = 0
 
     def read_exact(self, n: int) -> bytes:
         if n == 0:
             return b""
+        if n < 0:
+            raise ValueError(f"negative GGUF read length {n}")
+        if self._file_size is not None and self.pos + n > self._file_size:
+            raise ValueError(
+                f"unexpected EOF in GGUF header at offset {self.pos} (wanted {n}, remaining {self._file_size - self.pos})"
+            )
         buf = self._fh.read(n)
         if len(buf) != n:
             raise ValueError(f"unexpected EOF in GGUF header at offset {self.pos} (wanted {n}, got {len(buf)})")
@@ -388,23 +400,32 @@ class _GgufStreamCursor:
             raise ValueError(f"implausible GGUF string length {n}")
         return self.read_exact(n).decode("utf-8", errors="replace")
 
-    def read_value(self, vtype: int) -> Any:
+    def read_value(self, vtype: int, _depth: int = 0) -> Any:
         if vtype == _GGUF_TYPE_STRING:
             return self.read_str()
         if vtype == _GGUF_TYPE_BOOL:
             return bool(self.read_u8())
         if vtype == _GGUF_TYPE_ARRAY:
+            if _depth >= _MAX_GGUF_ARRAY_DEPTH:
+                raise ValueError(
+                    f"GGUF array nesting depth {_depth + 1} exceeds maximum {_MAX_GGUF_ARRAY_DEPTH}"
+                )
             elem_type = self.read_u32()
             count = self.read_u64()
-            if count > 10_000_000:
+            if count > _MAX_GGUF_TOTAL_ARRAY_ELEMS:
                 raise ValueError(f"implausible GGUF array length {count}")
+            if self._array_elems_total + count > _MAX_GGUF_TOTAL_ARRAY_ELEMS:
+                raise ValueError(
+                    f"cumulative GGUF array elements {self._array_elems_total + count} exceed {_MAX_GGUF_TOTAL_ARRAY_ELEMS}"
+                )
+            self._array_elems_total += count
             if elem_type in _SCALAR_STRUCTS:
                 st = _SCALAR_STRUCTS[elem_type]
                 raw = self.read_exact(count * st.size)
                 return list(struct.unpack(f"<{count}{st.format[-1]}", raw)) if count else []
             if elem_type == _GGUF_TYPE_STRING:
                 return [self.read_str() for _ in range(count)]
-            return [self.read_value(elem_type) for _ in range(count)]
+            return [self.read_value(elem_type, _depth + 1) for _ in range(count)]
         st = _SCALAR_STRUCTS.get(vtype)
         if st is None:
             raise ValueError(f"unknown GGUF metadata value type {vtype}")
@@ -448,7 +469,7 @@ def read_gguf_header(path: pathlib.Path) -> GgufShard:
         raise ValueError(f"file is too small to be GGUF: {p}")
 
     with p.open("rb") as fh:
-        cur = _GgufStreamCursor(fh)
+        cur = _GgufStreamCursor(fh, file_size=file_size)
         magic = cur.read_exact(4)
         if magic != GGUF_MAGIC:
             raise ValueError(f"invalid GGUF magic {magic!r} in {p}")

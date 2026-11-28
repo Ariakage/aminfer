@@ -21,6 +21,7 @@ import math
 import pathlib
 import random
 import re
+import stat
 import struct
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
@@ -37,6 +38,7 @@ from aminfer_tools.amf import (
     _bf16_to_f32_bytes,
     _read_exact,
     _read_shard_header,
+    _resolve_contained_file,
     bf16_bytes_to_f16_bytes,
     f16_bytes_to_bf16_bytes,
     f32_values_to_f16_bytes,
@@ -312,13 +314,35 @@ def pack_lora_from_peft(
 
     src = pathlib.Path(input_path)
     if src.is_dir():
-        st_path = src / "adapter_model.safetensors"
-        if not st_path.is_file():
+        st_cand = src / "adapter_model.safetensors"
+        if not (st_cand.exists() or st_cand.is_symlink()):
             raise FileNotFoundError(f"adapter_model.safetensors not found in {src}")
-        cfg_path = adapter_config_path if adapter_config_path is not None else (src / "adapter_config.json")
+        st_path = _resolve_contained_file(src, "adapter_model.safetensors", label="adapter weights")
+        if adapter_config_path is not None:
+            cfg_path = pathlib.Path(adapter_config_path)
+        else:
+            cfg_cand = src / "adapter_config.json"
+            cfg_path = (
+                _resolve_contained_file(src, "adapter_config.json", label="adapter config")
+                if (cfg_cand.exists() or cfg_cand.is_symlink())
+                else None
+            )
     else:
-        st_path = src
-        cfg_path = adapter_config_path if adapter_config_path is not None else (src.parent / "adapter_config.json")
+        if not src.is_file():
+            raise FileNotFoundError(f"adapter weights not found: {src}")
+        st_resolved = src.resolve()
+        if not stat.S_ISREG(st_resolved.stat().st_mode):
+            raise ValueError(f"adapter weights is not a regular file: {src}")
+        st_path = st_resolved
+        if adapter_config_path is not None:
+            cfg_path = pathlib.Path(adapter_config_path)
+        else:
+            cfg_cand = src.parent / "adapter_config.json"
+            cfg_path = (
+                _resolve_contained_file(src.parent, "adapter_config.json", label="adapter config")
+                if (cfg_cand.exists() or cfg_cand.is_symlink())
+                else None
+            )
 
     cfg_dict: dict[str, object] = {}
     if cfg_path is not None and cfg_path.is_file():

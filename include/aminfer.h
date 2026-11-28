@@ -50,7 +50,8 @@ enum {
     AMI_SDK_ERR_SEQUENCE_FULL     = -12,
     AMI_SDK_ERR_VISION            = -13,
     AMI_SDK_ERR_CANCELLED         = -14,
-    AMI_SDK_ERR_UNSUPPORTED       = -15
+    AMI_SDK_ERR_UNSUPPORTED       = -15,
+    AMI_SDK_ERR_BUSY              = -16
 };
 
 /* Scalar element data types for zero-copy tensor views. */
@@ -345,7 +346,19 @@ const char *ami_sdk_last_error(void);
 void ami_sdk_clear_last_error(void);
 ami_sdk_status ami_sdk_host_vm_snapshot(ami_sdk_host_vm_info *out_info);
 
-/* Default struct initializers (set struct_size, abi_version, and safe defaults). */
+/*
+ * ABI Struct Size Contract:
+ *   - Input option/parameter structs (`const ami_sdk_*_options *`,
+ *     `const ami_sdk_*_params *`): initialize with `ami_sdk_*_init(&s)` (or
+ *     zero-initialize with `struct_size == 0` for defaults where valid). Non-zero
+ *     `struct_size != sizeof(T)` is rejected with `AMI_SDK_ERR_ABI_MISMATCH`.
+ *   - Pure output structs (`*out_info`, `*out_stats`, `*out_result`, `*out_view`):
+ *     callers may pass uninitialized stack/heap storage without pre-setting
+ *     `struct_size`. The library never reads `out->struct_size` on entry,
+ *     zero-initializes `*out` before populating fields, and sets
+ *     `out->struct_size = sizeof(T)` on success.
+ */
+/* Default input struct initializers (set struct_size, abi_version, and safe defaults). */
 void ami_sdk_engine_options_init(ami_sdk_engine_options *opts);
 void ami_sdk_gen_params_init(ami_sdk_gen_params *params);
 void ami_sdk_embed_params_init(ami_sdk_embed_params *params);
@@ -414,6 +427,16 @@ ami_sdk_status ami_sdk_detokenize(const ami_sdk_tokenizer *tokenizer,
 
 /* -------------------------------------------------------------------------
  * Engine Lifecycle, Co-Tenant Memory Governance & Low-Level Stepping
+ *
+ * Threading contract (F3):
+ *   An `ami_sdk_engine` instance is NOT safe for concurrent generation or
+ *   mutation calls across threads ("one active call at a time per engine").
+ *   Concurrent mutating/generation/view calls on the same handle are rejected
+ *   immediately with `AMI_SDK_ERR_BUSY`.
+ *   `ami_sdk_engine_destroy()` marks the engine closing, cancels any active
+ *   request token, and waits for any in-flight call on that handle to finish
+ *   before freeing resources. Callers must still ensure no new calls are
+ *   started on a handle after `ami_sdk_engine_destroy()` begins.
  * ------------------------------------------------------------------------- */
 
 ami_sdk_status ami_sdk_engine_create(const ami_sdk_engine_options *opts,
@@ -544,6 +567,12 @@ ami_sdk_status ami_sdk_embed_text(ami_sdk_engine *engine,
                                   float *out_embedding, size_t out_cap,
                                   size_t *out_dims);
 
+/*
+ * Scores `(query, documents[i])` pairs. `doc_id_ptrs[i]` / `doc_ptrs[i]` and
+ * `prefix_ids` / `suffix_ids` may be `NULL` when their corresponding length is `0`.
+ * `ami_sdk_rerank_texts()` tokenizes untrusted query and document content with
+ * `allow_special_tokens = 0` so embedded control tokens cannot inject roles.
+ */
 ami_sdk_status ami_sdk_rerank_tokens(ami_sdk_engine *engine,
                                      const uint32_t *query_ids, size_t query_len,
                                      const uint32_t *const *doc_id_ptrs,
@@ -603,6 +632,12 @@ ami_sdk_status ami_sdk_vision_lock_plane(ami_sdk_vision_input *vision,
 ami_sdk_status ami_sdk_vision_unlock(ami_sdk_vision_input *vision,
                                      uint32_t read_only);
 
+/*
+ * Encodes zero-copy `frames[0..frame_count)` together with optional `prefix_ids`
+ * and `suffix_ids` (`NULL` allowed when `prefix_len == 0` / `suffix_len == 0`).
+ * Requires a model with loaded vision/projector weights; returns
+ * `AMI_SDK_ERR_UNSUPPORTED` on text-only models lacking vision weights.
+ */
 ami_sdk_status ami_sdk_prefill_vision(ami_sdk_engine *engine,
                                       const uint32_t *prefix_ids, size_t prefix_len,
                                       const ami_sdk_vision_input *const *frames,
