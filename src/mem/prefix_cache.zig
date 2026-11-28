@@ -461,8 +461,19 @@ pub const PrefixCache = struct {
             return .{ .entry_id = existing, .already_existed = true, .evicted = null };
         }
 
+        var parent_temp_pinned = false;
+        if (parent_id != NONE_ID) {
+            self.pinUnchecked(parent_id);
+            parent_temp_pinned = true;
+        }
+        errdefer if (parent_temp_pinned) self.unpinRestoringEvictNoTick(parent_id);
+
         const alloc_res = try self.allocateEntrySlot(opts.evict_if_full, opts.evicted_handles_out);
         const id = alloc_res.entry_id;
+        if (parent_id != NONE_ID and id == parent_id) {
+            self.returnFreeSlot(id);
+            return error.InvalidParent;
+        }
 
         self.tick += 1;
         const prefix_len = std.math.add(u32, parent_prefix_len, self.spec.block_tokens) catch {
@@ -501,6 +512,10 @@ pub const PrefixCache = struct {
         self.hashInsert(id, h);
         if (parent_id != NONE_ID) {
             self.linkChild(parent_id, id);
+            if (parent_temp_pinned) {
+                self.unpinRestoringEvictNoTick(parent_id);
+                parent_temp_pinned = false;
+            }
         }
         if (opts.pin_on_insert) {
             self.pinUnchecked(id);
@@ -564,8 +579,19 @@ pub const PrefixCache = struct {
             }
         }
 
+        var parent_temp_pinned = false;
+        if (parent_id != NONE_ID) {
+            self.pinUnchecked(parent_id);
+            parent_temp_pinned = true;
+        }
+        errdefer if (parent_temp_pinned) self.unpinRestoringEvictNoTick(parent_id);
+
         const alloc_res = try self.allocateEntrySlot(opts.evict_if_full, opts.evicted_handles_out);
         const id = alloc_res.entry_id;
+        if (parent_id != NONE_ID and id == parent_id) {
+            self.returnFreeSlot(id);
+            return error.InvalidParent;
+        }
 
         self.tick += 1;
         const valid_u32: u32 = @intCast(tail_tokens.len);
@@ -605,6 +631,10 @@ pub const PrefixCache = struct {
         self.live_count += 1;
         if (parent_id != NONE_ID) {
             self.linkChild(parent_id, id);
+            if (parent_temp_pinned) {
+                self.unpinRestoringEvictNoTick(parent_id);
+                parent_temp_pinned = false;
+            }
         } else {
             self.linkRootTail(id);
         }
@@ -700,10 +730,16 @@ pub const PrefixCache = struct {
             var cur = list_head;
             while (cur != NONE_ID) : (cur = self.entries[cur].next_sibling) {
                 const e = &self.entries[cur];
-                // Only active_tile entries can be CoW-copied via `ami_kv_tile_cow_copy`.
-                if (self.kv_handles[@as(usize, cur) * self.spec.num_kv_layers].storage != .active_tile) {
-                    continue;
+                // Only entries whose attention layers are ALL `.active_tile` can be CoW-copied via `ami_kv_tile_cow_copy`.
+                const h_base = @as(usize, cur) * self.spec.num_kv_layers;
+                var all_active = true;
+                for (self.kv_handles[h_base .. h_base + self.spec.num_kv_layers]) |h| {
+                    if (h.storage != .active_tile) {
+                        all_active = false;
+                        break;
+                    }
                 }
+                if (!all_active) continue;
                 const tok_start = @as(usize, cur) * bs;
                 const cand_tokens = self.tokens[tok_start .. tok_start + e.valid_tokens];
                 const max_cmp = @min(cand_tokens.len, rem_slice.len);
@@ -1212,6 +1248,18 @@ pub const PrefixCache = struct {
             }
         }
         e.pin_count += 1;
+    }
+
+    fn unpinRestoringEvictNoTick(self: *PrefixCache, id: u32) void {
+        const e = &self.entries[id];
+        std.debug.assert(e.in_use and e.pin_count > 0);
+        e.pin_count -= 1;
+        if (e.pin_count == 0) {
+            self.pinned_count -= 1;
+            if (e.child_count == 0 and !e.in_evict_list) {
+                self.evictPushHead(id);
+            }
+        }
     }
 
     fn promoteToCanonical(self: *PrefixCache, id: u32) void {
@@ -1855,21 +1903,53 @@ pub const DiskPrefixCache = struct {
             return null;
         }
 
-        // Validate aligned section geometry.
+        // Validate aligned section geometry without u64 wrap-around.
         const tok_raw_bytes: u64 = @as(u64, hdr.token_count) * @sizeOf(u32);
-        const expected_tok_blob: u64 = try page.alignUp(@intCast(tok_raw_bytes));
-        const expected_kv_blob: u64 = if (hdr.kv_data_bytes > 0) try page.alignUp(@intCast(hdr.kv_data_bytes)) else 0;
-        const expected_gdn_blob: u64 = if (hdr.has_gdn_snapshot != 0 and hdr.gdn_state_bytes > 0)
-            try page.alignUp(@intCast(hdr.gdn_state_bytes))
+        const expected_tok_blob: u64 = page.alignUp(@intCast(tok_raw_bytes)) catch {
+            self.reloads_rejected_corrupt += 1;
+            return error.CorruptHeader;
+        };
+        const expected_kv_blob: u64 = if (hdr.kv_data_bytes > 0)
+            page.alignUp(@intCast(hdr.kv_data_bytes)) catch {
+                self.reloads_rejected_corrupt += 1;
+                return error.CorruptHeader;
+            }
         else
             0;
+        const expected_gdn_blob: u64 = if (hdr.has_gdn_snapshot != 0 and hdr.gdn_state_bytes > 0)
+            page.alignUp(@intCast(hdr.gdn_state_bytes)) catch {
+                self.reloads_rejected_corrupt += 1;
+                return error.CorruptHeader;
+            }
+        else
+            0;
+        const expected_kv_offset = std.math.add(u64, hdr.tokens_offset, hdr.tokens_blob_bytes) catch {
+            self.reloads_rejected_corrupt += 1;
+            return error.CorruptHeader;
+        };
+        const expected_gdn_offset = std.math.add(u64, hdr.kv_offset, hdr.kv_blob_bytes) catch {
+            self.reloads_rejected_corrupt += 1;
+            return error.CorruptHeader;
+        };
+        const sum_tok = std.math.add(u64, page.APPLE_PAGE_SIZE, hdr.tokens_blob_bytes) catch {
+            self.reloads_rejected_corrupt += 1;
+            return error.CorruptHeader;
+        };
+        const sum_kv = std.math.add(u64, sum_tok, hdr.kv_blob_bytes) catch {
+            self.reloads_rejected_corrupt += 1;
+            return error.CorruptHeader;
+        };
+        const expected_file_size = std.math.add(u64, sum_kv, hdr.gdn_blob_bytes) catch {
+            self.reloads_rejected_corrupt += 1;
+            return error.CorruptHeader;
+        };
         if (hdr.tokens_offset != page.APPLE_PAGE_SIZE or
             hdr.tokens_blob_bytes != expected_tok_blob or
-            hdr.kv_offset != hdr.tokens_offset + hdr.tokens_blob_bytes or
+            hdr.kv_offset != expected_kv_offset or
             hdr.kv_blob_bytes != expected_kv_blob or
-            (hdr.has_gdn_snapshot != 0 and hdr.gdn_offset != hdr.kv_offset + hdr.kv_blob_bytes) or
+            (hdr.has_gdn_snapshot != 0 and hdr.gdn_offset != expected_gdn_offset) or
             hdr.gdn_blob_bytes != expected_gdn_blob or
-            page.APPLE_PAGE_SIZE + hdr.tokens_blob_bytes + hdr.kv_blob_bytes + hdr.gdn_blob_bytes != file_size)
+            expected_file_size != file_size)
         {
             self.reloads_rejected_corrupt += 1;
             return error.CorruptHeader;
@@ -2193,9 +2273,11 @@ pub const DiskPrefixCache = struct {
     }
 
     fn diskPreadExact(fd: std.c.fd_t, dst: []u8, offset: u64) DiskPrefixError!void {
+        const MAX_PREAD_CHUNK: usize = 0x7fff_c000;
         var done: usize = 0;
         while (done < dst.len) {
-            const rc = std.c.pread(fd, dst.ptr + done, dst.len - done, @intCast(offset + done));
+            const chunk = @min(dst.len - done, MAX_PREAD_CHUNK);
+            const rc = std.c.pread(fd, dst.ptr + done, chunk, @intCast(offset + done));
             if (rc < 0) {
                 const err = std.c.errno(rc);
                 if (err == .INTR) continue;
@@ -3254,4 +3336,157 @@ test "R10 DiskPrefixCache spills/reloads q8 + FP4 KV tiles and GDN snapshots acr
         try std.testing.expect(miss == null);
         try std.testing.expectEqual(@as(u32, 0), try other_model.countModelArtifacts());
     }
+}
+
+test "F10 PrefixCache protects unpinned parent_id across evictLru without self-cycle" {
+    const spec: PrefixCacheSpec = .{
+        .max_entries = 2,
+        .block_tokens = 4,
+        .num_kv_layers = 2,
+    };
+    const need = try PrefixCache.requiredBytes(spec);
+    var arena = try arena_mod.WiredArena.init(need, makeTestBudget(need));
+    defer arena.deinit();
+
+    var cache = try PrefixCache.init(&arena, spec);
+
+    const h0 = [2]KvBlockHandle{
+        .{ .k_tex_id = 1, .v_tex_id = 2, .pool_slot_id = 0, .storage = .active_tile },
+        .{ .k_tex_id = 3, .v_tex_id = 4, .pool_slot_id = 1, .storage = .active_tile },
+    };
+    const h1 = [2]KvBlockHandle{
+        .{ .k_tex_id = 5, .v_tex_id = 6, .pool_slot_id = 2, .storage = .active_tile },
+        .{ .k_tex_id = 7, .v_tex_id = 8, .pool_slot_id = 3, .storage = .active_tile },
+    };
+
+    const blk0 = [_]u32{ 10, 11, 12, 13 };
+    const blk1 = [_]u32{ 20, 21, 22, 23 };
+    const blk2 = [_]u32{ 30, 31, 32, 33 };
+    const tail1 = [_]u32{ 40, 41 };
+
+    // Case 1: Cache full (max_entries = 2). Entry 0 is canonical unpinned leaf;
+    // Entry 1 is an unpinned `evict_first` parent sitting at `evict_first_tail`.
+    // Attaching a child to Entry 1 must evict Entry 0 and NEVER evict Entry 1 itself!
+    const r0 = try cache.insertFullBlock(NONE_ID, &blk0, &h0, .{ .pin_on_insert = false });
+    const r1 = try cache.insertFullBlock(NONE_ID, &blk1, &h1, .{ .pin_on_insert = false, .evict_first = true });
+    try std.testing.expectEqual(@as(u32, 2), cache.liveEntries());
+    try std.testing.expectEqual(@as(u32, 0), cache.entries[r1.entry_id].pin_count);
+
+    const child_res = try cache.insertTailBlock(r1.entry_id, &tail1, &h1, .{
+        .evict_if_full = true,
+        .evict_first = true,
+    });
+    try std.testing.expect(child_res.entry_id != r1.entry_id);
+    try std.testing.expectEqual(r0.entry_id, child_res.evicted.?.entry_id);
+    try std.testing.expectEqual(r1.entry_id, cache.entries[child_res.entry_id].parent_id);
+    try std.testing.expectEqual(@as(u32, 0), cache.entries[r1.entry_id].pin_count);
+    try std.testing.expectEqual(@as(u32, 1), cache.entries[r1.entry_id].child_count);
+
+    // Case 2: Pin the child so `r1` is the only ancestor and there are NO other
+    // unpinned leaves; inserting another full block under a fresh unpinned leaf
+    // returns `CacheFull` without creating a self-parented cycle.
+    cache.reset();
+    const p_pinned = try cache.insertFullBlock(NONE_ID, &blk0, &h0, .{ .pin_on_insert = true });
+    const p_parent = try cache.insertFullBlock(NONE_ID, &blk1, &h1, .{ .pin_on_insert = false, .evict_first = true });
+    try std.testing.expectError(
+        error.CacheFull,
+        cache.insertFullBlock(p_parent.entry_id, &blk2, &h0, .{ .evict_if_full = true }),
+    );
+    try std.testing.expectEqual(@as(u32, 0), cache.entries[p_parent.entry_id].pin_count);
+    try std.testing.expectEqual(@as(u32, 0), cache.entries[p_parent.entry_id].child_count);
+    try std.testing.expect(cache.entries[p_parent.entry_id].parent_id != p_parent.entry_id);
+    try cache.unpin(p_pinned.entry_id);
+}
+
+test "L9 PrefixCache matchAndPin skips CoW tail source if any attention layer is retired" {
+    const spec: PrefixCacheSpec = .{
+        .max_entries = 4,
+        .block_tokens = 4,
+        .num_kv_layers = 2,
+    };
+    const need = try PrefixCache.requiredBytes(spec);
+    var arena = try arena_mod.WiredArena.init(need, makeTestBudget(need));
+    defer arena.deinit();
+
+    var cache = try PrefixCache.init(&arena, spec);
+    const full_toks = [_]u32{ 1, 2, 3, 4 };
+    const tail_toks = [_]u32{ 5, 6, 7 };
+    const handles = [2]KvBlockHandle{
+        .{ .k_tex_id = 10, .v_tex_id = 11, .pool_slot_id = 0, .storage = .active_tile },
+        .{ .k_tex_id = 12, .v_tex_id = 13, .pool_slot_id = 1, .storage = .active_tile },
+    };
+
+    const f_res = try cache.insertFullBlock(NONE_ID, &full_toks, &handles, .{});
+    const t_res = try cache.insertTailBlock(f_res.entry_id, &tail_toks, &handles, .{});
+    // Retire ONLY layer 1 on the tail entry (layer 0 stays `.active_tile`).
+    cache.kv_handles[@as(usize, t_res.entry_id) * 2 + 1] = KvBlockHandle.retiredQ8(9);
+
+    const prompt = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8 };
+    var full_ids: [4]u32 = undefined;
+    var m = try cache.matchAndPin(&prompt, &full_ids, .{ .allow_partial_tail = true });
+
+    try std.testing.expectEqual(@as(usize, 1), m.full_block_count);
+    try std.testing.expectEqual(NONE_ID, m.tail_entry_id);
+    try std.testing.expectEqual(@as(u32, 0), m.tail_tokens);
+    try cache.releaseMatch(&m, &full_ids);
+}
+
+test "F19.4 DiskPrefixCache.reload rejects u64-overflowing header offsets cleanly" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const cache_dir = try std.fmt.bufPrint(&dir_buf, ".zig-cache/tmp/{s}/overflow_pc", .{tmp.sub_path});
+
+    const amf_hdr_crc: u32 = 0x1122_3344;
+    const amf_dir_crc: u32 = 0x5566_7788;
+    const tokens = [_]u32{ 11, 22, 33, 44 };
+    const p_hash = hashPrefix(&tokens, 4);
+
+    var disk = try DiskPrefixCache.init(gpa, .{
+        .cache_dir = cache_dir,
+        .amf_header_crc32 = amf_hdr_crc,
+        .amf_dir_crc32 = amf_dir_crc,
+        .max_tokens_per_artifact = 16,
+        .max_kv_bytes_per_artifact = 4096,
+        .enable_async_worker = false,
+    });
+    defer disk.deinit(gpa);
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path_z = try DiskPrefixCache.formatArtifactPath(cache_dir, amf_hdr_crc, amf_dir_crc, p_hash, &path_buf);
+
+    // Craft a valid-CRC header whose `kv_data_bytes = 0x8000_0000_0000_0000` (16 KiB aligned,
+    // passes `page.alignUp`, overflows `u64` when summed with `APPLE_PAGE_SIZE + tokens_blob_bytes`).
+    var hdr = std.mem.zeroes(DiskPrefixHeader);
+    hdr.magic = DISK_PREFIX_MAGIC;
+    hdr.version = DISK_PREFIX_VERSION;
+    hdr.page_size = page.APPLE_PAGE_SIZE;
+    hdr.amf_header_crc32 = amf_hdr_crc;
+    hdr.amf_dir_crc32 = amf_dir_crc;
+    hdr.prefix_hash = p_hash;
+    hdr.token_count = tokens.len;
+    hdr.num_kv_layers = 1;
+    hdr.kv_format = @backingInt(DiskKvFormat.retired_q8);
+    hdr.quant_profile_tag = 1;
+    hdr.tokens_offset = page.APPLE_PAGE_SIZE;
+    hdr.tokens_blob_bytes = page.APPLE_PAGE_SIZE;
+    hdr.kv_offset = 2 * page.APPLE_PAGE_SIZE;
+    hdr.kv_data_bytes = 0x8000_0000_0000_0000;
+    hdr.kv_blob_bytes = 0x8000_0000_0000_0000;
+    hdr.header_crc32 = hdr.computeCrc32();
+
+    var page0: [page.APPLE_PAGE_SIZE]u8 = @splat(0);
+    @memcpy(page0[0..@sizeOf(DiskPrefixHeader)], std.mem.asBytes(&hdr));
+    const fd = std.c.open(path_z.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
+    try std.testing.expect(fd >= 0);
+    defer _ = std.c.close(fd);
+    _ = std.c.pwrite(fd, &page0, page0.len, 0);
+
+    var kv_out: [4096]u8 = undefined;
+    try std.testing.expectError(
+        error.CorruptHeader,
+        disk.reload(p_hash, &tokens, .retired_q8, 1, &kv_out, null),
+    );
 }

@@ -94,6 +94,10 @@ comptime {
 }
 
 extern "c" fn aio_read(aiocbp: *Aiocb) c_int;
+extern "c" fn aio_cancel(fildes: c_int, aiocbp: ?*Aiocb) c_int;
+const AIO_ALLDONE: c_int = 0x1;
+const AIO_CANCELED: c_int = 0x2;
+const AIO_NOTCANCELED: c_int = 0x4;
 extern "c" fn pthread_cond_timedwait_relative_np(
     cond: *std.c.pthread_cond_t,
     mutex: *std.c.pthread_mutex_t,
@@ -292,6 +296,7 @@ pub const KqueueAioEngine = struct {
     free_top: usize,
     events: []std.c.kevent64_s,
     inflight: usize,
+    next_sync_tag: u64 = 0xA105_0000_0000_0001,
 
     pub fn init(allocator: std.mem.Allocator, max_inflight: usize) EngineError!KqueueAioEngine {
         if (max_inflight == 0 or max_inflight > MAX_INFLIGHT) return error.InvalidArgument;
@@ -332,14 +337,30 @@ pub const KqueueAioEngine = struct {
         };
     }
 
-    /// Drains all in-flight kernel AIO requests so no kernel reference to
-    /// `&slot.cb` or destination wired buffers outlives the engine, then frees
-    /// startup storage and closes the `kqueue` fd.
+    /// Cancels and drains all in-flight kernel AIO requests until `inflight == 0`
+    /// so no kernel reference to `&slot.cb` or destination wired buffers outlives
+    /// the engine, then frees startup storage and closes the `kqueue` fd.
     pub fn deinit(self: *KqueueAioEngine, allocator: std.mem.Allocator) void {
         if (self.kq_fd >= 0) {
+            for (self.slots, 0..) |*slot, i| {
+                if (slot.in_use) {
+                    const rc = aio_cancel(slot.cb.aio_fildes, &slot.cb);
+                    if (rc == AIO_CANCELED) {
+                        slot.in_use = false;
+                        self.inflight -= 1;
+                        self.free_stack[self.free_top] = @intCast(i);
+                        self.free_top += 1;
+                    }
+                }
+            }
             var scratch: [MAX_INFLIGHT]Completion = undefined;
             while (self.inflight > 0) {
-                const count = self.wait(&scratch, 5_000) catch break;
+                const count = self.wait(&scratch, null) catch |err| {
+                    std.debug.panic(
+                        "KqueueAioEngine.deinit: wait failed while draining {d} inflight AIO ops: {}",
+                        .{ self.inflight, err },
+                    );
+                };
                 if (count == 0) break;
             }
             _ = std.c.close(self.kq_fd);
@@ -369,6 +390,10 @@ pub const KqueueAioEngine = struct {
 
     /// Submits one 16 KiB-aligned asynchronous read with zero heap allocation.
     pub fn submit(self: *KqueueAioEngine, req: ReadRequest) EngineError!void {
+        _ = try self.submitWithSlot(req);
+    }
+
+    fn submitWithSlot(self: *KqueueAioEngine, req: ReadRequest) EngineError!struct { slot_idx: usize, gen: u32 } {
         try validateReadRequest(req);
         if (self.free_top == 0) return error.QueueFull;
 
@@ -376,7 +401,8 @@ pub const KqueueAioEngine = struct {
         const slot = &self.slots[slot_idx];
         std.debug.assert(!slot.in_use);
 
-        const tag: u64 = (@as(u64, slot.generation) << 32) | @as(u64, slot_idx);
+        const gen = slot.generation;
+        const tag: u64 = (@as(u64, gen) << 32) | @as(u64, slot_idx);
         slot.cb = .{
             .aio_fildes = req.fd,
             .aio_offset = @intCast(req.offset),
@@ -415,6 +441,7 @@ pub const KqueueAioEngine = struct {
                 else => error.SubmitFailed,
             };
         }
+        return .{ .slot_idx = slot_idx, .gen = gen };
     }
 
     /// Non-blocking completion reap (`timeout = 0`). Returns `0..out.len`.
@@ -430,20 +457,60 @@ pub const KqueueAioEngine = struct {
         return self.reap(out, timeout_ms);
     }
 
-    /// Submits one read and waits until it completes, returning bytes read.
+    /// Submits one read and waits until its matching completion arrives, draining
+    /// any stale completions and cancelling+draining on timeout before returning
+    /// `error.Timeout`.
     pub fn readSync(self: *KqueueAioEngine, req: ReadRequest, timeout_ms: u64) EngineError!usize {
-        try self.submit(req);
+        const sync_tag = self.next_sync_tag;
+        self.next_sync_tag +%= 1;
+        if (self.next_sync_tag == 0) self.next_sync_tag = 0xA105_0000_0000_0001;
+
+        var tagged_req = req;
+        tagged_req.user_data = sync_tag;
+        const handle = try self.submitWithSlot(tagged_req);
         const start_ns = monotonicNowNs();
         const deadline_ns = start_ns +| (timeout_ms *| std.time.ns_per_ms);
-        var comp: [1]Completion = undefined;
+        var comps: [MAX_INFLIGHT]Completion = undefined;
         while (true) {
             const now = monotonicNowNs();
-            if (now >= deadline_ns) return error.Timeout;
-            const rem_ms = @max(@as(u64, 1), (deadline_ns - now) / std.time.ns_per_ms);
-            const got = try self.wait(&comp, rem_ms);
-            if (got > 0) {
-                return try comp[0].check();
+            if (now >= deadline_ns) {
+                // One non-blocking poll before cancelling in case it just finished at deadline.
+                if (self.poll(&comps)) |n| {
+                    for (comps[0..n]) |c| {
+                        if (c.user_data == sync_tag) return try c.check();
+                    }
+                } else |_| {}
+                self.cancelAndDrainSlot(handle.slot_idx, handle.gen);
+                return error.Timeout;
             }
+            const rem_ms = @max(@as(u64, 1), (deadline_ns - now) / std.time.ns_per_ms);
+            const got = try self.wait(&comps, rem_ms);
+            for (comps[0..got]) |c| {
+                if (c.user_data == sync_tag) {
+                    return try c.check();
+                }
+            }
+        }
+    }
+
+    fn cancelAndDrainSlot(self: *KqueueAioEngine, slot_idx: usize, gen: u32) void {
+        const slot = &self.slots[slot_idx];
+        if (!slot.in_use or slot.generation != gen) return;
+        const rc = aio_cancel(slot.cb.aio_fildes, &slot.cb);
+        if (rc == AIO_CANCELED) {
+            // XNU synchronously canceled the queued entry without posting an EVFILT_AIO kevent;
+            // leave this slot retired from free_stack because XNU retains canceled SIGEV_KEVENT
+            // aiocb pointers until exit.
+            slot.in_use = false;
+            slot.generation +%= 1;
+            if (slot.generation == 0) slot.generation = 1;
+            self.inflight -= 1;
+            return;
+        }
+        var scratch: [MAX_INFLIGHT]Completion = undefined;
+        while (slot.in_use and slot.generation == gen) {
+            const count = self.wait(&scratch, null) catch break;
+            if (count == 0) break;
         }
     }
 
@@ -643,6 +710,7 @@ pub const EcorePreadPool = struct {
     const WorkItem = struct {
         req: ReadRequest,
         submit_ns: u64,
+        cancel_flag: ?*std.atomic.Value(bool) = null,
     };
 
     const ReqRing = WorkRing(WorkItem);
@@ -680,6 +748,7 @@ pub const EcorePreadPool = struct {
     spawned: usize,
     max_inflight: usize,
     inflight: usize,
+    next_sync_tag: u64 = 0xEC04_0000_0000_0001,
 
     pub fn init(allocator: std.mem.Allocator, config: EcorePoolConfig) EcorePoolError!EcorePreadPool {
         if (config.max_inflight == 0 or config.max_inflight > MAX_INFLIGHT) return error.InvalidArgument;
@@ -796,12 +865,17 @@ pub const EcorePreadPool = struct {
 
     /// Enqueues one 16 KiB-aligned direct `pread` request with zero heap allocation.
     pub fn submit(self: *EcorePreadPool, req: ReadRequest) EngineError!void {
+        return self.submitInternal(req, null);
+    }
+
+    fn submitInternal(self: *EcorePreadPool, req: ReadRequest, cancel_flag: ?*std.atomic.Value(bool)) EngineError!void {
         try validateReadRequest(req);
         if (self.inflight >= self.max_inflight) return error.QueueFull;
 
         const item: WorkItem = .{
             .req = req,
             .submit_ns = monotonicNowNs(),
+            .cancel_flag = cancel_flag,
         };
         const state = self.state;
         if (!state.req_ring.tryPush(item)) return error.QueueFull;
@@ -874,19 +948,47 @@ pub const EcorePreadPool = struct {
         }
     }
 
-    /// Submits one read and waits for its completion, returning bytes read.
+    /// Submits one read and waits for its matching completion, draining stale
+    /// completions and cancelling+draining on timeout before returning `error.Timeout`.
     pub fn readSync(self: *EcorePreadPool, req: ReadRequest, timeout_ms: u64) EngineError!usize {
-        try self.submit(req);
+        const sync_tag = self.next_sync_tag;
+        self.next_sync_tag +%= 1;
+        if (self.next_sync_tag == 0) self.next_sync_tag = 0xEC04_0000_0000_0001;
+
+        var tagged_req = req;
+        tagged_req.user_data = sync_tag;
+        var cancel_flag: std.atomic.Value(bool) = .init(false);
+        try self.submitInternal(tagged_req, &cancel_flag);
+
         const start_ns = monotonicNowNs();
         const deadline_ns = start_ns +| (timeout_ms *| std.time.ns_per_ms);
-        var comp: [1]Completion = undefined;
+        var comps: [MAX_INFLIGHT]Completion = undefined;
         while (true) {
             const now = monotonicNowNs();
-            if (now >= deadline_ns) return error.Timeout;
+            if (now >= deadline_ns) {
+                if (self.poll(&comps)) |n| {
+                    for (comps[0..n]) |c| {
+                        if (c.user_data == sync_tag) return try c.check();
+                    }
+                } else |_| {}
+                cancel_flag.store(true, .release);
+                while (true) {
+                    const n = self.wait(&comps, null) catch break;
+                    if (n == 0) break;
+                    var found = false;
+                    for (comps[0..n]) |c| {
+                        if (c.user_data == sync_tag) found = true;
+                    }
+                    if (found) break;
+                }
+                return error.Timeout;
+            }
             const rem_ms = @max(@as(u64, 1), (deadline_ns - now) / std.time.ns_per_ms);
-            const got = try self.wait(&comp, rem_ms);
-            if (got > 0) {
-                return try comp[0].check();
+            const got = try self.wait(&comps, rem_ms);
+            for (comps[0..got]) |c| {
+                if (c.user_data == sync_tag) {
+                    return try c.check();
+                }
             }
         }
     }
@@ -914,7 +1016,17 @@ pub const EcorePreadPool = struct {
         while (true) {
             if (state.req_ring.tryPop()) |item| {
                 _ = state.pending_reqs.fetchSub(1, .acq_rel);
-                const comp = executePread(item);
+                const comp = if (item.cancel_flag != null and item.cancel_flag.?.load(.acquire))
+                    Completion{
+                        .user_data = item.req.user_data,
+                        .bytes_read = 0,
+                        .err_code = @backingInt(std.c.E.CANCELED),
+                        .short_read = false,
+                        .submit_ns = item.submit_ns,
+                        .complete_ns = monotonicNowNs(),
+                    }
+                else
+                    executePread(item);
                 while (!state.comp_ring.tryPush(comp)) {
                     std.atomic.spinLoopHint();
                 }
@@ -946,15 +1058,17 @@ pub const EcorePreadPool = struct {
 
     fn executePread(item: WorkItem) Completion {
         const req = item.req;
+        const MAX_PREAD_CHUNK: usize = 0x7fff_c000;
         var done: usize = 0;
         var err_code: i32 = 0;
         var short_read = false;
 
         while (done < req.dst.len) {
+            const chunk = @min(req.dst.len - done, MAX_PREAD_CHUNK);
             const rc = std.c.pread(
                 req.fd,
                 req.dst.ptr + done,
-                req.dst.len - done,
+                chunk,
                 @intCast(req.offset + done),
             );
             if (rc < 0) {
@@ -1990,4 +2104,108 @@ test "runSpikeS3 executes compact end-to-end sweep in TMPDIR with zero swapouts"
     var writer = std.Io.Writer.fixed(&text_buf);
     try report.write(&writer);
     try std.testing.expect(std.mem.indexOf(u8, writer.buffered(), "spike_s3.recommended_backend") != null);
+}
+
+test "F15.1 readSync matches user_data tag (draining stale completions) and cancels+drains on timeout and deinit" {
+    const gpa = std.testing.allocator;
+    const blob_bytes: usize = 64 * 1024;
+    const file_bytes: usize = 4 * blob_bytes;
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path_z = try makeTestTempFile("f15_sync", file_bytes, &path_buf);
+    defer _ = std.c.unlink(path_z.ptr);
+
+    var dfile = try DirectFile.openReadOnly(path_z);
+    defer dfile.close();
+
+    const stale_dst = try page.WiredRegion.init(blob_bytes);
+    defer stale_dst.deinit();
+    const target_dst = try page.WiredRegion.init(blob_bytes);
+    defer target_dst.deinit();
+
+    // 1. KqueueAioEngine: stale unpolled read + tagged readSync, then timeout_ms=0 cancel+drain, then deinit with inflight read.
+    {
+        var eng = try KqueueAioEngine.init(gpa, 8);
+        defer eng.deinit(gpa);
+
+        // Stale read from offset 0 (different pattern and tag) left unreaped in kqueue.
+        try eng.submit(.{
+            .fd = dfile.fd,
+            .offset = 0,
+            .dst = stale_dst.bytes,
+            .user_data = 0xDEAD,
+        });
+        var settle_ts: std.c.timespec = .{ .sec = 0, .nsec = 20 * std.time.ns_per_ms };
+        _ = std.c.nanosleep(&settle_ts, null);
+
+        @memset(target_dst.bytes, 0);
+        const got = try eng.readSync(.{
+            .fd = dfile.fd,
+            .offset = 2 * blob_bytes,
+            .dst = target_dst.bytes,
+            .user_data = 0,
+        }, 5_000);
+        try std.testing.expectEqual(blob_bytes, got);
+        try verifyExactPattern(target_dst.bytes, 2 * blob_bytes);
+        try std.testing.expectEqual(@as(usize, 0), eng.inflightCount());
+
+        // Timeout cancel+drain leaves inflight == 0 (if timeout hit before instant completion).
+        if (eng.readSync(.{
+            .fd = dfile.fd,
+            .offset = blob_bytes,
+            .dst = target_dst.bytes,
+        }, 0)) |n| {
+            try std.testing.expectEqual(blob_bytes, n);
+        } else |err| {
+            try std.testing.expectEqual(error.Timeout, err);
+        }
+        try std.testing.expectEqual(@as(usize, 0), eng.inflightCount());
+
+        // Submit one final in-flight read and immediately let `deinit` cancel/drain it before `target_dst.deinit()`.
+        try eng.submit(.{
+            .fd = dfile.fd,
+            .offset = 0,
+            .dst = target_dst.bytes,
+            .user_data = 0xCAFE,
+        });
+    }
+
+    // 2. EcorePreadPool: stale unpolled read + tagged readSync, plus timeout_ms=0 cancel+drain.
+    {
+        var pool = try EcorePreadPool.init(gpa, .{
+            .max_inflight = 8,
+            .worker_count = 2,
+        });
+        defer pool.deinit(gpa);
+
+        try pool.submit(.{
+            .fd = dfile.fd,
+            .offset = 0,
+            .dst = stale_dst.bytes,
+            .user_data = 0xBEEF,
+        });
+        var pool_settle_ts: std.c.timespec = .{ .sec = 0, .nsec = 20 * std.time.ns_per_ms };
+        _ = std.c.nanosleep(&pool_settle_ts, null);
+
+        @memset(target_dst.bytes, 0);
+        const got = try pool.readSync(.{
+            .fd = dfile.fd,
+            .offset = 3 * blob_bytes,
+            .dst = target_dst.bytes,
+            .user_data = 0,
+        }, 5_000);
+        try std.testing.expectEqual(blob_bytes, got);
+        try verifyExactPattern(target_dst.bytes, 3 * blob_bytes);
+        try std.testing.expectEqual(@as(usize, 0), pool.inflightCount());
+
+        if (pool.readSync(.{
+            .fd = dfile.fd,
+            .offset = blob_bytes,
+            .dst = target_dst.bytes,
+        }, 0)) |n| {
+            try std.testing.expectEqual(blob_bytes, n);
+        } else |err| {
+            try std.testing.expectEqual(error.Timeout, err);
+        }
+        try std.testing.expectEqual(@as(usize, 0), pool.inflightCount());
+    }
 }

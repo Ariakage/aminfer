@@ -46,7 +46,14 @@ pub const WiredArena = struct {
     /// slice (address and length both 16 KiB aligned). Calling `deinit()` on a
     /// sub-arena resets its cursor without unmapping the parent `WiredRegion`.
     pub fn initFromAlignedSlice(slice: []align(page.APPLE_PAGE_SIZE) u8) WiredArena {
-        std.debug.assert(std.mem.isAligned(slice.len, page.APPLE_PAGE_SIZE));
+        if (!std.mem.isAligned(@intFromPtr(slice.ptr), page.APPLE_PAGE_SIZE) or
+            !std.mem.isAligned(slice.len, page.APPLE_PAGE_SIZE))
+        {
+            std.debug.panic(
+                "WiredArena.initFromAlignedSlice: slice ptr=0x{x} len={d} is not 16 KiB aligned",
+                .{ @intFromPtr(slice.ptr), slice.len },
+            );
+        }
         return .{
             .region = .{ .bytes = slice },
             .used = 0,
@@ -78,8 +85,14 @@ pub const WiredArena = struct {
     /// Byte offset of a pointer carved from this arena relative to its base.
     pub fn offsetOf(self: *const WiredArena, ptr: [*]const u8) usize {
         const base = @intFromPtr(self.region.bytes.ptr);
+        const end = base + self.region.bytes.len;
         const addr = @intFromPtr(ptr);
-        std.debug.assert(addr >= base and addr <= base + self.region.bytes.len);
+        if (addr < base or addr > end) {
+            std.debug.panic(
+                "WiredArena.offsetOf: ptr=0x{x} out of arena bounds [0x{x}, 0x{x}]",
+                .{ addr, base, end },
+            );
+        }
         return addr - base;
     }
 

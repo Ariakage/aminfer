@@ -64,6 +64,7 @@ pub const ClusterError = PlanError ||
     transport.TransportError ||
     transport.ProtocolError ||
     transport.SlabError ||
+    transport.FramePayloadError ||
     error{
         InvalidConfig,
         PeerCountMismatch,
@@ -170,7 +171,8 @@ pub const ExpertPartitionPlan = struct {
     }
 
     pub fn localExpertCount(self: *const ExpertPartitionPlan) u16 {
-        return self.rankExpertCount(self.local_rank) catch unreachable;
+        std.debug.assert(self.local_rank < self.world_size);
+        return self.rankExpertCount(self.local_rank) catch return 0;
     }
 
     /// Returns the 1024-bit ownership bitmap for `rank`.
@@ -565,6 +567,8 @@ pub const PeerWorkerConfig = struct {
     /// Optional `16 KiB`-aligned slice carved from an external `WiredArena`.
     /// When `null`, `PeerWorkerServer` maps and locks its own `WiredRegion`.
     external_slab: ?[]align(page.APPLE_PAGE_SIZE) u8 = null,
+    /// Optional pre-shared key enabling HMAC-SHA256 authentication on every frame.
+    psk: ?[]const u8 = null,
 };
 
 pub const WorkerStats = struct {
@@ -577,6 +581,7 @@ pub const WorkerStats = struct {
 
 const WorkerClientSlot = struct {
     active: bool = false,
+    last_activity_ns: u64 = 0,
     chan: transport.FrameChannel = undefined,
 };
 
@@ -607,16 +612,26 @@ pub const PeerWorkerServer = struct {
     stat_compute_ns: std.atomic.Value(u64),
 
     pub fn perSlotTxBytes(max_tokens: u16, hidden_size: u32) ClusterError!usize {
+        return perSlotTxBytesWithAuth(max_tokens, hidden_size, false);
+    }
+
+    fn perSlotTxBytesWithAuth(max_tokens: u16, hidden_size: u32, has_psk: bool) ClusterError!usize {
         const resp_payload = try transport.evalRespPayloadBytes(max_tokens, hidden_size);
         const min_payload = @max(resp_payload, transport.HelloPayload.WIRE_BYTES);
-        const frame = try std.math.add(usize, transport.HEADER_BYTES, min_payload);
+        const tag_bytes: usize = if (has_psk) transport.AUTH_TAG_BYTES else 0;
+        const frame = try std.math.add(usize, transport.HEADER_BYTES + tag_bytes, min_payload);
         return try page.alignUp(frame);
     }
 
     pub fn perSlotRxBytes(max_tokens: u16, hidden_size: u32, max_assignments: u32) ClusterError!usize {
+        return perSlotRxBytesWithAuth(max_tokens, hidden_size, max_assignments, false);
+    }
+
+    fn perSlotRxBytesWithAuth(max_tokens: u16, hidden_size: u32, max_assignments: u32, has_psk: bool) ClusterError!usize {
         const req_payload = try transport.evalReqPayloadBytes(max_tokens, hidden_size, max_assignments);
         const min_payload = @max(req_payload, transport.HelloPayload.WIRE_BYTES);
-        const frame = try std.math.add(usize, transport.HEADER_BYTES, min_payload);
+        const tag_bytes: usize = if (has_psk) transport.AUTH_TAG_BYTES else 0;
+        const frame = try std.math.add(usize, transport.HEADER_BYTES + tag_bytes, min_payload);
         return try page.alignUp(frame);
     }
 
@@ -625,8 +640,9 @@ pub const PeerWorkerServer = struct {
         if (config.hidden_size == 0 or config.max_tokens == 0 or config.max_assignments == 0) {
             return error.InvalidConfig;
         }
-        const tx_each = try perSlotTxBytes(config.max_tokens, config.hidden_size);
-        const rx_each = try perSlotRxBytes(config.max_tokens, config.hidden_size, config.max_assignments);
+        const has_psk = config.psk != null;
+        const tx_each = try perSlotTxBytesWithAuth(config.max_tokens, config.hidden_size, has_psk);
+        const rx_each = try perSlotRxBytesWithAuth(config.max_tokens, config.hidden_size, config.max_assignments, has_psk);
         const per_client = try std.math.add(usize, tx_each, rx_each);
         return try std.math.mul(usize, per_client, config.max_clients);
     }
@@ -634,8 +650,9 @@ pub const PeerWorkerServer = struct {
     pub fn init(config: PeerWorkerConfig) ClusterError!PeerWorkerServer {
         const resolved = try transport.selectTransport(config.transport_kind);
         const total_slab = try requiredSlabBytes(config);
-        const tx_each = try perSlotTxBytes(config.max_tokens, config.hidden_size);
-        const rx_each = try perSlotRxBytes(config.max_tokens, config.hidden_size, config.max_assignments);
+        const has_psk = config.psk != null;
+        const tx_each = try perSlotTxBytesWithAuth(config.max_tokens, config.hidden_size, has_psk);
+        const rx_each = try perSlotRxBytesWithAuth(config.max_tokens, config.hidden_size, config.max_assignments, has_psk);
 
         var slab = if (config.external_slab) |ext|
             try transport.WiredSlab.initBorrowed(ext)
@@ -647,9 +664,12 @@ pub const PeerWorkerServer = struct {
         for (0..config.max_clients) |i| {
             const tx_buf = try slab.carvePages(tx_each);
             const rx_buf = try slab.carvePages(rx_each);
+            var ch = try transport.FrameChannel.init(-1, tx_buf, rx_buf);
+            ch.setPsk(config.psk);
             slots[i] = .{
                 .active = false,
-                .chan = try transport.FrameChannel.init(-1, tx_buf, rx_buf),
+                .last_activity_ns = 0,
+                .chan = ch,
             };
         }
 
@@ -742,14 +762,33 @@ pub const PeerWorkerServer = struct {
     }
 
     /// Runs the zero-allocation `kqueue` server loop until stopped or a `shutdown`
-    /// control frame is received.
+    /// control frame is received, enforcing `config.timeout_ms` idle eviction.
     pub fn run(self: *PeerWorkerServer) void {
         self.running.store(true, .release);
         defer self.running.store(false, .release);
 
         var events: [MAX_SERVER_CLIENTS * 2 + 4]std.c.kevent64_s = undefined;
         while (!self.stop_requested.load(.acquire)) {
-            const nev = transport.kqueueWait(self.kq_fd, &events, null) catch break;
+            var wait_timeout_ns: ?u64 = null;
+            if (self.config.timeout_ms > 0) {
+                const now = vmstat.nowNs() catch break;
+                const limit_ns = @as(u64, self.config.timeout_ms) * std.time.ns_per_ms;
+                var min_rem_ns: ?u64 = null;
+                for (0..self.slot_count) |i| {
+                    if (!self.slots[i].active) continue;
+                    const elapsed = now -| self.slots[i].last_activity_ns;
+                    if (elapsed >= limit_ns) {
+                        self.closeSlot(i);
+                        continue;
+                    }
+                    const rem = limit_ns - elapsed;
+                    min_rem_ns = if (min_rem_ns) |m| @min(m, rem) else rem;
+                }
+                if (min_rem_ns) |rem| {
+                    wait_timeout_ns = @max(@as(u64, 1), rem);
+                }
+            }
+            const nev = transport.kqueueWait(self.kq_fd, &events, wait_timeout_ns) catch break;
             for (events[0..nev]) |ev| {
                 if (ev.udata == WORKER_UDATA_STOP) {
                     if (self.stop_requested.load(.acquire)) break;
@@ -762,6 +801,10 @@ pub const PeerWorkerServer = struct {
                 const idx: usize = @intCast(ev.udata);
                 if (idx >= self.slot_count or !self.slots[idx].active) continue;
 
+                if ((ev.flags & std.c.EV.ERROR) != 0) {
+                    self.closeSlot(idx);
+                    continue;
+                }
                 if (ev.filter == std.c.EVFILT.WRITE) {
                     self.driveClientWrite(idx);
                     if (self.slots[idx].active and !self.slots[idx].chan.hasPendingTx()) {
@@ -770,6 +813,8 @@ pub const PeerWorkerServer = struct {
                 } else if (ev.filter == std.c.EVFILT.READ) {
                     if (!self.slots[idx].chan.hasPendingTx()) {
                         self.driveClientRead(idx);
+                    } else if ((ev.flags & std.c.EV.EOF) != 0) {
+                        self.closeSlot(idx);
                     }
                 }
                 if (self.stop_requested.load(.acquire)) break;
@@ -796,6 +841,7 @@ pub const PeerWorkerServer = struct {
                 continue;
             };
             self.slots[free_idx].active = true;
+            self.slots[free_idx].last_activity_ns = vmstat.nowNs() catch 0;
             self.slots[free_idx].chan.fd = client_fd;
             self.slots[free_idx].chan.resetState();
         }
@@ -813,6 +859,7 @@ pub const PeerWorkerServer = struct {
             self.slots[idx].chan.close();
         }
         self.slots[idx].active = false;
+        self.slots[idx].last_activity_ns = 0;
     }
 
     fn armWrite(self: *PeerWorkerServer, idx: usize) void {
@@ -853,6 +900,7 @@ pub const PeerWorkerServer = struct {
         };
         switch (step) {
             .complete => |n| {
+                self.slots[idx].last_activity_ns = vmstat.nowNs() catch self.slots[idx].last_activity_ns;
                 if (n > 0) _ = self.stat_bytes_tx.fetchAdd(n, .monotonic);
                 self.disarmWrite(idx);
                 if (self.config.max_requests > 0 and self.stat_requests_served.load(.acquire) >= self.config.max_requests) {
@@ -860,7 +908,10 @@ pub const PeerWorkerServer = struct {
                 }
             },
             .would_block => |n| {
-                if (n > 0) _ = self.stat_bytes_tx.fetchAdd(n, .monotonic);
+                if (n > 0) {
+                    self.slots[idx].last_activity_ns = vmstat.nowNs() catch self.slots[idx].last_activity_ns;
+                    _ = self.stat_bytes_tx.fetchAdd(n, .monotonic);
+                }
                 self.armWrite(idx);
             },
         }
@@ -874,7 +925,10 @@ pub const PeerWorkerServer = struct {
             };
             switch (step) {
                 .would_block => |n| {
-                    if (n > 0) _ = self.stat_bytes_rx.fetchAdd(n, .monotonic);
+                    if (n > 0) {
+                        self.slots[idx].last_activity_ns = vmstat.nowNs() catch self.slots[idx].last_activity_ns;
+                        _ = self.stat_bytes_rx.fetchAdd(n, .monotonic);
+                    }
                     return;
                 },
                 .peer_closed => {
@@ -882,6 +936,7 @@ pub const PeerWorkerServer = struct {
                     return;
                 },
                 .frame_ready => |frame| {
+                    self.slots[idx].last_activity_ns = vmstat.nowNs() catch self.slots[idx].last_activity_ns;
                     if (frame.bytes_read > 0) {
                         _ = self.stat_bytes_rx.fetchAdd(frame.bytes_read, .monotonic);
                     }
@@ -1075,6 +1130,8 @@ pub const CoordinatorConfig = struct {
     /// Optional `16 KiB`-aligned slice carved from an external `WiredArena`.
     /// When `null`, `ExpertParallelCoordinator` maps and locks its own `WiredRegion`.
     external_slab: ?[]align(page.APPLE_PAGE_SIZE) u8 = null,
+    /// Optional pre-shared key enabling HMAC-SHA256 authentication on every frame.
+    psk: ?[]const u8 = null,
 };
 
 pub const DispatchStats = struct {
@@ -1121,16 +1178,26 @@ pub const ExpertParallelCoordinator = struct {
     total_bytes_transferred: u64,
 
     pub fn perPeerTxBytes(max_tokens: u16, hidden_size: u32, max_assignments: u32) ClusterError!usize {
+        return perPeerTxBytesWithAuth(max_tokens, hidden_size, max_assignments, false);
+    }
+
+    fn perPeerTxBytesWithAuth(max_tokens: u16, hidden_size: u32, max_assignments: u32, has_psk: bool) ClusterError!usize {
         const req_payload = try transport.evalReqPayloadBytes(max_tokens, hidden_size, max_assignments);
         const min_payload = @max(req_payload, transport.HelloPayload.WIRE_BYTES);
-        const frame = try std.math.add(usize, transport.HEADER_BYTES, min_payload);
+        const tag_bytes: usize = if (has_psk) transport.AUTH_TAG_BYTES else 0;
+        const frame = try std.math.add(usize, transport.HEADER_BYTES + tag_bytes, min_payload);
         return try page.alignUp(frame);
     }
 
     pub fn perPeerRxBytes(max_tokens: u16, hidden_size: u32) ClusterError!usize {
+        return perPeerRxBytesWithAuth(max_tokens, hidden_size, false);
+    }
+
+    fn perPeerRxBytesWithAuth(max_tokens: u16, hidden_size: u32, has_psk: bool) ClusterError!usize {
         const resp_payload = try transport.evalRespPayloadBytes(max_tokens, hidden_size);
         const min_payload = @max(resp_payload, transport.HelloPayload.WIRE_BYTES);
-        const frame = try std.math.add(usize, transport.HEADER_BYTES, min_payload);
+        const tag_bytes: usize = if (has_psk) transport.AUTH_TAG_BYTES else 0;
+        const frame = try std.math.add(usize, transport.HEADER_BYTES + tag_bytes, min_payload);
         return try page.alignUp(frame);
     }
 
@@ -1138,9 +1205,10 @@ pub const ExpertParallelCoordinator = struct {
         if (config.hidden_size == 0 or config.max_tokens == 0 or config.max_assignments == 0) {
             return error.InvalidConfig;
         }
+        const has_psk = config.psk != null;
         const remote_count: usize = config.plan.world_size - 1;
-        const tx_each = try perPeerTxBytes(config.max_tokens, config.hidden_size, config.max_assignments);
-        const rx_each = try perPeerRxBytes(config.max_tokens, config.hidden_size);
+        const tx_each = try perPeerTxBytesWithAuth(config.max_tokens, config.hidden_size, config.max_assignments, has_psk);
+        const rx_each = try perPeerRxBytesWithAuth(config.max_tokens, config.hidden_size, has_psk);
         const peer_pair = try std.math.add(usize, tx_each, rx_each);
         const peers_total = try std.math.mul(usize, peer_pair, remote_count);
 
@@ -1172,9 +1240,10 @@ pub const ExpertParallelCoordinator = struct {
             seen_rank[ep.rank] = true;
         }
 
+        const has_psk = config.psk != null;
         const total_slab = try requiredSlabBytes(config);
-        const tx_each = try perPeerTxBytes(config.max_tokens, config.hidden_size, config.max_assignments);
-        const rx_each = try perPeerRxBytes(config.max_tokens, config.hidden_size);
+        const tx_each = try perPeerTxBytesWithAuth(config.max_tokens, config.hidden_size, config.max_assignments, has_psk);
+        const rx_each = try perPeerRxBytesWithAuth(config.max_tokens, config.hidden_size, has_psk);
 
         var slab = if (config.external_slab) |ext|
             try transport.WiredSlab.initBorrowed(ext)
@@ -1187,10 +1256,12 @@ pub const ExpertParallelCoordinator = struct {
         for (config.peers, 0..) |ep, i| {
             const tx_buf = try slab.carvePages(tx_each);
             const rx_buf = try slab.carvePages(rx_each);
+            var ch = try transport.FrameChannel.init(-1, tx_buf, rx_buf);
+            ch.setPsk(config.psk);
             peer_slots[i] = .{
                 .rank = ep.rank,
                 .connected = false,
-                .chan = try transport.FrameChannel.init(-1, tx_buf, rx_buf),
+                .chan = ch,
             };
             rank_to_peer_idx[ep.rank] = @intCast(i);
         }
@@ -1227,63 +1298,18 @@ pub const ExpertParallelCoordinator = struct {
         const local_bitmap = try config.plan.fillExpertBitmap(config.plan.local_rank);
         const local_range = try config.plan.rankExpertRange(config.plan.local_rank);
 
-        for (config.peers, 0..) |ep, i| {
-            const fd = try transport.connectNonBlocking(.{
-                .host = ep.host,
-                .port = ep.port,
-            }, config.timeout_ms);
-            peer_slots[i].chan.fd = fd;
-            peer_slots[i].chan.resetState();
-            peer_slots[i].connected = true;
-
-            // Send `hello_req` and validate `hello_resp`.
-            const seq = next_seq;
-            next_seq += 1;
-            var hello_req: transport.HelloPayload = .{
-                .expert_bitmap = local_bitmap,
-                .hidden_size = config.hidden_size,
-                .rank = config.plan.local_rank,
-                .world_size = config.plan.world_size,
-                .num_layers = config.plan.num_layers,
-                .num_experts = config.plan.num_experts,
-                .expert_range_start = local_range.start,
-                .expert_range_end = local_range.end,
-                .transport_kind = @backingInt(resolved.kind),
-                .status = 0,
-            };
-            const dst = try peer_slots[i].chan.preparePayload(transport.HelloPayload.WIRE_BYTES);
-            hello_req.encode(dst[0..transport.HelloPayload.WIRE_BYTES]);
-            _ = peer_slots[i].chan.commitFrame(.hello_req, 0, seq, transport.HelloPayload.WIRE_BYTES);
-
-            _ = try peer_slots[i].chan.sendFrameSync(handshake_kq, config.timeout_ms);
-            const resp_frame = try peer_slots[i].chan.recvFrameSync(handshake_kq, config.timeout_ms);
-            defer peer_slots[i].chan.resetRx();
-
-            if (resp_frame.header.msg_type != .hello_resp) return error.UnexpectedMessage;
-            if (resp_frame.header.seq_id != seq) return error.SequenceMismatch;
-            const hello_resp = try transport.HelloPayload.decode(resp_frame.payload);
-            if (hello_resp.status != 0) return error.HandshakeRejected;
-            if (hello_resp.rank != ep.rank or
-                hello_resp.world_size != config.plan.world_size or
-                hello_resp.num_layers != config.plan.num_layers or
-                hello_resp.num_experts != config.plan.num_experts or
-                hello_resp.hidden_size != config.hidden_size)
-            {
-                return error.HandshakeMismatch;
-            }
-            const expected_bitmap = try config.plan.fillExpertBitmap(ep.rank);
-            if (!std.mem.eql(u64, &expected_bitmap, &hello_resp.expert_bitmap)) {
-                return error.ExpertOwnershipMismatch;
-            }
-            peer_slots[i].remote_bitmap = hello_resp.expert_bitmap;
-
-            // Register persistent level-triggered EVFILT_READ on `kq_fd`.
-            try transport.kqueueSetFilter(
+        for (0..expected_peers) |i| {
+            try connectAndHandshakePeer(
+                &peer_slots[i],
+                config.peers[i],
+                config,
+                resolved.kind,
+                local_bitmap,
+                local_range,
+                &next_seq,
+                handshake_kq,
                 kq_fd,
-                fd,
-                std.c.EVFILT.READ,
-                std.c.EV.ADD | std.c.EV.ENABLE,
-                @intCast(i),
+                i,
             );
         }
 
@@ -1306,12 +1332,152 @@ pub const ExpertParallelCoordinator = struct {
         };
     }
 
+    fn connectAndHandshakePeer(
+        peer: *RemotePeerSlot,
+        ep: PeerEndpoint,
+        config: CoordinatorConfig,
+        resolved_kind: transport.TransportKind,
+        local_bitmap: [transport.MAX_EXPERTS_BITMAP_WORDS]u64,
+        local_range: ExpertRange,
+        next_seq: *u64,
+        handshake_kq: std.c.fd_t,
+        kq_fd: std.c.fd_t,
+        p_idx: usize,
+    ) ClusterError!void {
+        const fd = try transport.connectNonBlocking(.{
+            .host = ep.host,
+            .port = ep.port,
+        }, config.timeout_ms);
+        peer.chan.fd = fd;
+        peer.chan.resetState();
+        peer.chan.setPsk(config.psk);
+        peer.connected = true;
+        errdefer {
+            peer.chan.close();
+            peer.connected = false;
+        }
+
+        const seq = next_seq.*;
+        next_seq.* += 1;
+        var hello_req: transport.HelloPayload = .{
+            .expert_bitmap = local_bitmap,
+            .hidden_size = config.hidden_size,
+            .rank = config.plan.local_rank,
+            .world_size = config.plan.world_size,
+            .num_layers = config.plan.num_layers,
+            .num_experts = config.plan.num_experts,
+            .expert_range_start = local_range.start,
+            .expert_range_end = local_range.end,
+            .transport_kind = @backingInt(resolved_kind),
+            .status = 0,
+        };
+        const dst = try peer.chan.preparePayload(transport.HelloPayload.WIRE_BYTES);
+        hello_req.encode(dst[0..transport.HelloPayload.WIRE_BYTES]);
+        _ = try peer.chan.commitFrameChecked(.hello_req, 0, seq, transport.HelloPayload.WIRE_BYTES);
+
+        _ = try peer.chan.sendFrameSync(handshake_kq, config.timeout_ms);
+        const resp_frame = try peer.chan.recvFrameSync(handshake_kq, config.timeout_ms);
+        defer peer.chan.resetRx();
+
+        if (resp_frame.header.msg_type != .hello_resp) return error.UnexpectedMessage;
+        if (resp_frame.header.seq_id != seq) return error.SequenceMismatch;
+        const hello_resp = try transport.HelloPayload.decode(resp_frame.payload);
+        if (hello_resp.status != 0) return error.HandshakeRejected;
+        if (hello_resp.rank != ep.rank or
+            hello_resp.world_size != config.plan.world_size or
+            hello_resp.num_layers != config.plan.num_layers or
+            hello_resp.num_experts != config.plan.num_experts or
+            hello_resp.hidden_size != config.hidden_size)
+        {
+            return error.HandshakeMismatch;
+        }
+        const expected_bitmap = try config.plan.fillExpertBitmap(ep.rank);
+        if (!std.mem.eql(u64, &expected_bitmap, &hello_resp.expert_bitmap)) {
+            return error.ExpertOwnershipMismatch;
+        }
+        peer.remote_bitmap = hello_resp.expert_bitmap;
+
+        // Register persistent level-triggered EVFILT_READ on `kq_fd`.
+        try transport.kqueueSetFilter(
+            kq_fd,
+            fd,
+            std.c.EVFILT.READ,
+            std.c.EV.ADD | std.c.EV.ENABLE,
+            @intCast(p_idx),
+        );
+    }
+
+    fn disconnectPeer(self: *ExpertParallelCoordinator, p_idx: usize) void {
+        const peer = &self.peer_slots[p_idx];
+        if (peer.chan.fd >= 0) {
+            peer.chan.close();
+        } else {
+            peer.chan.resetState();
+        }
+        peer.connected = false;
+    }
+
+    fn ensurePeerConnected(self: *ExpertParallelCoordinator, p_idx: usize) ClusterError!void {
+        const peer = &self.peer_slots[p_idx];
+        if (peer.connected and peer.chan.fd >= 0) return;
+        const handshake_kq = try transport.kqueueCreate();
+        defer _ = std.c.close(handshake_kq);
+        const local_bitmap = try self.config.plan.fillExpertBitmap(self.config.plan.local_rank);
+        const local_range = try self.config.plan.rankExpertRange(self.config.plan.local_rank);
+        try connectAndHandshakePeer(
+            peer,
+            self.config.peers[p_idx],
+            self.config,
+            self.resolved_transport.kind,
+            local_bitmap,
+            local_range,
+            &self.next_seq_id,
+            handshake_kq,
+            self.kq_fd,
+            p_idx,
+        );
+    }
+
+    fn handleIdlePeerEvent(self: *ExpertParallelCoordinator, p_idx: usize, ev: std.c.kevent64_s) void {
+        if (p_idx >= self.peer_count or !self.peer_slots[p_idx].connected) return;
+        const peer = &self.peer_slots[p_idx];
+        if ((ev.flags & std.c.EV.ERROR) != 0) {
+            self.disconnectPeer(p_idx);
+            return;
+        }
+        if (ev.filter == std.c.EVFILT.WRITE) {
+            self.disarmPeerWrite(p_idx) catch self.disconnectPeer(p_idx);
+            return;
+        }
+        if (ev.filter == std.c.EVFILT.READ) {
+            while (peer.connected) {
+                const step = peer.chan.stepRecv() catch {
+                    self.disconnectPeer(p_idx);
+                    return;
+                };
+                switch (step) {
+                    .frame_ready => {
+                        // Drain unexpected/stale frame on idle peer to clear level-triggered EVFILT_READ.
+                        peer.chan.resetRx();
+                    },
+                    .peer_closed => {
+                        self.disconnectPeer(p_idx);
+                        return;
+                    },
+                    .would_block => {
+                        if ((ev.flags & std.c.EV.EOF) != 0 or peer.chan.rx_len > 0) {
+                            self.disconnectPeer(p_idx);
+                        }
+                        return;
+                    },
+                }
+            }
+        }
+    }
+
     pub fn deinit(self: *ExpertParallelCoordinator) void {
         for (0..self.peer_count) |i| {
-            if (self.peer_slots[i].connected) {
-                self.peer_slots[i].chan.close();
-                self.peer_slots[i].connected = false;
-            }
+            self.disconnectPeer(i);
         }
         if (self.kq_fd >= 0) {
             _ = std.c.close(self.kq_fd);
@@ -1324,7 +1490,14 @@ pub const ExpertParallelCoordinator = struct {
     pub fn pingPeer(self: *ExpertParallelCoordinator, rank: u16) ClusterError!u64 {
         if (rank >= self.config.plan.world_size) return error.InvalidRank;
         const p_idx = self.rank_to_peer_idx[rank] orelse return error.PeerRankNotFound;
+        try self.ensurePeerConnected(p_idx);
         const peer = &self.peer_slots[p_idx];
+
+        errdefer {
+            if (peer.chan.hasPendingTx() or peer.chan.rx_len > 0 or peer.chan.rx_header != null) {
+                self.disconnectPeer(p_idx);
+            }
+        }
 
         const t0 = vmstat.nowNs() catch return error.ClockFailed;
         const seq = self.next_seq_id;
@@ -1332,30 +1505,52 @@ pub const ExpertParallelCoordinator = struct {
 
         const dst = try peer.chan.preparePayload(8);
         std.mem.writeInt(u64, dst[0..8], t0, .little);
-        _ = peer.chan.commitFrame(.ping, 0, seq, 8);
+        _ = try peer.chan.commitFrameChecked(.ping, 0, seq, 8);
 
         const deadline_ns = t0 + @as(u64, self.config.timeout_ms) * std.time.ns_per_ms;
         try self.drivePeerTxToCompletion(p_idx, deadline_ns);
 
-        var events: [MAX_WORLD_SIZE]std.c.kevent64_s = undefined;
+        var events: [MAX_WORLD_SIZE * 2]std.c.kevent64_s = undefined;
         while (true) {
             switch (try peer.chan.stepRecv()) {
                 .frame_ready => |frame| {
                     defer peer.chan.resetRx();
-                    if (frame.header.msg_type != .pong) return error.UnexpectedMessage;
-                    if (frame.header.seq_id != seq) return error.SequenceMismatch;
+                    if (frame.header.msg_type == .pong and frame.header.seq_id < seq) {
+                        continue;
+                    }
+                    if (frame.header.msg_type != .pong) {
+                        self.disconnectPeer(p_idx);
+                        return error.UnexpectedMessage;
+                    }
+                    if (frame.header.seq_id != seq) {
+                        self.disconnectPeer(p_idx);
+                        return error.SequenceMismatch;
+                    }
                     if (frame.payload.len != 8 or std.mem.readInt(u64, frame.payload[0..8], .little) != t0) {
+                        self.disconnectPeer(p_idx);
                         return error.MalformedPayload;
                     }
                     const t1 = vmstat.nowNs() catch return error.ClockFailed;
                     return t1 -| t0;
                 },
-                .peer_closed => return error.UnexpectedEof,
+                .peer_closed => {
+                    self.disconnectPeer(p_idx);
+                    return error.UnexpectedEof;
+                },
                 .would_block => {
                     const now = vmstat.nowNs() catch return error.ClockFailed;
                     if (now >= deadline_ns) return error.Timeout;
                     const nev = try transport.kqueueWait(self.kq_fd, &events, deadline_ns - now);
                     if (nev == 0) return error.Timeout;
+                    for (events[0..nev]) |ev| {
+                        const ev_idx: usize = @intCast(ev.udata);
+                        if (ev_idx != p_idx) {
+                            self.handleIdlePeerEvent(ev_idx, ev);
+                        } else if ((ev.flags & std.c.EV.ERROR) != 0) {
+                            self.disconnectPeer(p_idx);
+                            return error.ConnectionReset;
+                        }
+                    }
                 },
             }
         }
@@ -1370,7 +1565,7 @@ pub const ExpertParallelCoordinator = struct {
             const seq = self.next_seq_id;
             self.next_seq_id += 1;
             _ = try self.peer_slots[i].chan.preparePayload(0);
-            _ = self.peer_slots[i].chan.commitFrame(.shutdown, 0, seq, 0);
+            _ = try self.peer_slots[i].chan.commitFrameChecked(.shutdown, 0, seq, 0);
             try self.drivePeerTxToCompletion(i, deadline_ns);
         }
     }
@@ -1418,6 +1613,15 @@ pub const ExpertParallelCoordinator = struct {
         var peer_pending_recv: [MAX_WORLD_SIZE]bool = @splat(false);
         var pending_recv_count: usize = 0;
 
+        errdefer {
+            for (0..self.peer_count) |pi| {
+                const p = &self.peer_slots[pi];
+                if (peer_pending_recv[pi] or p.chan.hasPendingTx() or p.chan.rx_len > 0 or p.chan.rx_header != null) {
+                    self.disconnectPeer(pi);
+                }
+            }
+        }
+
         // 2) Fire non-blocking remote `eval_experts_req` frames FIRST to overlap with local compute.
         const rpc_t0 = vmstat.nowNs() catch return error.ClockFailed;
         const deadline_ns = rpc_t0 + @as(u64, self.config.timeout_ms) * std.time.ns_per_ms;
@@ -1427,6 +1631,7 @@ pub const ExpertParallelCoordinator = struct {
             const count = rank_counts[peer.rank];
             if (count == 0) continue;
 
+            try self.ensurePeerConnected(p_idx);
             const peer_assignments = self.rank_buckets[peer.rank][0..count];
             const payload_len = try transport.evalReqPayloadBytes(
                 num_tokens,
@@ -1443,7 +1648,9 @@ pub const ExpertParallelCoordinator = struct {
                 hidden_f16[0..total_elems],
             );
             std.debug.assert(written == payload_len);
-            _ = peer.chan.commitFrame(.eval_experts_req, 0, seq_id, payload_len);
+            _ = try peer.chan.commitFrameChecked(.eval_experts_req, 0, seq_id, payload_len);
+            peer_pending_recv[p_idx] = true;
+            pending_recv_count += 1;
 
             switch (try peer.chan.stepSend()) {
                 .complete => |n| {
@@ -1455,8 +1662,6 @@ pub const ExpertParallelCoordinator = struct {
                 },
             }
 
-            peer_pending_recv[p_idx] = true;
-            pending_recv_count += 1;
             stats.active_remote_peers += 1;
             stats.remote_assignments += @intCast(count);
         }
@@ -1486,8 +1691,16 @@ pub const ExpertParallelCoordinator = struct {
 
             for (events[0..nev]) |ev| {
                 const p_idx: usize = @intCast(ev.udata);
-                if (p_idx >= self.peer_count or !peer_pending_recv[p_idx]) continue;
+                if (p_idx >= self.peer_count) continue;
+                if (!peer_pending_recv[p_idx]) {
+                    self.handleIdlePeerEvent(p_idx, ev);
+                    continue;
+                }
                 const peer = &self.peer_slots[p_idx];
+
+                if ((ev.flags & std.c.EV.ERROR) != 0) {
+                    return error.ConnectionReset;
+                }
 
                 if (ev.filter == std.c.EVFILT.WRITE and peer.chan.hasPendingTx()) {
                     switch (try peer.chan.stepSend()) {
@@ -1503,38 +1716,48 @@ pub const ExpertParallelCoordinator = struct {
                 }
 
                 if (ev.filter == std.c.EVFILT.READ) {
-                    switch (try peer.chan.stepRecv()) {
-                        .would_block => |n| {
-                            stats.bytes_rx += n;
-                        },
-                        .peer_closed => return error.UnexpectedEof,
-                        .frame_ready => |frame| {
-                            defer peer.chan.resetRx();
-                            stats.bytes_rx += frame.bytes_read;
-                            if (frame.header.msg_type != .eval_experts_resp) return error.UnexpectedMessage;
-                            if (frame.header.seq_id != seq_id) return error.SequenceMismatch;
+                    while (peer_pending_recv[p_idx]) {
+                        switch (try peer.chan.stepRecv()) {
+                            .would_block => |n| {
+                                if ((ev.flags & std.c.EV.EOF) != 0 and n == 0) {
+                                    return error.UnexpectedEof;
+                                }
+                                stats.bytes_rx += n;
+                                break;
+                            },
+                            .peer_closed => return error.UnexpectedEof,
+                            .frame_ready => |frame| {
+                                defer peer.chan.resetRx();
+                                stats.bytes_rx += frame.bytes_read;
+                                if (frame.header.msg_type == .eval_experts_resp and frame.header.seq_id < seq_id) {
+                                    continue;
+                                }
+                                if (frame.header.msg_type != .eval_experts_resp) return error.UnexpectedMessage;
+                                if (frame.header.seq_id != seq_id) return error.SequenceMismatch;
 
-                            const view = try transport.decodeEvalRespView(frame.payload);
-                            if (view.header.status != @backingInt(transport.EvalStatus.ok)) {
-                                return error.RemoteEvalFailed;
-                            }
-                            if (view.header.num_tokens != num_tokens or
-                                view.header.hidden_size != self.config.hidden_size or
-                                view.accum_out_f32.len != total_elems)
-                            {
-                                return error.MalformedPayload;
-                            }
+                                const view = try transport.decodeEvalRespView(frame.payload);
+                                if (view.header.status != @backingInt(transport.EvalStatus.ok)) {
+                                    return error.RemoteEvalFailed;
+                                }
+                                if (view.header.num_tokens != num_tokens or
+                                    view.header.hidden_size != self.config.hidden_size or
+                                    view.accum_out_f32.len != total_elems)
+                                {
+                                    return error.MalformedPayload;
+                                }
 
-                            for (out_slice, view.accum_out_f32) |*dst_v, src_v| {
-                                dst_v.* += src_v;
-                            }
-                            if (view.header.peer_compute_ns > stats.max_peer_compute_ns) {
-                                stats.max_peer_compute_ns = view.header.peer_compute_ns;
-                            }
+                                for (out_slice, view.accum_out_f32) |*dst_v, src_v| {
+                                    dst_v.* += src_v;
+                                }
+                                if (view.header.peer_compute_ns > stats.max_peer_compute_ns) {
+                                    stats.max_peer_compute_ns = view.header.peer_compute_ns;
+                                }
 
-                            peer_pending_recv[p_idx] = false;
-                            pending_recv_count -= 1;
-                        },
+                                peer_pending_recv[p_idx] = false;
+                                pending_recv_count -= 1;
+                                break;
+                            },
+                        }
                     }
                 }
             }
@@ -1603,7 +1826,8 @@ pub const ExpertParallelCoordinator = struct {
 
     fn drivePeerTxToCompletion(self: *ExpertParallelCoordinator, p_idx: usize, deadline_ns: u64) ClusterError!void {
         const peer = &self.peer_slots[p_idx];
-        var events: [MAX_WORLD_SIZE]std.c.kevent64_s = undefined;
+        errdefer self.disconnectPeer(p_idx);
+        var events: [MAX_WORLD_SIZE * 2]std.c.kevent64_s = undefined;
         while (true) {
             switch (try peer.chan.stepSend()) {
                 .complete => {
@@ -1616,6 +1840,18 @@ pub const ExpertParallelCoordinator = struct {
                     if (now >= deadline_ns) return error.Timeout;
                     const nev = try transport.kqueueWait(self.kq_fd, &events, deadline_ns - now);
                     if (nev == 0) return error.Timeout;
+                    for (events[0..nev]) |ev| {
+                        const ev_idx: usize = @intCast(ev.udata);
+                        if (ev_idx != p_idx) {
+                            self.handleIdlePeerEvent(ev_idx, ev);
+                        } else if ((ev.flags & std.c.EV.ERROR) != 0) {
+                            return error.ConnectionReset;
+                        } else if (ev.filter == std.c.EVFILT.READ) {
+                            if ((ev.flags & std.c.EV.EOF) != 0) return error.UnexpectedEof;
+                            self.handleIdlePeerEvent(p_idx, ev);
+                            if (!peer.connected) return error.ConnectionReset;
+                        }
+                    }
                 },
             }
         }
@@ -2273,5 +2509,337 @@ test "CpuMoeExpertStore evaluates f16, q3_affine, and q2_affine SwiGLU experts w
             l2 += v * v;
         }
         try std.testing.expect(l2 > 0.0);
+    }
+}
+
+test "L5 PeerWorkerServer and ExpertParallelCoordinator enforce optional PSK HMAC-SHA256 authentication" {
+    const plan_srv = try ExpertPartitionPlan.init(2, 1, 1, 8, .contiguous_by_rank);
+    const plan_coord = try ExpertPartitionPlan.init(2, 0, 1, 8, .contiguous_by_rank);
+
+    var dummy_ctx: u8 = 0;
+    const dummy_backend: ExpertEvalBackend = .{
+        .ctx = &dummy_ctx,
+        .evalLocalSubsetFn = struct {
+            fn f(_: *anyopaque, _: u16, num_tokens: u16, hidden: []const f16, _: []const transport.Assignment, out: []f32) EvalError!u64 {
+                const n = @min(hidden.len, out.len);
+                _ = num_tokens;
+                for (0..n) |i| out[i] += @floatCast(hidden[i]);
+                return 10;
+            }
+        }.f,
+    };
+
+    var srv = try PeerWorkerServer.init(.{
+        .host = .{ 127, 0, 0, 1 },
+        .port = 0,
+        .plan = plan_srv,
+        .hidden_size = 16,
+        .backend = dummy_backend,
+        .psk = "cluster-shared-key-2026",
+    });
+    defer srv.deinit();
+    try srv.start();
+
+    const peers = [_]PeerEndpoint{.{ .rank = 1, .host = .{ 127, 0, 0, 1 }, .port = srv.boundPort() }};
+
+    // 1. Unauthenticated coordinator (psk = null) is rejected.
+    try std.testing.expectError(
+        error.UnexpectedEof,
+        ExpertParallelCoordinator.init(.{
+            .plan = plan_coord,
+            .hidden_size = 16,
+            .peers = &peers,
+            .local_backend = dummy_backend,
+            .psk = null,
+        }),
+    );
+
+    // 2. Wrong PSK is rejected.
+    try std.testing.expectError(
+        error.UnexpectedEof,
+        ExpertParallelCoordinator.init(.{
+            .plan = plan_coord,
+            .hidden_size = 16,
+            .peers = &peers,
+            .local_backend = dummy_backend,
+            .psk = "wrong-key",
+        }),
+    );
+
+    // 3. Matching PSK connects, pings, and evaluates remote experts cleanly.
+    var coord = try ExpertParallelCoordinator.init(.{
+        .plan = plan_coord,
+        .hidden_size = 16,
+        .peers = &peers,
+        .local_backend = dummy_backend,
+        .psk = "cluster-shared-key-2026",
+    });
+    defer coord.deinit();
+
+    _ = try coord.pingPeer(1);
+    const hidden: [16]f16 = @splat(1.0);
+    const assigns = [_]transport.Assignment{.{ .token_idx = 0, .expert_id = 5, .weight = 1.0 }};
+    var out: [16]f32 = @splat(0.0);
+    const st = try coord.dispatchLayerExperts(0, 1, &hidden, &assigns, &out);
+    try std.testing.expectEqual(@as(u32, 1), st.remote_assignments);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), out[0], 1e-4);
+}
+
+test "F16.1-F16.4 Coordinator resets timed-out peers, drains idle EOF without livelock, and Worker evicts idle clients" {
+    // 1. F16.4: PeerWorkerServer with max_clients = 1 and timeout_ms = 60 evicts an idle socket
+    //    so a subsequent coordinator connects and succeeds cleanly.
+    const plan_srv = try ExpertPartitionPlan.init(2, 1, 1, 8, .contiguous_by_rank);
+    const plan_coord = try ExpertPartitionPlan.init(2, 0, 1, 8, .contiguous_by_rank);
+
+    var eval_ctx: u8 = 0;
+    const eval_backend: ExpertEvalBackend = .{
+        .ctx = &eval_ctx,
+        .evalLocalSubsetFn = struct {
+            fn f(_: *anyopaque, _: u16, _: u16, hidden: []const f16, _: []const transport.Assignment, out: []f32) EvalError!u64 {
+                for (out, 0..) |*o, i| o.* += @floatCast(hidden[i]);
+                return 5;
+            }
+        }.f,
+    };
+
+    var srv = try PeerWorkerServer.init(.{
+        .host = .{ 127, 0, 0, 1 },
+        .port = 0,
+        .plan = plan_srv,
+        .hidden_size = 16,
+        .max_clients = 1,
+        .timeout_ms = 60,
+        .backend = eval_backend,
+    });
+    defer srv.deinit();
+    try srv.start();
+
+    // Park a completely idle TCP client occupying the sole worker slot (`max_clients = 1`).
+    const idle_fd = try transport.connectNonBlocking(.{ .host = .{ 127, 0, 0, 1 }, .port = srv.boundPort() }, 1000);
+    defer _ = std.c.close(idle_fd);
+
+    // Wait past `timeout_ms = 60` so worker evicts the idle client slot.
+    const wait_ts = transport.nsToTimespec(150 * std.time.ns_per_ms);
+    _ = std.c.nanosleep(&wait_ts, null);
+
+    const peers = [_]PeerEndpoint{.{ .rank = 1, .host = .{ 127, 0, 0, 1 }, .port = srv.boundPort() }};
+    var coord = try ExpertParallelCoordinator.init(.{
+        .plan = plan_coord,
+        .hidden_size = 16,
+        .peers = &peers,
+        .local_backend = eval_backend,
+        .timeout_ms = 1000,
+    });
+    defer coord.deinit();
+    _ = try coord.pingPeer(1);
+
+    // 2. F16.1 & F16.2: If coordinator times out on a slow/unresponsive peer while TX/RX is active,
+    //    it disconnects & resets the peer (`connected == false`, `!hasPendingTx()`), and subsequent
+    //    dispatches reconnect cleanly without mid-frame TX splice or SequenceMismatch cascade.
+    {
+        var srv_slow = try PeerWorkerServer.init(.{
+            .host = .{ 127, 0, 0, 1 },
+            .port = 0,
+            .plan = plan_srv,
+            .hidden_size = 16,
+            .timeout_ms = 2000,
+            .backend = .{
+                .ctx = &eval_ctx,
+                .evalLocalSubsetFn = struct {
+                    var delay_ms: std.atomic.Value(u32) = .init(150);
+                    fn f(_: *anyopaque, _: u16, _: u16, hidden: []const f16, _: []const transport.Assignment, out: []f32) EvalError!u64 {
+                        const d = delay_ms.load(.acquire);
+                        if (d > 0) {
+                            const ts = transport.nsToTimespec(@as(u64, d) * std.time.ns_per_ms);
+                            _ = std.c.nanosleep(&ts, null);
+                        }
+                        for (out, 0..) |*o, i| o.* += @floatCast(hidden[i]);
+                        return 10;
+                    }
+                }.f,
+            },
+        });
+        defer srv_slow.deinit();
+        try srv_slow.start();
+
+        const slow_peers = [_]PeerEndpoint{.{ .rank = 1, .host = .{ 127, 0, 0, 1 }, .port = srv_slow.boundPort() }};
+        var slow_coord = try ExpertParallelCoordinator.init(.{
+            .plan = plan_coord,
+            .hidden_size = 16,
+            .peers = &slow_peers,
+            .local_backend = eval_backend,
+            .timeout_ms = 25,
+        });
+        defer slow_coord.deinit();
+
+        const hidden: [16]f16 = @splat(2.0);
+        const assigns = [_]transport.Assignment{.{ .token_idx = 0, .expert_id = 5, .weight = 1.0 }};
+        var out: [16]f32 = @splat(0.0);
+        try std.testing.expectError(
+            error.Timeout,
+            slow_coord.dispatchLayerExperts(0, 1, &hidden, &assigns, &out),
+        );
+        try std.testing.expect(!slow_coord.peer_slots[0].connected);
+        try std.testing.expect(!slow_coord.peer_slots[0].chan.hasPendingTx());
+
+        // Even if server wakes up later, next dispatch with increased timeout reconnects cleanly!
+        slow_coord.config.timeout_ms = 1000;
+        const st = try slow_coord.dispatchLayerExperts(0, 1, &hidden, &assigns, &out);
+        try std.testing.expectEqual(@as(u32, 1), st.remote_assignments);
+        try std.testing.expectApproxEqAbs(@as(f32, 2.0), out[0], 1e-4);
+    }
+
+    // 2b. F16.2 explicit stale-sequence drain on connected peer channel.
+    {
+        var listener = try transport.TcpListener.bind(.{ .host = .{ 127, 0, 0, 1 }, .port = 0 }, 4);
+        defer listener.close();
+
+        var slab = try transport.WiredSlab.initOwned(2 * page.APPLE_PAGE_SIZE);
+        defer slab.deinit();
+        const s_tx = try slab.carvePages(page.APPLE_PAGE_SIZE);
+        const s_rx = try slab.carvePages(page.APPLE_PAGE_SIZE);
+
+        const ThreadCtx = struct {
+            listener: *transport.TcpListener,
+            s_tx: []align(page.APPLE_PAGE_SIZE) u8,
+            s_rx: []align(page.APPLE_PAGE_SIZE) u8,
+            plan: ExpertPartitionPlan,
+            fn run(ctx: *@This()) void {
+                var fd: std.c.fd_t = -1;
+                for (0..200) |_| {
+                    if (ctx.listener.acceptNonBlocking() catch null) |f| {
+                        fd = f;
+                        break;
+                    }
+                    const ts = transport.nsToTimespec(1 * std.time.ns_per_ms);
+                    _ = std.c.nanosleep(&ts, null);
+                }
+                if (fd < 0) return;
+                var ch = transport.FrameChannel.init(fd, ctx.s_tx, ctx.s_rx) catch return;
+                defer ch.close();
+                const kq = transport.kqueueCreate() catch return;
+                defer _ = std.c.close(kq);
+
+                // Handshake
+                const hreq = ch.recvFrameSync(kq, 2000) catch return;
+                ch.resetRx();
+                const bmp = ctx.plan.fillExpertBitmap(1) catch return;
+                const rng = ctx.plan.rankExpertRange(1) catch return;
+                var hresp: transport.HelloPayload = .{
+                    .expert_bitmap = bmp,
+                    .hidden_size = 16,
+                    .rank = 1,
+                    .world_size = 2,
+                    .num_layers = 1,
+                    .num_experts = 8,
+                    .expert_range_start = rng.start,
+                    .expert_range_end = rng.end,
+                    .status = 0,
+                };
+                const hdst = ch.preparePayload(transport.HelloPayload.WIRE_BYTES) catch return;
+                hresp.encode(hdst[0..transport.HelloPayload.WIRE_BYTES]);
+                _ = ch.commitFrameChecked(.hello_resp, 0, hreq.header.seq_id, transport.HelloPayload.WIRE_BYTES) catch return;
+                _ = ch.sendFrameSync(kq, 2000) catch return;
+
+                // Read eval request (seq = N), then send a STALE response (seq = N - 1) followed
+                // by the real response (seq = N)!
+                const req_f = ch.recvFrameSync(kq, 2000) catch return;
+                ch.resetRx();
+                const resp_bytes = transport.evalRespPayloadBytes(1, 16) catch return;
+                for ([_]u64{ req_f.header.seq_id - 1, req_f.header.seq_id }) |sid| {
+                    const dst = ch.preparePayload(resp_bytes) catch return;
+                    const hdr: transport.EvalExpertsRespHeader = .{
+                        .status = @backingInt(transport.EvalStatus.ok),
+                        .num_tokens = 1,
+                        .hidden_size = 16,
+                        .assignments_evaluated = 1,
+                        .peer_compute_ns = 7,
+                    };
+                    hdr.encode(dst[0..transport.EvalExpertsRespHeader.WIRE_BYTES]);
+                    const out_raw: []align(4) u8 = @alignCast(dst[transport.EvalExpertsRespHeader.WIRE_BYTES..resp_bytes]);
+                    const out_f32 = std.mem.bytesAsSlice(f32, out_raw);
+                    @memset(out_f32, if (sid == req_f.header.seq_id) 5.0 else 999.0);
+                    _ = ch.commitFrameChecked(.eval_experts_resp, 0, sid, resp_bytes) catch return;
+                    _ = ch.sendFrameSync(kq, 2000) catch return;
+                }
+            }
+        };
+        var tctx = ThreadCtx{ .listener = &listener, .s_tx = s_tx, .s_rx = s_rx, .plan = plan_srv };
+        const th = try std.Thread.spawn(.{}, ThreadCtx.run, .{&tctx});
+        defer th.join();
+
+        const stale_peers = [_]PeerEndpoint{.{ .rank = 1, .host = .{ 127, 0, 0, 1 }, .port = listener.bound_port }};
+        var stale_coord = try ExpertParallelCoordinator.init(.{
+            .plan = plan_coord,
+            .hidden_size = 16,
+            .peers = &stale_peers,
+            .local_backend = eval_backend,
+            .timeout_ms = 2000,
+        });
+        defer stale_coord.deinit();
+
+        const hidden: [16]f16 = @splat(1.0);
+        const assigns = [_]transport.Assignment{.{ .token_idx = 0, .expert_id = 5, .weight = 1.0 }};
+        var out: [16]f32 = @splat(0.0);
+        const st2 = try stale_coord.dispatchLayerExperts(0, 1, &hidden, &assigns, &out);
+        try std.testing.expectEqual(@as(u32, 1), st2.remote_assignments);
+        try std.testing.expectApproxEqAbs(@as(f32, 5.0), out[0], 1e-4);
+    }
+
+    // 3. F16.3: Non-participating peer hitting EOF must NOT spin kevent64 at 100% CPU.
+    {
+        const plan3 = try ExpertPartitionPlan.init(3, 0, 1, 12, .contiguous_by_rank);
+        const p1_plan = try ExpertPartitionPlan.init(3, 1, 1, 12, .contiguous_by_rank);
+        const p2_plan = try ExpertPartitionPlan.init(3, 2, 1, 12, .contiguous_by_rank);
+
+        var srv1 = try PeerWorkerServer.init(.{
+            .host = .{ 127, 0, 0, 1 },
+            .port = 0,
+            .plan = p1_plan,
+            .hidden_size = 16,
+            .backend = eval_backend,
+        });
+        defer srv1.deinit();
+        try srv1.start();
+
+        var srv2 = try PeerWorkerServer.init(.{
+            .host = .{ 127, 0, 0, 1 },
+            .port = 0,
+            .plan = p2_plan,
+            .hidden_size = 16,
+            .backend = eval_backend,
+        });
+        var srv2_alive = true;
+        defer if (srv2_alive) srv2.deinit();
+        try srv2.start();
+
+        const peers3 = [_]PeerEndpoint{
+            .{ .rank = 1, .host = .{ 127, 0, 0, 1 }, .port = srv1.boundPort() },
+            .{ .rank = 2, .host = .{ 127, 0, 0, 1 }, .port = srv2.boundPort() },
+        };
+        var coord3 = try ExpertParallelCoordinator.init(.{
+            .plan = plan3,
+            .hidden_size = 16,
+            .peers = &peers3,
+            .local_backend = eval_backend,
+            .timeout_ms = 500,
+        });
+        defer coord3.deinit();
+
+        // Stop peer 2 completely (creates EV_EOF on peer 2's socket!) while dispatching only to peer 1!
+        srv2.deinit();
+        srv2_alive = false;
+        const ts_eof = transport.nsToTimespec(10 * std.time.ns_per_ms);
+        _ = std.c.nanosleep(&ts_eof, null);
+
+        const hidden: [16]f16 = @splat(3.0);
+        // Expert 4 belongs to rank 1 (range 4..8); rank 2 (8..12) is non-participating.
+        const assigns = [_]transport.Assignment{.{ .token_idx = 0, .expert_id = 4, .weight = 1.0 }};
+        var out: [16]f32 = @splat(0.0);
+        const st = try coord3.dispatchLayerExperts(0, 1, &hidden, &assigns, &out);
+        try std.testing.expectEqual(@as(u32, 1), st.remote_assignments);
+        try std.testing.expectApproxEqAbs(@as(f32, 3.0), out[0], 1e-4);
+        // Idle peer 2 EOF was handled and disconnected cleanly.
+        try std.testing.expect(!coord3.peer_slots[1].connected);
     }
 }

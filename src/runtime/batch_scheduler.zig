@@ -707,7 +707,7 @@ pub const BatchScheduler = struct {
     ) bool {
         if (slot_id >= self.config.max_batch_size) return false;
         const slot = &self.slots[slot_id];
-        if (slot.state == .free) return false;
+        if (slot.state == .free or slot.state == .cancelled or slot.state == .finished) return false;
 
         const user_tag = slot.user_tag;
         const prompt_tokens = slot.prompt_len;
@@ -738,6 +738,7 @@ pub const BatchScheduler = struct {
         observer: ?StepObserver,
     ) void {
         const slot = &self.slots[slot_id];
+        if (slot.state == .free or slot.state == .cancelled or slot.state == .finished) return;
         const user_tag = slot.user_tag;
         const prompt_tokens = slot.prompt_len;
         const generated_tokens = slot.generated_tokens;
@@ -769,6 +770,7 @@ pub const BatchScheduler = struct {
         observer: ?StepObserver,
     ) void {
         const slot = &self.slots[slot_id];
+        if (slot.state == .free or slot.state == .cancelled or slot.state == .finished) return;
         const user_tag = slot.user_tag;
         const prefix_handle = slot.prefix_handle;
 
@@ -903,9 +905,15 @@ pub const BatchScheduler = struct {
             if (!is_final) continue;
 
             // Final prefill chunk finished: notify observer and emit first generated token.
+            const slot_gen = slot.generation;
             if (observer) |obs| {
                 if (obs.onPrefillDoneFn) |f| {
-                    if (!f(obs.ctx, slot_id, slot.user_tag, slot.prompt_len, slot.prefix_hit_tokens)) {
+                    const keep = f(obs.ctx, slot_id, slot.user_tag, slot.prompt_len, slot.prefix_hit_tokens);
+                    if (slot.state == .free or slot.state == .cancelled or slot.state == .finished or slot.generation != slot_gen) {
+                        summary.slots_cancelled += 1;
+                        continue;
+                    }
+                    if (!keep) {
                         self.finishSlotInternal(slot_id, .cancelled, backend, observer);
                         summary.slots_cancelled += 1;
                         continue;
@@ -927,7 +935,12 @@ pub const BatchScheduler = struct {
 
             if (observer) |obs| {
                 if (obs.onTokenFn) |f| {
-                    if (!f(obs.ctx, slot_id, slot.user_tag, first_tok, slot.generated_tokens)) {
+                    const keep = f(obs.ctx, slot_id, slot.user_tag, first_tok, slot.generated_tokens);
+                    if (slot.state == .free or slot.state == .cancelled or slot.state == .finished or slot.generation != slot_gen) {
+                        summary.slots_cancelled += 1;
+                        continue;
+                    }
+                    if (!keep) {
                         self.finishSlotInternal(slot_id, .cancelled, backend, observer);
                         summary.slots_cancelled += 1;
                         continue;
@@ -1016,9 +1029,15 @@ pub const BatchScheduler = struct {
             slot.seq_pos += 1;
             summary.tokens_emitted += 1;
 
+            const slot_gen = slot.generation;
             if (observer) |obs| {
                 if (obs.onTokenFn) |f| {
-                    if (!f(obs.ctx, sid, slot.user_tag, next_tok, slot.generated_tokens)) {
+                    const keep = f(obs.ctx, sid, slot.user_tag, next_tok, slot.generated_tokens);
+                    if (slot.state == .free or slot.state == .cancelled or slot.state == .finished or slot.generation != slot_gen) {
+                        summary.slots_cancelled += 1;
+                        continue;
+                    }
+                    if (!keep) {
                         self.finishSlotInternal(sid, .cancelled, backend, observer);
                         summary.slots_cancelled += 1;
                         continue;
@@ -1870,4 +1889,116 @@ test "C15 BatchScheduler splits prefill chunk at message_boundary_token with che
     try std.testing.expectEqualSlices(u32, &.{ 512, 512, 376 }, spy_off.chunk_lens[0..3]);
     try std.testing.expectEqualSlices(bool, &.{ false, false, false }, spy_off.chunk_flags[0..3]);
     try std.testing.expectEqual(@as(u64, 0), sched_off.telemetry().message_boundary_checkpoints);
+}
+
+test "L9 BatchScheduler re-entrant cancelSlot inside onPrefillDoneFn and onTokenFn returning false is idempotent" {
+    const gpa = std.testing.allocator;
+
+    const ReentrantCtx = struct {
+        sched: *BatchScheduler,
+        cancel_on_prefill: bool,
+        cancel_on_first_tok: bool,
+        cancel_on_decode_tok: bool,
+        release_calls: u32 = 0,
+        finish_calls: u32 = 0,
+
+        fn lookupPrefix(_: *anyopaque, _: u16, _: []const u32) PrefixLookupResult {
+            return .{};
+        }
+        fn prefill(_: *anyopaque, chunk: *const PrefillChunkView) BackendError!PrefillResult {
+            return .{ .first_token = if (chunk.is_final_chunk) 77 else 0 };
+        }
+        fn decode(_: *anyopaque, view: *const BatchStepView, out: []u32) BackendError!void {
+            for (0..view.batchSize()) |b| out[b] = 88;
+        }
+        fn release(ctx_raw: *anyopaque, _: u16, _: u64) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx_raw));
+            self.release_calls += 1;
+        }
+
+        fn backend(self: *@This()) BatchBackend {
+            return .{
+                .ctx = self,
+                .lookupPrefixFn = lookupPrefix,
+                .prefillSlotFn = prefill,
+                .stepDecodeBatchFn = decode,
+                .releaseSlotFn = release,
+            };
+        }
+
+        fn observer(self: *@This()) StepObserver {
+            return .{
+                .ctx = self,
+                .onPrefillDoneFn = onPrefillDone,
+                .onTokenFn = onToken,
+                .onFinishFn = onFinish,
+            };
+        }
+
+        fn onPrefillDone(ctx_raw: *anyopaque, slot_id: u16, _: u64, _: u32, _: u32) bool {
+            const self: *@This() = @ptrCast(@alignCast(ctx_raw));
+            if (self.cancel_on_prefill) {
+                _ = self.sched.cancelSlot(slot_id, self.backend(), self.observer());
+                return false;
+            }
+            return true;
+        }
+
+        fn onToken(ctx_raw: *anyopaque, slot_id: u16, _: u64, _: u32, gen_count: u32) bool {
+            const self: *@This() = @ptrCast(@alignCast(ctx_raw));
+            if (self.cancel_on_first_tok and gen_count == 1) {
+                _ = self.sched.cancelSlot(slot_id, self.backend(), self.observer());
+                return false;
+            }
+            if (self.cancel_on_decode_tok and gen_count >= 2) {
+                _ = self.sched.cancelSlot(slot_id, self.backend(), self.observer());
+                return false;
+            }
+            return true;
+        }
+
+        fn onFinish(ctx_raw: *anyopaque, _: u16, _: u64, reason: FinishReason, _: u32, _: u32) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx_raw));
+            std.debug.assert(reason == .cancelled);
+            self.finish_calls += 1;
+        }
+    };
+
+    const prompt = [_]u32{ 1, 2, 3, 4 };
+    var sched = try BatchScheduler.init(gpa, .{
+        .max_batch_size = 2,
+        .max_prefill_chunk_tokens = 16,
+        .max_prompt_tokens = 32,
+    });
+    defer sched.deinit(gpa);
+
+    // 1. Re-entrant cancel inside onPrefillDoneFn returning false.
+    var ctx1 = ReentrantCtx{ .sched = &sched, .cancel_on_prefill = true, .cancel_on_first_tok = false, .cancel_on_decode_tok = false };
+    _ = try sched.enqueue(&prompt, .{ .request_id = 1, .max_tokens = 4 });
+    const s1 = sched.step(ctx1.backend(), ctx1.observer());
+    try std.testing.expectEqual(@as(u32, 1), s1.slots_cancelled);
+    try std.testing.expectEqual(@as(u32, 1), ctx1.release_calls);
+    try std.testing.expectEqual(@as(u32, 1), ctx1.finish_calls);
+    try std.testing.expectEqual(@as(u64, 1), sched.telemetry().cancelled_requests);
+    try std.testing.expectEqual(@as(usize, 0), sched.activeSlotCount());
+
+    // 2. Re-entrant cancel inside prefill first-token onTokenFn returning false.
+    var ctx2 = ReentrantCtx{ .sched = &sched, .cancel_on_prefill = false, .cancel_on_first_tok = true, .cancel_on_decode_tok = false };
+    _ = try sched.enqueue(&prompt, .{ .request_id = 2, .max_tokens = 4 });
+    const s2 = sched.step(ctx2.backend(), ctx2.observer());
+    try std.testing.expectEqual(@as(u32, 1), s2.slots_cancelled);
+    try std.testing.expectEqual(@as(u32, 1), ctx2.release_calls);
+    try std.testing.expectEqual(@as(u32, 1), ctx2.finish_calls);
+    try std.testing.expectEqual(@as(u64, 2), sched.telemetry().cancelled_requests);
+    try std.testing.expectEqual(@as(usize, 0), sched.activeSlotCount());
+
+    // 3. Re-entrant cancel inside decode-batch onTokenFn returning false.
+    var ctx3 = ReentrantCtx{ .sched = &sched, .cancel_on_prefill = false, .cancel_on_first_tok = false, .cancel_on_decode_tok = true };
+    _ = try sched.enqueue(&prompt, .{ .request_id = 3, .max_tokens = 4 });
+    const s3 = sched.step(ctx3.backend(), ctx3.observer());
+    try std.testing.expectEqual(@as(u32, 1), s3.slots_cancelled);
+    try std.testing.expectEqual(@as(u32, 1), ctx3.release_calls);
+    try std.testing.expectEqual(@as(u32, 1), ctx3.finish_calls);
+    try std.testing.expectEqual(@as(u64, 3), sched.telemetry().cancelled_requests);
+    try std.testing.expectEqual(@as(usize, 0), sched.activeSlotCount());
 }

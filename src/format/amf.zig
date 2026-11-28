@@ -755,10 +755,17 @@ pub const AmfFile = struct {
     }
 };
 
+const MAX_PREAD_CHUNK: usize = 0x7fff_c000;
+
+fn nextPreadChunkLen(remaining: usize) usize {
+    return @min(remaining, MAX_PREAD_CHUNK);
+}
+
 fn preadExact(fd: std.c.fd_t, dst: []u8, offset: u64) IoError!void {
     var done: usize = 0;
     while (done < dst.len) {
-        const rc = std.c.pread(fd, dst.ptr + done, dst.len - done, @intCast(offset + done));
+        const chunk = nextPreadChunkLen(dst.len - done);
+        const rc = std.c.pread(fd, dst.ptr + done, chunk, @intCast(offset + done));
         if (rc < 0) {
             const err = std.c.errno(rc);
             if (err == .INTR) continue;
@@ -3529,4 +3536,14 @@ test "C28 populateArchFromJson and inspectAmfPath extract max_position_embedding
     try std.testing.expectEqual(@as(u32, 152064), insp.arch.vocab_size);
     try std.testing.expectEqual(@as(u32, 65536), insp.arch.max_position_embeddings);
     try std.testing.expect(insp.arch.has_vision);
+}
+
+test "L6 nextPreadChunkLen clamps >= 2 GiB spans below macOS INT_MAX EINVAL boundary" {
+    const two_gib: usize = 2 * 1024 * 1024 * 1024;
+    const c1 = nextPreadChunkLen(two_gib + page.APPLE_PAGE_SIZE);
+    try std.testing.expectEqual(MAX_PREAD_CHUNK, c1);
+    try std.testing.expect(c1 <= std.math.maxInt(c_int));
+    try std.testing.expectEqual(@as(usize, 0), c1 % page.APPLE_PAGE_SIZE);
+    const rem = (two_gib + page.APPLE_PAGE_SIZE) - c1;
+    try std.testing.expectEqual(rem, nextPreadChunkLen(rem));
 }

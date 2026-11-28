@@ -78,6 +78,12 @@ pub const LiveAdmissionPlan = struct {
     cache_scaled_down: bool,
 };
 
+/// Returns the total bytes currently wired across all live `WiredRegion`s in
+/// this process.
+pub fn currentProcessWiredBytes() u64 {
+    return page.currentProcessWiredBytes();
+}
+
 pub const Budget = struct {
     /// Maximum bytes aminfer may wire, rounded down to whole 16 KiB pages.
     limit_bytes: u64,
@@ -85,6 +91,15 @@ pub const Budget = struct {
     binding_limit: BindingLimit,
     /// The raw (pre-alignment) ceiling reported by `binding_limit`.
     raw_limit_bytes: u64,
+    /// When `true`, `checkPlan` enforces `currentProcessWiredBytes() + required_bytes <= limit_bytes`.
+    enforce_process_ledger: bool = false,
+
+    /// Returns a copy of `self` with process-wide wired-ledger accounting enabled.
+    pub fn withProcessLedger(self: Budget) Budget {
+        var copy = self;
+        copy.enforce_process_ledger = true;
+        return copy;
+    }
 
     pub fn compute(inputs: Inputs) Budget {
         const physical_usable = if (inputs.memory_bytes > inputs.headroom_bytes)
@@ -131,13 +146,20 @@ pub const Budget = struct {
             .gpu_working_set_bytes = device_info.recommendedMaxWorkingSetSize(),
             .configured_cap = config.configured_cap,
             .headroom_bytes = config.headroom_bytes,
-        });
+        }).withProcessLedger();
     }
 
     /// Rejects any model/arena plan that exceeds the wired budget instead of
     /// silently degrading to pageable memory (ADR-0012).
     pub fn checkPlan(self: Budget, required_bytes: u64) PlanError!void {
-        if (required_bytes > self.limit_bytes) return error.BudgetExceeded;
+        if (self.enforce_process_ledger) {
+            const total = std.math.add(u64, currentProcessWiredBytes(), required_bytes) catch {
+                return error.BudgetExceeded;
+            };
+            if (total > self.limit_bytes) return error.BudgetExceeded;
+        } else {
+            if (required_bytes > self.limit_bytes) return error.BudgetExceeded;
+        }
     }
 
     /// Alias of `checkPlan` enforcing the static `ADR-0012` wired ceiling.
@@ -171,7 +193,9 @@ fn planWithLiveRamImpl(
     if (cfg.strict_live_ram and required_wired_bytes > live_budget_bytes) {
         return error.ExceedsLiveZeroSwapRam;
     }
-    const static_headroom: u64 = budget.limit_bytes - required_wired_bytes;
+    const base_wired: u64 = if (budget.enforce_process_ledger) currentProcessWiredBytes() else 0;
+    const projected_wired: u64 = base_wired +| required_wired_bytes;
+    const static_headroom: u64 = budget.limit_bytes -| projected_wired;
     const live_headroom: u64 = live_budget_bytes -| required_wired_bytes;
     const granted_optional_cache_bytes: u64 = @min(optional_cache_bytes, @min(static_headroom, live_headroom));
     return .{
@@ -369,4 +393,42 @@ test "scaleOptionalCount clamps cleanly between min_count and requested_count" {
     try std.testing.expectEqual(@as(usize, 0), scaleOptionalCount(0, unit, 1024 * 1024, 4));
     try std.testing.expectEqual(@as(usize, 3), scaleOptionalCount(3, unit, 0, 8));
     try std.testing.expectEqual(@as(usize, 16), scaleOptionalCount(16, 0, 0, 2));
+}
+
+test "process ledger enforces combined component A + component B wired ceiling" {
+    const facts = try sysinfo.Facts.read();
+    const device = try metal.Device.open();
+    defer device.close();
+    const info = try device.info();
+
+    const base_wired = currentProcessWiredBytes();
+    const page_sz: u64 = page.APPLE_PAGE_SIZE;
+    // Cap at baseline + 5 pages so component A (3 pages) + component B (3 pages) exceeds budget.
+    const host_budget = Budget.fromHost(facts, info, .{
+        .configured_cap = base_wired + 5 * page_sz,
+    });
+    try std.testing.expect(host_budget.enforce_process_ledger);
+
+    const comp_a_bytes: usize = 3 * page.APPLE_PAGE_SIZE;
+    const comp_b_bytes: usize = 3 * page.APPLE_PAGE_SIZE;
+
+    try host_budget.checkPlan(comp_a_bytes);
+    const region_a = try page.WiredRegion.init(comp_a_bytes);
+    var region_a_active = true;
+    defer if (region_a_active) region_a.deinit();
+
+    try std.testing.expectEqual(base_wired + comp_a_bytes, currentProcessWiredBytes());
+
+    // A fresh Budget.fromHost recomputed by another subsystem still sees component A wired.
+    const second_budget = Budget.fromHost(facts, info, .{
+        .configured_cap = base_wired + 5 * page_sz,
+    });
+    try std.testing.expectError(error.BudgetExceeded, second_budget.checkPlan(comp_b_bytes));
+    try std.testing.expectError(error.BudgetExceeded, second_budget.checkPlan(std.math.maxInt(u64)));
+    try second_budget.checkPlan(2 * page_sz);
+
+    region_a.deinit();
+    region_a_active = false;
+    try std.testing.expectEqual(base_wired, currentProcessWiredBytes());
+    try second_budget.checkPlan(comp_b_bytes);
 }

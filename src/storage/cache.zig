@@ -443,6 +443,7 @@ const SlotState = enum(u8) {
     inflight,
     ready,
     failed,
+    quarantined,
 };
 
 const SlotMeta = struct {
@@ -620,7 +621,7 @@ pub const ExpertCache = struct {
                 break :blk switch (self.slots[rec.slot].state) {
                     .ready => .cached_ready,
                     .inflight => .cached_inflight,
-                    .empty, .failed => .cold_nvme,
+                    .empty, .failed, .quarantined => .cold_nvme,
                 };
             },
         };
@@ -855,6 +856,14 @@ pub const ExpertCache = struct {
         return count;
     }
 
+    pub fn quarantinedSlotCount(self: *const ExpertCache) usize {
+        var count: usize = 0;
+        for (self.slots) |slot| {
+            if (slot.state == .quarantined) count += 1;
+        }
+        return count;
+    }
+
     /// Returns the current decayed LFU score of a resident/in-flight cold expert,
     /// or `null` if it is hot, unregistered, or not currently in the slot pool.
     pub fn slotLfuScore(self: *const ExpertCache, layer: u16, expert_idx: u16) ?u32 {
@@ -972,7 +981,7 @@ pub const ExpertCache = struct {
                     self.stats.prefetch_coalesced += 1;
                     return .coalesced_inflight;
                 },
-                .empty, .failed => {
+                .empty, .failed, .quarantined => {
                     rec.slot = INVALID_SLOT;
                 },
             }
@@ -1075,14 +1084,14 @@ pub const ExpertCache = struct {
                         .failed => {
                             self.clearFailedUnpinnedSlot(s, idx);
                         },
-                        .empty => {
+                        .empty, .quarantined => {
                             rec.slot = INVALID_SLOT;
                         },
                     }
                 }
 
-                // Cold miss: if every slot is actively pinned, refuse eviction immediately.
-                if (self.pinned_slot_count >= self.slots.len) {
+                // Cold miss: if every slot is actively pinned or quarantined, refuse eviction immediately.
+                if (self.pinned_slot_count + self.quarantinedSlotCount() >= self.slots.len) {
                     return error.NoEvictableSlot;
                 }
 
@@ -1092,7 +1101,7 @@ pub const ExpertCache = struct {
                 // currently in-flight prefetches, wait cleanly for one DMA to finish.
                 var victim_idx: ?u32 = self.selectEvictionVictim();
                 while (victim_idx == null) {
-                    if (self.pinned_slot_count >= self.slots.len) return error.NoEvictableSlot;
+                    if (self.pinned_slot_count + self.quarantinedSlotCount() >= self.slots.len) return error.NoEvictableSlot;
                     if (self.reader.inflightCount() == 0) return error.NoEvictableSlot;
                     const got = try self.waitCompletions(self.io_timeout_ms);
                     if (got == 0) return error.Timeout;
@@ -1346,6 +1355,41 @@ pub const ExpertCache = struct {
         return (@as(u64, generation) << 32) | (@as(u64, slot_idx) << 8) | @as(u64, blob_kind);
     }
 
+    fn finalizePartialSubmitRollback(
+        self: *ExpertCache,
+        slot_idx: u32,
+        record_idx: usize,
+        submitted: u8,
+        pin_immediately: bool,
+    ) void {
+        const slot = &self.slots[slot_idx];
+        if (submitted == 0) {
+            if (pin_immediately) self.unpinSlot(slot_idx);
+            self.records[record_idx].slot = INVALID_SLOT;
+            slot.state = .empty;
+            slot.pending_blobs = 0;
+            slot.prefetched_unused = false;
+        } else {
+            slot.pending_blobs = submitted;
+            slot.io_err_code = @backingInt(std.c.E.IO);
+            self.waitSlotDoneBestEffort(slot_idx);
+            if (pin_immediately) self.unpinSlot(slot_idx);
+            if (self.records[record_idx].slot == slot_idx) {
+                self.records[record_idx].slot = INVALID_SLOT;
+            }
+            if (slot.pending_blobs != 0 or slot.state == .inflight) {
+                slot.state = .quarantined;
+                slot.prefetched_unused = false;
+            } else {
+                slot.state = .empty;
+                slot.pending_blobs = 0;
+                slot.prefetched_unused = false;
+                slot.io_err_code = 0;
+                slot.io_short_read = false;
+            }
+        }
+    }
+
     fn startSlotLoad(
         self: *ExpertCache,
         slot_idx: u32,
@@ -1405,24 +1449,7 @@ pub const ExpertCache = struct {
         var submitted: u8 = 0;
         for (reqs) |req| {
             self.reader.submit(req) catch |err| {
-                // Roll back safely: if prior sub-blobs were submitted to kernel/workers,
-                // wait for those DMA operations to complete before clearing the slot.
-                if (submitted == 0) {
-                    if (pin_immediately) self.unpinSlot(slot_idx);
-                    self.records[record_idx].slot = INVALID_SLOT;
-                    slot.state = .empty;
-                    slot.pending_blobs = 0;
-                    slot.prefetched_unused = false;
-                } else {
-                    slot.pending_blobs = submitted;
-                    slot.io_err_code = @backingInt(std.c.E.IO);
-                    self.waitSlotDoneBestEffort(slot_idx);
-                    if (pin_immediately) self.unpinSlot(slot_idx);
-                    self.records[record_idx].slot = INVALID_SLOT;
-                    slot.state = .empty;
-                    slot.pending_blobs = 0;
-                    slot.prefetched_unused = false;
-                }
+                self.finalizePartialSubmitRollback(slot_idx, record_idx, submitted, pin_immediately);
                 return err;
             };
             submitted += 1;
@@ -1435,7 +1462,13 @@ pub const ExpertCache = struct {
         if (slot_idx >= self.slots.len) return;
 
         const slot = &self.slots[slot_idx];
-        if (slot.state != .inflight or slot.generation != gen or slot.pending_blobs == 0) return;
+        if (slot.generation != gen or slot.pending_blobs == 0) return;
+        if (slot.state == .quarantined) {
+            self.stats.bytes_read += comp.bytes_read;
+            slot.pending_blobs -= 1;
+            return;
+        }
+        if (slot.state != .inflight) return;
 
         self.stats.bytes_read += comp.bytes_read;
         if (comp.err_code != 0 and slot.io_err_code == 0) {
@@ -2341,4 +2374,93 @@ test "C27 filterColdTailWorkspace lossless default 0.0 and opt-in skipping prese
     for (ws.unique_experts[0..num_u]) |ue| {
         try std.testing.expect(ue != 5 and ue != 6 and ue != 7);
     }
+}
+
+test "F15.2 ExpertCache quarantines slot when partial submit fails and undrained blobs remain" {
+    const gpa = std.testing.allocator;
+    const blob_bytes = page.APPLE_PAGE_SIZE;
+    var pack = try SyntheticColdPack.create("f15_quarantine", 1, 2, blob_bytes);
+    defer pack.deinit();
+
+    const spec: PoolSpec = .{
+        .num_slots = 1,
+        .gate_blob_bytes = blob_bytes,
+        .up_blob_bytes = blob_bytes,
+        .down_blob_bytes = blob_bytes,
+    };
+    var pool = try ExpertSlotPool.initOwned(testBudget(try spec.totalBytes()), null, spec);
+    defer pool.deinit();
+
+    // Use max_inflight = 4 (>= BLOBS_PER_EXPERT = 3) and occupy 2 slots with unreaped
+    // reads so submitting 3 sub-blobs fails on blob 2 with QueueFull!
+    var reader = try aio.AsyncExpertReader.init(gpa, .{
+        .backend = .ecore_pread,
+        .max_inflight = 4,
+        .worker_count = 1,
+    });
+    defer reader.deinit(gpa);
+
+    var cache = try ExpertCache.init(gpa, &pool, &reader, .{
+        .num_layers = 1,
+        .num_experts = 2,
+        .io_timeout_ms = 5_000,
+    });
+    defer cache.deinit(gpa);
+
+    const cold0 = try pack.tripleFor(0, 0);
+    const cold1 = try pack.tripleFor(0, 1);
+    try cache.registerCold(0, 0, cold0);
+    try cache.registerCold(0, 1, cold1);
+
+    var scratch = try page.WiredRegion.init(blob_bytes);
+    defer scratch.deinit();
+    for (0..2) |k| {
+        try reader.submit(.{
+            .fd = cold0.fd,
+            .offset = cold0.gate.offset,
+            .dst = scratch.bytes,
+            .user_data = ExpertCache.packTag(0, 0, @intCast(k)),
+        });
+    }
+
+    // 1. Real partial submit failure when drain succeeds: slot returns cleanly to `.empty`.
+    try std.testing.expectError(error.QueueFull, cache.startSlotLoad(0, .{ .layer = 0, .expert = 0 }, 0, cold0, false, true));
+    try std.testing.expectEqual(@as(usize, 0), cache.quarantinedSlotCount());
+    try std.testing.expectEqual(SlotState.empty, cache.slots[0].state);
+
+    // 2. Partial submit rollback when `pending_blobs` cannot drain (`reader` holds 1 unreaped op
+    //    whose generation doesn't match): slot transitions to `.quarantined` and is NEVER reusable!
+    try reader.submit(.{
+        .fd = cold0.fd,
+        .offset = cold0.gate.offset,
+        .dst = scratch.bytes,
+        .user_data = ExpertCache.packTag(2, 0, 0),
+    });
+    // Temporarily force zero timeout + inflight state to verify quarantine on undrained rollback.
+    cache.slots[0].state = .inflight;
+    cache.slots[0].generation = 99;
+    cache.slots[0].pin_count = 1;
+    cache.pinned_slots[0] = 0;
+    cache.pinned_slot_count = 1;
+    cache.records[0].slot = 0;
+    cache.io_timeout_ms = 0;
+    cache.finalizePartialSubmitRollback(0, 0, 1, true);
+    cache.io_timeout_ms = 5_000;
+    try std.testing.expectEqual(SlotState.quarantined, cache.slots[0].state);
+    try std.testing.expectEqual(@as(usize, 1), cache.quarantinedSlotCount());
+    try std.testing.expectEqual(INVALID_SLOT, cache.records[0].slot);
+    try std.testing.expectEqual(ResidencyState.cold_nvme, cache.residencyState(0, 0));
+    try std.testing.expect(cache.selectEvictionVictim() == null);
+    try std.testing.expectError(error.NoEvictableSlot, cache.acquirePinned(0, 1));
+
+    // Even if a late completion for the quarantined generation arrives, slot stays `.quarantined`!
+    cache.handleCompletion(.{
+        .user_data = ExpertCache.packTag(99, 0, 0),
+        .bytes_read = blob_bytes,
+        .err_code = 0,
+        .short_read = false,
+    });
+    try std.testing.expectEqual(@as(u8, 0), cache.slots[0].pending_blobs);
+    try std.testing.expectEqual(SlotState.quarantined, cache.slots[0].state);
+    try std.testing.expect(cache.selectEvictionVictim() == null);
 }

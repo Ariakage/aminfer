@@ -199,8 +199,51 @@ pub const MemoryTableKind = enum(u8) {
     engram_conditional = 1,
 };
 
+const RowGeometry = struct { code_bytes: usize, param_bytes: usize };
+
+fn quantRowGeometry(comptime bits: quant.QuantBits, dim: usize, group_size: u16) Error!RowGeometry {
+    inline for (.{ 32, 64, 128 }) |gs| {
+        if (group_size == gs) {
+            const Ops = quant.QuantOps(.{ .bits = bits, .group_size = gs });
+            return .{
+                .code_bytes = Ops.rowWeightBytes(dim) catch return error.InvalidShape,
+                .param_bytes = Ops.scaleBiasBytes(1, dim) catch return error.InvalidShape,
+            };
+        }
+    }
+    return error.UnsupportedGroupSize;
+}
+
+fn dequantizeQuantRow(
+    comptime bits: quant.QuantBits,
+    group_size: u16,
+    embed_dim: usize,
+    code_bytes: []const u8,
+    param_bytes: []const u8,
+    out_row: []f32,
+) Error!void {
+    inline for (.{ 32, 64, 128 }) |gs| {
+        if (group_size == gs) {
+            const Ops = quant.QuantOps(.{ .bits = bits, .group_size = gs });
+            const gb = Ops.groupWeightBytes();
+            const groups = embed_dim / gs;
+            for (0..groups) |g| {
+                const scale_bits = std.mem.readInt(u16, param_bytes[g * 4 + 0 ..][0..2], .little);
+                const bias_bits = std.mem.readInt(u16, param_bytes[g * 4 + 2 ..][0..2], .little);
+                const sb: quant.ScaleBias = .{
+                    .scale = @bitCast(scale_bits),
+                    .bias = @bitCast(bias_bits),
+                };
+                const out_grp: *[gs]f32 = out_row[g * gs ..][0..gs];
+                Ops.dequantizeGroup(code_bytes[g * gb ..][0..gb], sb, out_grp);
+            }
+            return;
+        }
+    }
+    return error.UnsupportedGroupSize;
+}
+
 const Q4 = quant.QuantOps(.{ .bits = .q4, .group_size = 64 });
-const Q3 = quant.QuantOps(.{ .bits = .q3, .group_size = 64 });
 const Q2 = quant.QuantOps(.{ .bits = .q2, .group_size = 64 });
 
 const EMPTY_HASH_SLOT: u32 = std.math.maxInt(u32);
@@ -213,6 +256,7 @@ pub const Error = amf.ParseError || amf.IoError || aio.EcorePoolError ||
     NoSparseTablesFound,
     InvalidCacheConfig,
     UnsupportedDType,
+    UnsupportedGroupSize,
     InconsistentEmbedDim,
     LayerOutOfRange,
     LayerNotFound,
@@ -823,6 +867,16 @@ pub const PlePageCache = struct {
         self.stats.bytes_read += bytes_read;
     }
 
+    fn applyCompletionBatch(self: *PlePageCache, comps: []const aio.Completion) aio.EngineError!void {
+        var first_err: ?aio.EngineError = null;
+        for (comps) |c| {
+            self.applyCompletion(c) catch |err| {
+                if (first_err == null) first_err = err;
+            };
+        }
+        if (first_err) |err| return err;
+    }
+
     /// Reaps any already-completed asynchronous prefetches without blocking.
     pub fn reapPrefetches(self: *PlePageCache) aio.EngineError!usize {
         if (self.async_reader.inflightCount() == 0) return 0;
@@ -831,9 +885,7 @@ pub const PlePageCache = struct {
         while (self.async_reader.inflightCount() > 0) {
             const got = try self.async_reader.poll(&comps);
             if (got == 0) break;
-            for (comps[0..got]) |c| {
-                try self.applyCompletion(c);
-            }
+            try self.applyCompletionBatch(comps[0..got]);
             total += got;
         }
         return total;
@@ -844,9 +896,7 @@ pub const PlePageCache = struct {
         while (self.async_reader.inflightCount() > 0) {
             const got = try self.async_reader.wait(&comps, self.timeout_ms);
             if (got == 0) return error.Timeout;
-            for (comps[0..got]) |c| {
-                try self.applyCompletion(c);
-            }
+            try self.applyCompletionBatch(comps[0..got]);
         }
     }
 
@@ -907,9 +957,7 @@ pub const PlePageCache = struct {
         while (self.slots[target_slot].state == .inflight) {
             const got = try self.async_reader.wait(&comps, self.timeout_ms);
             if (got == 0) return error.Timeout;
-            for (comps[0..got]) |c| {
-                try self.applyCompletion(c);
-            }
+            try self.applyCompletionBatch(comps[0..got]);
         }
     }
 
@@ -942,9 +990,7 @@ pub const PlePageCache = struct {
             var comps: [aio.MAX_INFLIGHT]aio.Completion = undefined;
             const got = try self.async_reader.wait(&comps, self.timeout_ms);
             if (got == 0) return error.Timeout;
-            for (comps[0..got]) |c| {
-                try self.applyCompletion(c);
-            }
+            try self.applyCompletionBatch(comps[0..got]);
             victim_opt = self.acquireVictimSlot();
         }
         const victim = victim_opt.?;
@@ -1170,6 +1216,7 @@ const ShardDesc = struct {
     shard_id: u32,
     entry_idx: u32,
     dtype: amf.DType,
+    group_size: u16,
     blob_offset: u64,
     blob_bytes: u64,
     params_offset: u64,
@@ -1253,7 +1300,7 @@ pub const PleStore = struct {
             for (f.parsed.entries) |*entry| {
                 if ((try entry.tensorKind()) != .sparse_table) continue;
                 const dtype = try entry.dataType();
-                const geom = try rowGeometry(dtype, entry.shape[1]);
+                const geom = try rowGeometry(dtype, entry.shape[1], entry.group_size);
                 const layer_idx = try resolveLayerIndex(entry);
                 if (layer_idx >= MAX_LAYERS) return error.LayerOutOfRange;
 
@@ -1316,7 +1363,7 @@ pub const PleStore = struct {
             for (f.parsed.entries, 0..) |*entry, entry_idx| {
                 if ((try entry.tensorKind()) != .sparse_table) continue;
                 const dtype = try entry.dataType();
-                const geom = try rowGeometry(dtype, entry.shape[1]);
+                const geom = try rowGeometry(dtype, entry.shape[1], entry.group_size);
                 const layer_idx = try resolveLayerIndex(entry);
                 const shard_id = resolveShardIndex(entry);
 
@@ -1327,6 +1374,7 @@ pub const PleStore = struct {
                     .shard_id = shard_id,
                     .entry_idx = @intCast(entry_idx),
                     .dtype = dtype,
+                    .group_size = entry.group_size,
                     .blob_offset = entry.blob_offset,
                     .blob_bytes = entry.blob_bytes,
                     .params_offset = entry.params_offset,
@@ -1657,21 +1705,11 @@ pub const PleStore = struct {
                     break :blk dst;
                 };
 
-                const groups = @as(usize, self.embed_dim) / 64;
-                for (0..groups) |g| {
-                    const scale_bits = std.mem.readInt(u16, param_bytes[g * 4 + 0 ..][0..2], .little);
-                    const bias_bits = std.mem.readInt(u16, param_bytes[g * 4 + 2 ..][0..2], .little);
-                    const sb: quant.ScaleBias = .{
-                        .scale = @bitCast(scale_bits),
-                        .bias = @bitCast(bias_bits),
-                    };
-                    const out_grp: *[64]f32 = out_row[g * 64 ..][0..64];
-                    switch (sh.dtype) {
-                        .q4_affine => Q4.dequantizeGroup(code_bytes[g * 32 ..][0..32], sb, out_grp),
-                        .q3_affine => Q3.dequantizeGroup(code_bytes[g * 24 ..][0..24], sb, out_grp),
-                        .q2_affine => Q2.dequantizeGroup(code_bytes[g * 16 ..][0..16], sb, out_grp),
-                        else => unreachable,
-                    }
+                switch (sh.dtype) {
+                    .q4_affine => try dequantizeQuantRow(.q4, sh.group_size, self.embed_dim, code_bytes, param_bytes, out_row),
+                    .q3_affine => try dequantizeQuantRow(.q3, sh.group_size, self.embed_dim, code_bytes, param_bytes, out_row),
+                    .q2_affine => try dequantizeQuantRow(.q2, sh.group_size, self.embed_dim, code_bytes, param_bytes, out_row),
+                    else => unreachable,
                 }
             },
             .fp8_e4m3_row => {
@@ -2243,7 +2281,7 @@ fn readScaleVectorF32(
     return out;
 }
 
-fn rowGeometry(dtype: amf.DType, embed_dim: u32) Error!struct { code_bytes: usize, param_bytes: usize } {
+fn rowGeometry(dtype: amf.DType, embed_dim: u32, group_size: u16) Error!RowGeometry {
     if (embed_dim == 0) return error.InvalidShape;
     const dim: usize = embed_dim;
     return switch (dtype) {
@@ -2253,18 +2291,9 @@ fn rowGeometry(dtype: amf.DType, embed_dim: u32) Error!struct { code_bytes: usiz
             .{ .code_bytes = dim, .param_bytes = dim / 32 }
         else
             error.InvalidShape,
-        .q4_affine => .{
-            .code_bytes = Q4.rowWeightBytes(dim) catch return error.InvalidShape,
-            .param_bytes = Q4.scaleBiasBytes(1, dim) catch return error.InvalidShape,
-        },
-        .q3_affine => .{
-            .code_bytes = Q3.rowWeightBytes(dim) catch return error.InvalidShape,
-            .param_bytes = Q3.scaleBiasBytes(1, dim) catch return error.InvalidShape,
-        },
-        .q2_affine => .{
-            .code_bytes = Q2.rowWeightBytes(dim) catch return error.InvalidShape,
-            .param_bytes = Q2.scaleBiasBytes(1, dim) catch return error.InvalidShape,
-        },
+        .q4_affine => try quantRowGeometry(.q4, dim, group_size),
+        .q3_affine => try quantRowGeometry(.q3, dim, group_size),
+        .q2_affine => try quantRowGeometry(.q2, dim, group_size),
         else => error.UnsupportedDType,
     };
 }
@@ -2299,9 +2328,11 @@ fn resolveShardIndex(entry: *const amf.TensorEntry) u32 {
 }
 
 fn preadExact(fd: std.c.fd_t, dst: []u8, offset: u64) aio.EngineError!void {
+    const MAX_PREAD_CHUNK: usize = 0x7fff_c000;
     var done: usize = 0;
     while (done < dst.len) {
-        const rc = std.c.pread(fd, dst.ptr + done, dst.len - done, @intCast(offset + done));
+        const chunk = @min(dst.len - done, MAX_PREAD_CHUNK);
+        const rc = std.c.pread(fd, dst.ptr + done, chunk, @intCast(offset + done));
         if (rc < 0) {
             const err = std.c.errno(rc);
             if (err == .INTR) continue;
@@ -2323,7 +2354,25 @@ const SyntheticTableSpec = struct {
     num_rows: u32,
     embed_dim: u32,
     seed: u64,
+    group_size: u16 = 64,
 };
+
+fn packSyntheticQuantRowGroup(
+    comptime bits: quant.QuantBits,
+    group_size: u16,
+    codes: []const u8,
+    out: []u8,
+) void {
+    inline for (.{ 32, 64, 128 }) |gs| {
+        if (group_size == gs) {
+            const Ops = quant.QuantOps(.{ .bits = bits, .group_size = gs });
+            const gb = Ops.groupWeightBytes();
+            Ops.packGroup(codes[0..gs], out[0..gb]);
+            return;
+        }
+    }
+    unreachable;
+}
 
 fn buildSyntheticPleAmf(
     allocator: std.mem.Allocator,
@@ -2347,7 +2396,7 @@ fn buildSyntheticPleAmf(
 
     var next_off: usize = dir_offset + dir_bytes;
     for (specs, 0..) |sp, i| {
-        const geom = try rowGeometry(sp.dtype, sp.embed_dim);
+        const geom = try rowGeometry(sp.dtype, sp.embed_dim, sp.group_size);
         const data_bytes: usize = @as(usize, sp.num_rows) * geom.code_bytes;
         const params_offset: usize = if (geom.param_bytes > 0) amf.align64(data_bytes) else 0;
         const params_bytes: usize = @as(usize, sp.num_rows) * geom.param_bytes;
@@ -2386,11 +2435,17 @@ fn buildSyntheticPleAmf(
                     }
                 }
             },
-            .q4_affine, .q2_affine => {
-                const groups = sp.embed_dim / 64;
-                const max_q: u64 = if (sp.dtype == .q4_affine) 15 else 3;
-                const grp_code_bytes: usize = if (sp.dtype == .q4_affine) 32 else 16;
-                var codes: [64]u8 = undefined;
+            .q4_affine, .q3_affine, .q2_affine => {
+                const gs: usize = sp.group_size;
+                const groups = sp.embed_dim / gs;
+                const max_q: u64 = switch (sp.dtype) {
+                    .q4_affine => 15,
+                    .q3_affine => 7,
+                    .q2_affine => 3,
+                    else => unreachable,
+                };
+                const grp_code_bytes: usize = geom.code_bytes / groups;
+                var codes: [128]u8 = undefined;
                 for (0..sp.num_rows) |r| {
                     for (0..groups) |g| {
                         const sb: quant.ScaleBias = .{
@@ -2401,18 +2456,19 @@ fn buildSyntheticPleAmf(
                         std.mem.writeInt(u16, blob[p_off + 0 ..][0..2], @bitCast(sb.scale), .little);
                         std.mem.writeInt(u16, blob[p_off + 2 ..][0..2], @bitCast(sb.bias), .little);
 
-                        for (0..64) |j| {
+                        for (0..gs) |j| {
                             const q: u8 = @intCast((sp.seed +% r * 11 +% g * 5 +% j * 3) % (max_q + 1));
                             codes[j] = q;
-                            ref[r * sp.embed_dim + g * 64 + j] =
+                            ref[r * sp.embed_dim + g * gs + j] =
                                 @as(f32, @floatFromInt(q)) * @as(f32, @floatCast(sb.scale)) +
                                 @as(f32, @floatCast(sb.bias));
                         }
                         const c_off = r * geom.code_bytes + g * grp_code_bytes;
-                        if (sp.dtype == .q4_affine) {
-                            Q4.packGroup(&codes, blob[c_off..][0..32]);
-                        } else {
-                            Q2.packGroup(&codes, blob[c_off..][0..16]);
+                        switch (sp.dtype) {
+                            .q4_affine => packSyntheticQuantRowGroup(.q4, sp.group_size, codes[0..gs], blob[c_off .. c_off + grp_code_bytes]),
+                            .q3_affine => packSyntheticQuantRowGroup(.q3, sp.group_size, codes[0..gs], blob[c_off .. c_off + grp_code_bytes]),
+                            .q2_affine => packSyntheticQuantRowGroup(.q2, sp.group_size, codes[0..gs], blob[c_off .. c_off + grp_code_bytes]),
+                            else => unreachable,
                         }
                     }
                 }
@@ -2444,8 +2500,13 @@ fn buildSyntheticPleAmf(
                 e.quant_bits = 8;
                 e.group_size = 0;
             } else {
-                e.quant_bits = if (sp.dtype == .q4_affine) 4 else 2;
-                e.group_size = 64;
+                e.quant_bits = switch (sp.dtype) {
+                    .q4_affine => 4,
+                    .q3_affine => 3,
+                    .q2_affine => 2,
+                    else => 2,
+                };
+                e.group_size = sp.group_size;
             }
             e.params_offset = params_offset;
             e.params_bytes = params_bytes;
@@ -3013,7 +3074,7 @@ fn buildSyntheticPleAmfWithAux(
 
     var next_off: usize = dir_offset + dir_bytes;
     for (specs, 0..) |sp, i| {
-        const geom = try rowGeometry(sp.dtype, sp.embed_dim);
+        const geom = try rowGeometry(sp.dtype, sp.embed_dim, sp.group_size);
         const data_bytes: usize = @as(usize, sp.num_rows) * geom.code_bytes;
         const params_offset: usize = if (geom.param_bytes > 0) amf.align64(data_bytes) else 0;
         const params_bytes: usize = @as(usize, sp.num_rows) * geom.param_bytes;
@@ -3375,4 +3436,81 @@ test "M9.4 Qwen3.8 PLE multi-head hash with EOS reset and MXFP8_G32 Engram shard
         try std.testing.expectEqualSlices(f32, out0, out1);
         try std.testing.expectEqual(reads_r0, store.stats().nvme_reads);
     }
+}
+
+test "F19.2 PleStore honors group_size 32/64/128 and rejects unsupported group sizes" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // 1. Verify group_size = 32 (q3_affine) and group_size = 128 (q4_affine) decode identically to FP32 reference.
+    const embed_dim: u32 = 128;
+    const num_rows: u32 = 4;
+    const ref_g32 = try gpa.alloc(f32, num_rows * embed_dim);
+    defer gpa.free(ref_g32);
+    const ref_g128 = try gpa.alloc(f32, num_rows * embed_dim);
+    defer gpa.free(ref_g128);
+
+    const specs = [_]SyntheticTableSpec{
+        .{ .name = "ple.layers.0.weight", .layer = 0, .dtype = .q3_affine, .num_rows = num_rows, .embed_dim = embed_dim, .seed = 101, .group_size = 32 },
+        .{ .name = "ple.layers.1.weight", .layer = 1, .dtype = .q4_affine, .num_rows = num_rows, .embed_dim = embed_dim, .seed = 202, .group_size = 128 },
+    };
+    var refs = [_][]f32{ ref_g32, ref_g128 };
+    const img = try buildSyntheticPleAmf(gpa, &specs, &refs);
+    defer gpa.free(img);
+
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "ple_groups.amf", .data = img });
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path_raw = try std.fmt.bufPrint(path_buf[0 .. path_buf.len - 1], ".zig-cache/tmp/{s}/ple_groups.amf", .{tmp.sub_path});
+    path_buf[path_raw.len] = 0;
+    const path_z: [:0]const u8 = path_buf[0..path_raw.len :0];
+
+    var store = try PleStore.openSingle(gpa, path_z, .{
+        .cache = .{ .cache_pages = 4, .budget_override = testBudget(8 * page.APPLE_PAGE_SIZE) },
+    });
+    defer store.deinit(gpa);
+
+    var decoded: [embed_dim]f32 = undefined;
+    for (0..num_rows) |r| {
+        try store.decodeRowF32(0, @intCast(r), &decoded);
+        for (0..embed_dim) |d| {
+            try std.testing.expectApproxEqAbs(ref_g32[r * embed_dim + d], decoded[d], 1e-4);
+        }
+        try store.decodeRowF32(1, @intCast(r), &decoded);
+        for (0..embed_dim) |d| {
+            try std.testing.expectApproxEqAbs(ref_g128[r * embed_dim + d], decoded[d], 1e-4);
+        }
+    }
+
+    // 2. Reject unsupported group_size (e.g. 16 or 0) on sparse quantized tables.
+    try std.testing.expectError(error.UnsupportedGroupSize, rowGeometry(.q4_affine, embed_dim, 16));
+    try std.testing.expectError(error.UnsupportedGroupSize, rowGeometry(.q2_affine, embed_dim, 0));
+}
+
+test "F19.3 PlePageCache applyCompletionBatch processes all completions before returning first error" {
+    const gpa = std.testing.allocator;
+    var pcache = try PlePageCache.init(gpa, .{
+        .cache_pages = 4,
+        .max_inflight = 4,
+        .budget_override = testBudget(8 * page.APPLE_PAGE_SIZE),
+    });
+    defer pcache.deinit(gpa);
+
+    const k0: PageKey = .{ .file_idx = 0, .page_idx = 10 };
+    const k1: PageKey = .{ .file_idx = 0, .page_idx = 11 };
+    pcache.slots[0] = .{ .state = .inflight, .key = k0 };
+    pcache.hashInsert(k0, 0);
+    pcache.slots[1] = .{ .state = .inflight, .key = k1 };
+    pcache.hashInsert(k1, 1);
+    pcache.free_top = 2; // slots 0 and 1 popped
+
+    const comps = [_]aio.Completion{
+        .{ .user_data = 0, .bytes_read = 0, .err_code = @backingInt(std.c.E.IO), .short_read = false },
+        .{ .user_data = 1, .bytes_read = page.APPLE_PAGE_SIZE, .err_code = 0, .short_read = false },
+    };
+
+    try std.testing.expectError(error.ReadFailed, pcache.applyCompletionBatch(&comps));
+    // Slot 0 rolled back to empty; Slot 1 MUST be ready (NOT wedged in .inflight)!
+    try std.testing.expectEqual(PlePageCache.SlotState.empty, pcache.slots[0].state);
+    try std.testing.expectEqual(PlePageCache.SlotState.ready, pcache.slots[1].state);
 }

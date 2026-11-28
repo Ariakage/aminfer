@@ -22,6 +22,8 @@ pub const APPLE_PAGE_SIZE: usize = page.APPLE_PAGE_SIZE;
 pub const MAGIC: u32 = std.mem.readInt(u32, "AMI7", .little);
 pub const PROTOCOL_VERSION: u16 = 1;
 pub const HEADER_BYTES: usize = 32;
+pub const FLAG_AUTHENTICATED: u8 = 0x80;
+pub const AUTH_TAG_BYTES: usize = 32;
 pub const MAX_FRAME_PAYLOAD_BYTES: usize = std.math.maxInt(u32);
 pub const MAX_EXPERTS_BITMAP_WORDS: usize = 16;
 pub const MAX_EXPERTS_BITMAP_BITS: usize = MAX_EXPERTS_BITMAP_WORDS * 64;
@@ -81,6 +83,7 @@ pub const ProtocolError = error{
     PayloadCrcMismatch,
     PayloadTooLarge,
     MalformedPayload,
+    AuthenticationFailed,
 };
 
 pub const SlabError = page.WiredRegion.InitError || page.ShareError || error{
@@ -92,6 +95,7 @@ pub const FramePayloadError = error{
     PayloadTooLarge,
     BufferTooSmall,
     Overflow,
+    PendingTxInProgress,
 };
 
 /// Dynamically probed `libibverbs` / `RDMA.framework` symbols (no link dep).
@@ -951,6 +955,7 @@ pub const FrameChannel = struct {
     rx_expected: usize = 0,
     rx_header: ?FrameHeader = null,
     write_armed: bool = false,
+    psk: ?[]const u8 = null,
 
     pub fn init(
         fd: std.c.fd_t,
@@ -964,6 +969,10 @@ pub const FrameChannel = struct {
             .tx_buf = tx_buf,
             .rx_buf = rx_buf,
         };
+    }
+
+    pub fn setPsk(self: *FrameChannel, psk: ?[]const u8) void {
+        self.psk = psk;
     }
 
     pub fn resetState(self: *FrameChannel) void {
@@ -994,8 +1003,10 @@ pub const FrameChannel = struct {
     }
 
     fn validateTxPayloadBounds(self: *const FrameChannel, payload_len: usize) FramePayloadError!usize {
-        const total = std.math.add(usize, HEADER_BYTES, payload_len) catch return error.Overflow;
-        if (payload_len > MAX_FRAME_PAYLOAD_BYTES) return error.PayloadTooLarge;
+        const tag_len: usize = if (self.psk != null) AUTH_TAG_BYTES else 0;
+        const wire_payload = std.math.add(usize, payload_len, tag_len) catch return error.Overflow;
+        const total = std.math.add(usize, HEADER_BYTES, wire_payload) catch return error.Overflow;
+        if (payload_len > MAX_FRAME_PAYLOAD_BYTES or wire_payload > MAX_FRAME_PAYLOAD_BYTES) return error.PayloadTooLarge;
         if (total > self.tx_buf.len) return error.BufferTooSmall;
         return total;
     }
@@ -1003,14 +1014,17 @@ pub const FrameChannel = struct {
     /// Reserves an 8-byte-aligned payload region inside `tx_buf` directly after
     /// the 32-byte frame header so callers encode payloads with zero extra copy.
     pub fn preparePayload(self: *FrameChannel, payload_len: usize) FramePayloadError![]align(8) u8 {
+        if (self.hasPendingTx()) return error.PendingTxInProgress;
         const total = try self.validateTxPayloadBounds(payload_len);
-        const slice: []align(8) u8 = @alignCast(self.tx_buf[HEADER_BYTES..total]);
+        const tag_len: usize = if (self.psk != null) AUTH_TAG_BYTES else 0;
+        const slice: []align(8) u8 = @alignCast(self.tx_buf[HEADER_BYTES .. total - tag_len]);
         return slice;
     }
 
-    /// Validates `payload_len` against both `MAX_FRAME_PAYLOAD_BYTES` (`u32`) and
-    /// `tx_buf.len`, then finalizes the 32-byte `AMI7` header for a payload
-    /// previously written into `tx_buf[HEADER_BYTES..]`.
+    /// Validates `payload_len` against both `MAX_FRAME_PAYLOAD_BYTES` (`u32`),
+    /// `tx_buf.len`, and pending TX completion, then finalizes the 32-byte `AMI7`
+    /// header (plus optional HMAC-SHA256 tag trailer when `psk` is set) for a
+    /// payload previously written into `tx_buf[HEADER_BYTES..]`.
     pub fn commitFrameChecked(
         self: *FrameChannel,
         msg_type: MsgType,
@@ -1018,15 +1032,38 @@ pub const FrameChannel = struct {
         seq_id: u64,
         payload_len: usize,
     ) FramePayloadError!FrameHeader {
+        if (self.hasPendingTx()) return error.PendingTxInProgress;
         const total = try self.validateTxPayloadBounds(payload_len);
-        const payload_len_u32 = std.math.cast(u32, payload_len) orelse return error.PayloadTooLarge;
-        const payload = self.tx_buf[HEADER_BYTES..total];
+        const tag_len: usize = if (self.psk != null) AUTH_TAG_BYTES else 0;
+        const wire_payload_len = payload_len + tag_len;
+        const payload_len_u32 = std.math.cast(u32, wire_payload_len) orelse return error.PayloadTooLarge;
+        const eff_flags: u8 = if (self.psk != null) (flags | FLAG_AUTHENTICATED) else flags;
+
+        if (self.psk) |key| {
+            var prefix_buf: [HEADER_BYTES]u8 = undefined;
+            const prefix_hdr: FrameHeader = .{
+                .msg_type = msg_type,
+                .flags = eff_flags,
+                .seq_id = seq_id,
+                .payload_len = payload_len_u32,
+                .payload_crc32 = 0,
+            };
+            FrameHeader.writeHeaderFields(prefix_hdr, 0, &prefix_buf);
+            var mac = std.crypto.auth.hmac.sha2.HmacSha256.init(key);
+            mac.update(prefix_buf[0..20]);
+            mac.update(self.tx_buf[HEADER_BYTES .. HEADER_BYTES + payload_len]);
+            var tag: [AUTH_TAG_BYTES]u8 = undefined;
+            mac.final(&tag);
+            @memcpy(self.tx_buf[HEADER_BYTES + payload_len .. total], &tag);
+        }
+
+        const wire_payload = self.tx_buf[HEADER_BYTES..total];
         const raw_hdr: FrameHeader = .{
             .msg_type = msg_type,
-            .flags = flags,
+            .flags = eff_flags,
             .seq_id = seq_id,
             .payload_len = payload_len_u32,
-            .payload_crc32 = std.hash.Crc32.hash(payload),
+            .payload_crc32 = std.hash.Crc32.hash(wire_payload),
         };
         const encoded = raw_hdr.encode(self.tx_buf[0..HEADER_BYTES]);
         self.tx_len = total;
@@ -1045,6 +1082,14 @@ pub const FrameChannel = struct {
         payload_len: usize,
     ) FrameHeader {
         return self.commitFrameChecked(msg_type, flags, seq_id, payload_len) catch |err| switch (err) {
+            error.PendingTxInProgress => .{
+                .msg_type = msg_type,
+                .flags = flags,
+                .seq_id = seq_id,
+                .payload_len = 0,
+                .header_crc32 = 0,
+                .payload_crc32 = 0,
+            },
             error.PayloadTooLarge, error.BufferTooSmall, error.Overflow => {
                 self.tx_len = 0;
                 self.tx_sent = 0;
@@ -1133,14 +1178,35 @@ pub const FrameChannel = struct {
             }
 
             const hdr = self.rx_header.?;
-            const payload: []align(8) const u8 = @alignCast(self.rx_buf[HEADER_BYTES..self.rx_expected]);
-            if (std.hash.Crc32.hash(payload) != hdr.payload_crc32) {
+            const wire_payload = self.rx_buf[HEADER_BYTES..self.rx_expected];
+            if (std.hash.Crc32.hash(wire_payload) != hdr.payload_crc32) {
                 return error.PayloadCrcMismatch;
             }
+            const app_payload: []align(8) const u8 = if (self.psk) |key| blk: {
+                if ((hdr.flags & FLAG_AUTHENTICATED) == 0 or wire_payload.len < AUTH_TAG_BYTES) {
+                    return error.AuthenticationFailed;
+                }
+                const body_len = wire_payload.len - AUTH_TAG_BYTES;
+                var mac = std.crypto.auth.hmac.sha2.HmacSha256.init(key);
+                mac.update(self.rx_buf[0..20]);
+                mac.update(wire_payload[0..body_len]);
+                var expected_tag: [AUTH_TAG_BYTES]u8 = undefined;
+                mac.final(&expected_tag);
+                const recv_tag = wire_payload[body_len..][0..AUTH_TAG_BYTES];
+                if (!std.crypto.timing_safe.eql([AUTH_TAG_BYTES]u8, expected_tag, recv_tag.*)) {
+                    return error.AuthenticationFailed;
+                }
+                break :blk @alignCast(wire_payload[0..body_len]);
+            } else blk: {
+                if ((hdr.flags & FLAG_AUTHENTICATED) != 0) {
+                    return error.AuthenticationFailed;
+                }
+                break :blk @alignCast(wire_payload);
+            };
             return .{
                 .frame_ready = .{
                     .header = hdr,
-                    .payload = payload,
+                    .payload = app_payload,
                     .bytes_read = total_read,
                 },
             };
@@ -1455,4 +1521,96 @@ test "X1 FrameChannel enforces u32 MAX_FRAME_PAYLOAD_BYTES and tx_buf bounds wit
     try std.testing.expectEqual(@as(u32, max_fit), ok_hdr.payload_len);
     try std.testing.expect(chan.hasPendingTx());
     try std.testing.expectEqual(APPLE_PAGE_SIZE, chan.tx_len);
+
+    // 6. F16.1: calling preparePayload or commitFrameChecked while TX is pending fails cleanly.
+    try std.testing.expectError(error.PendingTxInProgress, chan.preparePayload(8));
+    try std.testing.expectError(error.PendingTxInProgress, chan.commitFrameChecked(.ping, 0, 7, 8));
+}
+
+test "L5 FrameChannel HMAC-SHA256 PSK authentication accepts matching PSK and rejects wrong/unauthenticated peers" {
+    var slab = try WiredSlab.initOwned(4 * APPLE_PAGE_SIZE);
+    defer slab.deinit();
+
+    const c_tx = try slab.carvePages(APPLE_PAGE_SIZE);
+    const c_rx = try slab.carvePages(APPLE_PAGE_SIZE);
+    const s_tx = try slab.carvePages(APPLE_PAGE_SIZE);
+    const s_rx = try slab.carvePages(APPLE_PAGE_SIZE);
+
+    var listener = try TcpListener.bind(.{ .host = .{ 127, 0, 0, 1 }, .port = 0 }, 4);
+    defer listener.close();
+
+    const kq_c = try kqueueCreate();
+    defer _ = std.c.close(kq_c);
+    const kq_s = try kqueueCreate();
+    defer _ = std.c.close(kq_s);
+
+    const openPair = struct {
+        fn go(l: *TcpListener, ct: []align(APPLE_PAGE_SIZE) u8, cr: []align(APPLE_PAGE_SIZE) u8, st: []align(APPLE_PAGE_SIZE) u8, sr: []align(APPLE_PAGE_SIZE) u8) !struct { c: FrameChannel, s: FrameChannel } {
+            const cfd = try connectNonBlocking(.{ .host = .{ 127, 0, 0, 1 }, .port = l.bound_port }, 2000);
+            var c_ch = try FrameChannel.init(cfd, ct, cr);
+            errdefer c_ch.close();
+            var sfd: std.c.fd_t = -1;
+            for (0..200) |_| {
+                if (try l.acceptNonBlocking()) |fd| {
+                    sfd = fd;
+                    break;
+                }
+                const ts = nsToTimespec(1 * std.time.ns_per_ms);
+                _ = std.c.nanosleep(&ts, null);
+            }
+            try std.testing.expect(sfd >= 0);
+            const s_ch = try FrameChannel.init(sfd, st, sr);
+            return .{ .c = c_ch, .s = s_ch };
+        }
+    }.go;
+
+    // 1. Matching PSK authenticates and strips the 32-byte MAC trailer cleanly.
+    {
+        var p = try openPair(&listener, c_tx, c_rx, s_tx, s_rx);
+        defer p.c.close();
+        defer p.s.close();
+        p.c.setPsk("tb5-cluster-secret");
+        p.s.setPsk("tb5-cluster-secret");
+
+        const out = try p.c.preparePayload(8);
+        std.mem.writeInt(u64, out[0..8], 0xCAFE_BABE_1234_5678, .little);
+        const hdr = try p.c.commitFrameChecked(.ping, 0, 11, 8);
+        try std.testing.expectEqual(@as(u32, 8 + AUTH_TAG_BYTES), hdr.payload_len);
+        try std.testing.expect((hdr.flags & FLAG_AUTHENTICATED) != 0);
+        _ = try p.c.sendFrameSync(kq_c, 2000);
+
+        const rec = try p.s.recvFrameSync(kq_s, 2000);
+        try std.testing.expectEqual(@as(usize, 8), rec.payload.len);
+        try std.testing.expectEqual(@as(u64, 0xCAFE_BABE_1234_5678), std.mem.readInt(u64, rec.payload[0..8], .little));
+        p.s.resetRx();
+    }
+
+    // 2. Wrong PSK -> AuthenticationFailed.
+    {
+        var p = try openPair(&listener, c_tx, c_rx, s_tx, s_rx);
+        defer p.c.close();
+        defer p.s.close();
+        p.c.setPsk("wrong-secret");
+        p.s.setPsk("tb5-cluster-secret");
+
+        const out = try p.c.preparePayload(8);
+        @memset(out, 0x11);
+        _ = try p.c.commitFrameChecked(.ping, 0, 12, 8);
+        _ = try p.c.sendFrameSync(kq_c, 2000);
+        try std.testing.expectError(error.AuthenticationFailed, p.s.recvFrameSync(kq_s, 2000));
+    }
+
+    // 3. Unauthenticated peer (psk == null) -> authenticated server (psk != null) -> AuthenticationFailed.
+    {
+        var p = try openPair(&listener, c_tx, c_rx, s_tx, s_rx);
+        defer p.c.close();
+        defer p.s.close();
+        p.s.setPsk("tb5-cluster-secret");
+
+        const out = try p.c.preparePayload(8);
+        @memset(out, 0x22);
+        _ = try p.c.commitFrameChecked(.ping, 0, 13, 8);
+        _ = try p.c.sendFrameSync(kq_c, 2000);
+        try std.testing.expectError(error.AuthenticationFailed, p.s.recvFrameSync(kq_s, 2000));
+    }
 }

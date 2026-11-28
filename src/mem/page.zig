@@ -31,6 +31,14 @@ pub fn checkShareable(ptr: [*]const u8, len: usize) ShareError!void {
 
 /// Anonymous memory pinned with `mlock`: never paged out and never swapped.
 /// Created at startup only; the hot path never allocates.
+var g_process_wired_bytes: std.atomic.Value(u64) = .init(0);
+
+/// Returns the total bytes currently wired across all live `WiredRegion`s in
+/// this process.
+pub fn currentProcessWiredBytes() u64 {
+    return g_process_wired_bytes.load(.acquire);
+}
+
 pub const WiredRegion = struct {
     bytes: []align(APPLE_PAGE_SIZE) u8,
 
@@ -62,12 +70,19 @@ pub const WiredRegion = struct {
             .PERM => return error.PermissionDenied,
             else => |err| return std.posix.unexpectedErrno(err),
         }
+        _ = g_process_wired_bytes.fetchAdd(@intCast(size), .acq_rel);
         return .{ .bytes = mapping };
     }
 
     /// Explicitly unwires and unmaps the pages.
     pub fn deinit(self: WiredRegion) void {
-        _ = std.c.munlock(self.bytes.ptr, self.bytes.len);
+        const prev = g_process_wired_bytes.fetchSub(@intCast(self.bytes.len), .acq_rel);
+        std.debug.assert(prev >= self.bytes.len);
+        const rc = std.c.munlock(self.bytes.ptr, self.bytes.len);
+        if (rc != 0) {
+            const err = std.c.errno(rc);
+            std.debug.panic("WiredRegion.deinit: munlock failed: {s}", .{@tagName(err)});
+        }
         std.posix.munmap(self.bytes);
     }
 };
@@ -102,4 +117,17 @@ test "WiredRegion is 16 KiB aligned in address and length" {
 
 test "WiredRegion rejects a zero length" {
     try std.testing.expectError(error.ZeroLength, WiredRegion.init(0));
+}
+
+test "currentProcessWiredBytes tracks WiredRegion init and deinit" {
+    const before = currentProcessWiredBytes();
+    const r1 = try WiredRegion.init(2 * APPLE_PAGE_SIZE);
+    errdefer r1.deinit();
+    try std.testing.expectEqual(before + 2 * APPLE_PAGE_SIZE, currentProcessWiredBytes());
+    const r2 = try WiredRegion.init(APPLE_PAGE_SIZE);
+    try std.testing.expectEqual(before + 3 * APPLE_PAGE_SIZE, currentProcessWiredBytes());
+    r2.deinit();
+    try std.testing.expectEqual(before + 2 * APPLE_PAGE_SIZE, currentProcessWiredBytes());
+    r1.deinit();
+    try std.testing.expectEqual(before, currentProcessWiredBytes());
 }
